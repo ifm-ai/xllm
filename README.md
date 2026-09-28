@@ -181,7 +181,7 @@ xllm/
   modules/        Attention, expert layers, normalization, and operators
   distributed/    Parallelism and distributed training utilities
   optim/          Optimizers and learning-rate schedulers
-  eval/           Evaluation tasks and runnersxllm_bridges/     Hugging Face conversion and vLLM integration
+  eval/           Evaluation tasks and runners
 examples/         Training launch scripts and benchmarks
 tests/            Tests and validation utilities
 ```
