@@ -1,0 +1,12 @@
+NVIDIA Transformer Engine
+https://github.com/NVIDIA/TransformerEngine
+
+Copyright (c) 2022-2025, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+xllm includes a modified subset of Transformer Engine in
+xllm/csrc/transformer_engine for its cuBLAS grouped matrix multiplication
+backend. The subset is compiled into xllm_extension, with local PyTorch
+bindings and selected tensor, CUDA runtime, and matrix multiplication utilities.
+
+The Transformer Engine code is covered by the accompanying Apache-2.0 LICENSE.
+This attribution notice was added by xllm for its vendored copy.

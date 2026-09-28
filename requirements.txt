@@ -1,0 +1,16 @@
+# packages
+
+fire
+nltk
+pathlib
+nvidia-ml-py
+rouge_score
+sentencepiece
+submitit
+tqdm
+tensorboard
+typeguard>=4.5.0
+wandb
+tiktoken==0.8.0
+blobfile
+einops
