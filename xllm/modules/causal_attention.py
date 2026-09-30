@@ -122,7 +122,7 @@ class CausalSoftmaxAttention(nn.Module):
             xv = repeat_kv(xv, n_rep)
 
             if segments is not None:
-                q_segment_idx, k_segment_idx, _, _, _ = segments
+                q_segment_idx, k_segment_idx = segments
             else:
                 q_segment_idx, k_segment_idx = None, None
 
