@@ -289,7 +289,7 @@ class PPLDataLoader:
         self.world_rank = world_rank
         self.world_size = world_size
         self.keep_tail = keep_tail
-        self.reader = JSONLFileIterator(data, world_rank, world_size, infinite=False)
+        self.reader = JSONLFileIterator(data, world_rank, world_size)
 
     def __iter__(self) -> Iterator[Batch]:
         return self._batch_iterator()

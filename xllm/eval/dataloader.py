@@ -34,7 +34,6 @@ class EvalTaskDataloader:
             self.path,
             self.world_rank,
             self.world_size,
-            infinite=False,
         )
         try:
             examples = [instance.raw_data for instance in reader]
