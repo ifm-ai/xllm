@@ -247,7 +247,6 @@ class ValidConf(Config):
     batch_size: int = 32  # Eval batch size per DP process.
     seq_len: int = 8192  # Input seq_len in tokens for PPL eval.
     n_batches: int = -1  # Max batches per PPL file per DP process used for PPL eval (<= 0 for full evaluation).
-    add_template: bool = False  # Applies chat template when tokenizing eval examples.
 
     # Decoding parameters
     use_sampling: bool = False  # Whether to sample during generations. False uses argmax greedy decoding.

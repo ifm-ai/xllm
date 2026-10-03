@@ -26,7 +26,6 @@ class EvalTaskDataloader:
         self.path = path
         self.batch_size = batch_size
         self.task = task
-        self.task.add_template = cfg.add_template
         self.rng = RandomState((seed, world_rank))
 
     def batch_iterator(self):

@@ -7,7 +7,6 @@ import numpy as np
 import torch
 
 from xllm.data.dataset_streamer.tokenizer import Tokenizer
-from xllm.data.dataset_streamer.templator.templator import tokenize_multiturn_template
 
 
 Example = Dict[str, Any]
@@ -24,7 +23,6 @@ class BaseTask:
     examplar_file: str
     n_fewshot: int = 0
     fewshot_index: Optional[List[int]] = None
-    add_template: bool = False
 
     def __init__(self, tokenizer: Tokenizer, task_dir: str):
         self.tokenizer = tokenizer
@@ -53,24 +51,10 @@ class BaseTask:
         text: str,
         target: str,
     ) -> Tuple[List[int], List[int]]:
-        if self.add_template:
-            # text is the prompt (user turn), target is the assistant response.
-            # Format as a single-turn conversation and apply the chat template.
-            sample = {
-                "conversation": [
-                    {"role": "user", "content": text.split(target)[0]},
-                    {"role": "assistant", "content": target},
-                ]
-            }
-            result = tokenize_multiturn_template(sample, self.tokenizer, text_format=None)
-            x = result["input_ids"]
-            y = result["labels"]
-            return x[:-1], y[1:]
-        else:
-            x = self.tokenizer.encode(text, bos=True, eos=False)
-            len_completion = len(self.tokenizer.encode(target, bos=False, eos=False))
-            y = [-100 if k < len(x) - len_completion else t for k, t in enumerate(x)]
-            return x[:-1], y[1:]
+        x = self.tokenizer.encode(text, bos=True, eos=False)
+        len_completion = len(self.tokenizer.encode(target, bos=False, eos=False))
+        y = [-100 if k < len(x) - len_completion else t for k, t in enumerate(x)]
+        return x[:-1], y[1:]
 
     def _load_examplar_file(self) -> List[Example]:
         all_examples: List[Example] = []
