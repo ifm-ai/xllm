@@ -31,6 +31,10 @@ from xllm.modules.context_parallel import (
     recv_from_prev_context_parallel_region,
     gather_from_context_parallel_region,
 )
+from xllm.modules.utils import (
+    get_bos_mask,
+    get_segment_idx_from_bos_mask
+)
 from xllm.models.xllm import XLLModel
 from xllm.models.fused_blocks import (
     GekkoBlockFunction,
@@ -372,8 +376,8 @@ class Gekko(XLLModel):
             assert token_mask is None
 
         if multi_segments:
-            bos_mask = torch.eq(tokens, self.bos_id)
-            segment_idx = torch.cumsum(bos_mask, dim=-1)
+            bos_mask = get_bos_mask(tokens, self.eos_id, use_eos=True)
+            segment_idx = get_segment_idx_from_bos_mask(bos_mask)
             prev_segment_count = None
         else:
             bos_mask = None

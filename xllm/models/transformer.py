@@ -25,6 +25,10 @@ from xllm.modules.model_parallel import (
     gather_copy_model_parallel_region,
 )
 from xllm.modules.context_parallel import gather_from_context_parallel_region
+from xllm.modules.utils import (
+    get_bos_mask,
+    get_segment_idx_from_bos_mask,
+)
 from xllm.config import ModelConf
 from xllm.models.xllm import XLLModel
 from xllm.distributed import (
@@ -631,7 +635,7 @@ class Transformer(XLLModel):
 
         if multi_segments:
             assert cache is None
-            bos_mask = torch.eq(tokens, self.bos_id)
+            bos_mask = get_bos_mask(tokens, self.eos_id, use_eos=True)
             segments = self.get_segment_arg(bos_mask)
         else:
             bos_mask = None
@@ -717,18 +721,18 @@ class Transformer(XLLModel):
             total_seqlen_k = cu_seqlens_k[-1].item()
             return cu_seqlens_q.int(), cu_seqlens_k.int(), max_seqlen_q, max_seqlen_k, total_seqlen_k
         elif self.causal_attn_backend == 'swift':
-            segment_idx = torch.cumsum(bos_mask, dim=-1)
+            segment_idx = get_segment_idx_from_bos_mask(bos_mask)
             # B x L1
             q_segment_idx = segment_idx[:, start:end]
             # B x L2
             k_segment_idx = segment_idx[:, :end]
             return q_segment_idx, k_segment_idx
         elif self.causal_attn_backend == 'xattn':
-            segment_idx = torch.cumsum(bos_mask, dim=-1)
+            segment_idx = get_segment_idx_from_bos_mask(bos_mask)
             return segment_idx[:, :end]
         else:
             assert self.causal_attn_backend is None
-            segment_idx = torch.cumsum(bos_mask, dim=-1)
+            segment_idx = get_segment_idx_from_bos_mask(bos_mask)
             # B x L1
             q_segment_idx = segment_idx[:, start:end]
             # B x L2
