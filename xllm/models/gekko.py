@@ -205,7 +205,7 @@ class GekkoOutputLayer(nn.Module):
         super().__init__()
 
         self.model_dim = cfg.model_dim
-        self.output_size = cfg.vocab_size if cfg.output_size == -1 else cfg.output_size
+        self.output_size = cfg.vocab_size
         self.recompute_logits = cfg.recompute_logits
 
         self.final_norm = TimestepDecayNorm(

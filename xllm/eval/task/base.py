@@ -51,7 +51,7 @@ class BaseTask:
         text: str,
         target: str,
     ) -> Tuple[List[int], List[int]]:
-        x = self.tokenizer.encode(text, bos=True, eos=False)
+        x = self.tokenizer.encode(text, bos=None, eos=False)
         len_completion = len(self.tokenizer.encode(target, bos=False, eos=False))
         y = [-100 if k < len(x) - len_completion else t for k, t in enumerate(x)]
         return x[:-1], y[1:]

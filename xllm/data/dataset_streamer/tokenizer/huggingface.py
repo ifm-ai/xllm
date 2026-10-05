@@ -1,7 +1,7 @@
 import os
 import json
 from logging import getLogger
-from typing import Any, Dict, List, Union
+from typing import Any, Dict, List, Optional
 
 from xllm.data.dataset_streamer.tokenizer.tokenizer import Tokenizer
 from xllm.config import TokenizerConf
@@ -10,8 +10,8 @@ logger = getLogger()
 
 
 class HuggingFaceTokenizer(Tokenizer):
-    def __init__(self, tokenizer_cfg: TokenizerConf):
-        super().__init__(tokenizer_cfg)
+    def __init__(self, cfg: TokenizerConf):
+        super().__init__(cfg)
         try:
             import transformers
         except ImportError:
@@ -19,10 +19,10 @@ class HuggingFaceTokenizer(Tokenizer):
                 f"The transformers library must be installed to use huggingface tokenizer"
             )
 
-        model_path = tokenizer_cfg.tokenizer_path
+        model_path = cfg.tokenizer_path
         self._tokenizer = transformers.AutoTokenizer.from_pretrained(pretrained_model_name_or_path=model_path)
-        if tokenizer_cfg.template_dict_json:
-            template_dict = json.loads(tokenizer_cfg.template_dict_json)
+        if cfg.template_dict_json:
+            template_dict = json.loads(cfg.template_dict_json)
             self._tokenizer.chat_template = {k: open(os.path.join(model_path, v)).read() for k, v in template_dict.items()}
         logger.info(f"Reloaded huggingface tokenizer from {model_path}")
 
@@ -39,23 +39,11 @@ class HuggingFaceTokenizer(Tokenizer):
             f"#words: {self.vocab_size} - BOS ID: {self.bos_id} - EOS ID: {self.eos_id} - PAD ID: {self.pad_id}"
         )
 
-    def encode(self, s: Union[str, List[int]], bos: bool, eos: bool) -> List[int]:
-        assert type(s) is str
-        t = self._tokenizer(s, add_special_tokens=False).input_ids
+    def _encode(self, text: str) -> List[int]:
+        tokens = self._tokenizer(text, add_special_tokens=False).input_ids
+        return tokens
 
-        if bos:
-            t.insert(0, self.bos_id)
-        if eos:
-            t.append(self.eos_id)
-
-        return t
-
-    def decode(self, tokens: List[int], cut_at_eos: bool = True, remove_prefix_bos: bool = True) -> str:
-        if cut_at_eos:
-            tokens = self.cut_at_eos(tokens)
-        if remove_prefix_bos:
-            tokens = self.remove_prefix_bos(tokens)
-
+    def _decode(self, tokens: List[int]) -> str:
         return self._tokenizer.decode(tokens)
 
     def apply_chat_template(self, conversation, **kwargs):

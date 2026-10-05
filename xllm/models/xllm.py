@@ -28,7 +28,7 @@ class XLLModel(nn.Module):
         self.num_layers = cfg.num_layers
         assert cfg.vocab_size > 0
         self.vocab_size = cfg.vocab_size
-        self.output_size = self.vocab_size if cfg.output_size == -1 else cfg.output_size
+        self.output_size = self.vocab_size
 
         self.model_dim = cfg.model_dim
 

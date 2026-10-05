@@ -25,6 +25,7 @@ class TokenizerConf(Config):
     # Config for processing different types of data
     type: str = 'llama2'  # Supports llama2/sentencepiece, llama3, or huggingface
     path: Optional[str] = None  # Path to the tokenizer folder
+    use_bos: bool = False  # True adds the BOS token at beginning of each sequence
     num_reserved_special_tokens: int = 0  # Reserved tokens used by SentencePiece tokenizer, multiples of 256
     template_dict_json: Optional[str] = None  # Allows different chat templates to be used in runtime for HF tokenizer. The json str should have a template name to template file relative path mapping.
 
@@ -43,7 +44,7 @@ class DataLoaderConfig(Config):
     buffer_size: int = 512  # The num of tokens in buffer is buffer_size * seq_len
     num_workers: int = 1  # Tokenizer worker threads during buffer refill
     packing_type: str = "simple"  # Sequence packing strategy: simple = concatenation, bestfit = find best sequence to pack into to reduce truncations
-    skip_long_docs: bool = False  # True skips overlong non-text docs; otherwise they are split into seq_len chunks.
+    skip_long_docs: bool = False  # True skips overlong non-text docs; otherwise they are split into seq_len chunks
     max_consecutive_skips: int = 10000  # Fail a source that repeatedly produces no tokenized sample
 
 
@@ -149,7 +150,6 @@ class ModelConf(Config):
     init_logits_std: Optional[float] = None  # Std used to truncate normal init of output projection weights. If None, = 1 / sqrt(model_dim)
     # Input & output
     vocab_size: int = -1  # Defined later by tokenizer
-    output_size: int = -1  # Output size. -1 means using vocab_size
     # Normalization
     timenorm_num_groups: int = 32  # Num of groups of features used in timestep decay normalization in Gekko.
     timenorm_beta1: float = 0.999  # Used in timestep decay normalization.

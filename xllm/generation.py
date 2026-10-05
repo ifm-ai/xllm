@@ -33,7 +33,7 @@ def generate(
     model.eval()
 
     if prompt is not None:
-        prompt_tokens = [tokenizer.encode(t, bos=True, eos=False) for t in prompt]
+        prompt_tokens = [tokenizer.encode(t, bos=None, eos=False) for t in prompt]
         nb_truncated_prompts = sum([max_prompt_len < len(t) for t in prompt_tokens])
     else:
         prompt_tokens, nb_truncated_prompts = None, 0

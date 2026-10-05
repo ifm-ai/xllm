@@ -4,6 +4,7 @@ from typing import Optional
 import numpy as np
 
 from xllm.data.data_types import Instance
+from xllm.data.dataset_streamer.tokenizer import Tokenizer
 from xllm.data.dataset_streamer.templator.templator import SimpleJsonlTemplator
 from xllm.data.dataset_streamer.templator.templator import (
     ChatTemplateError,
@@ -16,7 +17,7 @@ class FeatureBuilder:
     def build(
         self,
         instance: Instance,
-        tokenizer: "Tokenizer",
+        tokenizer: Tokenizer,
     ) -> Optional[Instance]:
         raise NotImplementedError
 
@@ -30,10 +31,10 @@ class DefaultFeatureBuilder(FeatureBuilder):
     def build(
         self,
         instance: Instance,
-        tokenizer: "Tokenizer",
+        tokenizer: Tokenizer,
     ) -> Instance:
         text = self.templator.render(instance.raw_data)
-        instance.tokens = tokenizer.encode(text, bos=True, eos=True)
+        instance.tokens = tokenizer.encode(text, bos=None, eos=True)
         instance.target_mask = None
         return instance
 
@@ -48,7 +49,7 @@ class ChatTemplateFeatureBuilder(FeatureBuilder):
     def build(
         self,
         instance: Instance,
-        tokenizer: "Tokenizer",
+        tokenizer: Tokenizer,
     ) -> Optional[Instance]:
         try:
             result = tokenize_multiturn_template(
