@@ -233,8 +233,6 @@ class ModelConf(Config):
         if self.arch == 'transformer':
             if self.fused_block:
                 assert self.causal_attn_backend is not None, 'requiring efficient attention when using fused block'
-                if self.qknorm:
-                    assert self.recompute_v and self.recompute_q, "QK-norm w. fused block requires qkv re-computation."
 
 
 @dataclass

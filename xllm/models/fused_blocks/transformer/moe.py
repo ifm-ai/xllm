@@ -43,7 +43,6 @@ class TransformerMoEBlockFunction(torch.autograd.Function):
         wg: Optional[torch.Tensor],  # (d/MP, d)
         wo: torch.Tensor,  # (d, v/MP)
         q_norm_w: Optional[torch.Tensor],  # (d/MP)
-        k_norm_w: Optional[torch.Tensor],  # (d/MP)
         local_heads: int,
         local_kv_heads: int,
         head_dim: int,
@@ -116,11 +115,11 @@ class TransformerMoEBlockFunction(torch.autograd.Function):
 
         # MHA forward
         xqkv, cu_seqlens, attn_out, xh, rng_states = multihead_attention_fwd(
-            mx, freqs_cis, segments, wq, wk, wv, wr, wo, q_norm_w, k_norm_w,
+            mx, freqs_cis, segments, wq, wk, wv, wr, wo, q_norm_w,
             head_dim, rope_head_dim, local_heads, local_kv_heads, rmsnorm_eps,
             attn_gate_func, dropout, attention_dropout, hidden_dropout,
         )
-        xq, xk, xv = xqkv
+        xq, xk, xv, xk_rstd = xqkv
         cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, total_seqlen_k, end_seq = cu_seqlens
         attn_out, attn_lse = attn_out
         flash_rng_state, attn_rng_state, attn_out_rng_state, xh_rng_state = rng_states
@@ -173,7 +172,6 @@ class TransformerMoEBlockFunction(torch.autograd.Function):
             wg,  # (h/MP, d)
             wo,  # (d, v/MP)
             q_norm_w,  # (d/MP)
-            k_norm_w,  # (d/MP)
             attn_res_w,  # (d/MP, c)
             moe_norm_w,  # (d)
             moe_norm_b,  # (d)
@@ -188,6 +186,7 @@ class TransformerMoEBlockFunction(torch.autograd.Function):
             moe_res_w,  # (d/MP, c)
             xq if not recompute_q else None,  # (bsz, slen, n_heads, head_dim)
             xk if not recompute_kv else None,  # (bsz, slen, n_kv_heads, head_dim)
+            xk_rstd if not recompute_kv else None,  # (bsz, slen, kv_heads)
             xv if not recompute_kv else None,  # (bsz, slen, n_kv_heads, head_dim)
             attn_out if not recompute_attention else None,  # (bsz, slen, n_heads, head_dim)
             attn_lse if not recompute_attention else None,  # (bsz, h/MP, slen, slen)
@@ -265,7 +264,6 @@ class TransformerMoEBlockFunction(torch.autograd.Function):
             wg,  # (h/MP, d)
             wo,  # (d, v/MP)
             q_norm_w,  # (d/MP)
-            k_norm_w,  # (d/MP)
             attn_res_w,  # (d/MP, c)
             moe_norm_w,  # (d)
             moe_norm_b,  # (d)
@@ -280,6 +278,7 @@ class TransformerMoEBlockFunction(torch.autograd.Function):
             moe_res_w,  # (d/MP, c)
             xq,  # (bsz, slen, n_heads, head_dim)
             xk,  # (bsz, slen, n_kv_heads, head_dim)
+            xk_rstd,  # (bsz, slen, kv_heads)
             xv,  # (bsz, slen, n_kv_heads, head_dim)
             attn_out,  # (bsz, slen, n_heads, head_dim)
             attn_lse,  # (bsz, h/MP, slen, slen)
@@ -405,15 +404,15 @@ class TransformerMoEBlockFunction(torch.autograd.Function):
             mx = reshape_gathered_tensor_along_specific_dim(mx, gather_dim=2)
 
         attn_outs, q_outs, k_outs, v_outs, handle_kv, attn_gate_outs = multihead_attention_recompute(
-            attn_out, attn_lse, xq, xk, xv, total_seqlen_k, end_seq,
-            mx, freqs_cis, wq, wk, wv, wr, q_norm_w, k_norm_w,
+            attn_out, attn_lse, xq, xk, xv, xk_rstd, total_seqlen_k, end_seq,
+            mx, freqs_cis, wq, wk, wv, wr, q_norm_w,
             head_dim, rope_head_dim, local_heads, local_kv_heads, rmsnorm_eps,
             cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k,
             attn_scale, attn_gate_func, attention_dropout, attn_rng_state,
         )
         attn_out, attn_lse = attn_outs
-        xq, xq_, xq_invvar = q_outs
-        xk, xk_, xk_invvar = k_outs
+        xq, xq_, xq_rstd = q_outs
+        xk, xk_, xk_rstd = k_outs
         xv, xv_ = v_outs
         handle_xk, handle_xv = handle_kv
         rmx, r = attn_gate_outs
@@ -449,10 +448,10 @@ class TransformerMoEBlockFunction(torch.autograd.Function):
         # MHA backward
         # B x L x D -> B x L x H x D/H
         attn_r_grad = attn_r_grad.view(bsz, seq_len, local_heads, head_dim)
-        x_grad, wq_grad, wk_grad, wv_grad, wr_grad, q_norm_w_grad, k_norm_w_grad, attn_norm_w_grad, attn_norm_b_grad = multihead_attention_bwd(
+        x_grad, wq_grad, wk_grad, wv_grad, wr_grad, q_norm_w_grad, attn_norm_w_grad, attn_norm_b_grad = multihead_attention_bwd(
             attn_r_grad, r_grad, attn_out, attn_lse, xq_, xk_, xv_, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k,
             total_seqlen_k, end_seq, freqs_cis, local_kv_heads, rope_head_dim,
-            xq, xk, xq_invvar, xk_invvar, rmx, mx, q_norm_w, k_norm_w, wq, wk, wv, wr,
+            xq, xk, xq_rstd, xk_rstd, rmx, mx, q_norm_w, wq, wk, wv, wr,
             attn_scale, attn_gate_func, attention_dropout, flash_rng_state, deterministic,
             x_, x_mean, x_invvar, attn_norm_w, attn_norm_b, norm_local_groups, apply_rmsnorm, gather_before_norm
         )
@@ -473,7 +472,6 @@ class TransformerMoEBlockFunction(torch.autograd.Function):
             None,
             wo_grad,
             q_norm_w_grad,
-            k_norm_w_grad,
             None,  # local_heads
             None,  # local_kv_heads
             None,  # head_dim

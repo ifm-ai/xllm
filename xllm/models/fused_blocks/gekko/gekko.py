@@ -102,7 +102,6 @@ class GekkoBlockFunction(torch.autograd.Function):
         causal_conv_backend: str,
         causal_conv_weight_normalization: bool,
         qnorm_w: torch.Tensor,  # (s/MP)
-        knorm_w: torch.Tensor,  # (s/MP)
         local_heads: int,
         local_kv_heads: int,
         attention_chunk_size: int,
@@ -240,7 +239,7 @@ class GekkoBlockFunction(torch.autograd.Function):
             handle4 = None
             handle5 = None
 
-        sk, _ = rmsnorm_fwd(xk_, knorm_w, local_kv_heads, rmsnorm_eps)
+        sk, _ = rmsnorm_fwd(xk_, None, local_kv_heads, rmsnorm_eps)
         sk = rearrange(sk, 'b l (k s) -> b l k s', k=local_kv_heads)
         # apply rotary embeddings
         sk = apply_rope(sk, freqs_cis, head_dim, rope_head_dim, False)
@@ -411,7 +410,6 @@ class GekkoBlockFunction(torch.autograd.Function):
             k_conv_w,  # (w, d/MP)
             v_conv_w,  # (w, v/MP)
             qnorm_w,  # (s/MP)
-            knorm_w,  # (s/MP)
             attn_res_w,  # (d/MP, c)
             ffn_norm_w,  # (d)
             ffn_norm_b,  # (d)
@@ -502,7 +500,6 @@ class GekkoBlockFunction(torch.autograd.Function):
             k_conv_w,  # (w, d/MP)
             v_conv_w,  # (w, v/MP)
             qnorm_w,  # (s/MP)
-            knorm_w,  # (s/MP)
             attn_res_w,  # (d/MP, c)
             ffn_norm_w,  # (d)
             ffn_norm_b,  # (d)
@@ -672,7 +669,7 @@ class GekkoBlockFunction(torch.autograd.Function):
             causal_conv_weight_normalization, causal_conv_backend, deterministic
         )
 
-        sk, sk_rstd = rmsnorm_fwd(xk_, knorm_w, local_kv_heads, rmsnorm_eps)
+        sk, sk_rstd = rmsnorm_fwd(xk_, None, local_kv_heads, rmsnorm_eps)
         sq, sq_rstd = rmsnorm_fwd(xq_, qnorm_w, local_heads, rmsnorm_eps)
         # B x L x H x S
         sk = rearrange(sk, 'b l (k s) -> b l k s', k=local_kv_heads)
@@ -873,7 +870,7 @@ class GekkoBlockFunction(torch.autograd.Function):
         # apply rotary embeddings
         sk_grad = apply_rope(sk_grad, freqs_cis, head_dim, rope_head_dim, True)
         # k norm grad
-        xk_grad, knorm_w_grad = rmsnorm_bwd(rearrange(sk_grad, 'b l k s -> b l (k s)'), xk_, sk_rstd, knorm_w, local_kv_heads)
+        xk_grad = mem_effn_rmsnorm_bwd(rearrange(sk_grad, 'b l k s -> b l (k s)'), sk, sk_rstd, local_kv_heads)
 
         aqk_grad = torch.ops.aten._softmax_backward_data(
             aqk_grad.float(), aqk_fp32, -1, torch.float32
@@ -1020,7 +1017,6 @@ class GekkoBlockFunction(torch.autograd.Function):
             None,  # causal_conv_backend
             None,  # causal_conv_weight_normalization
             qnorm_w_grad,
-            knorm_w_grad,
             None,  # local heads
             None,  # local kv heads
             None,  # chunk size

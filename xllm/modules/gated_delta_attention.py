@@ -179,9 +179,9 @@ class GatedDeltaAttention(nn.Module):
         self.key_norm = GroupRMSNorm(
             kdim,
             num_groups=self.num_kv_heads,
-            elementwise_affine=True,
+            elementwise_affine=False,
             eps=rmsnorm_eps,
-            memory_efficient=False,
+            memory_efficient=True,  # for knorm, always use efficient memory
         )
 
         self.wr = ColumnParallelLinear(

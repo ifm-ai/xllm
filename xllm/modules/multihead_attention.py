@@ -42,8 +42,8 @@ class MultiheadAttention(nn.Module):
         rope_head_dim: Optional[int],
         attn_act_func: str,
         qknorm: bool,
-        norm_num_groups,
-        norm_affine,
+        norm_num_groups: int,
+        norm_affine: bool,
         layernorm_eps: float,
         rmsnorm_eps: float,
         memory_efficient_norm: bool,
@@ -154,15 +154,15 @@ class MultiheadAttention(nn.Module):
             num_groups=self.n_heads * nq,
             elementwise_affine=True,
             eps=rmsnorm_eps,
-            memory_efficient=True,  # for qknorm, always use efficient memory
+            memory_efficient=False,
         ) if self.qknorm else None
 
         self.key_norm = GroupRMSNorm(
             self.n_kv_heads * self.head_dim,
             num_groups=self.n_kv_heads,
-            elementwise_affine=True,
+            elementwise_affine=False,
             eps=rmsnorm_eps,
-            memory_efficient=True,  # for qknorm, always use efficient memory
+            memory_efficient=True,  # for knorm, always use efficient memory
         ) if self.qknorm else None
 
         if self.attn_act_func == "softmax":

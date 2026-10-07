@@ -19,6 +19,7 @@ from .utils import (
     layer_or_rmsnorm_bwd,
     rmsnorm_fwd,
     rmsnorm_bwd,
+    mem_effn_rmsnorm_bwd,
     fused_permute_y_fwd,
     fused_permute_y_bwd_y_grad,
     fused_permute_y_bwd_scores_grad,
@@ -36,7 +37,7 @@ from .distributed import (
 
 
 def mova_fwd(
-    mx, freqs_cis, segments, wq, wk, wv, wr, wo, q_norm_w, k_norm_w,
+    mx, freqs_cis, segments, wq, wk, wv, wr, wo, q_norm_w,
     head_dim, rope_head_dim, local_heads, local_kv_heads, eps, gather_before_norm,
     router_w, router_bias, routing_score_func, routing_scaling_factor, router_load_balancing_type,
     n_values, topk, value_backend, moe_permutation_backend, attn_gate_func,
@@ -116,13 +117,15 @@ def mova_fwd(
 
     attn_scale = 1.0 / math.sqrt(head_dim)
     end_seq = (get_context_parallel_rank() + 1) * seq_len
+
     # compute k
     xk = F.linear(mx, wk)
-    if k_norm_w is not None:
-        xk, _ = rmsnorm_fwd(xk, k_norm_w, local_kv_heads, eps)
-    xk = xk.view(bsz, seq_len, local_kv_heads, head_dim)
-    xk = apply_rope(xk, freqs_cis, head_dim, rope_head_dim, False)
-    xk_, handle_xk = all_gather(xk, parallel_region='context', async_op=True)
+    xk_rstd = None
+    if q_norm_w is not None:
+        xk, xk_rstd = rmsnorm_fwd(xk, None, local_kv_heads, eps)
+    xk_ = rearrange(xk, 'b l (k s) -> b l k s', k=local_kv_heads)
+    xk_ = apply_rope(xk_, freqs_cis, head_dim, rope_head_dim, False)
+    xk_, handle_xk = all_gather(xk_, parallel_region='context', async_op=True)
 
     # compute r
     r = attn_gate_fn(F.linear(mx, wr, None)) if wr is not None else None
@@ -142,9 +145,11 @@ def mova_fwd(
     # compute q
     xq = F.linear(mx, wq)
     if q_norm_w is not None:
-        xq, _ = rmsnorm_fwd(xq, q_norm_w, local_heads, eps)
-    xq = xq.view(bsz, seq_len, local_heads, head_dim)
-    xq = apply_rope(xq, freqs_cis, head_dim, rope_head_dim, False)
+        xq_, _ = rmsnorm_fwd(xq, q_norm_w, local_heads, eps)
+    else:
+        xq_ = xq
+    xq_ = rearrange(xq_, 'b l (h s) -> b l h s', h=local_heads)
+    xq_ = apply_rope(xq_, freqs_cis, head_dim, rope_head_dim, False)
 
     if handle_xk is not None:
         handle_xk.wait()
@@ -161,7 +166,7 @@ def mova_fwd(
         cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, total_seqlen_k = None, None, None, None, None
 
     attn_out, attn_lse, flash_rng_state, attn_rng_state = flash_attention_fwd(
-        xq, xk_, xv_, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, attn_scale, attention_dropout
+        xq_, xk_, xv_, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, attn_scale, attention_dropout
     )
 
     # B x L x H x D/H -> B x L x D
@@ -174,7 +179,7 @@ def mova_fwd(
     xh, xh_rng_state = memory_efficient_dropout_fwd(xh, dropout, True)
 
     return (
-        (xq, xk, xv), (cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, total_seqlen_k, end_seq),
+        (xq, xk, xv, xk_rstd), (cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, total_seqlen_k, end_seq),
         (attn_out, attn_lse), xh, aux_loss, (flash_rng_state, attn_rng_state, attn_out_rng_state, xh_rng_state),
         (original_scores, routing_indices, org_topk_scores, tokens_per_expert, group_sizes)
     )
@@ -183,8 +188,8 @@ def mova_fwd(
 def mova_bwd(
     attn_grad, r_grad, aux_loss_grad, attn_out, attn_lse, xq_, xk_, xv_,
     cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, total_seqlen_k, end_seq, freqs_cis,
-    local_kv_heads, rope_head_dim, xq, xk, xv, xvv_, xq_invvar, xk_invvar, rmx, mx,
-    q_norm_w, k_norm_w, wq, wk, wv, wr, attn_scale, attn_gate_func, attention_dropout, flash_rng_state, deterministic,
+    local_kv_heads, rope_head_dim, xq, xk, xv, xvv_, xq_rstd, xk_rstd, rmx, mx,
+    q_norm_w, wq, wk, wv, wr, attn_scale, attn_gate_func, attention_dropout, flash_rng_state, deterministic,
     sx, permuted_sx, original_scores, routing_indices, org_topk_scores, tokens_per_expert,
     sorted_indices, inverse_indices, group_sizes, router_w, router_bias, router_bias_update_rate,
     routing_score_func, routing_scaling_factor, router_load_balancing_type, n_values, topk,
@@ -222,8 +227,8 @@ def mova_bwd(
     # compute xq_grad
     xq_grad = apply_rope(xq_grad, freqs_cis, head_dim, rope_head_dim, True)
     if q_norm_w is not None:
-        xq_grad = xq_grad.view(bsz, seq_len, local_heads * head_dim)
-        xq_grad, q_norm_w_grad = rmsnorm_bwd(xq_grad, xq, xq_invvar, q_norm_w, local_heads)
+        xq_grad = rearrange(xq_grad, 'b l h s -> b l (h s)')
+        xq_grad, q_norm_w_grad = rmsnorm_bwd(xq_grad, xq, xq_rstd, q_norm_w, local_heads)
     else:
         q_norm_w_grad = None
     # B*L x H*D/H
@@ -254,11 +259,9 @@ def mova_bwd(
     if handle_xk is not None:
         handle_xk.wait()
     xk_grad = apply_rope(xk_grad, freqs_cis, head_dim, rope_head_dim, True)
-    if k_norm_w is not None:
-        xk_grad = xk_grad.view(bsz, seq_len, local_kv_heads * head_dim)
-        xk_grad, k_norm_w_grad = rmsnorm_bwd(xk_grad, xk, xk_invvar, k_norm_w, local_kv_heads)
-    else:
-        k_norm_w_grad = None
+    if q_norm_w is not None:
+        xk_grad = rearrange(xk_grad, 'b l k s -> b l (k s)')
+        xk_grad = mem_effn_rmsnorm_bwd(xk_grad, xk, xk_rstd, local_kv_heads)
     # B*L x H*D/H
     xk_grad = xk_grad.view(bsz * seq_len, local_kv_heads * head_dim)
     mx_grad = torch.addmm(mx_grad, xk_grad, wk, out=mx_grad)
@@ -391,34 +394,27 @@ def mova_bwd(
     if handle_norm_b is not None:
         handle_norm_b.wait()
 
-    return x_grad, wq_grad, wk_grad, wv_grad, wr_grad, q_norm_w_grad, k_norm_w_grad, attn_norm_w_grad, attn_norm_b_grad, router_w_grad
+    return x_grad, wq_grad, wk_grad, wv_grad, wr_grad, q_norm_w_grad, attn_norm_w_grad, attn_norm_b_grad, router_w_grad
 
 
 def mova_recompute(
-    attn_out, attn_lse, xq, xk, xv, total_seqlen_k, end_seq,
+    attn_out, attn_lse, xq, xk, xv, xk_rstd, total_seqlen_k, end_seq,
     sx, original_scores, routing_indices, org_topk_scores, group_sizes,
     router_w, routing_score_func, routing_scaling_factor, n_values, topk,
     value_backend, moe_permutation_backend, mx, freqs_cis,
-    wq, wk, wv, wr, q_norm_w, k_norm_w, head_dim, rope_head_dim,
+    wq, wk, wv, wr, q_norm_w, head_dim, rope_head_dim,
     local_heads, local_kv_heads, eps,
     cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k,
     attn_scale, attn_gate_func, attention_dropout, attn_rng_state,
 ):
-    def recompute_qk(cq, wc, norm_w, n_heads):
+    def recompute_qk(cq, wc, qknorm, norm_w, n_heads):
         if cq is None:
             cq = F.linear(mx, wc)
-            if norm_w is not None:
-                cq_, cq_invvar = rmsnorm_fwd(cq, norm_w, n_heads, eps)
-            else:
-                cq_ = cq
-                cq_invvar = None
-            cq_ = cq_.view(bsz, seq_len, n_heads, head_dim)
-            cq_ = apply_rope(cq_, freqs_cis, head_dim, rope_head_dim, False)
-        else:
-            cq_ = cq
-            cq_invvar = None
 
-        return cq, cq_, cq_invvar
+        cq_, cq_rstd = rmsnorm_fwd(cq, norm_w, n_heads, eps) if qknorm else (cq, None)
+        cq_ = rearrange(cq_, 'b l (h s) -> b l h s', h=n_heads)
+        cq_ = apply_rope(cq_, freqs_cis, head_dim, rope_head_dim, False)
+        return cq, cq_, cq_rstd
 
     bsz, seq_len, _ = mx.shape
     attn_gate_fn = {"silu": F.silu, "softplus": partial(F.softplus, beta=math.log(2))}[attn_gate_func]
@@ -441,18 +437,23 @@ def mova_recompute(
     permute_indices = sorted_indices // topk
     permuted_sx = torch.index_select(sx.view(bsz * seq_len, -1), 0, permute_indices)
 
-    # recompute kv
+    # recompute v
     if xv is None:
+        assert xk is None and xk_rstd is None
         # compute v
         wv = rearrange(wv, '(n v) d -> n v d', n=n_values)
         xv = multi_group_matmul_fwd(permuted_sx, wv, group_sizes, True, value_backend)
         # B*L*K x V/TP
         xv, handle_xv = reduce_scatter(xv, parallel_region='model', async_op=True)
+        # compute k
+        xk = F.linear(mx, wk)
+        if q_norm_w is not None:
+            xk, xk_rstd = rmsnorm_fwd(xk, None, local_kv_heads, eps)
     else:
         handle_xv = None
 
-    # compute k
-    xk, xk_, xk_invvar = recompute_qk(xk, wk, k_norm_w, local_kv_heads)
+    xk_ = rearrange(xk, 'b l (k s) -> b l k s', k=local_kv_heads)
+    xk_ = apply_rope(xk_, freqs_cis, head_dim, rope_head_dim, False)
     xk_, handle_xk = all_gather(xk_, parallel_region='context', async_op=True)
 
     if original_scores is None:
@@ -483,7 +484,12 @@ def mova_recompute(
     xv_, handle_xv = all_gather(xv_, parallel_region='context', async_op=True)
 
     # compute q
-    xq, xq_, xq_invvar = recompute_qk(xq, wq, q_norm_w, local_heads)
+    if xq is None:
+        xq = F.linear(mx, wq)
+    xq_, xq_rstd = rmsnorm_fwd(xq, q_norm_w, local_heads, eps) if q_norm_w is not None else (xq, None)
+    xq_ = rearrange(xq_, 'b l (h s) -> b l h s', h=local_heads)
+    xq_ = apply_rope(xq_, freqs_cis, head_dim, rope_head_dim, False)
+
     if wr is not None:
         # B x L x D
         rmx = F.linear(mx, wr, None)
@@ -514,6 +520,6 @@ def mova_recompute(
         )
 
     return (
-        (attn_out, attn_lse), (xq, xq_, xq_invvar), (xk, xk_, xk_invvar), (xv, xvv_, xv_), (handle_xk, handle_xv),
+        (attn_out, attn_lse), (xq, xq_, xq_rstd), (xk, xk_, xk_rstd), (xv, xvv_, xv_), (handle_xk, handle_xv),
         (rmx, r), (permuted_sx, original_scores, sorted_indices, inverse_indices)
     )

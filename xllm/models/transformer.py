@@ -136,7 +136,6 @@ class TransformerBlock(nn.Module):
                 self.attention.wg.weight if self.attention.attn_act_func == 'softdelta' else None,
                 self.attention.wo.weight,
                 self.attention.query_norm.weight if self.attention.qknorm else None,
-                self.attention.key_norm.weight if self.attention.qknorm else None,
                 self.attention.local_heads,
                 self.attention.local_kv_heads,
                 self.attention.head_dim,
@@ -280,7 +279,6 @@ class TransformerMoEBlock(nn.Module):
                 self.attention.wg.weight if self.attention.attn_act_func == 'softdelta' else None,
                 self.attention.wo.weight,
                 self.attention.query_norm.weight if self.attention.qknorm else None,
-                self.attention.key_norm.weight if self.attention.qknorm else None,
                 self.attention.local_heads,
                 self.attention.local_kv_heads,
                 self.attention.head_dim,
@@ -448,7 +446,6 @@ class TransformerMoVABlock(nn.Module):
                 self.mova.wg.weight if self.mova.attn_act_func == 'softdelta' else None,
                 self.mova.wo.weight,
                 self.mova.query_norm.weight if self.mova.qknorm else None,
-                self.mova.key_norm.weight if self.mova.qknorm else None,
                 self.mova.local_heads,
                 self.mova.local_kv_heads,
                 self.mova.head_dim,
@@ -752,7 +749,7 @@ class Transformer(XLLModel):
         # Norm
         norm_params_per_block = self.model_dim * (2 if self.apply_rmsnorm else 4)
         if self.qknorm:
-            norm_params_per_block += self.head_dim * (self.num_heads + self.num_kv_heads)
+            norm_params_per_block += self.head_dim * self.num_heads
         # FFN
         ffn_params_per_block = self.model_dim * self.ffn_hidden_dim * (3 if self.swiglu else 2)
         ffn_params_per_block += num_params_in_residual(self.residual_func, self.model_dim, self.residual_heads, self.ffn_hidden_dim)
@@ -795,7 +792,7 @@ class Transformer(XLLModel):
         logits_flops = self.model_dim * self.vocab_size
         norm_flops = self.model_dim * (4 if self.apply_rmsnorm else 8)
         if self.qknorm:
-            norm_flops += self.head_dim * (self.num_heads + self.num_kv_heads) * 2
+            norm_flops += self.head_dim * self.num_heads * 2
         attn_flops = self.model_dim * (self.num_heads + self.num_kv_heads) * self.head_dim * 2
 
         # FFN

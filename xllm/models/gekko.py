@@ -159,7 +159,6 @@ class GekkoBlock(nn.Module):
                 self.gda.causal_conv_backend,
                 self.gda.q_conv.normalize_weight,
                 self.gda.query_norm.weight,
-                self.gda.key_norm.weight,
                 self.gda.local_heads,
                 self.gda.local_kv_heads,
                 self.gda.chunk_size,
@@ -484,7 +483,7 @@ class Gekko(XLLModel):
         # conv params
         conv_params_per_block = self.causal_conv_width * (self.num_heads * self.head_dim + self.num_kv_heads * (self.head_dim + self.v_head_dim))
         # norm params
-        norm_params_per_block = self.model_dim * (3 if self.apply_rmsnorm else 4) + self.head_dim * (self.num_heads + self.num_kv_heads)
+        norm_params_per_block = self.model_dim * (3 if self.apply_rmsnorm else 4) + self.head_dim * self.num_heads
         if self.attn_act_func == 'softdelta':
             gda_params_per_block += self.model_dim * self.num_heads * (self.head_dim + 1)
             conv_params_per_block += self.causal_conv_width * self.num_heads * self.head_dim
