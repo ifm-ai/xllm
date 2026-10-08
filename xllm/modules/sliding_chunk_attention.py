@@ -50,7 +50,7 @@ class SlidingChunkAttention(nn.Module):
         prev_v: Optional[Tensor] = None,
         bos_mask: Optional[Tensor] = None,
         segment_idx: Optional[Tensor] = None,
-        fp32_attn_output: bool = False,
+        stability_control: int = 0,
         deterministic: bool = True,
     ):
         bs, slen, _ = xq.shape
@@ -71,7 +71,7 @@ class SlidingChunkAttention(nn.Module):
             assert slen % self.chunk_size == 0
             output = sliding_chunk_attention(
                 xq, xk, xv, self.chunk_size, self.scale, prev_k, prev_v, bos_mask,
-                segment_idx, self.dropout, fp32_attn_output, deterministic, self.backend, self.training
+                segment_idx, self.dropout, stability_control, deterministic, self.backend, self.training
             )
             prev_k = xk[:, (slen - self.chunk_size):]
             prev_v = xv[:, (slen - self.chunk_size):]

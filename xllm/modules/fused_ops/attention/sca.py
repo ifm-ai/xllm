@@ -34,7 +34,7 @@ class SlidingChunkAttentionFunc(torch.autograd.Function):
         bos_mask: Optional[Tensor] = None,
         segment_idx: Optional[Tensor] = None,
         dropout: float = 0.0,
-        high_precision_output: bool = False,
+        high_precision_level: int = 0,
         deterministic: bool = True,
         backend: str = 'swift',
         training: bool = True,
@@ -42,7 +42,7 @@ class SlidingChunkAttentionFunc(torch.autograd.Function):
         p = dropout if training else 0.0
         y, y_for_save, aux = sliding_chunk_attention_fwd(
             q, k, v, chunk_size, scale, prev_k, prev_v, bos_mask,
-            segment_idx, p, high_precision_output, backend, training
+            segment_idx, p, high_precision_level, backend, training
         )
         ctx.save_for_backward(
             q, k, v, y_for_save, aux,
@@ -52,6 +52,7 @@ class SlidingChunkAttentionFunc(torch.autograd.Function):
         ctx.chunk_size = chunk_size
         ctx.scale = scale
         ctx.dropout = dropout
+        ctx.high_precision_level = high_precision_level
         ctx.deterministic = deterministic
         ctx.backend = backend
         return y
@@ -67,11 +68,12 @@ class SlidingChunkAttentionFunc(torch.autograd.Function):
         chunk_size = ctx.chunk_size
         scale = ctx.scale
         dropout = ctx.dropout
+        high_precision_level = ctx.high_precision_level
         deterministic = ctx.deterministic
         backend = ctx.backend
         q_grad, k_grad, v_grad, prev_k_grad, prev_v_grad = sliding_chunk_attention_bwd(
             y_grad, q, k, v, y, aux, chunk_size, scale, prev_k, prev_v,
-            bos_mask, segment_idx, deterministic, backend
+            bos_mask, segment_idx, high_precision_level, deterministic, backend
         )
 
         return q_grad, k_grad, v_grad, None, None, prev_k_grad, prev_v_grad, \
@@ -231,7 +233,7 @@ def sliding_chunk_attention_fwd(
     bos_mask: Optional[Tensor] = None,
     segment_idx: Optional[Tensor] = None,
     dropout: float = 0.0,
-    high_precision_output: bool = False,
+    high_precision_level: int = 0,
     backend: str = 'xattn',
     requires_grad: bool = False
 ) -> Tuple[Tensor, Optional[Tensor], Optional[Tensor]]:
@@ -241,14 +243,14 @@ def sliding_chunk_attention_fwd(
         if bos_mask is not None:
             segment_idx = None
 
-        high_precision_output = high_precision_output and requires_grad
+        high_precision_level = high_precision_level if requires_grad else 0
         y, y_fp32, lse = flash_sca_fwd(
             q, k, v, chunk_size, scale, prev_k, prev_v,
             bos_mask=bos_mask, segment_idx=segment_idx,
-            high_precision_output=high_precision_output
+            high_precision_level=high_precision_level
         )
         lse = lse if requires_grad else None
-        y_for_bwd = y if requires_grad and (not high_precision_output) else y_fp32
+        y_for_bwd = y if requires_grad and high_precision_level == 0 else y_fp32
         return y, y_for_bwd, lse
     elif backend == 'swift':
         if segment_idx is not None and prev_k is not None:
@@ -279,6 +281,7 @@ def sliding_chunk_attention_bwd(
     prev_v: Optional[Tensor] = None,
     bos_mask: Optional[Tensor] = None,
     segment_idx: Optional[Tensor] = None,
+    high_precision_level: int = 0,
     deterministic: bool = False,
     backend: str = 'xattn',
 ) -> Tuple[Tensor, Tensor, Tensor, Optional[Tensor], Optional[Tensor]]:
@@ -289,7 +292,9 @@ def sliding_chunk_attention_bwd(
 
         return flash_sca_bwd(
             y_grad, q, k, v, y, aux, chunk_size, scale, prev_k, prev_v,
-            bos_mask=bos_mask, segment_idx=segment_idx, deterministic=deterministic,
+            bos_mask=bos_mask, segment_idx=segment_idx,
+            high_precision_level=high_precision_level,
+            deterministic=deterministic,
         )
     elif backend == 'swift':
         return _sequential_sliding_chunk_attention_bwd(

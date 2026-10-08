@@ -337,7 +337,7 @@ class TrainerConf(Config):
     seq_len: int = 8192  # Num of tokens in each sequence. Must be divisible by context_parallel_size * model.chunk_size.
     multi_segments: bool = True  # Whether to segment docs using BOS token. This will prevent attention across document boundaries.
     deterministic: bool = False  # Whether to request deterministic computations when supported.
-    fp32_attn_output: bool = False # Whether to use high precision attention output (only supported in xattn backend).
+    attn_stability_control: int = 0 # The high precision level for attention (only supported in xattn backend).
 
     steps: int = 100000  # Total number of training steps.
     dtype: str = get_default_training_half()  # Training compute dtype: bf16 (default), fp16, or fp32.

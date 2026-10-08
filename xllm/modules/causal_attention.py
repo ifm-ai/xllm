@@ -61,7 +61,7 @@ class CausalSoftmaxAttention(nn.Module):
         g: Optional[Tensor],
         freqs_cis: Optional[Tensor],
         segments: Optional[Any],
-        fp32_attn_output: bool = False,
+        stability_control: int = 0,
         deterministic: bool = True,
         cache: Optional[Tuple[Tensor, Tensor, int]] = None,
     ):
@@ -189,7 +189,7 @@ class CausalSoftdeltaAttention(nn.Module):
         g: Optional[Tensor],
         freqs_cis: Optional[Tensor],
         segments: Optional[Any],
-        fp32_attn_output: bool = False,
+        stability_control: int = 0,
         deterministic: bool = True,
         cache: Optional[Tuple[Tensor, Tensor, int]] = None,
     ):

@@ -117,7 +117,7 @@ class TransformerBlock(nn.Module):
         freqs_cis: Optional[Tensor],
         segments: Optional[Any] = None,
         moe_router_load_balancing_type: Optional[str] = None,
-        fp32_attn_output: bool = False,
+        attn_stability_control: int = 0,
         deterministic: bool = True,
         cache: Optional[Tuple[Tensor, Tensor, int]] = None,
     ) -> Tuple[Tensor, Optional[Tensor], Optional[Any]]:
@@ -160,7 +160,7 @@ class TransformerBlock(nn.Module):
                 self.attention.norm.gather_input,
                 self.residual_func,
                 self.residual_heads,
-                fp32_attn_output,
+                attn_stability_control,
                 deterministic,
                 self.recompute_q,
                 self.recompute_kv,
@@ -170,7 +170,7 @@ class TransformerBlock(nn.Module):
             )
 
         y, cache = self.attention(
-            x, freqs_cis, segments, fp32_attn_output, deterministic, cache
+            x, freqs_cis, segments, attn_stability_control, deterministic, cache
         )
         # FFN
         out = self.nffn(y)
@@ -260,7 +260,7 @@ class TransformerMoEBlock(nn.Module):
         freqs_cis: Optional[Tensor],
         segments: Optional[Any] = None,
         moe_router_load_balancing_type: Optional[str] = None,
-        fp32_attn_output: bool = False,
+        attn_stability_control: int = 0,
         deterministic: bool = True,
         cache: Optional[Tuple[Tensor, Tensor, int]] = None,
     ) -> Tuple[Tensor, Optional[Tensor], Optional[Any]]:
@@ -318,7 +318,7 @@ class TransformerMoEBlock(nn.Module):
                 self.attention.norm.gather_input,
                 self.residual_func,
                 self.residual_heads,
-                fp32_attn_output,
+                attn_stability_control,
                 deterministic,
                 self.recompute_q,
                 self.recompute_kv,
@@ -329,7 +329,7 @@ class TransformerMoEBlock(nn.Module):
             )
 
         y, cache = self.attention(
-            x, freqs_cis, segments, fp32_attn_output, deterministic, cache
+            x, freqs_cis, segments, attn_stability_control, deterministic, cache
         )
         # MoE
         out, aux_loss = self.moe(y, moe_router_load_balancing_type)
@@ -427,7 +427,7 @@ class TransformerMoVABlock(nn.Module):
         freqs_cis: Optional[Tensor],
         segments: Optional[Any] = None,
         moe_router_load_balancing_type: Optional[str] = None,
-        fp32_attn_output: bool = False,
+        attn_stability_control: int = 0,
         deterministic: bool = True,
         cache: Optional[Tuple[Tensor, Tensor, int]] = None,
     ) -> Tuple[Tensor, Optional[Tensor], Optional[Any]]:
@@ -490,7 +490,7 @@ class TransformerMoVABlock(nn.Module):
                 self.mova.norm.gather_input,
                 self.residual_func,
                 self.residual_heads,
-                fp32_attn_output,
+                attn_stability_control,
                 deterministic,
                 self.recompute_q,
                 self.recompute_kv,
@@ -501,7 +501,7 @@ class TransformerMoVABlock(nn.Module):
             )
 
         y, aux_loss_mova, cache = self.mova(
-            x, freqs_cis, segments, fp32_attn_output, deterministic, cache, moe_router_load_balancing_type
+            x, freqs_cis, segments, attn_stability_control, deterministic, cache, moe_router_load_balancing_type
         )
         # MoE
         out, aux_loss_moe = self.moe(y, moe_router_load_balancing_type)
@@ -621,7 +621,7 @@ class Transformer(XLLModel):
         targets: Optional[Tensor] = None,
         token_mask: Optional[Tensor] = None,
         moe_router_load_balancing_type: Optional[str] = None,
-        fp32_attn_output: bool = False,
+        attn_stability_control: int = 0,
         deterministic: bool = True,
         cache: Optional[List[Tuple[Tensor, Tensor, int]]] = None,
     ):
@@ -668,13 +668,13 @@ class Transformer(XLLModel):
             if self.layerwise_ckpt:
                 x, aux_loss, layer_cache = checkpoint(
                     layer, x, freq_cis, segments, moe_router_load_balancing_type,
-                    fp32_attn_output, deterministic, layer_cache,
+                    attn_stability_control, deterministic, layer_cache,
                     use_reentrant=False, preserve_rng_state=True
                 )
             else:
                 x, aux_loss, layer_cache = layer(
                     x, freq_cis, segments, moe_router_load_balancing_type,
-                    fp32_attn_output, deterministic, layer_cache
+                    attn_stability_control, deterministic, layer_cache
                 )
 
             if aux_loss is not None:

@@ -71,7 +71,7 @@ class TransformerBlockFunction(torch.autograd.Function):
         gather_before_norm: bool,
         residual_func: str,
         residual_heads: Optional[int],
-        fp32_attn_output: bool,
+        attn_stability_control: int,
         deterministic: bool,
         recompute_q: bool,
         recompute_kv: bool,
@@ -189,7 +189,7 @@ class TransformerBlockFunction(torch.autograd.Function):
         ctx.residual_func = residual_func
         ctx.residual_heads = residual_heads
         ctx.deterministic = deterministic
-        ctx.fp32_attn_output = fp32_attn_output
+        ctx.attn_stability_control = attn_stability_control
         ctx.max_seqlen_q = max_seqlen_q
         ctx.max_seqlen_k = max_seqlen_k
         ctx.total_seqlen_k = total_seqlen_k
@@ -257,7 +257,7 @@ class TransformerBlockFunction(torch.autograd.Function):
         attn_gate_func = ctx.attn_gate_func
         residual_func = ctx.residual_func
         residual_heads = ctx.residual_heads
-        fp32_attn_output = ctx.fp32_attn_output
+        attn_stability_control = ctx.attn_stability_control
         deterministic = ctx.deterministic
         max_seqlen_q = ctx.max_seqlen_q
         max_seqlen_k = ctx.max_seqlen_k
@@ -435,7 +435,7 @@ class TransformerBlockFunction(torch.autograd.Function):
             None,  # gather_before_norm
             None,  # residual_func
             None,  # residual_heads
-            None,  # fp32_attn_output
+            None,  # attn_stability_control
             None,  # deterministic
             None,  # recompute_q
             None,  # recompute_kv

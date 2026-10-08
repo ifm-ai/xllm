@@ -121,7 +121,7 @@ class GekkoBlock(nn.Module):
         segment_idx: Optional[Tensor] = None,
         prev_segment_count: Optional[Tensor] = None,
         moe_router_load_balancing_type: Optional[str] = None,
-        fp32_attn_output: bool = False,
+        attn_stability_control: int = 0,
         deterministic: bool = True,
         cache: Optional[Tuple[Tuple[Tensor, Tensor, int],
                               Tuple[Tensor, Tensor, Tensor],
@@ -186,7 +186,7 @@ class GekkoBlock(nn.Module):
                 self.apply_rmsnorm,
                 self.residual_func,
                 self.residual_heads,
-                fp32_attn_output,
+                attn_stability_control,
                 deterministic,
                 self.recompute_q,
                 self.recompute_kv,
@@ -197,7 +197,7 @@ class GekkoBlock(nn.Module):
             )
 
         y, cache = self.gda(
-            x, freqs_cis, bos_mask, segment_idx, prev_segment_count, fp32_attn_output, deterministic, cache
+            x, freqs_cis, bos_mask, segment_idx, prev_segment_count, attn_stability_control, deterministic, cache
         )
         out = self.nffn(y)
         return out, None, cache
@@ -359,7 +359,7 @@ class Gekko(XLLModel):
         targets: Optional[Tensor] = None,
         token_mask: Optional[Tensor] = None,
         moe_router_load_balancing_type: Optional[str] = None,
-        fp32_attn_output: bool = False,
+        attn_stability_control: int = 0,
         deterministic: bool = True,
         cache: Optional[Tuple[List[Tuple[Tuple[Tensor, Tensor, int],
                                          Tuple[Tensor, Tensor, Tensor, Tensor],
@@ -430,13 +430,13 @@ class Gekko(XLLModel):
             if self.layerwise_ckpt:
                 x, aux_loss, layer_cache = checkpoint(
                     layer, x, freq_cis, bos_mask, segment_idx, prev_segment_count,
-                    moe_router_load_balancing_type, fp32_attn_output, deterministic,
+                    moe_router_load_balancing_type, attn_stability_control, deterministic,
                     layer_cache, use_reentrant=False, preserve_rng_state=True
                 )
             else:
                 x, aux_loss, layer_cache = layer(
                     x, freq_cis, bos_mask, segment_idx, prev_segment_count,
-                    moe_router_load_balancing_type, fp32_attn_output, deterministic, layer_cache
+                    moe_router_load_balancing_type, attn_stability_control, deterministic, layer_cache
                 )
 
             if aux_loss is not None:

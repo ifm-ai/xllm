@@ -330,7 +330,7 @@ class GatedDeltaAttention(nn.Module):
         bos_mask: Optional[Tensor] = None,
         segment_idx: Optional[Tensor] = None,
         prev_segment_count: Optional[Tensor] = None,
-        fp32_attn_output: bool = False,
+        stability_control: int = 0,
         deterministic: bool = True,
         cache: Optional[Tuple[Tuple[Tensor, Tensor, int],
                               Tuple[Tensor, Tensor, Tensor, Tensor],
@@ -403,7 +403,7 @@ class GatedDeltaAttention(nn.Module):
         # B x L x E/TP
         sca, prev_sk, prev_v = self.sliding_chunk_attention(
             sq, sk, v, freqs_cis, prev_sk, prev_sv,
-            bos_mask, segment_idx, fp32_attn_output, deterministic
+            bos_mask, segment_idx, stability_control, deterministic
         )
         awk, awk_mask, memory, log_norm_term, prev_aqk, prev_akk, _ = self.adaptive_working_memory(
             xq, xk, xk, v, memory, log_norm_term, prev_aqk, prev_akk, prev_av,

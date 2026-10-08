@@ -397,7 +397,7 @@ def main(cfg: TrainerConf):
         tok_loss, aux_loss, _ = model(
             tokens=x, targets=y, token_mask=mask, multi_segments=cfg.multi_segments,
             moe_router_load_balancing_type=cfg.moe_router_load_balancing_type,
-            fp32_attn_output=cfg.fp32_attn_output, deterministic=cfg.deterministic
+            attn_stability_control=cfg.attn_stability_control, deterministic=cfg.deterministic
         )
 
         if mask is None:
