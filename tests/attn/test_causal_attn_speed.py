@@ -67,28 +67,28 @@ def test_flash_attention_speed(
 
 
 def test_xattn_attention_speed(
-    query, key, value, out_grad, bos_mask, segment_idx, fp32_output, scale, epochs
+    query, key, value, out_grad, bos_mask, segment_idx, high_prevision_level, scale, epochs
 ):
     with torch.no_grad():
         # warm up
         for _ in range(100):
             y, y_bwd, lse = xattn_causal_flash_attn_fwd(
-                query, key, value, scale, bos_mask, segment_idx, fp32_output, True
+                query, key, value, scale, bos_mask, segment_idx, high_prevision_level, requires_grad=True
             )
             xattn_causal_flash_attn_bwd(
                 out_grad, query, key, value, y_bwd, lse,
-                scale, bos_mask, segment_idx, False
+                scale, bos_mask, segment_idx, high_prevision_level, deterministic=False
             )
 
         torch.cuda.synchronize()
 
         api = 'bos' if bos_mask is not None else 'segidx'
-        suffix = "-fp32" if fp32_output else ""
+        suffix = f"-{high_prevision_level}"
 
         start = timer()
         for _ in range(epochs):
             y, y_bwd, lse = xattn_causal_flash_attn_fwd(
-                query, key, value, scale, bos_mask, segment_idx, fp32_output, True
+                query, key, value, scale, bos_mask, segment_idx, high_prevision_level, requires_grad=True
             )
 
         torch.cuda.synchronize()
@@ -100,7 +100,7 @@ def test_xattn_attention_speed(
         for _ in range(epochs):
             xattn_causal_flash_attn_bwd(
                 out_grad, query, key, value, y_bwd, lse,
-                scale, bos_mask, segment_idx, True
+                scale, bos_mask, segment_idx, high_prevision_level, deterministic=True
             )
         torch.cuda.synchronize()
 
@@ -110,7 +110,7 @@ def test_xattn_attention_speed(
         for _ in range(epochs):
             xattn_causal_flash_attn_bwd(
                 out_grad, query, key, value, y_bwd, lse,
-                scale, bos_mask, segment_idx, False
+                scale, bos_mask, segment_idx, high_prevision_level, deterministic=False
             )
         torch.cuda.synchronize()
 
@@ -149,10 +149,10 @@ def test(B: int, L: int, H: int, G: int, D: int, avg_len: int, dtype: str):
     print(f"B={B}, L={L}, H={H} ({G}), D={D}, AvgL={avg_len}, dtype={dtype}:")
     epochs = 5000
     test_flash_attention_speed(query, key, value, out_grad, cu_seqlens_k, max_seqlen_k, scale, epochs)
-    test_xattn_attention_speed(query, key, value, out_grad, bos_mask, segment_idx, False, scale, epochs)
-    test_xattn_attention_speed(query, key, value, out_grad, bos_mask, segment_idx, True, scale, epochs)
-    test_xattn_attention_speed(query, key, value, out_grad, None, segment_idx, False, scale, epochs)
-    test_xattn_attention_speed(query, key, value, out_grad, None, segment_idx, True, scale, epochs)
+    for level in range(5):
+        test_xattn_attention_speed(query, key, value, out_grad, bos_mask, segment_idx, level, scale, epochs)
+    for level in range(5):
+        test_xattn_attention_speed(query, key, value, out_grad, None, segment_idx, level, scale, epochs)
 
     print("*" * 70)
 
