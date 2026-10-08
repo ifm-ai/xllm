@@ -669,10 +669,10 @@ class GekkoBlockFunction(torch.autograd.Function):
             causal_conv_weight_normalization, causal_conv_backend, deterministic
         )
 
-        sk, sk_rstd = rmsnorm_fwd(xk_, None, local_kv_heads, rmsnorm_eps)
+        sk_, sk_rstd = rmsnorm_fwd(xk_, None, local_kv_heads, rmsnorm_eps)
         sq, sq_rstd = rmsnorm_fwd(xq_, qnorm_w, local_heads, rmsnorm_eps)
         # B x L x H x S
-        sk = rearrange(sk, 'b l (k s) -> b l k s', k=local_kv_heads)
+        sk = rearrange(sk_, 'b l (k s) -> b l k s', k=local_kv_heads)
         sq = rearrange(sq, 'b l (h s) -> b l h s', h=local_heads)
         # apply rotary embeddings
         sq, sk = apply_ropes(sq, sk, freqs_cis, head_dim, rope_head_dim, False)
@@ -870,7 +870,7 @@ class GekkoBlockFunction(torch.autograd.Function):
         # apply rotary embeddings
         sk_grad = apply_rope(sk_grad, freqs_cis, head_dim, rope_head_dim, True)
         # k norm grad
-        xk_grad = mem_effn_rmsnorm_bwd(rearrange(sk_grad, 'b l k s -> b l (k s)'), sk, sk_rstd, local_kv_heads)
+        xk_grad = mem_effn_rmsnorm_bwd(rearrange(sk_grad, 'b l k s -> b l (k s)'), sk_, sk_rstd, local_kv_heads)
 
         aqk_grad = torch.ops.aten._softmax_backward_data(
             aqk_grad.float(), aqk_fp32, -1, torch.float32
