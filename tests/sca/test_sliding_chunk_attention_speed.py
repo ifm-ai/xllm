@@ -73,7 +73,7 @@ def test_chunk_wise_attention_speed(
 
 
 def test_sliding_chunk_attention_speed(
-    query, key, value, out_grad, chunk_size, bos_mask, segment_idx, fp32_output, backend, epochs
+    query, key, value, out_grad, chunk_size, bos_mask, segment_idx, level, backend, epochs
 ):
     with torch.no_grad():
         # warm up
@@ -81,11 +81,11 @@ def test_sliding_chunk_attention_speed(
             deterministic = i % 2 == 0
             _, y_bwd, aux = sliding_chunk_attention_fwd(
                 query, key, value, chunk_size, 1.0, None, None,
-                bos_mask, segment_idx, 0.0, fp32_output, backend, True
+                bos_mask, segment_idx, 0.0, level, backend, True
             )
             sliding_chunk_attention_bwd(
                 out_grad, query, key, value, y_bwd, aux, chunk_size, 1.0, None, None,
-                bos_mask, segment_idx, deterministic, backend
+                bos_mask, segment_idx, level, deterministic, backend
             )
         torch.cuda.synchronize()
 
@@ -93,11 +93,11 @@ def test_sliding_chunk_attention_speed(
         for _ in range(epochs):
             _, y_bwd, aux = sliding_chunk_attention_fwd(
                 query, key, value, chunk_size, 1.0, None, None,
-                bos_mask, segment_idx, 0.0, fp32_output, backend, True
+                bos_mask, segment_idx, 0.0, level, backend, True
             )
         torch.cuda.synchronize()
 
-        suffix = "-fp32" if fp32_output else ""
+        suffix = f"-{level}"
         delta = timer() - start
         if backend == 'swift':
             print(f'SCA-{backend} fwd: {delta:.2f}s')
@@ -110,7 +110,7 @@ def test_sliding_chunk_attention_speed(
         for _ in range(epochs):
             sliding_chunk_attention_bwd(
                 out_grad, query, key, value, y_bwd, aux, chunk_size, 1.0, None, None,
-                bos_mask, segment_idx, deterministic, backend
+                bos_mask, segment_idx, level, deterministic, backend
             )
         torch.cuda.synchronize()
 
@@ -123,7 +123,7 @@ def test_sliding_chunk_attention_speed(
             for _ in range(epochs):
                 sliding_chunk_attention_bwd(
                     out_grad, query, key, value, y_bwd, aux, chunk_size, 1.0, None, None,
-                    bos_mask, segment_idx, deterministic, backend
+                    bos_mask, segment_idx, level, deterministic, backend
                 )
             torch.cuda.synchronize()
 
@@ -224,10 +224,9 @@ def test(B: int, L: int, H: int, HKV: int, D: int, V: int, chunk_size: int, avg_
     # if D == V and dtype in ['bf16', 'fp16']:
     #     test_flash_sliding_window_attention_speed(query, key, value, out_grad, chunk_size * 2, 1.0 / math.sqrt(D), epochs)
     test_sliding_chunk_attention_speed(query, key, value, out_grad, chunk_size, bos_mask, segment_idx, False, 'swift', epochs)
-    test_sliding_chunk_attention_speed(query, key, value, out_grad, chunk_size, bos_mask, segment_idx, False, 'xattn', epochs)
-    test_sliding_chunk_attention_speed(query, key, value, out_grad, chunk_size, bos_mask, segment_idx, True, 'xattn', epochs)
-    test_sliding_chunk_attention_speed(query, key, value, out_grad, chunk_size, None, segment_idx, False, 'xattn', epochs)
-    test_sliding_chunk_attention_speed(query, key, value, out_grad, chunk_size, None, segment_idx, True, 'xattn', epochs)
+    for level in range(5):
+        test_sliding_chunk_attention_speed(query, key, value, out_grad, chunk_size, bos_mask, segment_idx, level, 'xattn', epochs)
+        test_sliding_chunk_attention_speed(query, key, value, out_grad, chunk_size, None, segment_idx, level, 'xattn', epochs)
     print("*" * 70)
 
 

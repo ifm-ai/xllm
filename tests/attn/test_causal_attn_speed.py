@@ -151,7 +151,6 @@ def test(B: int, L: int, H: int, G: int, D: int, avg_len: int, dtype: str):
     test_flash_attention_speed(query, key, value, out_grad, cu_seqlens_k, max_seqlen_k, scale, epochs)
     for level in range(5):
         test_xattn_attention_speed(query, key, value, out_grad, bos_mask, segment_idx, level, scale, epochs)
-    for level in range(5):
         test_xattn_attention_speed(query, key, value, out_grad, None, segment_idx, level, scale, epochs)
 
     print("*" * 70)

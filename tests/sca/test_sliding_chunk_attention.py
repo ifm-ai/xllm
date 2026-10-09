@@ -122,13 +122,18 @@ def test(B: int, L: int, H: int, HKV: int, D: int, V: int, chunk_size: int, prev
         segment_idx = torch.cat([prev_segment_idx, segment_idx], dim=1)
 
     with torch.no_grad():
-        for backend, mode, fp32_output in [
-            ['swift', 'segidx', False],
-            ['xattn', 'bos', False],
-            ['xattn', 'segidx', False],
-            ['xattn', 'bos', True],
-            ['xattn', 'segidx', True]
-
+        for backend, mode, level in [
+            ['swift', 'segidx', 0],
+            ['xattn', 'bos', 0],
+            ['xattn', 'segidx', 0],
+            ['xattn', 'bos', 1],
+            ['xattn', 'segidx', 1],
+            ['xattn', 'bos', 2],
+            ['xattn', 'segidx', 2],
+            ['xattn', 'bos', 3],
+            ['xattn', 'segidx', 3],
+            ['xattn', 'bos', 4],
+            ['xattn', 'segidx', 4],
         ]:
             if mode == 'bos':
                 bmask = bos_mask
@@ -139,14 +144,14 @@ def test(B: int, L: int, H: int, HKV: int, D: int, V: int, chunk_size: int, prev
             else:
                 raise ValueError(f"unknown mode: {mode}")
 
-            suffix = "fp32" if fp32_output else "std"
+            suffix = f"{level}"
 
             atol = {"fp32": 1e-6, "bf16": 1e-3, "fp16": 2e-4}[dtype]
             rtol = {"fp32": 1e-5, "bf16": 1e-2, "fp16": 1e-3}[dtype]
 
             y_sca, y_bwd, aux = sliding_chunk_attention_fwd(
                 q, k, v, chunk_size, 1.0, prev_k, prev_v, bmask, segidx,
-                0.0, fp32_output, backend, requires_grad=True
+                0.0, level, backend, requires_grad=True
             )
             torch.testing.assert_close(y_sca, y_mannual.to(pt_dtype), rtol=rtol, atol=atol)
             print(f"B={B}, L={L}, H={H} ({HKV}), D={D}, V={V} chunk={chunk_size}, prev_chunk={prev_chunk}, "
@@ -158,7 +163,7 @@ def test(B: int, L: int, H: int, HKV: int, D: int, V: int, chunk_size: int, prev
             # non-deterministic
             q_grad_sca, k_grad_sca, v_grad_sca, prev_k_grad_sca, prev_v_grad_sca = sliding_chunk_attention_bwd(
                 y_grad, q, k, v, y_bwd, aux, chunk_size, 1.0,
-                prev_k, prev_v, bmask, segidx, False, backend
+                prev_k, prev_v, bmask, segidx, level, False, backend
             )
             torch.testing.assert_close(q_grad_sca, q_grad, rtol=rtol, atol=atol)
             torch.testing.assert_close(k_grad_sca, k_grad, rtol=rtol, atol=atol)
@@ -174,7 +179,7 @@ def test(B: int, L: int, H: int, HKV: int, D: int, V: int, chunk_size: int, prev
             # deterministic
             q_grad_sca, k_grad_sca, v_grad_sca, prev_k_grad_sca, prev_v_grad_sca = sliding_chunk_attention_bwd(
                 y_grad, q, k, v, y_bwd, aux, chunk_size, 1.0,
-                prev_k, prev_v, bmask, segidx, True, backend
+                prev_k, prev_v, bmask, segidx, level, True, backend
             )
             torch.testing.assert_close(q_grad_sca, q_grad, rtol=rtol, atol=atol)
             torch.testing.assert_close(k_grad_sca, k_grad, rtol=rtol, atol=atol)
