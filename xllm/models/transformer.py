@@ -164,7 +164,8 @@ class TransformerBlock(nn.Module):
                 self.recompute_kv,
                 self.recompute_attention,
                 self.recompute_fc1_out,
-                self.recompute_fc3_out
+                self.recompute_fc3_out,
+                self.layer_id,
             )
 
         y, cache = self.attention(
@@ -325,6 +326,7 @@ class TransformerMoEBlock(nn.Module):
                 self.recompute_fc1_out,
                 self.recompute_fc3_out,
                 self.recompute_router,
+                self.layer_id,
             )
 
         y, cache = self.attention(
@@ -498,6 +500,7 @@ class TransformerMoVABlock(nn.Module):
                 self.recompute_fc1_out,
                 self.recompute_fc3_out,
                 self.recompute_router,
+                self.layer_id,
             )
 
         y, aux_loss_mova, cache = self.mova(

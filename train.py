@@ -282,6 +282,7 @@ def main(cfg: TrainerConf):
         enabled=enable_health,
         freq=cfg.health_log_freq,
         num_layers=cfg.model.num_layers,
+        enable_query_key_stats=cfg.health_query_key_stats,
     )
 
     model.train()

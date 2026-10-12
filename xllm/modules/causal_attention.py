@@ -20,10 +20,17 @@ from xllm.modules.rotary_positional_embedding import (
     apply_rotary_embedding,
     apply_rotary_embeddings
 )
+from xllm.health_metrics import get_active_health_collector
 
 
 def repeat_kv(x: Tensor, n_rep: int) -> Tensor:
     return repeat(x, 'b l h d -> b l (h n) d', n=n_rep)
+
+
+def _record_query_key_stats(layer_id: Optional[int], xq: Tensor, xk: Tensor) -> None:
+    collector = get_active_health_collector()
+    if collector is not None and layer_id is not None:
+        collector.record_query_key_stats(layer_id, xq, xk)
 
 
 class CausalSoftmaxAttention(nn.Module):
@@ -40,6 +47,7 @@ class CausalSoftmaxAttention(nn.Module):
         scale: Optional[float],
         dropout: float,
         backend: Optional[str],
+        layer_id: Optional[int],
     ):
         super().__init__()
         self.n_heads = n_heads
@@ -48,6 +56,7 @@ class CausalSoftmaxAttention(nn.Module):
         self.rope_head_dim = rope_head_dim
         self.dropout = dropout
         self.backend = backend
+        self.layer_id = layer_id
         self.scale = 1.0 / math.sqrt(self.head_dim) if scale is None else scale
 
         if backend == 'xattn':
@@ -79,6 +88,9 @@ class CausalSoftmaxAttention(nn.Module):
             xq_rope, xk_rope = apply_rotary_embeddings(xq_rope, xk_rope, freqs_cis=freqs_cis, backward=False)
             xq = torch.cat([xq_rope, xq_nope], dim=-1)
             xk = torch.cat([xk_rope, xk_nope], dim=-1)
+
+        # Record local post-RoPE heads before K is gathered across context ranks.
+        _record_query_key_stats(self.layer_id, xq, xk)
 
         if cache is not None:
             assert segments is None
@@ -171,6 +183,7 @@ class CausalSoftdeltaAttention(nn.Module):
         scale: Optional[float],
         dropout: float,
         backend: Optional[str],
+        layer_id: Optional[int],
     ):
         super().__init__()
         self.n_heads = n_heads
@@ -179,6 +192,7 @@ class CausalSoftdeltaAttention(nn.Module):
         self.rope_head_dim = rope_head_dim
         self.dropout = dropout
         self.backend = backend
+        self.layer_id = layer_id
         self.scale = 1.0 / math.sqrt(self.head_dim)  if scale is None else scale
 
     def forward(
@@ -211,6 +225,9 @@ class CausalSoftdeltaAttention(nn.Module):
             xq = torch.cat([xq_rope, xq_nope], dim=-1)
             kq = torch.cat([kq_rope, kq_nope], dim=-1)
             xk = torch.cat([xk_rope, xk_nope], dim=-1)
+
+        # Record local post-RoPE heads before K is gathered across context ranks.
+        _record_query_key_stats(self.layer_id, xq, xk)
 
         if cache is not None:
             assert segments is None

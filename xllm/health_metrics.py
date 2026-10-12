@@ -39,18 +39,22 @@ class HealthMetricCollector:
         enabled: bool,
         freq: int,
         num_layers: int,
+        enable_query_key_stats: bool = False,
     ):
         self.enabled = enabled
         self.freq = freq
         self.num_layers = num_layers
+        self.enable_query_key_stats = enable_query_key_stats
         self.step: Optional[int] = None
         self.recording = False
         self.decoder_layer_activation_records: Dict[int, _LocalStats] = {}
+        self.query_key_stats_records: Dict[int, Dict[str, _LocalStats]] = {}
 
     def begin_step(self, step: int) -> None:
         global _ACTIVE_COLLECTOR
         self.step = step
         self.decoder_layer_activation_records = {}
+        self.query_key_stats_records = {}
         self.recording = self.enabled and step % self.freq == 0
         _ACTIVE_COLLECTOR = self if self.recording else None
 
@@ -75,6 +79,26 @@ class HealthMetricCollector:
 
         self.decoder_layer_activation_records[layer_idx] = self._local_stats(x)
 
+    @torch.no_grad()
+    def record_query_key_stats(self, layer_idx: int, q: torch.Tensor, k: torch.Tensor) -> None:
+        if not self.recording or not self.enable_query_key_stats:
+            return
+        if layer_idx in self.query_key_stats_records:
+            raise RuntimeError(f"Duplicate query/key statistics for layer {layer_idx}")
+        if q.numel() == 0 or k.numel() == 0:
+            raise RuntimeError(f"Empty query/key tensor for layer {layer_idx}")
+        if q.ndim == 0 or k.ndim == 0:
+            raise RuntimeError(f"Query/key tensors must have a head dimension for layer {layer_idx}")
+
+        q_vector_l2 = torch.linalg.vector_norm(q.detach(), dim=-1, dtype=torch.float32)
+        k_vector_l2 = torch.linalg.vector_norm(k.detach(), dim=-1, dtype=torch.float32)
+        self.query_key_stats_records[layer_idx] = {
+            "q": self._local_stats(q),
+            "q_vector_l2": self._local_stats(q_vector_l2),
+            "k": self._local_stats(k),
+            "k_vector_l2": self._local_stats(k_vector_l2),
+        }
+
     def flush(self, mlogger: "MetricLogger", step: int) -> None:
         if not self.recording:
             return
@@ -86,6 +110,11 @@ class HealthMetricCollector:
                 f"Expected {self.num_layers} activation records at step {self.step}, "
                 f"got layers {sorted(self.decoder_layer_activation_records)} at step {step}"
             )
+        if self.enable_query_key_stats and sorted(self.query_key_stats_records) != layers:
+            raise RuntimeError(
+                f"Expected {self.num_layers} query/key records at step {self.step}, "
+                f"got layers {sorted(self.query_key_stats_records)} at step {step}"
+            )
 
         entries = []
         for layer_idx in layers:
@@ -95,6 +124,19 @@ class HealthMetricCollector:
                 ("mean", "min", "max"),
                 self.decoder_layer_activation_records[layer_idx],
             ))
+            if self.enable_query_key_stats:
+                for name in ("q", "k"):
+                    prefix = f"{name}_stats/{layer}"
+                    entries.append((
+                        prefix,
+                        ("mean", "min", "max"),
+                        self.query_key_stats_records[layer_idx][name],
+                    ))
+                    entries.append((
+                        prefix,
+                        ("vector_l2_mean", "vector_l2_min", "vector_l2_max"),
+                        self.query_key_stats_records[layer_idx][f"{name}_vector_l2"],
+                    ))
 
         sums = torch.stack([stats[0] for _, _, stats in entries]).double()
         counts = torch.tensor(
@@ -106,6 +148,7 @@ class HealthMetricCollector:
         mins = _pack_extrema([stats[1] for _, _, stats in entries])
         maxs = _pack_extrema([stats[2] for _, _, stats in entries])
         self.decoder_layer_activation_records = {}
+        self.query_key_stats_records = {}
 
         if dist.is_available() and dist.is_initialized():
             dist.reduce(sum_count, dst=0, op=dist.ReduceOp.SUM)

@@ -181,6 +181,7 @@ class MultiheadAttention(nn.Module):
             None,
             self.attention_dropout,
             self.causal_attn_backend,
+            layer_id,
         )
 
         self.wo = RowParallelLinear(

@@ -335,6 +335,7 @@ class TrainerConf(Config):
     disable_logging: bool = False  # Whether to disable metric logging via MetricLogger, including JSONL, TensorBoard, and W&B.
     health_metrics: bool = False
     health_log_freq: int = 100
+    health_query_key_stats: bool = False
 
     # Training hyperparameters
     batch_size: Optional[int] = None  # Num of sequences per DP rank per step. Set either this or global_batch_size.
@@ -429,6 +430,8 @@ class TrainerConf(Config):
         if self.health_metrics:
             assert self.health_log_freq > 0
             assert self.model.arch == "transformer", "Health metrics currently require model.arch=transformer"
+        if self.health_query_key_stats:
+            assert self.health_metrics, "Query/key statistics require health_metrics=true"
 
         # async eval
         if self.async_eval_ngpus > 0:

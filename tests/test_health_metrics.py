@@ -42,11 +42,46 @@ def test_activation_stats_follow_frequency():
     assert metrics["activation_stats/layer_001/mean"] == 4.0
 
 
+def test_query_key_coordinate_and_vector_stats():
+    collector = health_metrics.HealthMetricCollector(
+        enabled=True, freq=1, num_layers=1, enable_query_key_stats=True
+    )
+    logger = RecordingLogger()
+    collector.begin_step(1)
+    collector.record_activation(0, torch.tensor([1.0]))
+    collector.record_query_key_stats(
+        0,
+        torch.tensor([[[[3.0, 4.0]], [[0.0, 2.0]]]]),
+        torch.tensor([[[[-3.0, 4.0]]]]),
+    )
+    collector.end_forward()
+    collector.flush(logger, 1)
+
+    metrics, _ = logger.calls[0]
+    assert metrics["q_stats/layer_000/mean"] == 2.25
+    assert metrics["q_stats/layer_000/min"] == 0.0
+    assert metrics["q_stats/layer_000/max"] == 4.0
+    assert metrics["q_stats/layer_000/vector_l2_mean"] == 3.5
+    assert metrics["q_stats/layer_000/vector_l2_min"] == 2.0
+    assert metrics["q_stats/layer_000/vector_l2_max"] == 5.0
+    assert metrics["k_stats/layer_000/mean"] == 0.5
+    assert metrics["k_stats/layer_000/min"] == -3.0
+    assert metrics["k_stats/layer_000/max"] == 4.0
+    assert metrics["k_stats/layer_000/vector_l2_mean"] == 5.0
+    assert metrics["k_stats/layer_000/vector_l2_min"] == 5.0
+    assert metrics["k_stats/layer_000/vector_l2_max"] == 5.0
+
+
 def test_health_stats_use_three_packed_reductions():
-    collector = health_metrics.HealthMetricCollector(enabled=True, freq=1, num_layers=1)
+    collector = health_metrics.HealthMetricCollector(
+        enabled=True, freq=1, num_layers=1, enable_query_key_stats=True
+    )
     logger = RecordingLogger()
     collector.begin_step(1)
     collector.record_activation(0, torch.tensor([1.0, 3.0]))
+    collector.record_query_key_stats(
+        0, torch.tensor([[[[1.0, 2.0]]]]), torch.tensor([[[[3.0, 4.0]]]])
+    )
     collector.end_forward()
     reductions = []
 
@@ -78,13 +113,18 @@ def test_health_stats_use_three_packed_reductions():
 
 
 def test_checkpoint_recomputation_does_not_duplicate_stats():
-    collector = health_metrics.HealthMetricCollector(enabled=True, freq=1, num_layers=1)
+    collector = health_metrics.HealthMetricCollector(
+        enabled=True, freq=1, num_layers=1, enable_query_key_stats=True
+    )
     logger = RecordingLogger()
     calls = 0
 
     def layer(x):
         nonlocal calls
         calls += 1
+        active = health_metrics.get_active_health_collector()
+        if active is not None:
+            active.record_query_key_stats(0, x, x)
         return torch.sin(x)
 
     x = torch.tensor([1.0], requires_grad=True)

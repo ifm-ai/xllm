@@ -3,6 +3,7 @@ import math
 import torch
 
 from xllm.distributed.utils import reshape_gathered_tensor_along_specific_dim
+from xllm.health_metrics import get_active_health_collector
 from xllm.modules.fused_ops import (
     memory_efficient_dropout_fwd,
     memory_efficient_dropout_bwd,
@@ -96,6 +97,7 @@ class TransformerMoVABlockFunction(torch.autograd.Function):
         recompute_fc1_out: bool,
         recompute_fc3_out: bool,
         recompute_router: bool,
+        layer_id: int,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], None]:
 
         bsz, seq_len, _ = x.size()
@@ -125,6 +127,9 @@ class TransformerMoVABlockFunction(torch.autograd.Function):
             attn_gate_func, dropout, attention_dropout, hidden_dropout,
         )
         xq, xk, xv = xqkv
+        health_collector = get_active_health_collector()
+        if health_collector is not None:
+            health_collector.record_query_key_stats(layer_id, xq, xk)
         cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, total_seqlen_k, end_seq = cu_seqlens
         attn_out, attn_lse = attn_out
         flash_rng_state, attn_rng_state, attn_out_rng_state, xh_rng_state = rng_states
@@ -567,4 +572,5 @@ class TransformerMoVABlockFunction(torch.autograd.Function):
             None,  # recompute_fc1_out
             None,  # recompute_fc3_out
             None,  # recompute_router
+            None,  # layer_id
         )
