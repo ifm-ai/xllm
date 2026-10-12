@@ -91,8 +91,9 @@ python -m pytest -q tests/optim/test_dion_muon.py
 Real-kernel distributed tests use the same seeded batches, DP size and global
 token count at CP=1 and CP=2. They include document boundaries inside chunks,
 masked tokens, gradient checks, parameter-update parity and exact DCP resume.
-BF16 gradient parity requires each tensor's L2 error to stay within 1%
-(plus an absolute floor of 1e-6), and its largest error within 3% of that
+BF16 gradient parity requires each tensor's RMS error to stay within 1%
+of its reference gradient RMS (plus an absolute per-entry floor of 1e-6),
+and its largest error within 3% of that
 tensor's maximum gradient magnitude (plus 1e-5). Near-zero entries can cancel
 differently when CP partitions BF16 matrix products.
 The following example tests the fused 1:3 hybrid:

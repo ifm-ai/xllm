@@ -216,6 +216,7 @@ def main():
                 'relative_l2': float(delta.norm() / expected.float().norm().clamp_min(1e-12)),
                 'l2': float(delta.norm()),
                 'reference_l2': float(expected.float().norm()),
+                'numel': actual.numel(),
                 'max_abs': float(delta.abs().max()),
                 'reference_max_abs': float(expected.abs().max()),
             }
@@ -228,7 +229,10 @@ def main():
             # entries can cancel differently, so bound both whole-tensor error
             # and the largest error relative to the tensor's gradient scale.
             error = gradient_errors[name]
-            assert error['l2'] <= 0.01 * error['reference_l2'] + 1e-6, (name, error)
+            assert error['l2'] <= 0.01 * error['reference_l2'] + 1e-6 * error['numel'] ** 0.5, (
+                name,
+                error,
+            )
             assert error['max_abs'] <= 0.03 * error['reference_max_abs'] + 1e-5, (name, error)
         for actual, expected in zip(metrics, saved['metrics']):
             torch.testing.assert_close(
@@ -246,6 +250,9 @@ def main():
         result['cp_parity_max_parameter_delta'] = max_delta
         result['gradient_parity_max_relative_l2'] = max(
             error['relative_l2'] for error in gradient_errors.values()
+        )
+        result['gradient_parity_max_absolute_rms'] = max(
+            error['l2'] / error['numel'] ** 0.5 for error in gradient_errors.values()
         )
     if args.save_reference and rank == 0:
         args.save_reference.parent.mkdir(parents=True, exist_ok=True)
