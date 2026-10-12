@@ -81,7 +81,13 @@ class SlurmConf(Config):
 
 @dataclass
 class OptimConf(Config):
+    optimizer: str = 'adamw'  # adamw or dion_muon (requires FSDP2)
     lr: float = 1e-3  # AdamW learning rate after warmup
+    muon_lr: float = 0.01  # Muon learning rate, before matrix-size adjustment
+    muon_momentum: float = 0.95
+    muon_nesterov: bool = False
+    muon_adjust_lr: str = 'spectral_norm'  # spectral_norm or rms_norm
+    muon_orthogonalizer: str = 'newton_schulz5'  # newton_schulz5 or polar_express
     warmup: int = 2000  # Num of steps for LR warmup. 0 means no warmup
     weight_decay: float = 0.1  # Decoupled weight decay
     epsilon: float = 1e-8
@@ -96,6 +102,23 @@ class OptimConf(Config):
     wsd_decay_style: str = 'cosine'  # The curve type of decay phase in WSD scheduler: cosine or linear
 
     def __post_init__(self):
+        if self.optimizer not in ['adamw', 'dion_muon']:
+            raise ValueError(f'Unknown optimizer: {self.optimizer}')
+        if self.optimizer == 'dion_muon':
+            import math
+            for name in ('lr', 'muon_lr', 'epsilon'):
+                value = getattr(self, name)
+                if isinstance(value, bool) or not math.isfinite(value) or value <= 0:
+                    raise ValueError(f'{name} must be finite and positive')
+            if not math.isfinite(self.weight_decay) or self.weight_decay < 0:
+                raise ValueError('weight_decay must be finite and nonnegative')
+            for name in ('muon_momentum', 'beta1', 'beta2'):
+                if not 0 <= getattr(self, name) < 1:
+                    raise ValueError(f'{name} must be in [0, 1)')
+            if self.muon_adjust_lr not in ['spectral_norm', 'rms_norm']:
+                raise ValueError('muon_adjust_lr must be spectral_norm or rms_norm')
+            if self.muon_orthogonalizer not in ['newton_schulz5', 'polar_express']:
+                raise ValueError('Unknown muon_orthogonalizer')
         assert self.scheduler in ['linear', 'cosine', 'constant', 'wsd']
         assert self.warmup >= 0
         if self.scheduler == 'wsd':
@@ -107,6 +130,7 @@ class ModelConf(Config):
     arch: str = "transformer"  # Architecture: transformer or gekko
     ddp_backend: str = 'fsdp1'  # Distributed parameter sharding implementation: fsdp1 or fsdp2
     num_layers: int = 8
+    full_attention_interval: int = 0  # Gekko: 0 = all Gekko; 4 = full/Gekko/Gekko/Gekko, starting with full attention
     model_dim: int = 1024  # Dimensions of token hidden state and residual stream
     # Attention
     chunk_size: int = 2048  # Used for local attention, memory update in Gekko and prefilling.
@@ -190,6 +214,16 @@ class ModelConf(Config):
 
     def __post_init__(self):
         assert self.arch in ['transformer', 'gekko']
+        if isinstance(self.full_attention_interval, bool) or not isinstance(self.full_attention_interval, int):
+            raise ValueError('full_attention_interval must be an integer')
+        if self.full_attention_interval:
+            if self.arch != 'gekko' or self.full_attention_interval < 2:
+                raise ValueError('full_attention_interval requires arch=gekko and an interval >= 2')
+            if self.num_experts or self.num_values:
+                raise ValueError('Hybrid Gekko currently requires dense FFNs')
+            head_dim = self.model_dim // self.num_heads if self.head_dim is None else self.head_dim
+            if self.v_head_dim is not None and self.v_head_dim != head_dim:
+                raise ValueError('Hybrid full attention requires v_head_dim=head_dim')
         assert self.ddp_backend in ['fsdp1', 'fsdp2']
 
         assert self.causal_attn_backend in [None, "swift", "flash", 'xattn']
@@ -409,6 +443,19 @@ class TrainerConf(Config):
     def __post_init__(self):
         # sanity check
         assert self.dtype in ["bf16", "fp16", "fp32"]
+        if self.optim.optimizer == 'dion_muon':
+            if self.model.ddp_backend != 'fsdp2':
+                raise ValueError('dion_muon requires model.ddp_backend=fsdp2')
+            if self.model_parallel_size != 1:
+                raise ValueError('dion_muon tensor parallelism is not supported')
+            if self.model.num_experts or self.model.num_values:
+                raise ValueError('dion_muon currently supports dense FFNs only')
+            if not self.dcp_for_optimizer or self.async_checkpointing:
+                raise ValueError('dion_muon requires synchronous DCP optimizer checkpoints')
+            if self.model.memory_efficient_norm:
+                raise ValueError('dion_muon qualification requires memory_efficient_norm=false')
+        if self.seq_len % (self.context_parallel_size * self.model.chunk_size):
+            raise ValueError('seq_len must be divisible by context_parallel_size * chunk_size')
         if self.dtype == "fp16":
             assert self.loss_rescaling, "loss rescaling needed for fp16!"
 

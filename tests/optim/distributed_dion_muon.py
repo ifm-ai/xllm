@@ -1,0 +1,262 @@
+"""Real-kernel FSDP2/CP parity and checkpoint test; launch with torchrun.
+
+Run CP=1 first with --save-reference; compare CP=2 with --reference using the
+same DP size, global tokens, model seed and batches. No mocked CUDA operators.
+"""
+
+import argparse
+import json
+from pathlib import Path
+import time
+from types import SimpleNamespace
+
+import torch
+import torch.distributed as dist
+import torch.distributed.checkpoint as dcp
+
+from xllm.config import ModelConf, OptimConf
+from xllm.distributed import (
+    get_data_parallel_group,
+    get_data_parallel_rank,
+    get_data_parallel_world_size,
+    get_hybrid_shard_data_parallel_group,
+    init_torch_distributed,
+    initialize_model_parallel,
+)
+from xllm.models import build_model, init_cache
+from xllm.monitor import Timings
+from xllm.optim import build_optimizer
+from xllm.optim.dion_muon import validate_optimizer_contract
+from xllm.utils import (
+    get_model_state,
+    get_sharded_optimizer_state,
+    set_model_state,
+    set_sharded_optimizer_state,
+)
+from train import State, get_optim_state, set_optim_state
+
+
+def full_state(model, gradients=False):
+    return {
+        name: (p.grad if gradients else p.detach()).full_tensor().cpu()
+        for name, p in model.named_parameters()
+    }
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--arch', choices=['transformer', 'gekko', 'hybrid'], required=True)
+    parser.add_argument('--cp', type=int, default=1)
+    parser.add_argument('--fused', action='store_true')
+    parser.add_argument('--steps', type=int, default=3)
+    parser.add_argument('--seq-len', type=int, default=1024)
+    parser.add_argument('--save-reference', type=Path)
+    parser.add_argument('--reference', type=Path)
+    parser.add_argument('--output', type=Path, required=True)
+    args = parser.parse_args()
+    init_torch_distributed(timeout=300)
+    initialize_model_parallel(1, args.cp, timeout=300)
+    rank = dist.get_rank()
+    torch.manual_seed(17)
+    torch.cuda.manual_seed(17)
+    cfg = ModelConf(
+        arch='transformer' if args.arch == 'transformer' else 'gekko',
+        full_attention_interval=4 if args.arch == 'hybrid' else 0,
+        ddp_backend='fsdp2',
+        num_layers=4,
+        model_dim=512,
+        ffn_hidden_dim=1024,
+        vocab_size=256,
+        num_heads=4,
+        num_kv_heads=1,
+        head_dim=128,
+        v_head_dim=128,
+        rope_head_dim=64,
+        chunk_size=128,
+        swiglu=True,
+        causal_attn_backend='xattn',
+        sca_backend='xattn',
+        causal_conv_backend='triton',
+        timenorm_num_groups=8,
+        layernorm_num_groups=1,
+        memory_efficient_norm=False,
+        apply_rmsnorm=True,
+        fused_block=args.fused,
+        recompute_q=args.fused,
+        recompute_v=args.fused,
+        recompute_attention=args.fused,
+        recompute_awk=args.fused and args.arch != 'transformer',
+        recompute_fc1_out=args.fused,
+        recompute_fc3_out=args.fused,
+    )
+    tokenizer = SimpleNamespace(vocab_size=256, bos_id=1, eos_id=2, pad_id=0)
+    optim_cfg = OptimConf(
+        optimizer='dion_muon', muon_lr=0.01, lr=0.001, warmup=2, weight_decay=0.01
+    )
+
+    def build():
+        model = build_model(cfg, 'bf16', None, True, True, False, tokenizer)
+        optimizer, scheduler = build_optimizer(model, optim_cfg, 20, 'bf16')
+        return model, optimizer, scheduler
+
+    model, optimizer, scheduler = build()
+    assert model._xllm_dion_mesh.ndim == 1
+    assert model._xllm_dion_mesh.size() == get_data_parallel_world_size()
+    if args.arch == 'hybrid':
+        assert model.full_attention_layers == (0,)
+        assert model.layers[0].__class__.__name__.startswith('FSDPTransformerBlock')
+    dp_rank = get_data_parallel_rank()
+    generator = torch.Generator().manual_seed(123 + dp_rank)
+    batches = []
+    for _ in range(args.steps + 1):
+        tokens = torch.randint(3, 256, (1, args.seq_len), generator=generator)
+        # Boundaries inside chunks and directly next to CP splits.
+        for position in (73, 129, args.seq_len // 2 - 2, args.seq_len // 2 + 5):
+            tokens[0, position] = 2
+        targets = torch.roll(tokens, -1, 1)
+        mask = torch.ones_like(tokens, dtype=torch.bool)
+        mask[:, -17:] = False
+        batches.append((tokens.cuda(), targets.cuda(), mask.cuda()))
+
+    def update(model, optimizer, scheduler, batch, capture_gradients=False):
+        tokens, targets, mask = batch
+        losses, _, _ = model(
+            tokens, multi_segments=True, targets=targets, token_mask=mask, deterministic=True
+        )
+        count = mask.sum()
+        dist.all_reduce(count, group=get_data_parallel_group())
+        divisor = count / (get_data_parallel_world_size() * args.cp)
+        train_loss = losses.sum() / (divisor + 1e-6)
+        train_loss.backward()
+        for name, p in model.named_parameters():
+            assert p.grad is not None, f'Missing gradient: {name}'
+            assert torch.isfinite(p.grad.to_local()).all(), f'Nonfinite gradient: {name}'
+        gradients = full_state(model, gradients=True) if capture_gradients else None
+        grad_norm = model.clip_grad_norm_(1.0)
+        optimizer.step()
+        scheduler.step()
+        optimizer.zero_grad(set_to_none=True)
+        loss = train_loss.detach() / args.cp
+        dist.all_reduce(loss)
+        return float(loss / dist.get_world_size()), grad_norm, gradients
+
+    initial = full_state(model)
+    metrics = []
+    torch.cuda.synchronize()
+    start = time.monotonic()
+    for step in range(args.steps):
+        loss, grad_norm, gradients = update(
+            model, optimizer, scheduler, batches[step], capture_gradients=step == 0
+        )
+        if step == 0:
+            first_gradients = gradients
+        metrics.append({'step': step + 1, 'loss': loss, 'grad_norm': grad_norm})
+        if rank == 0:
+            print(json.dumps(metrics[-1]), flush=True)
+    trained = full_state(model)
+    torch.cuda.synchronize()
+    elapsed = time.monotonic() - start
+    result = {
+        'arch': args.arch,
+        'cp': args.cp,
+        'dp': get_data_parallel_world_size(),
+        'fused': args.fused,
+        'steps': args.steps,
+        'seq_len': args.seq_len,
+        'metrics': metrics,
+        'torch': torch.__version__,
+        'wps': args.steps * args.seq_len * get_data_parallel_world_size() / elapsed,
+        'peak_memory_gib': torch.cuda.max_memory_allocated() / 2**30,
+    }
+    reference = {
+        'initial': initial,
+        'trained': trained,
+        'gradients': first_gradients,
+        'metrics': metrics,
+    }
+    if args.reference:
+        saved = torch.load(args.reference, weights_only=True)
+        max_delta = 0.0
+        for name in trained:
+            torch.testing.assert_close(initial[name], saved['initial'][name], rtol=0, atol=0)
+            max_delta = max(max_delta, (trained[name] - saved['trained'][name]).abs().max().item())
+            torch.testing.assert_close(trained[name], saved['trained'][name], rtol=0.03, atol=0.001)
+            torch.testing.assert_close(
+                first_gradients[name], saved['gradients'][name], rtol=0.03, atol=0.00001
+            )
+        for actual, expected in zip(metrics, saved['metrics']):
+            torch.testing.assert_close(
+                torch.tensor(actual['loss']), torch.tensor(expected['loss']), rtol=0.003, atol=0.001
+            )
+            torch.testing.assert_close(
+                torch.tensor(actual['grad_norm']),
+                torch.tensor(expected['grad_norm']),
+                rtol=0.03,
+                atol=0.001,
+            )
+        result['cp_parity_max_parameter_delta'] = max_delta
+    if args.save_reference and rank == 0:
+        args.save_reference.parent.mkdir(parents=True, exist_ok=True)
+        torch.save(reference, args.save_reference)
+
+    # Exercise the release's DCP helpers, then compare an uninterrupted update
+    # against the identical update after rebuilding FSDP2, optimizer and scheduler.
+    checkpoint = args.output.with_suffix('')
+    group = get_hybrid_shard_data_parallel_group()
+    model_state = get_model_state(model, full_state=False)
+    data_iterator = SimpleNamespace(
+        get_state=lambda: {'batch': args.steps}, set_state=lambda state: None
+    )
+    training_status = State(args.steps, 1.0, 0, 0)
+    optimizer_state, training_state = get_optim_state(
+        model, optimizer, True, scheduler, training_status, data_iterator, Timings()
+    )
+    dcp.save(
+        {'model': model_state, 'optimizer': optimizer_state},
+        checkpoint_id=checkpoint,
+        process_group=group,
+    )
+    expected_loss, _, _ = update(model, optimizer, scheduler, batches[-1])
+    expected_weights = full_state(model)
+    resumed, resumed_optimizer, resumed_scheduler = build()
+    validate_optimizer_contract(resumed_optimizer, training_state)
+    resumed_model_state = get_model_state(resumed, full_state=False)
+    resumed_optim_state = get_sharded_optimizer_state(resumed, resumed_optimizer, True)
+    dcp.load(
+        {'model': resumed_model_state, 'optimizer': resumed_optim_state},
+        checkpoint_id=checkpoint,
+        process_group=group,
+    )
+    set_model_state(resumed, resumed_model_state, full_state=False)
+    set_sharded_optimizer_state(resumed, resumed_optimizer, resumed_optim_state, True)
+    set_optim_state(
+        resumed_scheduler, training_state, State(0, 1.0, 0, 0), data_iterator, Timings(), optim_cfg
+    )
+    actual_loss, _, _ = update(resumed, resumed_optimizer, resumed_scheduler, batches[-1])
+    actual_weights = full_state(resumed)
+    for name in expected_weights:
+        torch.testing.assert_close(actual_weights[name], expected_weights[name], rtol=0, atol=0)
+    assert actual_loss == expected_loss
+    assert resumed_scheduler.get_last_lr() == scheduler.get_last_lr()
+    result['checkpoint_resume'] = 'exact'
+
+    # Hybrid cache dispatch must also work for ordinary unpacked generation.
+    if args.arch == 'hybrid' and args.cp == 1:
+        resumed.eval()
+        with torch.no_grad():
+            cache = init_cache(resumed)
+            _, _, cache = resumed(batches[0][0][:, :128], multi_segments=False, cache=cache)
+            logits, _, cache = resumed(batches[0][0][:, 128:129], multi_segments=False, cache=cache)
+            assert logits.shape == (1, 1, 256)
+            assert cache[0][0][-1] == 129
+        result['hybrid_cache'] = 'passed'
+    if rank == 0:
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        args.output.write_text(json.dumps(result, indent=2) + '\n')
+        print('QUALIFICATION_PASSED', json.dumps(result), flush=True)
+    dist.barrier()
+    dist.destroy_process_group()
+
+
+if __name__ == '__main__':
+    main()

@@ -58,6 +58,8 @@ from xllm.utils import (
 )
 from xllm.models import build_model
 from xllm.optim import build_optimizer, rescale_grads
+from xllm.optim.dion_muon import validate_optimizer_contract
+from xllm.optim.lr_scheduler import load_lr_scheduler_state
 from xllm.monitor import GPUMonitor, Timings
 from xllm.metrics import MetricLogger, build_mlogger
 from xllm.configuration import cfg_from_cli
@@ -167,6 +169,8 @@ def get_optim_state(
         "data_state": data_iterator.get_state(),
         "timings": timings.to_dict(),
     }
+    if hasattr(optimizer, '_xllm_optimizer_contract'):
+        training_state_dict['optimizer_contract'] = optimizer._xllm_optimizer_contract
     return optim_state_dict, training_state_dict
 
 
@@ -178,9 +182,7 @@ def set_optim_state(
     timings: Timings,
     opt_cfg: OptimConf
 ):
-    # setting LR manually to support overwriting during training from the same state
-    reloaded_training_state_dict["scheduler"]["base_lrs"] = [opt_cfg.lr]
-    scheduler.load_state_dict(reloaded_training_state_dict["scheduler"])
+    load_lr_scheduler_state(scheduler, reloaded_training_state_dict['scheduler'], opt_cfg)
     state.step, state.scale, state.scale_updates, state.clip_cumulative = (
         reloaded_training_state_dict["step"],
         reloaded_training_state_dict["scale"],
@@ -289,6 +291,8 @@ def main(cfg: TrainerConf):
 
     # reload model if available
     if model_path is not None:
+        reloaded_training_state_dict = torch.load(training_state_path, map_location='cpu', weights_only=False)
+        validate_optimizer_contract(optimizer, reloaded_training_state_dict)
         logger.info(f"Reloading model checkpoint from {model_path} ...")
         hsdp_group = get_hybrid_shard_data_parallel_group()
         # reload sharded model state
@@ -312,7 +316,6 @@ def main(cfg: TrainerConf):
 
         assert training_state_path is not None
         logger.info(f"Reloading training state checkpoint from {training_state_path} ...")
-        reloaded_training_state_dict = torch.load(training_state_path, map_location="cpu", weights_only=False)
         set_optim_state(scheduler, reloaded_training_state_dict, state, data_iterator, timings, cfg.optim)
     elif cfg.base_model_dir is not None:
         base_model_path, base_optim_path = get_base_model_checkpoint_path(
@@ -328,6 +331,11 @@ def main(cfg: TrainerConf):
         logger.info("Reloaded base model.")
 
         if cfg.reload_base_optim_state:
+            if cfg.optim.optimizer == 'dion_muon':
+                from xllm.checkpointing import training_state_dir, training_state_name
+                base_state_path = Path(cfg.base_model_dir) / training_state_dir() / training_state_name(cfg.slurm.global_rank)
+                base_state = torch.load(base_state_path, map_location='cpu', weights_only=False)
+                validate_optimizer_contract(optimizer, base_state)
             assert base_optim_path is not None, base_optim_path
             logger.info(f"Reloading base optimizer checkpoint from {base_optim_path} ...")
             if cfg.dcp_for_optimizer:
@@ -488,6 +496,8 @@ def main(cfg: TrainerConf):
             "avg_loss": reduce_scalar(curr_loss, op='mean'),
             "max_loss": reduce_scalar(curr_loss, op='max'),
         }
+        if cfg.optim.optimizer == 'dion_muon':
+            optim_metrics.update({f"lr_{group['group_id']}": float(group['lr']) for group in optimizer.param_groups})
         if aux_loss is not None:
             optim_metrics.update({
                 "avg_aux_loss": reduce_scalar(aux_loss, op='mean'),

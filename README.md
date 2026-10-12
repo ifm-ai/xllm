@@ -160,6 +160,23 @@ When changing these values, keep the constraints checked in
 ## Checkpoint Conversion & Serving
 Conversion and serving checkpoints of xLLM is supported by [xBridges](https://github.com/ifm-ai/xbridges).
 
+## Muon and hybrid Gekko
+
+Install `requirements-dion.txt` to use `--optim.optimizer dion_muon` with
+FSDP2. Hidden projection matrices use Dion's Muon implementation; embeddings,
+output projections, biases, norms and Gekko depthwise convolutions use AdamW.
+`--optim.muon_lr` controls Muon; `--optim.lr` controls AdamW. Existing scheduler,
+weight-decay and AdamW beta options apply to the corresponding groups.
+
+For a 1:3 hybrid, use `--model.arch gekko --model.full_attention_interval 4`.
+Layers 0, 4, 8, ... use the existing full-attention block; other layers use
+Gekko. Select `--model.causal_attn_backend xattn --model.sca_backend xattn`
+to use xattn for both. The hybrid preserves a Transformer output norm and
+supports the release's fused blocks and packed-document training.
+
+See [Muon training and qualification](docs/dion_muon.md) for CP, checkpoint
+requirements and reproducible tests.
+
 ## Documentation
 
 | I want to... | Start here |
