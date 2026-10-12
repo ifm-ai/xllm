@@ -53,6 +53,8 @@ Use `model.causal_attn_backend: xattn` for full layers and
 `model.sca_backend: xattn` for Gekko layers. Regular and fused blocks retain
 their existing recomputation settings. Packed training supplies full-attention
 segment metadata and Gekko's previous-chunk metadata independently.
+Full-attention recomputation and backward retain the selected FlashAttention
+or xattn backend, including its packed/CP metadata.
 Unpacked inference uses the corresponding cache type per layer; packed
 inference with a cache is not supported by the hybrid.
 
@@ -98,6 +100,9 @@ torchrun --standalone --nproc_per_node=4 tests/optim/distributed_dion_muon.py \
 ```
 
 Repeat with `--arch transformer` and `--arch gekko`, and without `--fused`.
+Use `--full-attn-backend flash` to test the installed FlashAttention variant,
+`--orthogonalizer polar_express` for that recipe, and `--optimizer adamw` to
+check the unchanged default optimizer.
 CP=4 needs eight ranks with the same DP size. Each output includes loss,
 gradient norm, throughput, peak allocated memory and checkpoint-resume result.
 Passing these tests qualifies only the tested runtime and topology; run them

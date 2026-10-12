@@ -20,6 +20,8 @@ from .utils import (
     flash_attention_fwd,
     flash_attention_bwd,
     recompute_flash_attention_lse,
+    xattn_fwd,
+    xattn_bwd,
     apply_rope,
 )
 from .distributed import (
@@ -94,6 +96,7 @@ def multihead_attention_bwd(
     xq, xk, xq_rstd, xk_rstd, rmx, mx, q_norm_w, wq, wk, wv, wr,
     attn_scale, attn_gate_func, attention_dropout, flash_rng_state, deterministic,
     x_, x_mean, x_invvar, attn_norm_w, attn_norm_b, norm_groups, apply_rmsnorm, gather_before_norm,
+    *, backend='flash', bos_mask=None, segment_idx=None, stability_control=0,
 ):
 
     # B x L x D -> B x L x H x D/H
@@ -103,10 +106,16 @@ def multihead_attention_bwd(
         "softplus": partial(torch.ops.aten.softplus_backward, beta=math.log(2), threshold=20)
     }[attn_gate_func]
 
-    xq_grad, xk_grad_, xv_grad_ = flash_attention_bwd(
-        attn_grad, attn_out, xq_, xk_, xv_, attn_lse, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k,
-        attn_scale, attention_dropout, flash_rng_state, deterministic
-    )
+    if backend == 'xattn':
+        xq_grad, xk_grad_, xv_grad_ = xattn_bwd(
+            attn_grad, xq_, xk_, xv_, attn_out, attn_lse, attn_scale,
+            bos_mask, segment_idx, stability_control, deterministic,
+        )
+    else:
+        xq_grad, xk_grad_, xv_grad_ = flash_attention_bwd(
+            attn_grad, attn_out, xq_, xk_, xv_, attn_lse, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k,
+            attn_scale, attention_dropout, flash_rng_state, deterministic
+        )
 
     tail_seq = get_context_parallel_world_size() * seq_len - end_seq
     pre_seq = 0 if total_seqlen_k is None else end_seq - total_seqlen_k
@@ -199,6 +208,7 @@ def multihead_attention_recompute(
     head_dim, rope_head_dim, local_heads, local_kv_heads, eps,
     cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k,
     attn_scale, attn_gate_func, attention_dropout, attn_rng_state,
+    *, backend='flash', bos_mask=None, segment_idx=None, stability_control=0,
 ):
     bsz, seq_len, _ = mx.shape
     attn_gate_fn = {"silu": F.silu, "softplus": partial(F.softplus, beta=math.log(2))}[attn_gate_func]
@@ -252,9 +262,15 @@ def multihead_attention_recompute(
             xk_ = xk_[:, -total_seqlen_k:]
             xv_ = xv_[:, -total_seqlen_k:]
 
-        attn_out, attn_lse, _ = recompute_flash_attention_lse(
-            xq_, xk_, xv_, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, attn_scale, attention_dropout, attn_rng_state
-        )
+        if backend == 'xattn':
+            _, attn_out, attn_lse = xattn_fwd(
+                xq_, xk_, xv_, attn_scale, bos_mask, segment_idx,
+                stability_control, requires_grad=True,
+            )
+        else:
+            attn_out, attn_lse, _ = recompute_flash_attention_lse(
+                xq_, xk_, xv_, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, attn_scale, attention_dropout, attn_rng_state
+            )
 
     return (
         (attn_out, attn_lse), (xq, xq_, xq_rstd), (xk, xk_, xk_rstd), (xv, xv_), (handle_xk, handle_xv), (rmx, r)

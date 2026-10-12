@@ -48,6 +48,13 @@ def main():
     parser.add_argument('--arch', choices=['transformer', 'gekko', 'hybrid'], required=True)
     parser.add_argument('--cp', type=int, default=1)
     parser.add_argument('--fused', action='store_true')
+    parser.add_argument('--full-attn-backend', choices=['xattn', 'flash'], default='xattn')
+    parser.add_argument('--optimizer', choices=['dion_muon', 'adamw'], default='dion_muon')
+    parser.add_argument(
+        '--orthogonalizer',
+        choices=['newton_schulz5', 'polar_express'],
+        default='newton_schulz5',
+    )
     parser.add_argument('--steps', type=int, default=3)
     parser.add_argument('--seq-len', type=int, default=1024)
     parser.add_argument('--save-reference', type=Path)
@@ -74,7 +81,7 @@ def main():
         rope_head_dim=64,
         chunk_size=128,
         swiglu=True,
-        causal_attn_backend='xattn',
+        causal_attn_backend=args.full_attn_backend,
         sca_backend='xattn',
         causal_conv_backend='triton',
         timenorm_num_groups=8,
@@ -91,7 +98,12 @@ def main():
     )
     tokenizer = SimpleNamespace(vocab_size=256, bos_id=1, eos_id=2, pad_id=0)
     optim_cfg = OptimConf(
-        optimizer='dion_muon', muon_lr=0.01, lr=0.001, warmup=2, weight_decay=0.01
+        optimizer=args.optimizer,
+        muon_lr=0.01,
+        lr=0.001,
+        warmup=2,
+        weight_decay=0.01,
+        muon_orthogonalizer=args.orthogonalizer,
     )
 
     def build():
@@ -121,7 +133,11 @@ def main():
     def update(model, optimizer, scheduler, batch, capture_gradients=False):
         tokens, targets, mask = batch
         losses, _, _ = model(
-            tokens, multi_segments=True, targets=targets, token_mask=mask, deterministic=True
+            tokens,
+            multi_segments=True,
+            targets=targets,
+            token_mask=mask,
+            deterministic=True,
         )
         count = mask.sum()
         dist.all_reduce(count, group=get_data_parallel_group())
@@ -161,6 +177,9 @@ def main():
         'cp': args.cp,
         'dp': get_data_parallel_world_size(),
         'fused': args.fused,
+        'full_attn_backend': args.full_attn_backend,
+        'optimizer': args.optimizer,
+        'orthogonalizer': args.orthogonalizer if args.optimizer == 'dion_muon' else None,
         'steps': args.steps,
         'seq_len': args.seq_len,
         'metrics': metrics,
@@ -186,7 +205,10 @@ def main():
             )
         for actual, expected in zip(metrics, saved['metrics']):
             torch.testing.assert_close(
-                torch.tensor(actual['loss']), torch.tensor(expected['loss']), rtol=0.003, atol=0.001
+                torch.tensor(actual['loss']),
+                torch.tensor(expected['loss']),
+                rtol=0.003,
+                atol=0.001,
             )
             torch.testing.assert_close(
                 torch.tensor(actual['grad_norm']),
@@ -230,7 +252,12 @@ def main():
     set_model_state(resumed, resumed_model_state, full_state=False)
     set_sharded_optimizer_state(resumed, resumed_optimizer, resumed_optim_state, True)
     set_optim_state(
-        resumed_scheduler, training_state, State(0, 1.0, 0, 0), data_iterator, Timings(), optim_cfg
+        resumed_scheduler,
+        training_state,
+        State(0, 1.0, 0, 0),
+        data_iterator,
+        Timings(),
+        optim_cfg,
     )
     actual_loss, _, _ = update(resumed, resumed_optimizer, resumed_scheduler, batches[-1])
     actual_weights = full_state(resumed)

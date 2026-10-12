@@ -246,7 +246,7 @@ class TransformerBlockFunction(torch.autograd.Function):
             xk,  # (bsz, slen, n_kv_heads, head_dim)
             xk_rstd,  # (bsz, slen, kv_heads)
             xv,  # (bsz, slen, n_kv_heads, head_dim)
-            attn_for_save,  # (bsz, slen, n_heads, head_dim)
+            attn_out,  # (bsz, slen, n_heads, head_dim)
             attn_lse,  # (bsz, h/MP, slen, slen)
             flash_rng_state,
             xo,  # (bsz, slen, d/MP)
@@ -277,6 +277,13 @@ class TransformerBlockFunction(torch.autograd.Function):
         max_seqlen_k = ctx.max_seqlen_k
         total_seqlen_k = ctx.total_seqlen_k
         end_seq = ctx.end_seq
+        cu_seqlens_q = seg1 if causal_attn_backend == 'flash' else None
+        cu_seqlens_k = seg2 if causal_attn_backend == 'flash' else None
+        attn_kwargs = dict(
+            backend=causal_attn_backend, bos_mask=bos_mask,
+            segment_idx=seg1 if causal_attn_backend == 'xattn' else None,
+            stability_control=attn_stability_control,
+        )
 
         attn_rng_state = ctx.attn_rng_state
         attn_out_rng_state = ctx.attn_out_rng_state
@@ -362,6 +369,7 @@ class TransformerBlockFunction(torch.autograd.Function):
             head_dim, rope_head_dim, local_heads, local_kv_heads, rmsnorm_eps,
             cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k,
             attn_scale, attn_gate_func, attention_dropout, attn_rng_state,
+            **attn_kwargs,
         )
         attn_out, attn_lse = attn_outs
         xq, xq_, xq_rstd = q_outs
@@ -371,7 +379,7 @@ class TransformerBlockFunction(torch.autograd.Function):
         rmx, r = attn_gate_outs
 
         # B x L x H x D/H -> B x L x D
-        attn_r = attn_out.view(bsz, seq_len, -1)
+        attn_r = attn_out.to(xh_grad.dtype).view(bsz, seq_len, -1)
         attn = attn_r * r if r is not None else attn_r
         attn, attn_noise = memory_efficient_dropout_fwd(attn, hidden_dropout, True, attn_out_rng_state)
 
@@ -406,7 +414,8 @@ class TransformerBlockFunction(torch.autograd.Function):
             total_seqlen_k, end_seq, freqs_cis, local_kv_heads, rope_head_dim,
             xq, xk, xq_rstd, xk_rstd, rmx, mx, q_norm_w, wq, wk, wv, wr,
             attn_scale, attn_gate_func, attention_dropout, flash_rng_state, deterministic,
-            x_, x_mean, x_invvar, attn_norm_w, attn_norm_b, norm_local_groups, apply_rmsnorm, gather_before_norm
+            x_, x_mean, x_invvar, attn_norm_w, attn_norm_b, norm_local_groups, apply_rmsnorm, gather_before_norm,
+            **attn_kwargs,
         )
 
         # residual connection
@@ -415,6 +424,7 @@ class TransformerBlockFunction(torch.autograd.Function):
         return (
             x_grad,
             None,  # freqs_cis
+            None,  # bos_mask
             None,  # segments
             attn_norm_w_grad,
             attn_norm_b_grad,
