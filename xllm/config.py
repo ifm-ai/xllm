@@ -333,6 +333,8 @@ class TrainerConf(Config):
     # Logging
     disable_workers_print: bool = False  # Whether to disable logging from non-main training processes (workers).
     disable_logging: bool = False  # Whether to disable metric logging via MetricLogger, including JSONL, TensorBoard, and W&B.
+    health_metrics: bool = False
+    health_log_freq: int = 100
 
     # Training hyperparameters
     batch_size: Optional[int] = None  # Num of sequences per DP rank per step. Set either this or global_batch_size.
@@ -424,6 +426,9 @@ class TrainerConf(Config):
         # freq checks
         assert self.dump_freq % self.log_freq == 0
         assert self.eval_freq < 0 or (self.eval_freq % self.log_freq == 0)
+        if self.health_metrics:
+            assert self.health_log_freq > 0
+            assert self.model.arch == "transformer", "Health metrics currently require model.arch=transformer"
 
         # async eval
         if self.async_eval_ngpus > 0:

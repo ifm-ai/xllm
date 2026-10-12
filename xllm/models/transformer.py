@@ -26,6 +26,7 @@ from xllm.modules.model_parallel import (
 )
 from xllm.modules.context_parallel import gather_from_context_parallel_region
 from xllm.config import ModelConf
+from xllm.health_metrics import get_active_health_collector
 from xllm.models.xllm import XLLModel
 from xllm.distributed import (
     get_context_parallel_world_size,
@@ -662,6 +663,7 @@ class Transformer(XLLModel):
         freq_cis = None if self.rope is None else self.rope.get_freqs_cis(cache_len, cache_len + seq_len, x.device)
 
         aux_loss_sum = None
+        health_collector = get_active_health_collector()
         for i, layer in enumerate(self.layers):
             layer_cache = cache[i] if cache is not None else None
             if self.layerwise_ckpt:
@@ -675,6 +677,9 @@ class Transformer(XLLModel):
                     x, freq_cis, segments, moe_router_load_balancing_type,
                     fp32_attn_output, deterministic, layer_cache
                 )
+
+            if health_collector is not None:
+                health_collector.record_activation(i, x)
 
             if aux_loss is not None:
                 aux_loss_sum = aux_loss if aux_loss_sum is None else aux_loss_sum + aux_loss

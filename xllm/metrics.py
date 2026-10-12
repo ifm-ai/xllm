@@ -3,6 +3,7 @@ from datetime import datetime
 from logging import getLogger
 from pathlib import Path
 import json
+from tensorboard.compat.proto.summary_pb2 import Summary
 from torch.utils.tensorboard import SummaryWriter
 try:
     import wandb
@@ -21,12 +22,14 @@ class MetricLogger:
         enable: bool = False,
         log_tb: bool = False,
         log_wandb: bool = False,
+        enable_prefix_keys: bool = True,
     ):
         self.outdir = outdir
         self.tag = tag
         self.enable = enable
         self.log_tb = log_tb
         self.log_wandb = log_wandb and has_wandb
+        self.enable_prefix_keys = enable_prefix_keys
 
         self.tb_writer: Optional[SummaryWriter] = None
         self.jsonl_writer: Optional[TextIO] = None
@@ -52,17 +55,23 @@ class MetricLogger:
         # check / sanitize inputs
         assert all(type(k) is str for k in metrics.keys())
 
+        prefixed_metrics = {}
+        for k, v in metrics.items():
+            assert not isinstance(v, dict), f"{k} {v}"
+            key = k if self.tag is None or not self.enable_prefix_keys else f"{self.tag}/{k}"
+            prefixed_metrics[key] = v
+
         # log in tensorboard
-        if self.tb_writer is not None:
-            for k, v in metrics.items():
-                k = k if self.tag is None else f"{self.tag}/{k}"
-                self.tb_writer.add_scalar(tag=k, scalar_value=v, global_step=step)
+        if self.tb_writer is not None and prefixed_metrics:
+            summary = Summary(value=[
+                Summary.Value(tag=k, simple_value=float(v))
+                for k, v in prefixed_metrics.items()
+            ])
+            self.tb_writer.file_writer.add_summary(summary, global_step=step)
 
         # log in wandb
-        if self.log_wandb:
-            for k, v in metrics.items():
-                k = k if self.tag is None else f"{self.tag}/{k}"
-                wandb.log({k: v}, step=step)
+        if self.log_wandb and prefixed_metrics:
+            wandb.log(prefixed_metrics, step=step)
 
         created_at = datetime.utcnow().isoformat()
         json_metrics = dict(global_step=step, created_at=created_at)
@@ -78,5 +87,14 @@ class MetricLogger:
             self.jsonl_writer = None
 
 
-def build_mlogger(outdir: str, tag: str, enable: bool, enable_wandb: bool=False) -> MetricLogger:
-    return MetricLogger(outdir=Path(outdir), tag=tag, enable=enable, log_tb=enable, log_wandb=enable_wandb)
+def build_mlogger(
+    outdir: str,
+    tag: str,
+    enable: bool,
+    enable_wandb: bool = False,
+    enable_prefix_keys: bool = True,
+) -> MetricLogger:
+    return MetricLogger(
+        outdir=Path(outdir), tag=tag, enable=enable, log_tb=enable,
+        log_wandb=enable_wandb, enable_prefix_keys=enable_prefix_keys,
+    )
