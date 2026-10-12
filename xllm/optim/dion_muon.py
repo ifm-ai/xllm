@@ -3,10 +3,25 @@
 import hashlib
 import json
 
+import torch
+import torch.distributed as dist
 from torch import nn
 
 from xllm.distributed import get_context_parallel_world_size, get_data_parallel_world_size
 from xllm.modules.model_parallel import ColumnParallelLinear, RowParallelLinear
+
+
+@torch.no_grad()
+def synchronize_replicas(optimizer, args, kwargs):
+    """Keep weights and moments identical across HSDP/CP replicas after NS."""
+    tensors = []
+    for group in optimizer.param_groups:
+        for parameter in group['params']:
+            tensors.append(parameter.detach().to_local())
+            for value in optimizer.state[parameter].values():
+                if isinstance(value, torch.Tensor):
+                    tensors.append(value.to_local() if hasattr(value, 'to_local') else value)
+    dist._broadcast_coalesced(optimizer._xllm_replica_group, tensors, 64 * 1024**2, 0)
 
 
 def parameter_groups(model, cfg):
@@ -61,6 +76,16 @@ def build_dion_muon(model, cfg):
     if mesh is None:
         raise ValueError('dion_muon requires a model built with FSDP2')
     groups, membership = parameter_groups(model, cfg)
+    # Tensor operations may reuse an equivalent DeviceMesh when a second
+    # FSDP2 model is built in-process. Use the parameters' actual shard group,
+    # not a newly created group with the same rank layout.
+    parameter_mesh = groups[0]['params'][0].device_mesh['dp']
+    if parameter_mesh.mesh.tolist() != mesh.mesh.tolist():
+        raise ValueError('Muon parameters do not match the native FSDP2 shard layout')
+    mesh = parameter_mesh
+    if any(p.device_mesh['dp'].get_group() != mesh.get_group() for p in groups[0]['params']):
+        raise ValueError('Muon projection matrices must share one FSDP2 shard group')
+    model._xllm_dion_mesh = mesh
     optimizer = Muon(
         groups,
         distributed_mesh=mesh,
@@ -74,6 +99,11 @@ def build_dion_muon(model, cfg):
         use_gram_newton_schulz=False,
         use_triton=False,
     )
+    full_mesh = groups[0]['params'][0].device_mesh
+    replicated = 'cp' in full_mesh.mesh_dim_names and full_mesh['cp'].size() > 1
+    if replicated:
+        optimizer._xllm_replica_group = full_mesh['cp'].get_group()
+        optimizer.register_step_post_hook(synchronize_replicas)
     optimizer._xllm_optimizer_contract = {
         'optimizer': 'dion_muon',
         'groups': membership,
@@ -81,6 +111,7 @@ def build_dion_muon(model, cfg):
         'mesh_dims': list(model._xllm_fsdp_mesh.mesh_dim_names),
         'context_parallel_size': get_context_parallel_world_size(),
         'data_parallel_size': get_data_parallel_world_size(),
+        'replica_sync': replicated,
         'orthogonalizer': cfg.muon_orthogonalizer,
         'recipe': {
             name: getattr(cfg, name)

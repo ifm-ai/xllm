@@ -63,7 +63,10 @@ inference with a cache is not supported by the hybrid.
 The release's FSDP2 mesh shards across `dp` and replicates across `cp`
 (including any additional HSDP replicas). FSDP2 performs gradient reduction;
 Muon receives only the 1-D `dp` shard mesh for matrix orthogonalization.
-There is no second optimizer-level CP gradient reduction.
+There is no second optimizer-level CP gradient reduction. After the optimizer
+step, a coalesced broadcast keeps parameter shards and optimizer tensors
+identical across replicas; independent BF16 orthogonalizations can otherwise
+drift. This adds replica communication but avoids inconsistent checkpoints.
 
 Use `context_parallel_size > 1` with sequence length divisible by
 `context_parallel_size * model.chunk_size`. The release requires at least two

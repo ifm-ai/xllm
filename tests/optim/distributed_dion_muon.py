@@ -43,12 +43,24 @@ def full_state(model, gradients=False):
     }
 
 
+def local_optimizer_state(model, optimizer):
+    result = {}
+    for name, parameter in model.named_parameters():
+        for key, value in optimizer.state[parameter].items():
+            if isinstance(value, torch.Tensor):
+                value = value.to_local() if hasattr(value, 'to_local') else value
+                value = value.detach().cpu().clone()
+            result[(name, key)] = value
+    return result
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--arch', choices=['transformer', 'gekko', 'hybrid'], required=True)
     parser.add_argument('--cp', type=int, default=1)
     parser.add_argument('--fused', action='store_true')
     parser.add_argument('--full-attn-backend', choices=['xattn', 'flash'], default='xattn')
+    parser.add_argument('--sca-backend', choices=['xattn', 'swift'], default='xattn')
     parser.add_argument('--optimizer', choices=['dion_muon', 'adamw'], default='dion_muon')
     parser.add_argument(
         '--orthogonalizer',
@@ -82,7 +94,7 @@ def main():
         chunk_size=128,
         swiglu=True,
         causal_attn_backend=args.full_attn_backend,
-        sca_backend='xattn',
+        sca_backend=args.sca_backend,
         causal_conv_backend='triton',
         timenorm_num_groups=8,
         layernorm_num_groups=1,
@@ -178,6 +190,7 @@ def main():
         'dp': get_data_parallel_world_size(),
         'fused': args.fused,
         'full_attn_backend': args.full_attn_backend,
+        'sca_backend': args.sca_backend if args.arch != 'transformer' else None,
         'optimizer': args.optimizer,
         'orthogonalizer': args.orthogonalizer if args.optimizer == 'dion_muon' else None,
         'steps': args.steps,
@@ -206,8 +219,6 @@ def main():
                 'max_abs': float(delta.abs().max()),
                 'reference_max_abs': float(expected.abs().max()),
             }
-        if rank == 0:
-            print('GRADIENT_PARITY', json.dumps(gradient_errors), flush=True)
         max_delta = 0.0
         for name in trained:
             torch.testing.assert_close(initial[name], saved['initial'][name], rtol=0, atol=0)
@@ -252,14 +263,20 @@ def main():
     optimizer_state, training_state = get_optim_state(
         model, optimizer, True, scheduler, training_status, data_iterator, Timings()
     )
+    saved_optimizer_tensors = local_optimizer_state(model, optimizer)
     dcp.save(
         {'model': model_state, 'optimizer': optimizer_state},
         checkpoint_id=checkpoint,
         process_group=group,
     )
-    expected_loss, _, _ = update(model, optimizer, scheduler, batches[-1])
+    training_state_path = checkpoint / f'training_state_{rank}.pt'
+    torch.save(training_state, training_state_path)
+    expected_loss, expected_norm, expected_gradients = update(
+        model, optimizer, scheduler, batches[-1], capture_gradients=True
+    )
     expected_weights = full_state(model)
     resumed, resumed_optimizer, resumed_scheduler = build()
+    training_state = torch.load(training_state_path, map_location='cpu', weights_only=False)
     validate_optimizer_contract(resumed_optimizer, training_state)
     resumed_model_state = get_model_state(resumed, full_state=False)
     resumed_optim_state = get_sharded_optimizer_state(resumed, resumed_optimizer, True)
@@ -278,10 +295,44 @@ def main():
         Timings(),
         optim_cfg,
     )
-    actual_loss, _, _ = update(resumed, resumed_optimizer, resumed_scheduler, batches[-1])
+    loaded_weights = full_state(resumed)
+    for name in trained:
+        torch.testing.assert_close(
+            loaded_weights[name],
+            trained[name],
+            rtol=0,
+            atol=0,
+            msg=lambda message: f'Loaded model {name}: {message}',
+        )
+    loaded_optimizer_tensors = local_optimizer_state(resumed, resumed_optimizer)
+    assert loaded_optimizer_tensors.keys() == saved_optimizer_tensors.keys()
+    for key, expected in saved_optimizer_tensors.items():
+        actual = loaded_optimizer_tensors[key]
+        if isinstance(expected, torch.Tensor):
+            torch.testing.assert_close(
+                actual,
+                expected,
+                rtol=0,
+                atol=0,
+                msg=lambda message: f'Loaded optimizer {key}: {message}',
+            )
+        else:
+            assert actual == expected, key
+    actual_loss, actual_norm, actual_gradients = update(
+        resumed, resumed_optimizer, resumed_scheduler, batches[-1], capture_gradients=True
+    )
+    assert actual_norm == expected_norm
+    for name in actual_gradients:
+        torch.testing.assert_close(actual_gradients[name], expected_gradients[name], rtol=0, atol=0)
     actual_weights = full_state(resumed)
     for name in expected_weights:
-        torch.testing.assert_close(actual_weights[name], expected_weights[name], rtol=0, atol=0)
+        torch.testing.assert_close(
+            actual_weights[name],
+            expected_weights[name],
+            rtol=0,
+            atol=0,
+            msg=lambda message: f'Resumed update {name}: {message}',
+        )
     assert actual_loss == expected_loss
     assert resumed_scheduler.get_last_lr() == scheduler.get_last_lr()
     result['checkpoint_resume'] = 'exact'
