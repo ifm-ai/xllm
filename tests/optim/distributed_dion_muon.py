@@ -7,6 +7,7 @@ same DP size, global tokens, model seed and batches. No mocked CUDA operators.
 import argparse
 import json
 from pathlib import Path
+import subprocess
 import time
 from types import SimpleNamespace
 
@@ -190,6 +191,7 @@ def main():
     torch.cuda.synchronize()
     elapsed = time.monotonic() - start
     result = {
+        'source_commit': subprocess.check_output(['git', 'rev-parse', 'HEAD']).decode().strip(),
         'arch': args.arch,
         'cp': args.cp,
         'dp': get_data_parallel_world_size(),
