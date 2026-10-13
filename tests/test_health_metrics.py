@@ -1,8 +1,10 @@
 import json
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
+from torch.distributed.tensor import Replicate, Shard
 from torch.utils.checkpoint import checkpoint
 
 import xllm.health_metrics as health_metrics
@@ -15,6 +17,73 @@ class RecordingLogger:
 
     def log(self, metrics, step):
         self.calls.append((metrics, step))
+
+
+MATRIX_FQNS = [
+    "attention.wq.weight",
+    "attention.wk.weight",
+    "attention.wv.weight",
+    "attention.wo.weight",
+    "nffn.fc1.weight",
+    "nffn.fc3.weight",
+    "nffn.fc2.weight",
+]
+
+
+def make_fsdp1_model(
+    weight_values,
+    shard_infos=None,
+    fsdp_size=1,
+    replica_count=1,
+    context_parallel_size=1,
+):
+    if shard_infos is None:
+        shard_infos = [
+            SimpleNamespace(in_shard=True, offset_in_shard=i, numel_in_shard=1)
+            for i in range(len(MATRIX_FQNS))
+        ]
+    flat_param = SimpleNamespace(
+        _fqns=MATRIX_FQNS,
+        _shard_param_infos=shard_infos,
+        _local_shard=torch.tensor(weight_values, dtype=torch.float32),
+    )
+    handle = SimpleNamespace(
+        _fully_sharded_module=SimpleNamespace(layer_id=0),
+        flat_param=flat_param,
+    )
+    return SimpleNamespace(
+        _all_handles=[handle],
+        world_size=fsdp_size,
+        data_parallel_world_size=fsdp_size * replica_count,
+        context_parallel_world_size=context_parallel_size,
+    )
+
+
+class FakeDeviceMesh:
+    def __init__(self, shape):
+        self.shape = shape
+
+    def size(self, mesh_dim):
+        return self.shape[mesh_dim]
+
+
+class FakeDTensor:
+    def __init__(self, local_values, placements, mesh_shape):
+        self.local_tensor = torch.as_tensor(local_values, dtype=torch.float32)
+        self.placements = placements
+        self.device_mesh = FakeDeviceMesh(mesh_shape)
+
+    def to_local(self):
+        return self.local_tensor
+
+
+def make_fsdp2_model(weight_values, placements=(Shard(0),), mesh_shape=(1,)):
+    parameters = [
+        (fqn, FakeDTensor(values, placements, mesh_shape))
+        for fqn, values in zip(MATRIX_FQNS, weight_values)
+    ]
+    layer = SimpleNamespace(named_parameters=lambda: iter(parameters))
+    return SimpleNamespace(layers=[layer])
 
 
 def test_activation_stats_follow_frequency():
@@ -72,6 +141,139 @@ def test_query_key_coordinate_and_vector_stats():
     assert metrics["k_stats/layer_000/vector_l2_max"] == 5.0
 
 
+def test_weight_norms_reconstruct_all_seven_matrices():
+    collector = health_metrics.HealthMetricCollector(
+        enabled=True, freq=1, num_layers=1, enable_weight_norms=True
+    )
+    logger = RecordingLogger()
+    collector.begin_step(1)
+    collector.record_activation(0, torch.tensor([1.0]))
+    collector.record_matrix_norms(make_fsdp1_model(
+        [3.0, -4.0, 5.0, -6.0, 7.0, -8.0, 9.0]
+    ))
+    collector.end_forward()
+    collector.flush(logger, 1)
+
+    metrics, _ = logger.calls[0]
+    assert metrics["weight_norms/layer_000/attention/q_proj/l2"] == 3.0
+    assert metrics["weight_norms/layer_000/attention/k_proj/l2"] == 4.0
+    assert metrics["weight_norms/layer_000/attention/v_proj/l2"] == 5.0
+    assert metrics["weight_norms/layer_000/attention/o_proj/l2"] == 6.0
+    assert metrics["weight_norms/layer_000/mlp/gate_proj/l2"] == 7.0
+    assert metrics["weight_norms/layer_000/mlp/up_proj/l2"] == 8.0
+    assert metrics["weight_norms/layer_000/mlp/down_proj/l2"] == 9.0
+
+
+def test_weight_norms_use_exact_local_shard_and_replica_correction():
+    shard_infos = [
+        SimpleNamespace(in_shard=True, offset_in_shard=0, numel_in_shard=2),
+        SimpleNamespace(in_shard=False, offset_in_shard=0, numel_in_shard=0),
+        SimpleNamespace(in_shard=False, offset_in_shard=0, numel_in_shard=0),
+        SimpleNamespace(in_shard=False, offset_in_shard=0, numel_in_shard=0),
+        SimpleNamespace(in_shard=False, offset_in_shard=0, numel_in_shard=0),
+        SimpleNamespace(in_shard=True, offset_in_shard=2, numel_in_shard=1),
+        SimpleNamespace(in_shard=False, offset_in_shard=0, numel_in_shard=0),
+    ]
+    collector = health_metrics.HealthMetricCollector(
+        enabled=True, freq=1, num_layers=1, enable_weight_norms=True
+    )
+    collector.begin_step(1)
+    collector.record_matrix_norms(make_fsdp1_model(
+        [3.0, 4.0, 12.0],
+        shard_infos=shard_infos,
+        fsdp_size=2,
+        replica_count=2,
+        context_parallel_size=2,
+    ))
+
+    assert collector.matrix_squared_l2_records[
+        "weight_norms/layer_000/attention/q_proj/l2"
+    ].item() == pytest.approx(25.0 / 4.0)
+    assert collector.matrix_squared_l2_records[
+        "weight_norms/layer_000/mlp/up_proj/l2"
+    ].item() == pytest.approx(144.0 / 4.0)
+    assert collector.matrix_squared_l2_records[
+        "weight_norms/layer_000/attention/k_proj/l2"
+    ].item() == 0.0
+    collector.end_forward()
+
+
+def test_fsdp2_weight_norms_use_per_parameter_dtensor_shards():
+    collector = health_metrics.HealthMetricCollector(
+        enabled=True, freq=1, num_layers=1, enable_weight_norms=True
+    )
+    collector.begin_step(1)
+
+    with patch.object(health_metrics, "DTensor", FakeDTensor):
+        collector.record_matrix_norms(make_fsdp2_model(
+            [[3.0, 4.0], [-5.0], [6.0], [-7.0], [8.0], [-9.0], [10.0]],
+            placements=(Shard(0),),
+            mesh_shape=(2,),
+        ))
+
+    assert collector.matrix_squared_l2_records[
+        "weight_norms/layer_000/attention/q_proj/l2"
+    ].item() == 25.0
+    assert collector.matrix_squared_l2_records[
+        "weight_norms/layer_000/mlp/down_proj/l2"
+    ].item() == 100.0
+    collector.end_forward()
+
+
+def test_fsdp2_weight_norms_correct_hybrid_and_context_replicas():
+    collector = health_metrics.HealthMetricCollector(
+        enabled=True, freq=1, num_layers=1, enable_weight_norms=True
+    )
+    collector.begin_step(1)
+
+    with patch.object(health_metrics, "DTensor", FakeDTensor):
+        collector.record_matrix_norms(make_fsdp2_model(
+            [[3.0, 4.0], [-5.0], [6.0], [-7.0], [8.0], [-9.0], [10.0]],
+            placements=(Replicate(), Shard(0)),
+            mesh_shape=(4, 2),
+        ))
+
+    assert collector.matrix_squared_l2_records[
+        "weight_norms/layer_000/attention/q_proj/l2"
+    ].item() == pytest.approx(25.0 / 4.0)
+    assert collector.matrix_squared_l2_records[
+        "weight_norms/layer_000/mlp/down_proj/l2"
+    ].item() == pytest.approx(100.0 / 4.0)
+    collector.end_forward()
+
+
+def test_weight_norms_share_existing_sum_reduction():
+    collector = health_metrics.HealthMetricCollector(
+        enabled=True, freq=1, num_layers=1, enable_weight_norms=True
+    )
+    logger = RecordingLogger()
+    collector.begin_step(1)
+    collector.record_activation(0, torch.tensor([1.0]))
+    collector.record_matrix_norms(make_fsdp1_model([1.0] * 7))
+    collector.end_forward()
+    reductions = []
+
+    def reduce(tensor, dst, op):
+        assert dst == 0
+        reductions.append(op)
+        if op == torch.distributed.ReduceOp.SUM:
+            assert tensor.numel() == 9  # Activation sum/count and seven squared norms.
+
+    with patch.object(health_metrics.dist, "is_initialized", return_value=True), \
+         patch.object(health_metrics.dist, "get_rank", return_value=0), \
+         patch.object(health_metrics.dist, "reduce", side_effect=reduce):
+        collector.flush(logger, 1)
+
+    assert reductions == [
+        torch.distributed.ReduceOp.SUM,
+        torch.distributed.ReduceOp.MIN,
+        torch.distributed.ReduceOp.MAX,
+    ]
+    assert len([
+        key for key in logger.calls[0][0] if key.startswith("weight_norms/")
+    ]) == 7
+
+
 def test_health_stats_use_three_packed_reductions():
     collector = health_metrics.HealthMetricCollector(
         enabled=True, freq=1, num_layers=1, enable_query_key_stats=True
@@ -89,8 +291,8 @@ def test_health_stats_use_three_packed_reductions():
         assert dst == 0
         reductions.append(op)
         if op == torch.distributed.ReduceOp.SUM:
-            tensor[0] += 8.0
-            tensor[1] += 2.0
+            tensor[:5] += 8.0
+            tensor[5:] += 2.0
         elif op == torch.distributed.ReduceOp.MIN:
             tensor.copy_(torch.minimum(tensor, torch.tensor([-4.0])))
         else:

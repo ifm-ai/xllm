@@ -283,6 +283,7 @@ def main(cfg: TrainerConf):
         freq=cfg.health_log_freq,
         num_layers=cfg.model.num_layers,
         enable_query_key_stats=cfg.health_query_key_stats,
+        enable_weight_norms=cfg.health_weight_norms,
     )
 
     model.train()
@@ -436,6 +437,8 @@ def main(cfg: TrainerConf):
             train_loss = state.scale * train_loss
 
         train_loss.backward()
+        if enable_health:
+            health_collector.record_matrix_norms(model)
 
         # grad clip
         s_clip = timer()
