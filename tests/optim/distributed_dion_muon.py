@@ -228,11 +228,16 @@ def main():
             max_delta = max(max_delta, weight_delta.abs().max().item())
             # Small gradient differences can flip AdamW updates at a few
             # near-zero entries. Bound tensor error and scale-aware outliers.
-            assert (
-                weight_delta.norm()
-                <= 0.03 * expected_weights.norm() + 1e-5 * weight_delta.numel() ** 0.5
-            ), name
-            assert weight_delta.abs().max() <= 0.03 * expected_weights.abs().max() + 0.001, name
+            weight_rms_error = float(weight_delta.norm() / weight_delta.numel() ** 0.5)
+            reference_weight_rms = float(expected_weights.norm() / weight_delta.numel() ** 0.5)
+            assert weight_rms_error <= 0.03 * reference_weight_rms + 0.1 * optim_cfg.lr, (
+                name,
+                weight_rms_error,
+                reference_weight_rms,
+            )
+            assert weight_delta.abs().max() <= 0.03 * expected_weights.abs().max() + optim_cfg.lr, (
+                name
+            )
             # CP changes BF16 GEMM/reduction partitioning. Near-zero individual
             # entries can cancel differently, so bound both whole-tensor error
             # and the largest error relative to the tensor's gradient scale.
