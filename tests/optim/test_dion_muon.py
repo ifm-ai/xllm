@@ -200,7 +200,8 @@ def test_partial_fused_rope_preserves_normalization_inputs():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason='Native xattn requires CUDA')
-def test_packed_xattn_trims_metadata_along_sequence_axis():
+@pytest.mark.parametrize('use_bos_mask', [False, True])
+def test_packed_xattn_trims_metadata_along_sequence_axis(use_bos_mask):
     from xllm.models.fused_blocks.utils import flash_attention_fwd, xattn_fwd
 
     query = torch.randn(2, 128, 4, 128, device='cuda', dtype=torch.bfloat16)
@@ -210,6 +211,7 @@ def test_packed_xattn_trims_metadata_along_sequence_axis():
     bos_mask[:, 0] = True
     bos_mask[:, 128] = True
     segments = bos_mask.cumsum(dim=1, dtype=torch.int32)
+    bos_mask = bos_mask if use_bos_mask else None
     scale = 128 ** -0.5
     actual = flash_attention_fwd(
         query, key, value, bos_mask, (segments, 128), scale, 0, 0,
@@ -217,7 +219,8 @@ def test_packed_xattn_trims_metadata_along_sequence_axis():
     )
     expected = xattn_fwd(
         query, key[:, -128:], value[:, -128:], scale,
-        bos_mask[:, -128:], segments[:, -128:], 0, requires_grad=True,
+        bos_mask[:, -128:] if bos_mask is not None else None,
+        segments[:, -128:], 0, requires_grad=True,
     )
     for result, reference in zip(actual[:3], expected):
         torch.testing.assert_close(result, reference, rtol=0, atol=0)
