@@ -214,6 +214,9 @@ def main():
         'gradients': first_gradients,
         'metrics': metrics,
     }
+    if args.save_reference and rank == 0:
+        args.save_reference.parent.mkdir(parents=True, exist_ok=True)
+        torch.save(reference, args.save_reference)
     if args.reference:
         saved = torch.load(args.reference, weights_only=True)
         gradient_errors = {}
@@ -228,6 +231,11 @@ def main():
                 'max_abs': float(delta.abs().max()),
                 'reference_max_abs': float(expected.abs().max()),
             }
+        if rank == 0:
+            args.output.parent.mkdir(parents=True, exist_ok=True)
+            args.output.with_suffix('.gradient_errors.json').write_text(
+                json.dumps(gradient_errors, indent=2) + '\n'
+            )
         max_delta = 0.0
         for name in trained:
             torch.testing.assert_close(initial[name], saved['initial'][name], rtol=0, atol=0)
@@ -275,10 +283,6 @@ def main():
         result['gradient_parity_max_absolute_rms'] = max(
             error['l2'] / error['numel'] ** 0.5 for error in gradient_errors.values()
         )
-    if args.save_reference and rank == 0:
-        args.save_reference.parent.mkdir(parents=True, exist_ok=True)
-        torch.save(reference, args.save_reference)
-
     # Exercise the release's DCP helpers, then compare an uninterrupted update
     # against the identical update after rebuilding FSDP2, optimizer and scheduler.
     checkpoint = args.output.with_suffix('')
