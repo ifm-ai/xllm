@@ -120,3 +120,31 @@ CP=4 needs eight ranks with the same DP size. Each output includes loss,
 gradient norm, throughput, peak allocated memory and checkpoint-resume result.
 Passing these tests qualifies only the tested runtime and topology; run them
 again after changing xattn, PyTorch, CUDA or GPU architecture.
+
+## Qualification status (2026-10-13)
+
+Tested against release base `651c530` on H200, PyTorch 2.11.0+cu128,
+CUDA toolkit 12.9, xattn `9bfc56a`, FlashAttention 4.0.0b34 and the pinned
+Dion revision. All 22 focused tests pass, including the partial-RoPE CUDA
+regression. Runs are recorded in the
+[qualification W&B project](https://wandb.ai/mbzuai-llm/xllm-release-v1.01-muon).
+
+| Architecture | Attention backends | Passed CP sizes, DP=2 | Blocks |
+| --- | --- | --- | --- |
+| Transformer | FlashAttention 4 or xattn | 1, 2, 4 | Regular and fused |
+| Pure Gekko | Swift or xattn | 1, 2, 4 | Regular and fused |
+| 1:3 hybrid | FlashAttention 4 + Swift | 1, 2, 4 | Regular and fused |
+| 1:3 hybrid | xattn + xattn | 1, 2 | Regular; fused checks pending |
+
+Passing cases include exact model/optimizer checkpoint restore and an exact
+resumed update. Hybrid CP1 also tests cache prefill/decode. For the all-xattn
+hybrid, regular CP4 exceeded the first-gradient budget on
+`layers.2.gda.v_conv.weight` (3.04% relative L2; 2.24e-6 absolute RMS).
+Its loss remained close to CP1; gradient diagnosis is still pending. Do not
+treat this case or the queued 32K cross-node CP16 tests as qualified yet.
+
+These are small, seeded four-layer correctness tests, not convergence or
+performance claims. The cold three-step throughput includes JIT startup and
+must not be used to compare attention speed. The release branch received
+another commit (`5cc29a2`) after this base was selected; that commit is not
+included in these results.
