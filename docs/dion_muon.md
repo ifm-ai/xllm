@@ -123,28 +123,40 @@ again after changing xattn, PyTorch, CUDA or GPU architecture.
 
 ## Qualification status (2026-10-13)
 
-Tested against release base `651c530` on H200, PyTorch 2.11.0+cu128,
+Rebased onto release `5cc29a2`, with model code tested at `6ef4996` on
+H200, PyTorch 2.11.0+cu128,
 CUDA toolkit 12.9, xattn `9bfc56a`, FlashAttention 4.0.0b34 and the pinned
-Dion revision. All 22 focused tests pass, including the partial-RoPE CUDA
-regression. Runs are recorded in the
+Dion revision. All 24 focused tests pass, including partial-RoPE preservation
+and packed-xattn metadata trimming with either BOS masks or segment indices.
+Runs are recorded in the
 [qualification W&B project](https://wandb.ai/mbzuai-llm/xllm-release-v1.01-muon).
 
 | Architecture | Attention backends | Passed CP sizes, DP=2 | Blocks |
 | --- | --- | --- | --- |
-| Transformer | FlashAttention 4 or xattn | 1, 2, 4 | Regular and fused |
-| Pure Gekko | Swift or xattn | 1, 2, 4 | Regular and fused |
-| 1:3 hybrid | FlashAttention 4 + Swift | 1, 2, 4 | Regular and fused |
-| 1:3 hybrid | xattn + xattn | 1, 2 | Regular; fused checks pending |
+| Transformer | xattn | 1, 2, 4 | Regular and fused |
+| Pure Gekko | xattn | 1, 2, 4 | Regular and fused |
+| 1:3 hybrid | xattn + xattn | 1, 2, 4 | Fused |
+| 1:3 hybrid | xattn + xattn | 1, 2 | Regular |
 
 Passing cases include exact model/optimizer checkpoint restore and an exact
 resumed update. Hybrid CP1 also tests cache prefill/decode. For the all-xattn
 hybrid, regular CP4 exceeded the first-gradient budget on
 `layers.2.gda.v_conv.weight` (3.04% relative L2; 2.24e-6 absolute RMS).
-Its loss remained close to CP1; gradient diagnosis is still pending. Do not
-treat this case or the queued 32K cross-node CP16 tests as qualified yet.
+Its loss remained close to CP1, and whole-model gradient relative L2 error
+was 0.45%. The discrepancy occurs before the first optimizer update and
+reproduces unchanged after the rebase; it is not yet proven to be rounding.
+Probes with the existing `attn_stability_control` settings 1 and 2 are queued.
+No gradient thresholds were relaxed during this diagnosis.
+
+32K fused Gekko and hybrid CP1 tests passed before the rebase. Fresh CP1
+references and cross-node CP4 tests on four 2-GPU nodes are queued; this
+layout exercises both CP and FSDP/Muon communication across nodes.
+Do not treat these pending checks, regular hybrid CP4, or CP16 as qualified.
+FlashAttention 4 dense and FlashAttention 4 + Swift hybrid/Gekko CP1/2/4
+passed on the earlier base; focused FA4 regressions after the rebase are queued.
 
 These are small, seeded four-layer correctness tests, not convergence or
 performance claims. The cold three-step throughput includes JIT startup and
-must not be used to compare attention speed. The release branch received
-another commit (`5cc29a2`) after this base was selected; that commit is not
-included in these results.
+must not be used to compare attention speed. The updated release's packed
+xattn changes required trimming metadata on the sequence axis and keeping
+fused recomputation/backward metadata aligned with trimmed keys.
