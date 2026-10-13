@@ -96,6 +96,10 @@ of its reference gradient RMS (plus an absolute per-entry floor of 1e-6),
 and its largest error within 3% of that
 tensor's maximum gradient magnitude (plus 1e-5). Near-zero entries can cancel
 differently when CP partitions BF16 matrix products.
+Trained weights use 3% tensor-RMS tolerance plus 1e-5, and a maximum-entry
+bound of 3% of the reference tensor's largest weight plus 0.001. This allows
+rare AdamW sign changes near zero without dropping the whole-tensor check.
+Checkpoint state and the resumed update still require bit-exact equality.
 The following example tests the fused 1:3 hybrid:
 
 ```bash
