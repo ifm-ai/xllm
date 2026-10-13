@@ -123,7 +123,7 @@ again after changing xattn, PyTorch, CUDA or GPU architecture.
 
 ## Qualification status (2026-10-13)
 
-Rebased onto release `5cc29a2`, with model code tested at `6ef4996` on
+Rebased onto release `5cc29a2`, with model code tested at `7a2bab9` on
 H200, PyTorch 2.11.0+cu128,
 CUDA toolkit 12.9, xattn `9bfc56a`, FlashAttention 4.0.0b34 and the pinned
 Dion revision. All 24 focused tests pass, including partial-RoPE preservation
@@ -131,12 +131,17 @@ and packed-xattn metadata trimming with either BOS masks or segment indices.
 Runs are recorded in the
 [qualification W&B project](https://wandb.ai/mbzuai-llm/xllm-release-v1.01-muon).
 
+The following matrix uses 1K sequences and deterministic backward.
+
 | Architecture | Attention backends | Passed CP sizes, DP=2 | Blocks |
 | --- | --- | --- | --- |
 | Transformer | xattn | 1, 2, 4 | Regular and fused |
 | Pure Gekko | xattn | 1, 2, 4 | Regular and fused |
 | 1:3 hybrid | xattn + xattn | 1, 2, 4 | Fused |
 | 1:3 hybrid | xattn + xattn | 1, 2 | Regular |
+| 1:3 hybrid | xattn + xattn, stability=1 or 2 | 4, across four nodes | Regular |
+| Transformer | FlashAttention 4 | 1, 2 | Fused |
+| 1:3 hybrid | FlashAttention 4 + Swift | 2 | Fused |
 
 Passing cases include exact model/optimizer checkpoint restore and an exact
 resumed update. Hybrid CP1 also tests cache prefill/decode. For the all-xattn
@@ -144,16 +149,24 @@ hybrid, regular CP4 exceeded the first-gradient budget on
 `layers.2.gda.v_conv.weight` (3.04% relative L2; 2.24e-6 absolute RMS).
 Its loss remained close to CP1, and whole-model gradient relative L2 error
 was 0.45%. The discrepancy occurs before the first optimizer update and
-reproduces unchanged after the rebase; it is not yet proven to be rounding.
-Probes with the existing `attn_stability_control` settings 1 and 2 are queued.
+reproduces unchanged after the rebase. Both `attn_stability_control: 1` and
+`2` pass the unchanged gradient checks and exact checkpoint resume at CP4
+across four nodes. This supports rounding sensitivity; it is not an FP32
+reference proof. The qualified regular-hybrid CP4 recipe uses stability=1.
 No gradient thresholds were relaxed during this diagnosis.
 
-32K fused Gekko and hybrid CP1 tests passed before the rebase. Fresh CP1
-references and cross-node CP4 tests on four 2-GPU nodes are queued; this
-layout exercises both CP and FSDP/Muon communication across nodes.
-Do not treat these pending checks, regular hybrid CP4, or CP16 as qualified.
-FlashAttention 4 dense and FlashAttention 4 + Swift hybrid/Gekko CP1/2/4
-passed on the earlier base; focused FA4 regressions after the rebase are queued.
+Fresh 32K fused Gekko and hybrid CP1 tests pass with stability=0, 1 and 2,
+including exact resume. At stability=0, cross-node CP4 exceeds the budget
+on small convolution gradients (absolute RMS errors about 1.2e-6 to 2.9e-6).
+32K CP4 retries at stability=1 and 2 are queued on two nodes with cyclic
+rank placement, so each CP group crosses machines. 32K CP4 and CP16 remain
+unqualified until those checks pass; do not extrapolate the 1K result.
+
+After the rebase, dense FA4 passes a fresh CP1-to-CP2 comparison and exact
+resume. The earlier failed FA4 retry used a missing reference path, not a
+model failure. Saved-attention fused Transformer and hybrid CP2 tests also
+pass without recomputation. FA4 dense and FA4 + Swift hybrid/Gekko CP1/2/4
+passed on the earlier base.
 
 These are small, seeded four-layer correctness tests, not convergence or
 performance claims. The cold three-step throughput includes JIT startup and
