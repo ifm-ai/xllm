@@ -177,3 +177,23 @@ def test_contract_rejects_drift_and_keeps_legacy_adamw_resume():
             SimpleNamespace(), {'optimizer_contract': optimizer._xllm_optimizer_contract}
         )
     validate_optimizer_contract(SimpleNamespace(), {})
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='Native RoPE kernel requires CUDA')
+def test_partial_fused_rope_preserves_normalization_inputs():
+    from xllm.models.fused_blocks.utils import apply_rope, apply_ropes
+
+    query = torch.randn(1, 16, 4, 128, device='cuda', dtype=torch.bfloat16)
+    key = torch.randn(1, 16, 1, 128, device='cuda', dtype=torch.bfloat16)
+    original_query, original_key = query.clone(), key.clone()
+    phase = torch.randn(16, 32, device='cuda')
+    frequencies = torch.polar(torch.ones_like(phase), phase)
+    rotated_query, rotated_key = apply_ropes(query, key, frequencies, 128, 64, False)
+    torch.testing.assert_close(query, original_query, rtol=0, atol=0)
+    torch.testing.assert_close(key, original_key, rtol=0, atol=0)
+    torch.testing.assert_close(rotated_query[..., 64:], query[..., 64:], rtol=0, atol=0)
+    torch.testing.assert_close(rotated_key[..., 64:], key[..., 64:], rtol=0, atol=0)
+    assert not torch.equal(rotated_key[..., :64], key[..., :64])
+    saved_gradient = rotated_key.clone()
+    apply_rope(rotated_key, frequencies, 128, 64, True)
+    torch.testing.assert_close(rotated_key, saved_gradient, rtol=0, atol=0)

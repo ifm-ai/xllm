@@ -826,7 +826,8 @@ def apply_rope(x: Tensor, freqs_cis: Tensor, head_dim: int, rope_head_dim: int, 
         x = apply_rotary_embedding(x, freqs_cis=freqs_cis, backward=backward)
     elif rope_head_dim > 0:
         x_rope = apply_rotary_embedding(x[:, :, :, :rope_head_dim], freqs_cis=freqs_cis, backward=backward)
-        x[:, :, :, :rope_head_dim] = x_rope
+        # Preserve inputs saved for normalization backward.
+        x = torch.cat((x_rope, x[:, :, :, rope_head_dim:]), dim=-1)
     return x
 
 
@@ -835,6 +836,6 @@ def apply_ropes(xq: Tensor, xk: Tensor, freqs_cis: Tensor, head_dim: int, rope_h
         xq, xk = apply_rotary_embeddings(xq, xk, freqs_cis=freqs_cis, backward=backward)
     elif rope_head_dim > 0:
         xq_rope, xk_rope = apply_rotary_embeddings(xq[:, :, :, :rope_head_dim], xk[:, :, :, :rope_head_dim], freqs_cis=freqs_cis, backward=backward)
-        xq[:, :, :, :rope_head_dim] = xq_rope
-        xk[:, :, :, :rope_head_dim] = xk_rope
+        xq = torch.cat((xq_rope, xq[:, :, :, rope_head_dim:]), dim=-1)
+        xk = torch.cat((xk_rope, xk[:, :, :, rope_head_dim:]), dim=-1)
     return xq, xk
