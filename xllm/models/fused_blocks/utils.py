@@ -469,7 +469,7 @@ def flash_attention_fwd(
             xk = xk[:, -total_seqlen_k:]
             xv = xv[:, -total_seqlen_k:]
             bos_mask = bos_mask[:, -total_seqlen_k:]
-            segidx = segidx[: -total_seqlen_k:]
+            segidx = segidx[:, -total_seqlen_k:]
         else:
             segidx = None
 

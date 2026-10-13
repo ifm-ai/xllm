@@ -63,6 +63,7 @@ def main():
     parser.add_argument('--save-awk', action='store_true')
     parser.add_argument('--full-attn-backend', choices=['xattn', 'flash'], default='xattn')
     parser.add_argument('--sca-backend', choices=['xattn', 'swift'], default='xattn')
+    parser.add_argument('--attn-stability-control', type=int, choices=[0, 1, 2], default=0)
     parser.add_argument('--optimizer', choices=['dion_muon', 'adamw'], default='dion_muon')
     parser.add_argument(
         '--orthogonalizer',
@@ -152,6 +153,7 @@ def main():
             multi_segments=True,
             targets=targets,
             token_mask=mask,
+            attn_stability_control=args.attn_stability_control,
             deterministic=True,
         )
         count = mask.sum()
@@ -196,6 +198,7 @@ def main():
         'recompute_awk': cfg.recompute_awk,
         'full_attn_backend': args.full_attn_backend,
         'sca_backend': args.sca_backend if args.arch != 'transformer' else None,
+        'attn_stability_control': args.attn_stability_control,
         'optimizer': args.optimizer,
         'orthogonalizer': args.orthogonalizer if args.optimizer == 'dion_muon' else None,
         'steps': args.steps,

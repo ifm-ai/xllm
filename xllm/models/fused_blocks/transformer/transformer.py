@@ -279,6 +279,9 @@ class TransformerBlockFunction(torch.autograd.Function):
         end_seq = ctx.end_seq
         cu_seqlens_q = seg1 if causal_attn_backend == 'flash' else None
         cu_seqlens_k = seg2 if causal_attn_backend == 'flash' else None
+        if causal_attn_backend == 'xattn' and total_seqlen_k is not None:
+            bos_mask = bos_mask[:, -total_seqlen_k:] if bos_mask is not None else None
+            seg1 = seg1[:, -total_seqlen_k:]
         attn_kwargs = dict(
             backend=causal_attn_backend, bos_mask=bos_mask,
             segment_idx=seg1 if causal_attn_backend == 'xattn' else None,
