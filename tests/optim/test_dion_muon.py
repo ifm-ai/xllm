@@ -210,7 +210,7 @@ def test_packed_xattn_trims_metadata_along_sequence_axis(use_bos_mask):
     bos_mask = torch.zeros(2, 256, device='cuda', dtype=torch.bool)
     bos_mask[:, 0] = True
     bos_mask[:, 128] = True
-    segments = bos_mask.cumsum(dim=1, dtype=torch.int32)
+    segments = bos_mask.cumsum(dim=1, dtype=torch.int64)
     bos_mask = bos_mask if use_bos_mask else None
     scale = 128 ** -0.5
     actual = flash_attention_fwd(
