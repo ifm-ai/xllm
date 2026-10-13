@@ -59,6 +59,8 @@ def main():
     parser.add_argument('--arch', choices=['transformer', 'gekko', 'hybrid'], required=True)
     parser.add_argument('--cp', type=int, default=1)
     parser.add_argument('--fused', action='store_true')
+    parser.add_argument('--no-recompute', action='store_true')
+    parser.add_argument('--save-awk', action='store_true')
     parser.add_argument('--full-attn-backend', choices=['xattn', 'flash'], default='xattn')
     parser.add_argument('--sca-backend', choices=['xattn', 'swift'], default='xattn')
     parser.add_argument('--optimizer', choices=['dion_muon', 'adamw'], default='dion_muon')
@@ -78,6 +80,7 @@ def main():
     rank = dist.get_rank()
     torch.manual_seed(17)
     torch.cuda.manual_seed(17)
+    recompute = args.fused and not args.no_recompute
     cfg = ModelConf(
         arch='transformer' if args.arch == 'transformer' else 'gekko',
         full_attention_interval=4 if args.arch == 'hybrid' else 0,
@@ -101,12 +104,12 @@ def main():
         memory_efficient_norm=False,
         apply_rmsnorm=True,
         fused_block=args.fused,
-        recompute_q=args.fused,
-        recompute_v=args.fused,
-        recompute_attention=args.fused,
-        recompute_awk=args.fused and args.arch != 'transformer',
-        recompute_fc1_out=args.fused,
-        recompute_fc3_out=args.fused,
+        recompute_q=recompute,
+        recompute_v=recompute,
+        recompute_attention=recompute,
+        recompute_awk=recompute and args.arch != 'transformer' and not args.save_awk,
+        recompute_fc1_out=recompute,
+        recompute_fc3_out=recompute,
     )
     tokenizer = SimpleNamespace(vocab_size=256, bos_id=1, eos_id=2, pad_id=0)
     optim_cfg = OptimConf(
@@ -189,6 +192,8 @@ def main():
         'cp': args.cp,
         'dp': get_data_parallel_world_size(),
         'fused': args.fused,
+        'recompute': recompute,
+        'recompute_awk': cfg.recompute_awk,
         'full_attn_backend': args.full_attn_backend,
         'sca_backend': args.sca_backend if args.arch != 'transformer' else None,
         'optimizer': args.optimizer,
