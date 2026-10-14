@@ -68,6 +68,13 @@ step, a coalesced broadcast keeps parameter shards and optimizer tensors
 identical across replicas; independent BF16 orthogonalizations can otherwise
 drift. This adds replica communication but avoids inconsistent checkpoints.
 
+Normalized Triton short-convolution weights and their raw gradients stay FP32
+through the softmax derivative, in both regular and fused Gekko blocks.
+Casting the raw gradient to BF16 before this subtraction amplified CP errors
+on small kernel gradients. Activations, convolution states and parameter dtypes
+are unchanged; the optimized Triton kernels still run. FLA retains its existing
+dtype behavior.
+
 Use `context_parallel_size > 1` with sequence length divisible by
 `context_parallel_size * model.chunk_size`. The release requires at least two
 FSDP shard ranks when CP is enabled; CP=2 therefore needs at least four GPUs.
@@ -87,6 +94,18 @@ Focused routing, configuration and scheduler tests:
 ```bash
 python -m pytest -q tests/optim/test_dion_muon.py
 ```
+
+Convolution precision and backward regressions (require CUDA):
+
+```bash
+python -m pytest -q tests/conv/test_normalized_causal_conv_precision.py \
+  tests/conv/test_causal_conv1d_bwd.py
+```
+
+The normalized-convolution regression compares both regular and fused paths,
+and four sequence pieces, to an FP32 reference. It also checks that FP32 weights
+with BF16 activations use the fast Triton path, including BOS resets, initial
+state and final-state gradients, in deterministic and non-deterministic modes.
 
 Real-kernel distributed tests use the same seeded batches, DP size and global
 token count at CP=1 and CP=2. They include document boundaries inside chunks,
@@ -121,17 +140,19 @@ gradient norm, throughput, peak allocated memory and checkpoint-resume result.
 Passing these tests qualifies only the tested runtime and topology; run them
 again after changing xattn, PyTorch, CUDA or GPU architecture.
 
-## Qualification status (2026-10-13)
+## Qualification status (2026-10-14)
 
-Rebased onto release `5cc29a2`, with model code tested at `7a2bab9` on
+Rebased onto release `5cc29a2`, with model code tested at `2546deb` on
 H200, PyTorch 2.11.0+cu128,
 CUDA toolkit 12.9, xattn `9bfc56a`, FlashAttention 4.0.0b34 and the pinned
-Dion revision. All 24 focused tests pass, including partial-RoPE preservation
-and packed-xattn metadata trimming with either BOS masks or segment indices.
+Dion revision. All 121 focused Muon and convolution tests pass at `6c03972`,
+without exclusions; the intervening commits change tests only. This includes
+partial-RoPE preservation, packed-xattn metadata trimming with either BOS masks
+or segment indices, and the FP32 convolution regressions.
 Runs are recorded in the
 [qualification W&B project](https://wandb.ai/mbzuai-llm/xllm-release-v1.01-muon).
 
-The following matrix uses 1K sequences and deterministic backward.
+The earlier matrix at `7a2bab9` used 1K sequences and deterministic backward:
 
 | Architecture | Attention backends | Passed CP sizes, DP=2 | Blocks |
 | --- | --- | --- | --- |
@@ -143,24 +164,22 @@ The following matrix uses 1K sequences and deterministic backward.
 | Transformer | FlashAttention 4 | 1, 2 | Fused |
 | 1:3 hybrid | FlashAttention 4 + Swift | 2 | Fused |
 
-Passing cases include exact model/optimizer checkpoint restore and an exact
-resumed update. Hybrid CP1 also tests cache prefill/decode. For the all-xattn
-hybrid, regular CP4 exceeded the first-gradient budget on
-`layers.2.gda.v_conv.weight` (3.04% relative L2; 2.24e-6 absolute RMS).
-Its loss remained close to CP1, and whole-model gradient relative L2 error
-was 0.45%. The discrepancy occurs before the first optimizer update and
-reproduces unchanged after the rebase. Both `attn_stability_control: 1` and
-`2` pass the unchanged gradient checks and exact checkpoint resume at CP4
-across four nodes. This supports rounding sensitivity; it is not an FP32
-reference proof. The qualified regular-hybrid CP4 recipe uses stability=1.
-No gradient thresholds were relaxed during this diagnosis.
+The previous blockers were small normalized-convolution gradients: regular
+hybrid CP4 at 1K, and fused pure/hybrid CP4 at 32K even with attention
+stability=1 or 2. They occurred before the first optimizer update. The FP32
+convolution correction addresses rounding before softmax backward, rather
+than changing Muon or relaxing gradient thresholds.
 
-Fresh 32K fused Gekko and hybrid CP1 tests pass with stability=0, 1 and 2,
-including exact resume. At stability=0, cross-node CP4 exceeds the budget
-on small convolution gradients (absolute RMS errors about 1.2e-6 to 2.9e-6).
-32K CP4 retries at stability=1 and 2 are queued on two nodes with cyclic
-rank placement, so each CP group crosses machines. 32K CP4 and CP16 remain
-unqualified until those checks pass; do not extrapolate the 1K result.
+Fresh 32K CP1-to-CP4 comparisons now pass for fused pure Gekko and the 1:3
+hybrid at attention stability=0, 1 and 2. CP4 uses eight GPUs across two
+nodes with cyclic rank placement, so each CP group crosses machines. Both
+cases include exact model/optimizer restore and an exact resumed update;
+hybrid CP1 also tests cache prefill/decode. Higher-precision attention is not
+needed to pass these default-recipe checks. CP16 remains unqualified.
+
+Regular hybrid CP1-to-cross-node-CP4 also passes at 1K with stability=0 and
+exact resume, closing the older short-sequence failure. The new qualification
+has seven matched CP1/CP4 pairs; no gradient, weight or resume tolerances changed.
 
 After the rebase, dense FA4 passes a fresh CP1-to-CP2 comparison and exact
 resume. The earlier failed FA4 retry used a missing reference path, not a
