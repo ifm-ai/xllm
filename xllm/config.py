@@ -81,7 +81,13 @@ class SlurmConf(Config):
 
 @dataclass
 class OptimConf(Config):
+    optimizer: str = "adamw"  # adamw, or muon (Muon for linear weights in the blocks, AdamW for the rest)
     lr: float = 1e-3  # AdamW learning rate after warmup
+    muon_lr: float = 0.01  # Muon learning rate after warmup (optimizer=muon)
+    muon_momentum: float = 0.95
+    muon_nesterov: bool = False
+    muon_adjust_lr: Optional[str] = "spectral_norm"  # Muon update scaling: spectral_norm, rms_norm or None
+    muon_per_head: bool = False  # Orthogonalize each attention head of wq/wk/wv/wr (rows) and wo (columns) on its own
     warmup: int = 2000  # Num of steps for LR warmup. 0 means no warmup
     weight_decay: float = 0.1  # Decoupled weight decay
     epsilon: float = 1e-8
@@ -96,6 +102,7 @@ class OptimConf(Config):
     wsd_decay_style: str = 'cosine'  # The curve type of decay phase in WSD scheduler: cosine or linear
 
     def __post_init__(self):
+        assert self.optimizer in ['adamw', 'muon']
         assert self.scheduler in ['linear', 'cosine', 'constant', 'wsd']
         assert self.warmup >= 0
         if self.scheduler == 'wsd':
@@ -411,6 +418,12 @@ class TrainerConf(Config):
         assert self.dtype in ["bf16", "fp16", "fp32"]
         if self.dtype == "fp16":
             assert self.loss_rescaling, "loss rescaling needed for fp16!"
+
+        if self.optim.optimizer == "muon":
+            assert self.model.ddp_backend == "fsdp2", "Muon requires FSDP2."
+            assert self.model_parallel_size == 1 and self.context_parallel_size == 1, "Muon requires TP=1 and CP=1."
+            assert self.model.num_experts == 0, "Muon does not support MoE."
+            assert self.dcp_for_optimizer, "Muon requires dcp_for_optimizer (sharded momentum)."
 
         # MoE
         if self.model.num_experts > 0:

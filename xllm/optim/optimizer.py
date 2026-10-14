@@ -6,6 +6,7 @@ from torch.optim import AdamW
 
 from xllm.config import OptimConf
 from .lr_scheduler import build_lr_scheduler
+from .muon import build_muon
 
 
 logger = getLogger()
@@ -21,15 +22,18 @@ def rescale_grads(model: nn.Module, scale: float):
         p.grad /= scale
 
 
-def build_optimizer(model: nn.Module, cfg: OptimConf, total_steps: int, param_dtype: str):
+def build_optimizer(model: nn.Module, cfg: OptimConf, total_steps: int, param_dtype: str, mesh=None):
     logger.info("Starting build of optimizer...")
-    optimizer = AdamW(
-        model.parameters(),
-        lr=cfg.lr,
-        betas=(cfg.beta1, cfg.beta2),
-        weight_decay=cfg.weight_decay,
-        eps=cfg.epsilon,
-    )
+    if cfg.optimizer == "muon":
+        optimizer = build_muon(model, mesh, cfg)
+    else:
+        optimizer = AdamW(
+            model.parameters(),
+            lr=cfg.lr,
+            betas=(cfg.beta1, cfg.beta2),
+            weight_decay=cfg.weight_decay,
+            eps=cfg.epsilon,
+        )
 
     # scheduler
     scheduler = build_lr_scheduler(optimizer, cfg, total_steps)

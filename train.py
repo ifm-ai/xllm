@@ -56,7 +56,7 @@ from xllm.utils import (
     set_sharded_optimizer_state,
     collect_provenance,
 )
-from xllm.models import build_model
+from xllm.models import build_model, build_fsdp_mesh
 from xllm.optim import build_optimizer, rescale_grads
 from xllm.monitor import GPUMonitor, Timings
 from xllm.metrics import MetricLogger, build_mlogger
@@ -179,7 +179,8 @@ def set_optim_state(
     opt_cfg: OptimConf
 ):
     # setting LR manually to support overwriting during training from the same state
-    reloaded_training_state_dict["scheduler"]["base_lrs"] = [opt_cfg.lr]
+    base_lrs = [opt_cfg.muon_lr, opt_cfg.lr] if opt_cfg.optimizer == "muon" else [opt_cfg.lr]
+    reloaded_training_state_dict["scheduler"]["base_lrs"] = base_lrs
     scheduler.load_state_dict(reloaded_training_state_dict["scheduler"])
     state.step, state.scale, state.scale_updates, state.clip_cumulative = (
         reloaded_training_state_dict["step"],
@@ -238,12 +239,15 @@ def main(cfg: TrainerConf):
 
     logger.info("Start building of model...")
     cfg.model.vocab_size = tokenizer.vocab_size
+    # the FSDP mesh is fixed here and shared by the model and the optimizer
+    device_mesh = build_fsdp_mesh(cfg.fully_sharded_size) if cfg.model.ddp_backend == "fsdp2" else None
     model = build_model(
         cfg.model, dtype=cfg.dtype,
         fully_sharded_size=cfg.fully_sharded_size,
         fp32_reduce_scatter=cfg.fp32_reduce_scatter,
         reshard_after_forward=cfg.reshard_after_forward,
-        forward_prefetch=cfg.forward_prefetch, tokenizer=tokenizer
+        forward_prefetch=cfg.forward_prefetch, tokenizer=tokenizer,
+        device_mesh=device_mesh,
     )
     torch.cuda.empty_cache()
     gc.collect(2)
@@ -260,7 +264,7 @@ def main(cfg: TrainerConf):
     tflops_per_token = model.tflops_per_token(cfg.seq_len)
 
     # build optimizer / scheduler
-    optimizer, scheduler = build_optimizer(model, cfg.optim, cfg.steps, cfg.dtype)
+    optimizer, scheduler = build_optimizer(model, cfg.optim, cfg.steps, cfg.dtype, device_mesh)
 
     # setup loggers
     enable_loggers = cfg.slurm.is_master and not cfg.disable_logging
@@ -485,6 +489,7 @@ def main(cfg: TrainerConf):
         optim_metrics = {
             "step": state.step,
             "lr": curr_lr,
+            **({"adamw_lr": float(optimizer.param_groups[1]["lr"])} if cfg.optim.optimizer == "muon" else {}),
             "avg_loss": reduce_scalar(curr_loss, op='mean'),
             "max_loss": reduce_scalar(curr_loss, op='max'),
         }
