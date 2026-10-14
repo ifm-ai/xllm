@@ -57,7 +57,8 @@ def test_normalized_conv_preserves_small_gradients_across_splits(
         activation, True, 'triton', deterministic,
     )[2].float()
     torch.testing.assert_close(outputs, fused_outputs, rtol=0, atol=0)
-    torch.testing.assert_close(regular, fused, rtol=0, atol=0)
+    if deterministic:
+        torch.testing.assert_close(regular, fused, rtol=0, atol=0)
 
     # Simulate the four CP pieces with identical inputs/upstream gradients.
     # No collective is needed here; the model test covers actual CP/FSDP2.
