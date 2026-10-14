@@ -221,7 +221,11 @@ def causal_conv1d_fwd(
     backend: str,
     deterministic: bool
 ) -> Tuple[Tensor, Optional[Tensor], Any]:
-    w = F.softmax(weight, dim=-1, dtype=torch.float32).to(x) if apply_weight_normalization else weight
+    w = weight
+    if apply_weight_normalization:
+        w = F.softmax(weight, dim=-1, dtype=torch.float32)
+        if backend != 'triton':
+            w = w.to(x)
     return conv1d_fwd(
         x, w, bias, initial_state, bos_mask, output_final_state, activation, backend, deterministic
     )
@@ -242,7 +246,7 @@ def causal_conv1d_bwd(
 ) -> Tuple[Tensor, Optional[Tensor], Tensor, Optional[Tensor]]:
     if apply_weight_normalization:
         w_fp32 = F.softmax(weight, dim=-1, dtype=torch.float32)
-        w = w_fp32.to(x)
+        w = w_fp32 if backend == 'triton' else w_fp32.to(x)
     else:
         w = weight
         w_fp32 = None
@@ -251,7 +255,7 @@ def causal_conv1d_bwd(
         activation, backend, deterministic
     )
     if apply_weight_normalization:
-        w_grad = torch.ops.aten._softmax_backward_data(w_grad.float(), w_fp32, -1, torch.float32).to(w)
+        w_grad = torch.ops.aten._softmax_backward_data(w_grad.float(), w_fp32, -1, torch.float32).to(weight)
 
     return x_grad, initial_state_grad, w_grad, b_grad
 
