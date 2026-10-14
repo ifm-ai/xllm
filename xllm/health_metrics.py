@@ -1,3 +1,4 @@
+import math
 from typing import Any, Dict, Optional, Tuple, TYPE_CHECKING
 
 import torch
@@ -98,12 +99,14 @@ class HealthMetricCollector:
         num_layers: int,
         enable_query_key_stats: bool = False,
         enable_weight_norms: bool = False,
+        enable_gradient_norms: bool = False,
     ):
         self.enabled = enabled
         self.freq = freq
         self.num_layers = num_layers
         self.enable_query_key_stats = enable_query_key_stats
         self.enable_weight_norms = enable_weight_norms
+        self.enable_gradient_norms = enable_gradient_norms
         self.step: Optional[int] = None
         self.recording = False
         self.decoder_layer_activation_records: Dict[int, _LocalStats] = {}
@@ -160,7 +163,11 @@ class HealthMetricCollector:
             "k_vector_l2": self._local_stats(k_vector_l2),
         }
 
-    def _record_fsdp2_matrix_norms(self, model: Any) -> None:
+    def _record_fsdp2_matrix_norms(
+        self,
+        model: Any,
+        gradient_scale: float,
+    ) -> None:
         layers = getattr(model, "layers", None)
         if layers is None or len(layers) != self.num_layers:
             raise RuntimeError("FSDP2 Transformer layers are unavailable for matrix norms")
@@ -184,6 +191,20 @@ class HealthMetricCollector:
                     self.matrix_squared_l2_records[metric_name] = (
                         _dtensor_squared_l2_contribution(weight)
                     )
+                if self.enable_gradient_norms:
+                    gradient = weight.grad
+                    if not isinstance(gradient, DTensor):
+                        raise RuntimeError(
+                            "FSDP2 gradient is unavailable or is not a DTensor: "
+                            f"layer {layer_idx}, {fqn}"
+                        )
+                    metric_name = f"gradient_norms/{metric_path}/l2"
+                    if metric_name in self.matrix_squared_l2_records:
+                        raise RuntimeError(f"Duplicate matrix norm metric: {metric_name}")
+                    squared_l2 = _dtensor_squared_l2_contribution(gradient)
+                    self.matrix_squared_l2_records[metric_name] = (
+                        squared_l2 if gradient_scale == 1 else squared_l2 / gradient_scale ** 2
+                    )
 
             if num_layer_matrices != len(_MATRIX_PARAMETER_PATHS):
                 raise RuntimeError(
@@ -191,7 +212,9 @@ class HealthMetricCollector:
                     f"{layer_idx}, found {num_layer_matrices}"
                 )
 
-        num_enabled_norms = int(self.enable_weight_norms)
+        num_enabled_norms = (
+            int(self.enable_weight_norms) + int(self.enable_gradient_norms)
+        )
         expected_records = (
             self.num_layers * len(_MATRIX_PARAMETER_PATHS) * num_enabled_norms
         )
@@ -202,18 +225,25 @@ class HealthMetricCollector:
             )
 
     @torch.no_grad()
-    def record_matrix_norms(self, model: Any) -> None:
-        if not self.recording or not self.enable_weight_norms:
+    def record_matrix_norms(self, model: Any, gradient_scale: float = 1.0) -> None:
+        if not self.recording or not (
+            self.enable_weight_norms or self.enable_gradient_norms
+        ):
             return
+        if self.enable_gradient_norms and (
+            gradient_scale <= 0.0 or not math.isfinite(gradient_scale)
+        ):
+            raise ValueError(f"gradient_scale must be finite and positive, got {gradient_scale}")
         if self.matrix_squared_l2_records:
             raise RuntimeError("Duplicate matrix norm records")
 
         handles = getattr(model, "_all_handles", None)
         if handles is None:
-            self._record_fsdp2_matrix_norms(model)
+            self._record_fsdp2_matrix_norms(model, gradient_scale)
             return
 
         replica_count = float(_matrix_norm_replica_count(model))
+        gradient_squared_l2_divisor = replica_count * gradient_scale ** 2
         for handle in handles:
             module = getattr(handle, "_fully_sharded_module", None)
             layer_idx = getattr(module, "layer_id", None)
@@ -234,6 +264,14 @@ class HealthMetricCollector:
                 )
             weight_shard = (
                 None if weight_shard is None else weight_shard.detach().reshape(-1)
+            )
+            gradient_shard = flat_param.grad
+            if self.enable_gradient_norms and gradient_shard is None:
+                raise RuntimeError(
+                    f"FSDP1 gradient shard is unavailable for layer {layer_idx}"
+                )
+            gradient_shard = (
+                None if gradient_shard is None else gradient_shard.detach().reshape(-1)
             )
 
             def local_squared_l2(
@@ -267,6 +305,16 @@ class HealthMetricCollector:
                     self.matrix_squared_l2_records[metric_name] = (
                         squared_l2 if replica_count == 1 else squared_l2 / replica_count
                     )
+                if self.enable_gradient_norms:
+                    assert gradient_shard is not None
+                    metric_name = f"gradient_norms/{metric_path}/l2"
+                    if metric_name in self.matrix_squared_l2_records:
+                        raise RuntimeError(f"Duplicate matrix norm metric: {metric_name}")
+                    squared_l2 = local_squared_l2(gradient_shard, shard_info)
+                    self.matrix_squared_l2_records[metric_name] = (
+                        squared_l2 if gradient_squared_l2_divisor == 1
+                        else squared_l2 / gradient_squared_l2_divisor
+                    )
 
             if num_layer_matrices != len(_MATRIX_PARAMETER_PATHS):
                 raise RuntimeError(
@@ -274,7 +322,9 @@ class HealthMetricCollector:
                     f"{layer_idx}, found {num_layer_matrices}"
                 )
 
-        num_enabled_norms = int(self.enable_weight_norms)
+        num_enabled_norms = (
+            int(self.enable_weight_norms) + int(self.enable_gradient_norms)
+        )
         expected_records = (
             self.num_layers * len(_MATRIX_PARAMETER_PATHS) * num_enabled_norms
         )
@@ -300,7 +350,9 @@ class HealthMetricCollector:
                 f"Expected {self.num_layers} query/key records at step {self.step}, "
                 f"got layers {sorted(self.query_key_stats_records)} at step {step}"
             )
-        num_enabled_norms = int(self.enable_weight_norms)
+        num_enabled_norms = (
+            int(self.enable_weight_norms) + int(self.enable_gradient_norms)
+        )
         expected_norms = (
             self.num_layers * len(_MATRIX_PARAMETER_PATHS) * num_enabled_norms
         )

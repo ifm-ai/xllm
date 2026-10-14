@@ -337,6 +337,7 @@ class TrainerConf(Config):
     health_log_freq: int = 100
     health_query_key_stats: bool = False
     health_weight_norms: bool = False
+    health_gradient_norms: bool = False
 
     # Training hyperparameters
     batch_size: Optional[int] = None  # Num of sequences per DP rank per step. Set either this or global_batch_size.
@@ -433,7 +434,7 @@ class TrainerConf(Config):
             assert self.model.arch == "transformer", "Health metrics currently require model.arch=transformer"
         if self.health_query_key_stats:
             assert self.health_metrics, "Query/key statistics require health_metrics=true"
-        if self.health_weight_norms:
+        if self.health_weight_norms or self.health_gradient_norms:
             assert self.health_metrics, "Matrix norms require health_metrics=true"
             assert self.model.num_experts == 0, "Matrix norms currently require a dense Transformer"
             assert self.model.swiglu, "Seven-matrix norms require SwiGLU"

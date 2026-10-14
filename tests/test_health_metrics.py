@@ -32,6 +32,7 @@ MATRIX_FQNS = [
 
 def make_fsdp1_model(
     weight_values,
+    gradient_values=None,
     shard_infos=None,
     fsdp_size=1,
     replica_count=1,
@@ -46,6 +47,10 @@ def make_fsdp1_model(
         _fqns=MATRIX_FQNS,
         _shard_param_infos=shard_infos,
         _local_shard=torch.tensor(weight_values, dtype=torch.float32),
+        grad=(
+            None if gradient_values is None
+            else torch.tensor(gradient_values, dtype=torch.float32)
+        ),
     )
     handle = SimpleNamespace(
         _fully_sharded_module=SimpleNamespace(layer_id=0),
@@ -72,16 +77,24 @@ class FakeDTensor:
         self.local_tensor = torch.as_tensor(local_values, dtype=torch.float32)
         self.placements = placements
         self.device_mesh = FakeDeviceMesh(mesh_shape)
+        self.grad = None
 
     def to_local(self):
         return self.local_tensor
 
 
-def make_fsdp2_model(weight_values, placements=(Shard(0),), mesh_shape=(1,)):
-    parameters = [
-        (fqn, FakeDTensor(values, placements, mesh_shape))
-        for fqn, values in zip(MATRIX_FQNS, weight_values)
-    ]
+def make_fsdp2_model(
+    weight_values,
+    gradient_values=None,
+    placements=(Shard(0),),
+    mesh_shape=(1,),
+):
+    parameters = []
+    for index, (fqn, values) in enumerate(zip(MATRIX_FQNS, weight_values)):
+        weight = FakeDTensor(values, placements, mesh_shape)
+        if gradient_values is not None:
+            weight.grad = FakeDTensor(gradient_values[index], placements, mesh_shape)
+        parameters.append((fqn, weight))
     layer = SimpleNamespace(named_parameters=lambda: iter(parameters))
     return SimpleNamespace(layers=[layer])
 
@@ -164,6 +177,34 @@ def test_weight_norms_reconstruct_all_seven_matrices():
     assert metrics["weight_norms/layer_000/mlp/down_proj/l2"] == 9.0
 
 
+def test_gradient_norms_reconstruct_all_seven_matrices_and_unscale():
+    collector = health_metrics.HealthMetricCollector(
+        enabled=True, freq=1, num_layers=1, enable_gradient_norms=True
+    )
+    logger = RecordingLogger()
+    collector.begin_step(1)
+    collector.record_activation(0, torch.tensor([1.0]))
+    collector.record_matrix_norms(make_fsdp1_model(
+        [0.0] * 7,
+        gradient_values=[6.0, -8.0, 10.0, -12.0, 14.0, -16.0, 18.0],
+    ), gradient_scale=2.0)
+    collector.end_forward()
+    collector.flush(logger, 1)
+
+    metrics, _ = logger.calls[0]
+    expected = {
+        "attention/q_proj": 3.0,
+        "attention/k_proj": 4.0,
+        "attention/v_proj": 5.0,
+        "attention/o_proj": 6.0,
+        "mlp/gate_proj": 7.0,
+        "mlp/up_proj": 8.0,
+        "mlp/down_proj": 9.0,
+    }
+    for matrix, norm in expected.items():
+        assert metrics[f"gradient_norms/layer_000/{matrix}/l2"] == norm
+
+
 def test_weight_norms_use_exact_local_shard_and_replica_correction():
     shard_infos = [
         SimpleNamespace(in_shard=True, offset_in_shard=0, numel_in_shard=2),
@@ -242,6 +283,112 @@ def test_fsdp2_weight_norms_correct_hybrid_and_context_replicas():
     collector.end_forward()
 
 
+def test_gradient_norms_use_exact_local_shard_and_replica_correction():
+    shard_infos = [
+        SimpleNamespace(in_shard=True, offset_in_shard=0, numel_in_shard=2),
+        SimpleNamespace(in_shard=False, offset_in_shard=0, numel_in_shard=0),
+        SimpleNamespace(in_shard=False, offset_in_shard=0, numel_in_shard=0),
+        SimpleNamespace(in_shard=False, offset_in_shard=0, numel_in_shard=0),
+        SimpleNamespace(in_shard=False, offset_in_shard=0, numel_in_shard=0),
+        SimpleNamespace(in_shard=True, offset_in_shard=2, numel_in_shard=1),
+        SimpleNamespace(in_shard=False, offset_in_shard=0, numel_in_shard=0),
+    ]
+    collector = health_metrics.HealthMetricCollector(
+        enabled=True, freq=1, num_layers=1, enable_gradient_norms=True
+    )
+    collector.begin_step(1)
+    collector.record_matrix_norms(make_fsdp1_model(
+        [0.0, 0.0, 0.0],
+        gradient_values=[6.0, 8.0, 24.0],
+        shard_infos=shard_infos,
+        fsdp_size=2,
+        replica_count=2,
+        context_parallel_size=2,
+    ), gradient_scale=2.0)
+
+    assert collector.matrix_squared_l2_records[
+        "gradient_norms/layer_000/attention/q_proj/l2"
+    ].item() == pytest.approx(100.0 / (4.0 * 2.0 ** 2))
+    assert collector.matrix_squared_l2_records[
+        "gradient_norms/layer_000/mlp/up_proj/l2"
+    ].item() == pytest.approx(576.0 / (4.0 * 2.0 ** 2))
+    assert collector.matrix_squared_l2_records[
+        "gradient_norms/layer_000/attention/k_proj/l2"
+    ].item() == 0.0
+    collector.end_forward()
+
+
+def test_fsdp2_matrix_norms_use_per_parameter_dtensor_shards():
+    collector = health_metrics.HealthMetricCollector(
+        enabled=True,
+        freq=1,
+        num_layers=1,
+        enable_weight_norms=True,
+        enable_gradient_norms=True,
+    )
+    collector.begin_step(1)
+    weight_values = [
+        [3.0, 4.0], [-5.0], [6.0], [-7.0], [8.0], [-9.0], [10.0]
+    ]
+    gradient_values = [
+        [6.0, 8.0], [-10.0], [12.0], [-14.0], [16.0], [-18.0], [20.0]
+    ]
+
+    with patch.object(health_metrics, "DTensor", FakeDTensor):
+        collector.record_matrix_norms(
+            make_fsdp2_model(
+                weight_values,
+                gradient_values,
+                placements=(Shard(0),),
+                mesh_shape=(2,),
+            ),
+            gradient_scale=2.0,
+        )
+
+    assert collector.matrix_squared_l2_records[
+        "weight_norms/layer_000/attention/q_proj/l2"
+    ].item() == 25.0
+    assert collector.matrix_squared_l2_records[
+        "gradient_norms/layer_000/attention/q_proj/l2"
+    ].item() == 25.0
+    assert collector.matrix_squared_l2_records[
+        "gradient_norms/layer_000/mlp/down_proj/l2"
+    ].item() == 100.0
+    collector.end_forward()
+
+
+def test_fsdp2_matrix_norms_correct_hybrid_and_context_replicas():
+    collector = health_metrics.HealthMetricCollector(
+        enabled=True,
+        freq=1,
+        num_layers=1,
+        enable_weight_norms=True,
+        enable_gradient_norms=True,
+    )
+    collector.begin_step(1)
+    weight_values = [[3.0, 4.0]] + [[1.0]] * 6
+    gradient_values = [[6.0, 8.0]] + [[2.0]] * 6
+
+    with patch.object(health_metrics, "DTensor", FakeDTensor):
+        collector.record_matrix_norms(
+            make_fsdp2_model(
+                weight_values,
+                gradient_values,
+                placements=(Replicate(), Shard(0)),
+                mesh_shape=(4, 2),
+            ),
+            gradient_scale=2.0,
+        )
+
+    assert collector.matrix_squared_l2_records[
+        "weight_norms/layer_000/attention/q_proj/l2"
+    ].item() == pytest.approx(25.0 / 4.0)
+    assert collector.matrix_squared_l2_records[
+        "gradient_norms/layer_000/attention/q_proj/l2"
+    ].item() == pytest.approx(25.0 / 4.0)
+    collector.end_forward()
+
+
 def test_weight_norms_share_existing_sum_reduction():
     collector = health_metrics.HealthMetricCollector(
         enabled=True, freq=1, num_layers=1, enable_weight_norms=True
@@ -272,6 +419,47 @@ def test_weight_norms_share_existing_sum_reduction():
     assert len([
         key for key in logger.calls[0][0] if key.startswith("weight_norms/")
     ]) == 7
+
+
+def test_weight_and_gradient_norms_share_existing_sum_reduction():
+    collector = health_metrics.HealthMetricCollector(
+        enabled=True,
+        freq=1,
+        num_layers=1,
+        enable_weight_norms=True,
+        enable_gradient_norms=True,
+    )
+    logger = RecordingLogger()
+    collector.begin_step(1)
+    collector.record_activation(0, torch.tensor([1.0]))
+    collector.record_matrix_norms(make_fsdp1_model(
+        [1.0] * 7, gradient_values=[2.0] * 7
+    ), gradient_scale=2.0)
+    collector.end_forward()
+    reductions = []
+
+    def reduce(tensor, dst, op):
+        assert dst == 0
+        reductions.append(op)
+
+    with patch.object(health_metrics.dist, "is_initialized", return_value=True), \
+         patch.object(health_metrics.dist, "get_rank", return_value=0), \
+         patch.object(health_metrics.dist, "reduce", side_effect=reduce):
+        collector.flush(logger, 1)
+
+    assert reductions == [
+        torch.distributed.ReduceOp.SUM,
+        torch.distributed.ReduceOp.MIN,
+        torch.distributed.ReduceOp.MAX,
+    ]
+    assert len([
+        key for key in logger.calls[0][0] if key.startswith("weight_norms/")
+    ]) == 7
+    assert len([
+        key for key in logger.calls[0][0] if key.startswith("gradient_norms/")
+    ]) == 7
+    assert logger.calls[0][0]["weight_norms/layer_000/attention/q_proj/l2"] == 1.0
+    assert logger.calls[0][0]["gradient_norms/layer_000/attention/q_proj/l2"] == 1.0
 
 
 def test_health_stats_use_three_packed_reductions():
