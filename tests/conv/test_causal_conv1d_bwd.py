@@ -465,7 +465,7 @@ def test_triton_deterministic_option_reaches_kernel(
     expected_mode = deterministic is True or global_deterministic
     x = _bf16_tensor(2, 513, 65).requires_grad_()
     layer = CausalConv1d(
-        65, 4, bias=True, activation="silu", **options,
+        65, 4, bias=True, activation="silu",
     ).to(device="cuda", dtype=torch.bfloat16)
     grad = _bf16_tensor(*x.shape)
     previous = torch.are_deterministic_algorithms_enabled()
@@ -473,7 +473,7 @@ def test_triton_deterministic_option_reaches_kernel(
     try:
         torch.use_deterministic_algorithms(global_deterministic)
         for _ in range(3):
-            out, _ = layer(x)
+            out, _ = layer(x, **options)
             actual = torch.autograd.grad(out, (x, layer.weight, layer.bias), grad)
             if expected_mode:
                 if len(selected_modes) > 1:
@@ -491,7 +491,12 @@ def test_triton_deterministic_option_reaches_kernel(
             torch.autograd.grad(out, (x, layer.weight), grad)
     finally:
         torch.use_deterministic_algorithms(previous, warn_only=warn_only)
-    assert selected_modes == [expected_mode] * (6 if global_deterministic else 5)
+    expected_modes = [expected_mode] * 5
+    if global_deterministic:
+        # The global flag is checked when the backward kernel executes; the
+        # per-call flag is saved at forward and survives a global-mode change.
+        expected_modes.append(deterministic is True)
+    assert selected_modes == expected_modes
 
 
 @pytest.mark.parametrize("execution", ["streams", "graphs"])
