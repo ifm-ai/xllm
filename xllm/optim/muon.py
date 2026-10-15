@@ -79,19 +79,21 @@ class Slice:
         return self.rows.stop - self.rows.start
 
 
-def split_muon_params(model: nn.Module, per_head: bool):
+def split_muon_params(model: nn.Module, per_head: bool, per_head_out: bool = True):
     """Linear weights inside the blocks go to Muon; everything else
     (embedding, output layer, norms, biases, convolutions) goes to AdamW.
 
     Returns the Muon params, one BlockSpec per Muon param, and the AdamW params.
     With per_head, modules that define `muon_blocks()` (the attention layers) say how
     their projections are cut into heads; all other matrices stay whole.
+    per_head_out=False keeps the column-head matrices (wo) whole.
     """
     heads = {}
     if per_head:
         for module in model.layers.modules():
             if hasattr(module, "muon_blocks"):
-                heads.update((id(weight), spec) for weight, spec in module.muon_blocks())
+                heads.update((id(weight), spec) for weight, spec in module.muon_blocks()
+                             if per_head_out or spec[0] == 0)
 
     muon = [
         m.weight for m in model.layers.modules()
@@ -162,6 +164,8 @@ class Muon(Optimizer):
         self.momentum = cfg.muon_momentum
         self.nesterov = cfg.muon_nesterov
         self.adjust_lr = cfg.muon_adjust_lr
+        self.block_scale = cfg.muon_block_scale          # row blocks and whole matrices
+        self.out_block_scale = cfg.muon_out_block_scale  # column blocks (wo heads)
         self.betas = (cfg.beta1, cfg.beta2)
         self.group = mesh.get_group()
         self.world = mesh.size()
@@ -171,6 +175,7 @@ class Muon(Optimizer):
     # ---- plan: built once from the global shapes, identical on every rank ----
 
     def _plan(self, shapes: List[Tuple[int, int]], specs: List[BlockSpec]):
+        self.shapes = shapes
         self.blocks: List[Block] = []
         for i, ((rows, cols), spec) in enumerate(zip(shapes, specs)):
             if spec is None:
@@ -205,8 +210,11 @@ class Muon(Optimizer):
         hi = max(lo, hi)
         return Slice(rows=slice(lo - s0, hi - s0), cols=slice(b.c0, b.c1), block_row=lo - b.r0)
 
-    def _scale(self, shape: Tuple[int, int]) -> float:
-        fan_out, fan_in = shape
+    def _scale(self, b: Block) -> float:
+        """Update scale of block b, from its own shape or from its whole matrix's shape."""
+        is_column_block = b.shape[1] != self.shapes[b.param][1]
+        mode = self.out_block_scale if is_column_block else self.block_scale
+        fan_out, fan_in = b.shape if mode == "block" else self.shapes[b.param]
         if self.adjust_lr == "spectral_norm":
             return math.sqrt(fan_out / fan_in)
         if self.adjust_lr == "rms_norm":
@@ -272,7 +280,7 @@ class Muon(Optimizer):
         params, lr, wd = group["params"], group["lr"], group["weight_decay"]
         updates = [self._momentum(p) for p in params]                      # 1. local shards
         gathered = self._gather(updates)                                   # 2. whole owned blocks
-        results = [o * self._scale(self.blocks[k].shape)                   # 3. Newton-Schulz + scale
+        results = [o * self._scale(self.blocks[k])                         # 3. Newton-Schulz + scale
                    for k, o in zip(self.owned, orthogonalize(gathered, group["eps"]))]
         self._scatter(results, updates)                                    # 4. back to the shards
         for p, u in zip(params, updates):
@@ -311,10 +319,11 @@ class Muon(Optimizer):
 
 def build_muon(model: nn.Module, mesh: DeviceMesh, cfg: OptimConf) -> Optimizer:
     """`mesh` is the FSDP mesh; Muon works over its shard dimension."""
-    muon, specs, adamw = split_muon_params(model, cfg.muon_per_head)
+    muon, specs, adamw = split_muon_params(model, cfg.muon_per_head, cfg.muon_per_head_out)
     shard_mesh = mesh if mesh.ndim == 1 else mesh["dp"]
     optimizer = Muon(muon, specs, adamw, shard_mesh, cfg)
-    logger.info(f"Muon: {len(muon)} matrices / {len(optimizer.blocks)} blocks / "
+    logger.info(f"Muon: {len(muon)} matrices / {len(optimizer.blocks)} blocks (scale rows={cfg.muon_block_scale}, "
+                f"columns={cfg.muon_out_block_scale}) / "
                 f"{sum(p.numel() for p in muon)} params; AdamW: {len(adamw)} tensors / "
                 f"{sum(p.numel() for p in adamw)} params")
     return optimizer

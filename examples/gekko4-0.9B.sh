@@ -146,7 +146,6 @@ VALID_DATA+=$(printf ",${V}/paloma/validation/val_%s.chunk0.jsonl" "${PALOMA[@]}
 TASK_ROOT=/lustrefs/users/xuezhe.ma/projects/data/eval
 TASKS="boolq,hellaswag,nq,piqa,siqa,winogrande_1.1,obqa,arc_easy,arc_challenge,race_middle,race_high,copa,mmlu,arabic_mmlu,tqa,gsm8k,bbh,drop,mbpp,human_eval"
 
-WANDB_PROJECT=residual_gekko
 WANDB_TEAM=mbzuai-llm
 
 DISTRIBUTED_CFGS=(
