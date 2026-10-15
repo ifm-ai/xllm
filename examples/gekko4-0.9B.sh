@@ -1,5 +1,8 @@
 #! /bin/bash
 
+#SBATCH --account=llm360
+#SBATCH --qos=normal
+#SBATCH --partition=main
 #SBATCH --cpus-per-task=12
 #SBATCH --gpus-per-node=8
 #SBATCH --job-name=gekko4-0.9B
@@ -13,14 +16,37 @@
 # gekko4-0.9B, k2-horizon 5T data mix, jais64k enx10 tokenizer, no BOS,
 # 8M tokens/step (4 nodes x 8 GPU x 4 x 64k), full FSDP2 over all GPUs.
 #
-# Submit from the repo root (slurm_logs/ must exist):
-#   SAVE=<dump_dir> [OPTIM=adamw|muon] [MUON_PER_HEAD=true] [PYTHON=...] sbatch examples/gekko4-0.9B.sh [extra train.py flags]
-# Extra flags are appended last and override the ones below.
+# Submit from the repo (or worktree) root; slurm_logs/ must exist:
+#   mkdir -p slurm_logs && SAVE=<dump_dir> [VAR=value ...] sbatch examples/gekko4-0.9B.sh [extra train.py flags]
+# Extra flags are appended last and override everything below.
+#
+# Variables (default):
+#   SAVE            dump dir (required)
+#   OPTIM           adamw | muon (adamw); MUON_PER_HEAD (true), MUON_LR (0.01) apply to muon
+#   LR              AdamW LR, also for the non-matrix params under muon (2e-3)
+#   SCHEDULER       constant | cosine | wsd (constant); WARMUP steps (3000);
+#                   WSD_DECAY_STEPS (20% of the run) for wsd
+#   TPP             run length in tokens per non-embedding parameter (200)
+#   EVAL_TPP        eval interval in TPP; every eval checkpoint is kept (20)
+#   CKPTS_PER_EVAL  rolling checkpoints per eval interval, bounds work lost to preemption (3)
+#   WANDB_PROJECT   (residual_gekko)
+#   PYTHON          interpreter (.venv/bin/python)
 
 : "${SAVE:?set SAVE}"
 PYTHON=${PYTHON:-.venv/bin/python}
 OPTIM=${OPTIM:-adamw}
 MUON_PER_HEAD=${MUON_PER_HEAD:-true}
+MUON_LR=${MUON_LR:-0.01}
+LR=${LR:-2e-3}
+SCHEDULER=${SCHEDULER:-constant}
+WARMUP=${WARMUP:-3000}
+TPP=${TPP:-200}
+EVAL_TPP=${EVAL_TPP:-20}
+CKPTS_PER_EVAL=${CKPTS_PER_EVAL:-3}
+WANDB_PROJECT=${WANDB_PROJECT:-residual_gekko}
+
+# run this checkout's xllm, not the one the venv was installed from
+export PYTHONPATH="${SLURM_SUBMIT_DIR:-$PWD}${PYTHONPATH:+:$PYTHONPATH}"
 
 export NCCL_DEBUG=WARN
 export NCCL_SOCKET_IFNAME=eth0
@@ -42,12 +68,22 @@ export UCX_NET_DEVICES=mlx5_ib0:1
 #export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
 
 BSZ=4
-LR=2e-3
 WD=0.02
 SEQ_LEN=65536
 ROPE_DIM=128
 ROPE_BASE=500000
-LR_SCHD="cosine"
+LOG_FREQ=10
+
+# Run length from tokens per non-embedding parameter (embedding and output layer excluded).
+NON_EMBED_PARAMS=881480704
+TOKENS_PER_STEP=$(( SLURM_NNODES * SLURM_GPUS_ON_NODE * BSZ * SEQ_LEN ))
+UNIT=$(( LOG_FREQ * CKPTS_PER_EVAL ))  # eval interval is a multiple of this, so rolling saves divide it
+EVAL_FREQ=$(( (EVAL_TPP * NON_EMBED_PARAMS / TOKENS_PER_STEP + UNIT / 2) / UNIT * UNIT ))
+STEPS=$(( EVAL_FREQ * TPP / EVAL_TPP ))
+DUMP_FREQ=$(( EVAL_FREQ / CKPTS_PER_EVAL ))
+WSD_DECAY_STEPS=${WSD_DECAY_STEPS:-$(( STEPS / 5 ))}
+echo "gekko4-0.9B: ${OPTIM} ${SCHEDULER}, ${STEPS} steps x ${TOKENS_PER_STEP} tokens" \
+     "(${TPP} TPP), eval+kept ckpt every ${EVAL_FREQ}, rolling ckpt every ${DUMP_FREQ}"
 
 mkdir -p "${SAVE}/restarts"
 cp "$0" "${SAVE}/run.sh"
@@ -134,12 +170,6 @@ MODEL_CFGS=(
   --model.apply_bias_term "false"
   --model.fused_block "false"
   --model.layerwise_ckpt "true"
-  --model.recompute_awk "true"
-  --model.recompute_q "true"
-  --model.recompute_v "true"
-  --model.recompute_attention "true"
-  --model.recompute_fc1_out "true"
-  --model.recompute_fc3_out "true"
   --model.recompute_logits "false"
   --model.init_mode "he"
   --model.rope_head_dim ${ROPE_DIM}
@@ -149,7 +179,8 @@ MODEL_CFGS=(
   --model.apply_rmsnorm "true"
 )
 
-# fused_block ignores residual_func, so it stays off.
+# fused_block ignores residual_func, so it stays off (and with it the fused-block
+# recompute_* options); activations are saved by layerwise_ckpt instead.
 RESIDUAL_CFGS=(
   --model.residual_func "ortho"
   --model.residual_heads 8
@@ -166,7 +197,7 @@ DATA_CFGS=(
 )
 
 TRAINING_CFGS=(
-  --steps 600000
+  --steps ${STEPS}
   --seed 42
   --dtype "bf16"
   --batch_size ${BSZ}
@@ -181,20 +212,23 @@ TRAINING_CFGS=(
 
 OPTIM_CFGS=(
   --optim.lr ${LR}
-  --optim.scheduler ${LR_SCHD}
+  --optim.scheduler ${SCHEDULER}
   --optim.lr_init_ratio 1e-4
   --optim.lr_end_ratio 0.1
   --optim.beta1 0.9
   --optim.beta2 0.95
   --optim.clip 1.0
-  --optim.warmup 3000
+  --optim.warmup ${WARMUP}
   --optim.weight_decay ${WD}
 )
+if [ "${SCHEDULER}" = "wsd" ]; then
+  OPTIM_CFGS+=(--optim.wsd_decay_duration_steps ${WSD_DECAY_STEPS} --optim.wsd_decay_style "linear")
+fi
 if [ "${OPTIM}" = "muon" ]; then
   # Muon: Column/RowParallelLinear weights in the layers; AdamW (--optim.lr) for the rest.
   OPTIM_CFGS+=(
     --optim.optimizer "muon"
-    --optim.muon_lr 0.01
+    --optim.muon_lr ${MUON_LR}
     --optim.muon_momentum 0.95
     --optim.muon_per_head ${MUON_PER_HEAD}
     --dcp_for_optimizer "true"
@@ -213,11 +247,11 @@ VALID_CFGS=(
 )
 
 LOGGING_CFGS=(
-  --log_freq 10
-  --dump_freq 500
-  --eval_freq 5000
+  --log_freq ${LOG_FREQ}
+  --dump_freq ${DUMP_FREQ}
+  --eval_freq ${EVAL_FREQ}
   --keep_eval_checkpoints "true"
-  --keep_n_last_checkpoints 10
+  --keep_n_last_checkpoints 2
   --log_wandb "true"
   --wandb_project ${WANDB_PROJECT}
   --wandb_entity ${WANDB_TEAM}
