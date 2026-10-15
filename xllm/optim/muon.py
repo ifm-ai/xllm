@@ -31,9 +31,7 @@ from torch.distributed.device_mesh import DeviceMesh
 from torch.optim import Optimizer
 
 from xllm.config import OptimConf
-from xllm.modules.gated_delta_attention import GatedDeltaAttention
 from xllm.modules.model_parallel.layers import ColumnParallelLinear, RowParallelLinear
-from xllm.modules.multihead_attention import MultiheadAttention
 
 
 logger = getLogger()
@@ -86,19 +84,14 @@ def split_muon_params(model: nn.Module, per_head: bool):
     (embedding, output layer, norms, biases, convolutions) goes to AdamW.
 
     Returns the Muon params, one BlockSpec per Muon param, and the AdamW params.
-    With per_head, the attention projections are cut into heads: rows of wq / wk / wv / wr,
-    columns of wo.
+    With per_head, modules that define `muon_blocks()` (the attention layers) say how
+    their projections are cut into heads; all other matrices stay whole.
     """
     heads = {}
     if per_head:
-        for attn in model.layers.modules():
-            if isinstance(attn, (GatedDeltaAttention, MultiheadAttention)):
-                v_dim = getattr(attn, "v_head_dim", attn.head_dim)
-                for name, dim, size in (("wq", 0, attn.head_dim), ("wk", 0, attn.head_dim),
-                                        ("wv", 0, v_dim), ("wr", 0, v_dim), ("wo", 1, v_dim)):
-                    linear = getattr(attn, name, None)
-                    if linear is not None:
-                        heads[id(linear.weight)] = (dim, size)
+        for module in model.layers.modules():
+            if hasattr(module, "muon_blocks"):
+                heads.update((id(weight), spec) for weight, spec in module.muon_blocks())
 
     muon = [
         m.weight for m in model.layers.modules()

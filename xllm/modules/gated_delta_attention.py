@@ -323,6 +323,18 @@ class GatedDeltaAttention(nn.Module):
         lnt = lnt.view(bsz, n_kv_heads, kdim)
         return prev_mean, prev_var, conv_q, conv_k, conv_v, prev_sk, prev_aqk, prev_akk, prev_v, mem, lnt
 
+    def muon_blocks(self):
+        """Per-head Muon blocks as (weight, (dim, size)): row heads of wq / wk / wv / wr,
+        column heads of wo. A q head is nq * head_dim rows (both softdelta queries)."""
+        q_rows = self.wq.weight.shape[0] // self.num_heads
+        return [
+            (self.wq.weight, (0, q_rows)),
+            (self.wk.weight, (0, self.head_dim)),
+            (self.wv.weight, (0, self.v_head_dim)),
+            (self.wr.weight, (0, self.v_head_dim)),
+            (self.wo.weight, (1, self.v_head_dim)),
+        ]
+
     def forward(
         self,
         x: Tensor,
