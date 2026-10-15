@@ -100,7 +100,7 @@ def main():
         specs = [spec if per_head else None for _, spec in MATRICES]
         full, vecs, grads, params = make(mesh, seed=0)
         got = run_sharded(Muon, mesh, params[:n], [g[:n] for g in grads], muon_params=params[:n],
-                          block_sizes=specs, adamw_params=[], mesh=mesh, cfg=cfg)
+                          block_specs=specs, adamw_params=[], mesh=mesh, cfg=cfg)
         want = dense_muon([x.clone() for x in full], specs, [g[:n] for g in grads], cfg)
         check(f"muon per_head={per_head} nesterov={cfg.muon_nesterov} adjust={cfg.muon_adjust_lr} "
               f"vs dense reference", got, want, full, 3e-2)
@@ -113,7 +113,7 @@ def main():
             assert err > 0.3, "per-head blocks are indistinguishable from whole matrices"
 
     full, vecs, grads, params = make(mesh, seed=0)
-    got = run_sharded(Muon, mesh, params, grads, muon_params=params[:n], block_sizes=[None] * n,
+    got = run_sharded(Muon, mesh, params, grads, muon_params=params[:n], block_specs=[None] * n,
                       adamw_params=params[n:], mesh=mesh, cfg=CFG_ADAMW)
     ref = [nn.Parameter(v.clone()) for v in vecs]
     adamw = torch.optim.AdamW(ref, lr=CFG_ADAMW.lr, betas=(CFG_ADAMW.beta1, CFG_ADAMW.beta2),
@@ -131,7 +131,7 @@ def main():
     if DionMuon is not None:
         full, vecs, grads, params = make(mesh, seed=1)
         got = run_sharded(Muon, mesh, params[:n], [g[:n] for g in grads], muon_params=params[:n],
-                          block_sizes=[None] * n, adamw_params=[], mesh=mesh, cfg=CFG)
+                          block_specs=[None] * n, adamw_params=[], mesh=mesh, cfg=CFG)
         _, _, _, dparams = make(mesh, seed=1)
         want = run_sharded(
             lambda **kw: DionMuon(**kw), mesh, dparams[:n], [g[:n] for g in grads],
