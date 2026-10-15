@@ -286,6 +286,7 @@ def main(cfg: TrainerConf):
         enable_weight_norms=cfg.health_weight_norms,
         enable_gradient_norms=cfg.health_gradient_norms,
         enable_logits_stats=cfg.health_logits_stats,
+        enable_gekko_stats=cfg.health_gekko_stats,
     )
 
     model.train()

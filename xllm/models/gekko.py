@@ -20,6 +20,7 @@ from xllm.modules.model_parallel import (
     vocab_parallel_cross_entropy,
 )
 from xllm.config import ModelConf
+from xllm.health_metrics import get_active_health_collector
 from xllm.distributed import (
     get_context_parallel_world_size,
     get_context_parallel_rank,
@@ -190,7 +191,8 @@ class GekkoBlock(nn.Module):
                 self.recompute_sca,
                 self.recompute_awk,
                 self.recompute_fc1_out,
-                self.recompute_fc3_out
+                self.recompute_fc3_out,
+                self.layer_id,
             )
 
         y, cache = self.gda(
@@ -422,6 +424,7 @@ class Gekko(XLLModel):
         freq_cis = None if self.rope is None else self.rope.get_freqs_cis(start, end, x.device)
 
         aux_loss_sum = None
+        health_collector = get_active_health_collector()
         for i, layer in enumerate(self.layers):
             layer_cache = cache_layers[i] if cache is not None else None
             if self.layerwise_ckpt:
@@ -435,6 +438,9 @@ class Gekko(XLLModel):
                     x, freq_cis, bos_mask, segment_idx, prev_segment_count,
                     moe_router_load_balancing_type, fp32_attn_output, deterministic, layer_cache
                 )
+
+            if health_collector is not None:
+                health_collector.record_activation(i, x)
 
             if aux_loss is not None:
                 aux_loss_sum = aux_loss if aux_loss_sum is None else aux_loss_sum + aux_loss

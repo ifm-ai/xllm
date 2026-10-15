@@ -46,6 +46,7 @@ class AdaptiveWorkingMemory(nn.Module):
         prev_v: Optional[Tensor],  # B x K x C x V
         segment_idx: Optional[Tensor] = None,  # B x L(+C)
         prev_segment_count: Optional[Tensor] = None,  # B
+        health_layer_id: Optional[int] = None,
     ):
         bsz, seq_len, _ = xq.shape
 
@@ -62,7 +63,8 @@ class AdaptiveWorkingMemory(nn.Module):
         if seq_len >= self.chunk_size:
             out, mask, memory, log_norm_term = adaptive_working_memory(
                 xq, xqk, xkk, xv, self.chunk_size, memory, log_norm_term, prev_qk, prev_kk, prev_v,
-                segment_idx, prev_segment_count, self.ortho, self.eps
+                segment_idx, prev_segment_count, self.ortho, self.eps,
+                health_layer_id=health_layer_id,
             )
             prev_qk = xqk[:, :, seq_len - self.chunk_size:]
             prev_kk = xkk[:, :, seq_len - self.chunk_size:]

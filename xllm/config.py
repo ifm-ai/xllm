@@ -339,6 +339,7 @@ class TrainerConf(Config):
     health_weight_norms: bool = False
     health_gradient_norms: bool = False
     health_logits_stats: bool = False
+    health_gekko_stats: bool = False
 
     # Training hyperparameters
     batch_size: Optional[int] = None  # Num of sequences per DP rank per step. Set either this or global_batch_size.
@@ -432,15 +433,24 @@ class TrainerConf(Config):
         assert self.eval_freq < 0 or (self.eval_freq % self.log_freq == 0)
         if self.health_metrics:
             assert self.health_log_freq > 0
-            assert self.model.arch == "transformer", "Health metrics currently require model.arch=transformer"
+            assert self.model.arch in ("transformer", "gekko"), "Health metrics require Transformer or Gekko"
+            if self.model.arch == "gekko":
+                assert self.model.attn_act_func == "softmax", "Gekko health metrics currently require softmax attention"
+                assert self.model.num_experts == 0 and self.model.num_values == 0, "Gekko health metrics currently require dense layers"
+        if self.health_gekko_stats:
+            assert self.health_metrics, "Gekko statistics require health_metrics=true"
+            assert self.model.arch == "gekko", "Gekko statistics require model.arch=gekko"
         if self.health_query_key_stats:
             assert self.health_metrics, "Query/key statistics require health_metrics=true"
         if self.health_logits_stats:
             assert self.health_metrics, "Logit statistics require health_metrics=true"
         if self.health_weight_norms or self.health_gradient_norms:
             assert self.health_metrics, "Matrix norms require health_metrics=true"
-            assert self.model.num_experts == 0, "Matrix norms currently require a dense Transformer"
-            assert self.model.swiglu, "Seven-matrix norms require SwiGLU"
+            # Dense Gekko is enforced by the health_metrics gate above.
+            assert self.model.num_experts == 0 and self.model.arch in ("transformer", "gekko"), (
+                "Matrix norms currently require a dense Transformer or Gekko"
+            )
+            assert self.model.swiglu, "Matrix norms require SwiGLU"
 
         # async eval
         if self.async_eval_ngpus > 0:
