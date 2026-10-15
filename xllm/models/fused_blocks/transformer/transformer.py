@@ -485,9 +485,23 @@ class TransformerOutputLayerFunction(torch.autograd.Function):
                 final_norm_b, _ = all_gather(final_norm_b, parallel_region='model', async_op=False)
 
         mx, _, _ = layer_or_rmsnorm_fwd(x, final_norm_w, final_norm_b, norm_local_groups, layernorm_eps, rmsnorm_eps, apply_rmsnorm)
-        loss, grad_mx, grad_wo = fused_linear_cross_entropy_fwd(
-            mx, wo, y, mask, compute_grad=(not recompute_logits), gather_input=(not gather_before_norm)
+        collector = get_active_health_collector()
+        output = fused_linear_cross_entropy_fwd(
+            mx, wo, y, mask, compute_grad=(not recompute_logits),
+            gather_input=(not gather_before_norm),
+            collect_logits_stats=(
+                collector is not None and collector.enable_logits_stats
+            ),
         )
+        if output.logits_stats is not None:
+            assert collector is not None
+            collector.record_logits_stats(
+                output.logits_stats.sum,
+                output.logits_stats.count,
+                output.logits_stats.minimum,
+                output.logits_stats.maximum,
+            )
+        loss, grad_mx, grad_wo = output.loss, output.grad_input, output.grad_weight
 
         ctx.save_for_backward(
             x,  # (bsz, slen, d/MP)

@@ -100,6 +100,7 @@ class HealthMetricCollector:
         enable_query_key_stats: bool = False,
         enable_weight_norms: bool = False,
         enable_gradient_norms: bool = False,
+        enable_logits_stats: bool = False,
     ):
         self.enabled = enabled
         self.freq = freq
@@ -107,11 +108,15 @@ class HealthMetricCollector:
         self.enable_query_key_stats = enable_query_key_stats
         self.enable_weight_norms = enable_weight_norms
         self.enable_gradient_norms = enable_gradient_norms
+        self.enable_logits_stats = enable_logits_stats
         self.step: Optional[int] = None
         self.recording = False
         self.decoder_layer_activation_records: Dict[int, _LocalStats] = {}
         self.query_key_stats_records: Dict[int, Dict[str, _LocalStats]] = {}
         self.matrix_squared_l2_records: Dict[str, torch.Tensor] = {}
+        self.logits_stats_record: Optional[Tuple[
+            torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor,
+        ]] = None
 
     def begin_step(self, step: int) -> None:
         global _ACTIVE_COLLECTOR
@@ -119,6 +124,7 @@ class HealthMetricCollector:
         self.decoder_layer_activation_records = {}
         self.query_key_stats_records = {}
         self.matrix_squared_l2_records = {}
+        self.logits_stats_record = None
         self.recording = self.enabled and step % self.freq == 0
         _ACTIVE_COLLECTOR = self if self.recording else None
 
@@ -223,6 +229,29 @@ class HealthMetricCollector:
                 f"Expected {expected_records} matrix norm records, "
                 f"found {len(self.matrix_squared_l2_records)}"
             )
+
+    @torch.no_grad()
+    def record_logits_stats(
+        self,
+        logits_sum: torch.Tensor,
+        logits_count: torch.Tensor,
+        logits_minimum: torch.Tensor,
+        logits_maximum: torch.Tensor,
+    ) -> None:
+        if not self.recording or not self.enable_logits_stats:
+            return
+        if self.logits_stats_record is not None:
+            raise RuntimeError("Duplicate logit statistics")
+        if any(value.numel() != 1 for value in (
+            logits_sum, logits_count, logits_minimum, logits_maximum,
+        )):
+            raise RuntimeError("Logit statistics must be scalars")
+        self.logits_stats_record = (
+            logits_sum.detach().float(),
+            logits_count.detach().double(),
+            logits_minimum.detach().float(),
+            logits_maximum.detach().float(),
+        )
 
     @torch.no_grad()
     def record_matrix_norms(self, model: Any, gradient_scale: float = 1.0) -> None:
@@ -350,6 +379,8 @@ class HealthMetricCollector:
                 f"Expected {self.num_layers} query/key records at step {self.step}, "
                 f"got layers {sorted(self.query_key_stats_records)} at step {step}"
             )
+        if self.enable_logits_stats and self.logits_stats_record is None:
+            raise RuntimeError(f"Missing logit statistics at step {step}")
         num_enabled_norms = (
             int(self.enable_weight_norms) + int(self.enable_gradient_norms)
         )
@@ -394,6 +425,16 @@ class HealthMetricCollector:
             dtype=torch.float64,
             device=sums.device,
         )
+        logits_index = None
+        logits_extrema = None
+        if self.logits_stats_record is not None:
+            logits_index = len(entries)
+            logits_sum, logits_count, logits_minimum, logits_maximum = (
+                self.logits_stats_record
+            )
+            sums = torch.cat((sums, logits_sum.reshape(1).double()))
+            counts = torch.cat((counts, logits_count.reshape(1)))
+            logits_extrema = logits_minimum, logits_maximum
         matrix_metric_names = sorted(self.matrix_squared_l2_records)
         matrix_squared_l2_start = sums.numel()
         if matrix_metric_names:
@@ -405,9 +446,14 @@ class HealthMetricCollector:
         sum_packet = torch.cat((sums, counts))
         mins = _pack_extrema([stats[1] for _, _, stats in entries])
         maxs = _pack_extrema([stats[2] for _, _, stats in entries])
+        if logits_extrema is not None:
+            logits_minimum, logits_maximum = logits_extrema
+            mins = torch.cat((mins, logits_minimum.reshape(1)))
+            maxs = torch.cat((maxs, logits_maximum.reshape(1)))
         self.decoder_layer_activation_records = {}
         self.query_key_stats_records = {}
         self.matrix_squared_l2_records = {}
+        self.logits_stats_record = None
 
         if dist.is_available() and dist.is_initialized():
             dist.reduce(sum_packet, dst=0, op=dist.ReduceOp.SUM)
@@ -420,12 +466,24 @@ class HealthMetricCollector:
         reduced_counts = sum_packet[num_sum_values:]
         num_stat_entries = len(entries)
         means = reduced_sums[:num_stat_entries] / reduced_counts[:num_stat_entries]
-        values = torch.stack((means.float(), mins, maxs), dim=1).cpu().tolist()
+        values = torch.stack((
+            means.float(), mins[:num_stat_entries], maxs[:num_stat_entries],
+        ), dim=1).cpu().tolist()
         metrics = {}
         for (prefix, names, _), stats in zip(entries, values):
             metrics.update({
                 f"{prefix}/{name}": value for name, value in zip(names, stats)
             })
+        if logits_index is not None:
+            logit_sum, logit_count, logit_minimum, logit_maximum = torch.stack((
+                reduced_sums[logits_index], reduced_counts[logits_index],
+                mins[logits_index], maxs[logits_index],
+            )).cpu().tolist()
+            if logit_count <= 0:
+                raise RuntimeError(f"No valid logits at step {step}")
+            metrics["logits_stats/mean"] = logit_sum / logit_count
+            metrics["logits_stats/min"] = logit_minimum
+            metrics["logits_stats/max"] = logit_maximum
         if matrix_metric_names:
             matrix_norm_values = (
                 reduced_sums[matrix_squared_l2_start:]

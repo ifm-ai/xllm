@@ -285,6 +285,7 @@ def main(cfg: TrainerConf):
         enable_query_key_stats=cfg.health_query_key_stats,
         enable_weight_norms=cfg.health_weight_norms,
         enable_gradient_norms=cfg.health_gradient_norms,
+        enable_logits_stats=cfg.health_logits_stats,
     )
 
     model.train()

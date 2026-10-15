@@ -154,6 +154,45 @@ def test_query_key_coordinate_and_vector_stats():
     assert metrics["k_stats/layer_000/vector_l2_max"] == 5.0
 
 
+def test_logit_stats_share_existing_reductions():
+    collector = health_metrics.HealthMetricCollector(
+        enabled=True, freq=1, num_layers=1, enable_logits_stats=True
+    )
+    logger = RecordingLogger()
+    collector.begin_step(1)
+    collector.record_activation(0, torch.tensor([1.0]))
+    collector.record_logits_stats(
+        torch.tensor(4.0), torch.tensor(2), torch.tensor(-2.0), torch.tensor(5.0)
+    )
+    collector.end_forward()
+    reductions = []
+
+    def reduce(tensor, dst, op):
+        assert dst == 0
+        reductions.append(op)
+        if op == torch.distributed.ReduceOp.SUM:
+            tensor[1] += 8.0
+            tensor[3] += 2.0
+        elif op == torch.distributed.ReduceOp.MIN:
+            tensor[-1] = -7.0
+        elif op == torch.distributed.ReduceOp.MAX:
+            tensor[-1] = 9.0
+
+    with patch.object(health_metrics.dist, "is_initialized", return_value=True), \
+         patch.object(health_metrics.dist, "get_rank", return_value=0), \
+         patch.object(health_metrics.dist, "reduce", side_effect=reduce):
+        collector.flush(logger, 1)
+
+    assert reductions == [
+        torch.distributed.ReduceOp.SUM,
+        torch.distributed.ReduceOp.MIN,
+        torch.distributed.ReduceOp.MAX,
+    ]
+    assert logger.calls[0][0]["logits_stats/mean"] == 3.0
+    assert logger.calls[0][0]["logits_stats/min"] == -7.0
+    assert logger.calls[0][0]["logits_stats/max"] == 9.0
+
+
 def test_weight_norms_reconstruct_all_seven_matrices():
     collector = health_metrics.HealthMetricCollector(
         enabled=True, freq=1, num_layers=1, enable_weight_norms=True
@@ -421,13 +460,14 @@ def test_weight_norms_share_existing_sum_reduction():
     ]) == 7
 
 
-def test_weight_and_gradient_norms_share_existing_sum_reduction():
+def test_logit_and_matrix_norms_share_existing_sum_reduction():
     collector = health_metrics.HealthMetricCollector(
         enabled=True,
         freq=1,
         num_layers=1,
         enable_weight_norms=True,
         enable_gradient_norms=True,
+        enable_logits_stats=True,
     )
     logger = RecordingLogger()
     collector.begin_step(1)
@@ -435,12 +475,17 @@ def test_weight_and_gradient_norms_share_existing_sum_reduction():
     collector.record_matrix_norms(make_fsdp1_model(
         [1.0] * 7, gradient_values=[2.0] * 7
     ), gradient_scale=2.0)
+    collector.record_logits_stats(
+        torch.tensor(6.0), torch.tensor(2), torch.tensor(-1.0), torch.tensor(4.0)
+    )
     collector.end_forward()
     reductions = []
 
     def reduce(tensor, dst, op):
         assert dst == 0
         reductions.append(op)
+        if op == torch.distributed.ReduceOp.SUM:
+            assert tensor.numel() == 18  # Two sums/counts and fourteen squared norms.
 
     with patch.object(health_metrics.dist, "is_initialized", return_value=True), \
          patch.object(health_metrics.dist, "get_rank", return_value=0), \
@@ -458,6 +503,9 @@ def test_weight_and_gradient_norms_share_existing_sum_reduction():
     assert len([
         key for key in logger.calls[0][0] if key.startswith("gradient_norms/")
     ]) == 7
+    assert logger.calls[0][0]["logits_stats/mean"] == 3.0
+    assert logger.calls[0][0]["logits_stats/min"] == -1.0
+    assert logger.calls[0][0]["logits_stats/max"] == 4.0
     assert logger.calls[0][0]["weight_norms/layer_000/attention/q_proj/l2"] == 1.0
     assert logger.calls[0][0]["gradient_norms/layer_000/attention/q_proj/l2"] == 1.0
 

@@ -1116,7 +1116,10 @@ class GekkoOutputLayerFunction(torch.autograd.Function):
             handle1 = None
             handle2 = None
 
-        loss, grad_tsn, grad_wo = fused_linear_cross_entropy_fwd(out_tsn, wo, y, mask, compute_grad=(not recompute_logits))
+        output = fused_linear_cross_entropy_fwd(
+            out_tsn, wo, y, mask, compute_grad=(not recompute_logits)
+        )
+        loss, grad_tsn, grad_wo = output.loss, output.grad_input, output.grad_weight
 
         if send_to_next:
             handle1.wait()
