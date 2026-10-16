@@ -157,6 +157,21 @@ When changing these values, keep the constraints checked in
 - With `keep_eval_checkpoints true` (the default), a positive `eval_freq` must
   also be divisible by `dump_freq`.
 
+## Hybrid Gekko
+
+Set `--model.arch gekko --model.full_attention_interval 4` to use
+`full, Gekko, Gekko, Gekko, ...`, starting with full attention.
+The default interval `0` preserves pure Gekko.
+The implementation reuses the existing Transformer/Gekko blocks and uses the
+Transformer output norm for hybrid models; no optimizer changes are required.
+
+For xattn, set both `--model.causal_attn_backend xattn` and
+`--model.sca_backend xattn`. Regular and fused blocks are supported.
+Head dimensions and RoPE settings are shared; full-attention layers require
+`v_head_dim=head_dim`. This initial version supports dense FFNs only.
+Unpacked generation dispatches the cache per layer; packed generation with a
+cache is not supported. Changing the layer pattern requires checkpoint conversion.
+
 ## Checkpoint Conversion & Serving
 Conversion and serving checkpoints of xLLM is supported by [xBridges](https://github.com/ifm-ai/xbridges).
 
