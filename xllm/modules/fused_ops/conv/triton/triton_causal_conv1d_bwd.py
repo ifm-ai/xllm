@@ -915,7 +915,14 @@ def _direct_path_supported(
     ):
         return False
 
-    tensors = (x, weight, bias, dout, dfinal_states)
+    # Normalized weights need FP32 gradients until after softmax backward.
+    if (
+        weight.device != x.device
+        or weight.dtype not in (torch.bfloat16, torch.float32)
+        or not weight.is_contiguous()
+    ):
+        return False
+    tensors = (x, bias, dout, dfinal_states)
     if initial_states is not None:
         tensors = (*tensors, initial_states)
     return all(
