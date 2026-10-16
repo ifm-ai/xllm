@@ -1,4 +1,5 @@
 import math
+from logging import getLogger
 from typing import Any, Dict, Optional, Tuple, TYPE_CHECKING
 
 import torch
@@ -8,6 +9,7 @@ from torch.distributed.tensor import DTensor, Replicate, Shard
 if TYPE_CHECKING:
     from xllm.metrics import MetricLogger
 
+logger = getLogger()
 
 _ACTIVE_COLLECTOR: Optional["HealthMetricCollector"] = None
 _LocalStats = Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]
@@ -477,33 +479,71 @@ class HealthMetricCollector:
             )
         self._check_matrix_norm_records(num_matrices)
 
+    def _clear_records(self) -> None:
+        self.decoder_layer_activation_records = {}
+        self.query_key_stats_records = {}
+        self.gekko_stats_records = {}
+        self.matrix_squared_l2_records = {}
+        self.expected_matrix_norm_records = None
+        self.logits_stats_record = None
+
     def flush(self, mlogger: "MetricLogger", step: int) -> None:
         if not self.recording:
             return
 
         self.recording = False
         layers = list(range(self.num_layers))
+        problems = []
         if step != self.step or sorted(self.decoder_layer_activation_records) != layers:
-            raise RuntimeError(
+            problems.append(
                 f"Expected {self.num_layers} activation records at step {self.step}, "
                 f"got layers {sorted(self.decoder_layer_activation_records)} at step {step}"
             )
         if self.enable_query_key_stats and sorted(self.query_key_stats_records) != layers:
-            raise RuntimeError(
+            problems.append(
                 f"Expected {self.num_layers} query/key records at step {self.step}, "
                 f"got layers {sorted(self.query_key_stats_records)} at step {step}"
             )
         if self.enable_logits_stats and self.logits_stats_record is None:
-            raise RuntimeError(f"Missing logit statistics at step {step}")
+            problems.append(f"Missing logit statistics at step {step}")
         if (self.enable_weight_norms or self.enable_gradient_norms) and (
             self.expected_matrix_norm_records is None
             or len(self.matrix_squared_l2_records) != self.expected_matrix_norm_records
         ):
-            raise RuntimeError(
+            problems.append(
                 f"Expected {self.expected_matrix_norm_records} matrix norm records "
                 f"at step {self.step}, "
                 f"got {len(self.matrix_squared_l2_records)} records at step {step}"
             )
+        if self.enable_gekko_stats:
+            if sorted(self.gekko_stats_records) != layers:
+                problems.append(f"Missing Gekko statistics at step {step}")
+            else:
+                problems.extend(
+                    f"Missing Gekko branch statistics for layer {layer_idx}"
+                    for layer_idx in layers
+                    if "output_gate" not in self.gekko_stats_records[layer_idx]
+                )
+
+        # Every rank must skip together, or the reductions below would hang.
+        skip_step = bool(problems)
+        if dist.is_available() and dist.is_initialized():
+            device = (
+                torch.device("cuda", torch.cuda.current_device())
+                if torch.cuda.is_available() else torch.device("cpu")
+            )
+            invalid = torch.tensor([float(skip_step)], device=device)
+            dist.all_reduce(invalid, op=dist.ReduceOp.MAX)
+            skip_step = invalid.item() > 0
+        if skip_step:
+            for problem in problems:
+                logger.warning(f"Skipping health metrics: {problem}")
+            if not problems:
+                logger.warning(
+                    f"Skipping health metrics at step {step}: another rank reported a problem"
+                )
+            self._clear_records()
+            return
 
         entries = []
         for layer_idx in layers:
@@ -528,12 +568,8 @@ class HealthMetricCollector:
                     ))
 
         if self.enable_gekko_stats:
-            if sorted(self.gekko_stats_records) != layers:
-                raise RuntimeError(f"Missing Gekko statistics at step {step}")
             for layer_idx in layers:
                 layer_stats = self.gekko_stats_records[layer_idx]
-                if "output_gate" not in layer_stats:
-                    raise RuntimeError(f"Missing Gekko branch statistics for layer {layer_idx}")
                 for name, stats in layer_stats.items():
                     entries.append((
                         f"gekko_stats/layer_{layer_idx:03d}/{name}",
@@ -571,12 +607,7 @@ class HealthMetricCollector:
             logits_minimum, logits_maximum = logits_extrema
             mins = torch.cat((mins, logits_minimum.reshape(1)))
             maxs = torch.cat((maxs, logits_maximum.reshape(1)))
-        self.decoder_layer_activation_records = {}
-        self.query_key_stats_records = {}
-        self.gekko_stats_records = {}
-        self.matrix_squared_l2_records = {}
-        self.expected_matrix_norm_records = None
-        self.logits_stats_record = None
+        self._clear_records()
 
         if dist.is_available() and dist.is_initialized():
             dist.reduce(sum_packet, dst=0, op=dist.ReduceOp.SUM)
@@ -633,7 +664,9 @@ class HealthMetricCollector:
                 mins[logits_index], maxs[logits_index],
             )).cpu().tolist()
             if logit_count <= 0:
-                raise RuntimeError(f"No valid logits at step {step}")
+                logger.warning(f"No valid logits at step {step}; logging NaN logit statistics")
+                logit_sum = logit_minimum = logit_maximum = float("nan")
+                logit_count = 1.0
             metrics["logits_stats/mean"] = logit_sum / logit_count
             metrics["logits_stats/min"] = logit_minimum
             metrics["logits_stats/max"] = logit_maximum

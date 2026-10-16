@@ -179,6 +179,7 @@ def test_logit_stats_share_existing_reductions():
             tensor[-1] = 9.0
 
     with patch.object(health_metrics.dist, "is_initialized", return_value=True), \
+         patch.object(health_metrics.dist, "all_reduce"), \
          patch.object(health_metrics.dist, "get_rank", return_value=0), \
          patch.object(health_metrics.dist, "reduce", side_effect=reduce):
         collector.flush(logger, 1)
@@ -446,6 +447,7 @@ def test_weight_norms_share_existing_sum_reduction():
             assert tensor.numel() == 9  # Activation sum/count and seven squared norms.
 
     with patch.object(health_metrics.dist, "is_initialized", return_value=True), \
+         patch.object(health_metrics.dist, "all_reduce"), \
          patch.object(health_metrics.dist, "get_rank", return_value=0), \
          patch.object(health_metrics.dist, "reduce", side_effect=reduce):
         collector.flush(logger, 1)
@@ -488,6 +490,7 @@ def test_logit_and_matrix_norms_share_existing_sum_reduction():
             assert tensor.numel() == 18  # Two sums/counts and fourteen squared norms.
 
     with patch.object(health_metrics.dist, "is_initialized", return_value=True), \
+         patch.object(health_metrics.dist, "all_reduce"), \
          patch.object(health_metrics.dist, "get_rank", return_value=0), \
          patch.object(health_metrics.dist, "reduce", side_effect=reduce):
         collector.flush(logger, 1)
@@ -535,6 +538,7 @@ def test_health_stats_use_three_packed_reductions():
             tensor.copy_(torch.maximum(tensor, torch.tensor([9.0])))
 
     with patch.object(health_metrics.dist, "is_initialized", return_value=True), \
+         patch.object(health_metrics.dist, "all_reduce"), \
          patch.object(health_metrics.dist, "get_rank", return_value=0), \
          patch.object(health_metrics.dist, "reduce", side_effect=reduce):
         collector.flush(logger, 1)
