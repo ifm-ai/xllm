@@ -17,7 +17,8 @@ from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor import Shard, distribute_tensor
 
 from xllm.config import OptimConf
-from xllm.optim.muon import Muon, newton_schulz5
+from xllm.distributed.wrap import enable_wrap, wrap
+from xllm.optim.muon import Muon, newton_schulz5, split_muon_params
 
 # (shape, block spec): None = whole matrix, (0, n) = row heads, (1, n) = column heads
 MATRICES = [
@@ -96,6 +97,32 @@ def check(name, got, want, init, tol):
     assert err < tol, name
 
 
+def check_marks(mesh):
+    """`muon` marks on layers survive fully_shard and .cuda() and decide the Muon / AdamW split."""
+    class Layer(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.wq = nn.Linear(64, 128, bias=False)
+            self.wo = nn.Linear(128, 64, bias=False)
+            self.fc = nn.Linear(64, 64)
+            self.wq.muon, self.wo.muon, self.fc.muon = (0, 32), (1, 32), True
+
+    # same as models/build.py: each layer wrapped, then .cuda() (swaps the DTensor params), then the root
+    with enable_wrap(mesh=mesh):
+        model = wrap(nn.Sequential(wrap(Layer().cuda()), nn.Linear(64, 8)).cuda())
+    for per_head, per_head_out, want in ((False, False, [None, None, None]),
+                                         (True, False, [(0, 32), None, None]),
+                                         (True, True, [(0, 32), (1, 32), None])):
+        muon, specs, adamw = split_muon_params(model, per_head, per_head_out)
+        layer = model[0]
+        assert muon == [layer.wq.weight, layer.wo.weight, layer.fc.weight], "wrong Muon params"
+        assert all(hasattr(p, "to_local") for p in muon), "Muon params are not the sharded ones"
+        assert specs == want, (per_head, per_head_out, specs)
+        assert len(adamw) == 3  # fc.bias, unmarked Linear weight and bias
+    if dist.get_rank() == 0:
+        print("muon marks survive fully_shard and .cuda() and split params as expected")
+
+
 def main():
     torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
     dist.init_process_group("nccl")
@@ -156,6 +183,8 @@ def main():
             epsilon=CFG.epsilon, adjust_lr="spectral_norm", use_polar_express=False,
         )
         check("muon whole-matrix vs dion.Muon", got, want, full, 3e-2)
+
+    check_marks(mesh)
 
     if dist.get_rank() == 0:
         print("MUON_TEST_OK")
