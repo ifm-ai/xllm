@@ -12,10 +12,10 @@
   (embedding, output layer, norms, biases, convolutions) uses AdamW with `--optim.lr`.
   Both groups follow the same LR schedule and `--optim.weight_decay`. The attention
   layers and the FFN mark their projections.
-- **Blocks.** `n` is the number of equal row groups the matrix is cut into, each
-  orthogonalized on its own: 1 = whole matrix, the number of heads = one group per head,
-  in between = groups of adjacent heads. Attention marks `wq` / `wr` with its heads and
-  `wk` / `wv` with its KV heads; `wo` and the FFN are 1. The groups are used only with
+- **Blocks.** `n` is the number of equal row blocks the matrix is cut into, each
+  orthogonalized on its own: 1 = whole matrix, the number of heads = one block per head,
+  in between = blocks of adjacent heads. Attention marks `wq` / `wr` with its heads and
+  `wk` / `wv` with its KV heads; `wo` and the FFN are 1. The blocks are used only with
   `--optim.muon_per_head true`; otherwise every matrix is one block.
 - **Mesh.** `train.py` builds the FSDP mesh once (`build_fsdp_mesh`) and passes the same
   mesh to `fully_shard` and to the optimizer. Muon works over the shard dimension.

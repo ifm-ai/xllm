@@ -197,7 +197,7 @@ class MultiheadAttention(nn.Module):
             num_features=self.n_heads * self.head_dim, eps=rmsnorm_eps, init_std=init_std
         )
 
-        # Muon row groups (xllm/optim/muon.py): one per head (a q head holds both softdelta queries)
+        # Muon row blocks (xllm/optim/muon.py): one per head (a q head holds both softdelta queries)
         self.wq.muon = self.local_heads
         self.wk.muon = self.wv.muon = self.local_kv_heads
         self.wo.muon = 1
