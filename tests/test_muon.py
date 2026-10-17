@@ -20,7 +20,7 @@ from xllm.config import OptimConf
 from xllm.distributed.wrap import enable_wrap, wrap
 from xllm.optim.muon import Muon, newton_schulz5, split_muon_params
 
-# (shape, row blocks with per-head): 1 = whole matrix
+# (shape, row blocks from the mark): 1 = whole matrix
 MATRICES = [
     ((2048, 1536), 8),  # wq, one block per head
     ((1024, 1536), 2),  # wk, blocks of 2 heads
@@ -33,8 +33,8 @@ MATRICES = [
 # no weight decay in the Muon checks: the comparison is on the orthogonalized update only
 CFG = OptimConf(optimizer="muon", lr=1e-3, muon_lr=0.02, muon_momentum=0.95, weight_decay=0.0,
                 beta1=0.9, beta2=0.95, epsilon=1e-8)
-CFG_NESTEROV_RMS = OptimConf(optimizer="muon", lr=1e-3, muon_lr=0.02, muon_momentum=0.95, weight_decay=0.0,
-                             beta1=0.9, beta2=0.95, epsilon=1e-8, muon_nesterov=True, muon_adjust_lr="rms_norm")
+CFG_PLAIN_RMS = OptimConf(optimizer="muon", lr=1e-3, muon_lr=0.02, muon_momentum=0.95, weight_decay=0.0,
+                          beta1=0.9, beta2=0.95, epsilon=1e-8, muon_nesterov=False, muon_adjust_lr="rms_norm")
 CFG_MATRIX_SCALE = OptimConf(optimizer="muon", lr=1e-3, muon_lr=0.02, muon_momentum=0.95, weight_decay=0.0,
                              beta1=0.9, beta2=0.95, epsilon=1e-8, muon_block_scale="matrix")
 CFG_ADAMW = OptimConf(optimizer="muon", lr=1e-3, muon_lr=0.02, weight_decay=0.1, beta1=0.9, beta2=0.95,
@@ -107,13 +107,12 @@ def check_marks(mesh):
     # same as models/build.py: each layer wrapped, then .cuda() (swaps the DTensor params), then the root
     with enable_wrap(mesh=mesh):
         model = wrap(nn.Sequential(wrap(Layer().cuda()), nn.Linear(64, 8)).cuda())
-    for per_head, want in ((False, [1, 1, 1]), (True, [4, 1, 1])):
-        muon, n_blocks, adamw = split_muon_params(model, per_head)
-        layer = model[0]
-        assert muon == [layer.wq.weight, layer.wo.weight, layer.fc.weight], "wrong Muon params"
-        assert all(hasattr(p, "to_local") for p in muon), "Muon params are not the sharded ones"
-        assert n_blocks == want, (per_head, n_blocks)
-        assert len(adamw) == 3  # fc.bias, unmarked Linear weight and bias
+    muon, n_blocks, adamw = split_muon_params(model)
+    layer = model[0]
+    assert muon == [layer.wq.weight, layer.wo.weight, layer.fc.weight], "wrong Muon params"
+    assert all(hasattr(p, "to_local") for p in muon), "Muon params are not the sharded ones"
+    assert n_blocks == [4, 1, 1], n_blocks
+    assert len(adamw) == 3  # fc.bias, unmarked Linear weight and bias
     if dist.get_rank() == 0:
         print("muon marks survive fully_shard and .cuda() and split params as expected")
 
@@ -124,13 +123,13 @@ def main():
     mesh = init_device_mesh("cuda", (dist.get_world_size(),))
     n = len(MATRICES)
 
-    for heads, cfg in ((True, CFG), (False, CFG), (True, CFG_NESTEROV_RMS), (True, CFG_MATRIX_SCALE)):
-        n_blocks = [b if heads else 1 for _, b in MATRICES]
+    for heads, cfg in ((True, CFG), (False, CFG), (True, CFG_PLAIN_RMS), (True, CFG_MATRIX_SCALE)):
+        n_blocks = [b if heads else 1 for _, b in MATRICES]  # heads=False: every matrix one block
         full, vecs, grads, params = make(mesh, seed=0)
         got = run_sharded(Muon, mesh, params[:n], [g[:n] for g in grads], muon_params=params[:n],
                           n_blocks=n_blocks, adamw_params=[], mesh=mesh, cfg=cfg)
         want = dense_muon([x.clone() for x in full], n_blocks, [g[:n] for g in grads], cfg)
-        check(f"muon per_head={heads} scale={cfg.muon_block_scale} nesterov={cfg.muon_nesterov} "
+        check(f"muon heads={heads} scale={cfg.muon_block_scale} nesterov={cfg.muon_nesterov} "
               f"adjust={cfg.muon_adjust_lr} vs dense reference", got, want, full, 3e-2)
         if heads and cfg is CFG:
             # negative controls: per-head vs whole-matrix, and block vs matrix scale, must differ far beyond the tolerance
@@ -167,7 +166,7 @@ def main():
         want = run_sharded(
             lambda **kw: DionMuon(**kw), mesh, dparams[:n], [g[:n] for g in grads],
             params=[{"params": dparams[:n], "algorithm": "muon", "lr": CFG.muon_lr}],
-            distributed_mesh=mesh, mu=CFG.muon_momentum, weight_decay=CFG.weight_decay,
+            distributed_mesh=mesh, mu=CFG.muon_momentum, nesterov=CFG.muon_nesterov, weight_decay=CFG.weight_decay,
             epsilon=CFG.epsilon, adjust_lr="spectral_norm", use_polar_express=False,
         )
         check("muon whole-matrix vs dion.Muon", got, want, full, 3e-2)
