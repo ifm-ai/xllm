@@ -85,10 +85,9 @@ class OptimConf(Config):
     lr: float = 1e-3  # AdamW learning rate after warmup
     muon_lr: float = 0.01  # Muon learning rate after warmup (optimizer=muon)
     muon_momentum: float = 0.95
-    muon_nesterov: bool = False
+    muon_nesterov: bool = True  # Nesterov momentum (Keller Jordan Muon, Moonlight)
     muon_adjust_lr: Optional[str] = "spectral_norm"  # Muon update scaling: spectral_norm, rms_norm or None
-    muon_per_head: bool = False  # Cut Muon matrices into the row blocks their layers mark (one per head of wq/wk/wv/wr); off = whole matrices
-    muon_block_scale: str = "block"  # Update scale of a row block: block (its own shape) or matrix (its whole matrix's shape)
+    muon_block_scale: str = "block"  # Update scale of a row block (from the layers' `muon` marks): block (its own shape) or matrix (its whole matrix's shape)
     warmup: int = 2000  # Num of steps for LR warmup. 0 means no warmup
     weight_decay: float = 0.1  # Decoupled weight decay
     epsilon: float = 1e-8

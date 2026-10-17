@@ -22,7 +22,7 @@
 #
 # Variables (default):
 #   SAVE            dump dir (required)
-#   OPTIM           adamw | muon (adamw); MUON_PER_HEAD (true), MUON_LR (0.01) apply to muon
+#   OPTIM           adamw | muon (adamw); MUON_LR (0.01) applies to muon (per-head blocks come from the model)
 #   LR              AdamW LR, also for the non-matrix params under muon (2e-3)
 #   SCHEDULER       constant | cosine | wsd (constant); WARMUP steps (3000);
 #                   WSD_DECAY_STEPS (20% of the run) for wsd
@@ -35,7 +35,6 @@
 : "${SAVE:?set SAVE}"
 PYTHON=${PYTHON:-.venv/bin/python}
 OPTIM=${OPTIM:-adamw}
-MUON_PER_HEAD=${MUON_PER_HEAD:-true}
 MUON_LR=${MUON_LR:-0.01}
 LR=${LR:-2e-3}
 SCHEDULER=${SCHEDULER:-constant}
@@ -229,7 +228,6 @@ if [ "${OPTIM}" = "muon" ]; then
     --optim.optimizer "muon"
     --optim.muon_lr ${MUON_LR}
     --optim.muon_momentum 0.95
-    --optim.muon_per_head ${MUON_PER_HEAD}
     --dcp_for_optimizer "true"
   )
 fi

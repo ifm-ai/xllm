@@ -22,7 +22,7 @@
 #
 # Variables (default):
 #   SAVE            dump dir (required)
-#   OPTIM           adamw | muon (adamw); for muon: MUON_LR (0.01), MUON_PER_HEAD (true),
+#   OPTIM           adamw | muon (adamw); for muon: MUON_LR (0.01),
 #                   MUON_BLOCK_SCALE (block): scale of a q/k/v/r head block from its own shape (block)
 #                   or its whole matrix's shape (matrix); wo stays whole
 #   LR              AdamW LR, also for the non-matrix params under muon (2e-3)
@@ -37,7 +37,6 @@
 : "${SAVE:?set SAVE}"
 PYTHON=${PYTHON:-.venv/bin/python}
 OPTIM=${OPTIM:-adamw}
-MUON_PER_HEAD=${MUON_PER_HEAD:-true}
 MUON_BLOCK_SCALE=${MUON_BLOCK_SCALE:-block}
 MUON_LR=${MUON_LR:-0.01}
 LR=${LR:-2e-3}
@@ -220,7 +219,6 @@ if [ "${OPTIM}" = "muon" ]; then
     --optim.optimizer "muon"
     --optim.muon_lr ${MUON_LR}
     --optim.muon_momentum 0.95
-    --optim.muon_per_head ${MUON_PER_HEAD}
     --optim.muon_block_scale ${MUON_BLOCK_SCALE}
     --dcp_for_optimizer "true"
   )
