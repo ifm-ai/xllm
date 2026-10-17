@@ -23,9 +23,8 @@
 # Variables (default):
 #   SAVE            dump dir (required)
 #   OPTIM           adamw | muon (adamw); for muon: MUON_LR (0.01), MUON_PER_HEAD (true),
-#                   MUON_PER_HEAD_OUT (false; true also cuts wo into heads); per-head update scale, block (own
-#                   shape) | matrix (whole matrix's shape): MUON_BLOCK_SCALE for q/k/v/r heads (block),
-#                   MUON_OUT_BLOCK_SCALE for wo heads (block)
+#                   MUON_BLOCK_SCALE (block): scale of a q/k/v/r head block from its own shape (block)
+#                   or its whole matrix's shape (matrix); wo stays whole
 #   LR              AdamW LR, also for the non-matrix params under muon (2e-3)
 #   SCHEDULER       constant | cosine | wsd (constant); WARMUP steps (3000);
 #                   WSD_DECAY_STEPS (20% of the run) for wsd
@@ -39,9 +38,7 @@
 PYTHON=${PYTHON:-.venv/bin/python}
 OPTIM=${OPTIM:-adamw}
 MUON_PER_HEAD=${MUON_PER_HEAD:-true}
-MUON_PER_HEAD_OUT=${MUON_PER_HEAD_OUT:-false}
 MUON_BLOCK_SCALE=${MUON_BLOCK_SCALE:-block}
-MUON_OUT_BLOCK_SCALE=${MUON_OUT_BLOCK_SCALE:-block}
 MUON_LR=${MUON_LR:-0.01}
 LR=${LR:-2e-3}
 SCHEDULER=${SCHEDULER:-constant}
@@ -218,15 +215,13 @@ if [ "${SCHEDULER}" = "wsd" ]; then
   OPTIM_CFGS+=(--optim.wsd_decay_duration_steps ${WSD_DECAY_STEPS} --optim.wsd_decay_style "linear")
 fi
 if [ "${OPTIM}" = "muon" ]; then
-  # Muon: Column/RowParallelLinear weights in the layers; AdamW (--optim.lr) for the rest.
+  # Muon: weights of the layers marked `muon` (attention, FFN); AdamW (--optim.lr) for the rest.
   OPTIM_CFGS+=(
     --optim.optimizer "muon"
     --optim.muon_lr ${MUON_LR}
     --optim.muon_momentum 0.95
     --optim.muon_per_head ${MUON_PER_HEAD}
-    --optim.muon_per_head_out ${MUON_PER_HEAD_OUT}
     --optim.muon_block_scale ${MUON_BLOCK_SCALE}
-    --optim.muon_out_block_scale ${MUON_OUT_BLOCK_SCALE}
     --dcp_for_optimizer "true"
   )
 fi
