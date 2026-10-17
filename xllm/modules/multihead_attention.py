@@ -197,19 +197,14 @@ class MultiheadAttention(nn.Module):
             num_features=self.n_heads * self.head_dim, eps=rmsnorm_eps, init_std=init_std
         )
 
-    def muon_blocks(self):
-        """Per-head Muon blocks as (weight, (dim, size)): row heads of wq / wk / wv / wr,
-        column heads of wo. A q head is nq * head_dim rows (both softdelta queries)."""
-        q_rows = self.wq.weight.shape[0] // self.n_heads
-        blocks = [
-            (self.wq.weight, (0, q_rows)),
-            (self.wk.weight, (0, self.head_dim)),
-            (self.wv.weight, (0, self.head_dim)),
-            (self.wo.weight, (1, self.head_dim)),
-        ]
+        # Muon (xllm/optim/muon.py): a q head is nq * head_dim rows (both softdelta queries)
+        self.wq.muon = (0, nq * self.head_dim)
+        self.wk.muon = self.wv.muon = (0, self.head_dim)
+        self.wo.muon = (1, self.head_dim)
         if self.wr is not None:
-            blocks.append((self.wr.weight, (0, self.head_dim)))
-        return blocks
+            self.wr.muon = (0, self.head_dim)
+        if self.wg is not None:
+            self.wg.muon = True
 
     def forward(
         self,

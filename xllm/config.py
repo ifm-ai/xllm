@@ -88,7 +88,7 @@ class OptimConf(Config):
     muon_nesterov: bool = False
     muon_adjust_lr: Optional[str] = "spectral_norm"  # Muon update scaling: spectral_norm, rms_norm or None
     muon_per_head: bool = False  # Orthogonalize each attention head of wq/wk/wv/wr (rows) and wo (columns) on its own
-    muon_per_head_out: bool = True  # With muon_per_head, also cut wo into heads; False keeps wo whole
+    muon_per_head_out: bool = False  # With muon_per_head, also cut wo into heads; False keeps wo whole
     muon_block_scale: str = "block"  # Scale of row-head blocks (wq / wk / wv / wr) and whole matrices: block (own shape) or matrix (whole matrix's shape)
     muon_out_block_scale: str = "block"  # Scale of column-head blocks (wo): block (own shape) or matrix (whole matrix's shape)
     warmup: int = 2000  # Num of steps for LR warmup. 0 means no warmup
