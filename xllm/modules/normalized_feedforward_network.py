@@ -89,6 +89,10 @@ class NormalizedFeedForwardNetwork(nn.Module):
             num_features=ffn_hidden_dim, eps=rmsnorm_eps, init_std=init_std
         )
 
+        for fc in (self.fc1, self.fc2, self.fc3):
+            if fc is not None:
+                fc.muon = True  # Muon (xllm/optim/muon.py)
+
     def forward(
         self,
         x: Tensor,

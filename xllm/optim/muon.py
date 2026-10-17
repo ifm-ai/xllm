@@ -1,5 +1,15 @@
 """Muon on FSDP2 with per-head orthogonalization.
 
+Which weights use Muon: a model marks a linear layer with a `muon` attribute, and that
+layer's weight goes to Muon; everything unmarked goes to AdamW.
+
+    linear.muon = True       Muon, orthogonalized as a whole matrix
+    linear.muon = (0, n)     Muon; with per-head, cut into heads of n rows (wq / wk / wv / wr)
+    linear.muon = (1, n)     Muon; with per-head and per-head-out, cut into heads of n columns (wo)
+
+The mark sits on the layer, not on the weight tensor: FSDP2 and Module._apply (.cuda(), .to())
+replace or swap DTensor parameters and drop attributes set on them.
+
 Terminology, for one Muon matrix W of shape [rows, cols]:
 
 - shard: FSDP2 Shard(0) stores W as contiguous row ranges, one per rank (torch.chunk).
@@ -31,7 +41,6 @@ from torch.distributed.device_mesh import DeviceMesh
 from torch.optim import Optimizer
 
 from xllm.config import OptimConf
-from xllm.modules.model_parallel.layers import ColumnParallelLinear, RowParallelLinear
 
 
 logger = getLogger()
@@ -79,29 +88,23 @@ class Slice:
         return self.rows.stop - self.rows.start
 
 
-def split_muon_params(model: nn.Module, per_head: bool, per_head_out: bool = True):
-    """Linear weights inside the blocks go to Muon; everything else
-    (embedding, output layer, norms, biases, convolutions) goes to AdamW.
+def split_muon_params(model: nn.Module, per_head: bool, per_head_out: bool = False):
+    """Weights of layers marked with a `muon` attribute go to Muon; everything else goes to AdamW.
 
-    Returns the Muon params, one BlockSpec per Muon param, and the AdamW params.
-    With per_head, modules that define `muon_blocks()` (the attention layers) say how
-    their projections are cut into heads; all other matrices stay whole.
-    per_head_out=False keeps the column-head matrices (wo) whole.
+    Returns the Muon params, one BlockSpec per Muon param (None = whole matrix), and the
+    AdamW params. A head mark is used only with per_head, a column-head mark (wo) only
+    with per_head_out as well; otherwise the matrix stays whole.
     """
-    heads = {}
-    if per_head:
-        for module in model.layers.modules():
-            if hasattr(module, "muon_blocks"):
-                heads.update((id(weight), spec) for weight, spec in module.muon_blocks()
-                             if per_head_out or spec[0] == 0)
-
-    muon = [
-        m.weight for m in model.layers.modules()
-        if isinstance(m, (ColumnParallelLinear, RowParallelLinear))
-    ]
-    specs = [heads.get(id(p)) for p in muon]
-    muon_ids = {id(p) for p in muon}
-    adamw = [p for p in model.parameters() if id(p) not in muon_ids]
+    marks = {id(m.weight): m.muon for m in model.modules() if hasattr(m, "muon")}
+    muon, specs, adamw = [], [], []
+    for p in model.parameters():
+        mark = marks.get(id(p))
+        if mark is None:
+            adamw.append(p)
+            continue
+        muon.append(p)
+        heads = per_head and mark is not True and (mark[0] == 0 or per_head_out)
+        specs.append(mark if heads else None)
     return muon, specs, adamw
 
 

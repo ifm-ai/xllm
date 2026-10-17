@@ -23,7 +23,7 @@
 # Variables (default):
 #   SAVE            dump dir (required)
 #   OPTIM           adamw | muon (adamw); for muon: MUON_LR (0.01), MUON_PER_HEAD (true),
-#                   MUON_PER_HEAD_OUT (true: also cut wo into heads); per-head update scale, block (own
+#                   MUON_PER_HEAD_OUT (false; true also cuts wo into heads); per-head update scale, block (own
 #                   shape) | matrix (whole matrix's shape): MUON_BLOCK_SCALE for q/k/v/r heads (block),
 #                   MUON_OUT_BLOCK_SCALE for wo heads (block)
 #   LR              AdamW LR, also for the non-matrix params under muon (2e-3)
@@ -39,7 +39,7 @@
 PYTHON=${PYTHON:-.venv/bin/python}
 OPTIM=${OPTIM:-adamw}
 MUON_PER_HEAD=${MUON_PER_HEAD:-true}
-MUON_PER_HEAD_OUT=${MUON_PER_HEAD_OUT:-true}
+MUON_PER_HEAD_OUT=${MUON_PER_HEAD_OUT:-false}
 MUON_BLOCK_SCALE=${MUON_BLOCK_SCALE:-block}
 MUON_OUT_BLOCK_SCALE=${MUON_OUT_BLOCK_SCALE:-block}
 MUON_LR=${MUON_LR:-0.01}
