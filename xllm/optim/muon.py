@@ -3,10 +3,10 @@
 Which weights use Muon: a model marks a linear layer with a `muon` attribute, and that
 layer's weight goes to Muon; everything unmarked goes to AdamW.
 
-    linear.muon = n    Muon; with per-head, its rows are cut into n equal groups, each
+    linear.muon = n    Muon; with per-head, its rows are cut into n equal blocks, each
                        orthogonalized on its own: 1 = whole matrix, the number of heads =
-                       one group per head, in between = groups of adjacent heads.
-                       Without per-head every matrix is one group.
+                       one block per head, in between = blocks of adjacent heads.
+                       Without per-head every matrix is one block.
 
 The mark sits on the layer, not on the weight tensor: FSDP2 and Module._apply (.cuda(), .to())
 replace or swap DTensor parameters and drop attributes set on them.
@@ -14,14 +14,14 @@ replace or swap DTensor parameters and drop attributes set on them.
 Terminology, for one Muon matrix W of shape [rows, cols]:
 
 - shard: FSDP2 Shard(0) stores W as contiguous row ranges, one per rank (torch.chunk).
-- Block: a row range of W that Newton-Schulz orthogonalizes on its own, chosen from the
-  model, not from the sharding: one of the matrix's groups (the whole matrix, or one or
+- Block: one of the n row ranges of W from its mark, orthogonalized by Newton-Schulz on
+  its own; chosen from the model, not from the sharding (the whole matrix, or one or
   more heads of wq / wk / wv / wr).
 - owner: the rank a Block is assigned to; it gathers the block and runs NS on it.
 - Slice: the rows of one Block stored on one rank (Block intersected with
   that rank's shard). Concatenating the slices in rank order gives the whole block.
 
-Example: wk [8, 4] with 2 heads of 4 rows on 3 ranks (torch.chunk: rows 0-2, 3-5, 6-7):
+Example: wk [8, 4] with wk.muon = 2 (2 heads of 4 rows) on 3 ranks (torch.chunk: rows 0-2, 3-5, 6-7):
 
     rank 0  rows 0-2  a          block 0 = rows 0-3 = cat(a, b1)
     rank 1  rows 3-5  b1 | b2    block 1 = rows 4-7 = cat(b2, c)
@@ -38,6 +38,7 @@ import torch.distributed as dist
 from torch import Tensor, nn
 from torch.distributed.device_mesh import DeviceMesh
 from torch.optim import Optimizer
+from torch.optim.adamw import adamw
 
 from xllm.config import OptimConf
 
@@ -53,9 +54,10 @@ NS_COEFFS = (
     (2.8366, -3.0525, 1.2012),
 )
 
+
 @dataclass
 class Block:
-    """Rows [r0, r1) of Muon matrix `param` (one group of heads, or the whole matrix), all
+    """Rows [r0, r1) of Muon matrix `param` (one or more heads, or the whole matrix), all
     `cols` columns; Newton-Schulz orthogonalizes it on its own."""
     param: int
     r0: int
@@ -83,19 +85,19 @@ class Slice:
 def split_muon_params(model: nn.Module, per_head: bool):
     """Weights of layers marked with a `muon` attribute go to Muon; everything else goes to AdamW.
 
-    Returns the Muon params, the number of row groups of each (1 without per_head), and
+    Returns the Muon params, the number of row blocks of each (1 without per_head), and
     the AdamW params.
     """
     marks = {id(m.weight): m.muon for m in model.modules() if hasattr(m, "muon")}
-    muon, groups, adamw = [], [], []
+    muon_params, n_blocks, adamw_params = [], [], []
     for p in model.parameters():
         mark = marks.get(id(p))
         if mark is None:
-            adamw.append(p)
+            adamw_params.append(p)
             continue
-        muon.append(p)
-        groups.append(mark if per_head else 1)
-    return muon, groups, adamw
+        muon_params.append(p)
+        n_blocks.append(mark if per_head else 1)
+    return muon_params, n_blocks, adamw_params
 
 
 def _local(t: Tensor) -> Tensor:
@@ -141,7 +143,7 @@ class Muon(Optimizer):
     def __init__(
         self,
         muon_params: List[nn.Parameter],
-        groups: List[int],
+        n_blocks: List[int],
         adamw_params: List[nn.Parameter],
         mesh: DeviceMesh,
         cfg: OptimConf,
@@ -159,17 +161,17 @@ class Muon(Optimizer):
         self.adjust_lr = cfg.muon_adjust_lr
         self.block_scale = cfg.muon_block_scale
         self.betas = (cfg.beta1, cfg.beta2)
-        self.group = mesh.get_group()
+        self.process_group = mesh.get_group()
         self.world = mesh.size()
         self.rank = mesh.get_local_rank()
-        self._plan([tuple(p.shape) for p in muon_params], groups)
+        self._plan([tuple(p.shape) for p in muon_params], n_blocks)
 
     # ---- plan: built once from the global shapes, identical on every rank ----
 
-    def _plan(self, shapes: List[Tuple[int, int]], groups: List[int]):
+    def _plan(self, shapes: List[Tuple[int, int]], n_blocks: List[int]):
         self.shapes = shapes
         self.blocks: List[Block] = []
-        for i, ((rows, cols), n) in enumerate(zip(shapes, groups)):
+        for i, ((rows, cols), n) in enumerate(zip(shapes, n_blocks)):
             assert rows % n == 0, (i, rows, n)
             size = rows // n
             self.blocks += [Block(i, s, min(s + size, rows), cols) for s in range(0, rows, size)]
@@ -217,7 +219,7 @@ class Muon(Optimizer):
         flat = [t.reshape(-1) for ts in send for t in ts]
         send_buf = torch.cat(flat) if flat else torch.empty(0, dtype=torch.bfloat16, device="cuda")
         recv_buf = torch.empty(sum(recv_sizes), dtype=torch.bfloat16, device="cuda")
-        dist.all_to_all_single(recv_buf, send_buf, recv_sizes, send_sizes, group=self.group)
+        dist.all_to_all_single(recv_buf, send_buf, recv_sizes, send_sizes, group=self.process_group)
         out = []
         for chunk, shapes in zip(recv_buf.split(recv_sizes), recv_shapes):
             out.append([t.view(shape) for t, shape in zip(chunk.split([m * n for m, n in shapes]), shapes)])
@@ -276,24 +278,18 @@ class Muon(Optimizer):
 
     @torch.no_grad()
     def _adamw_step(self, group: Dict):
-        lr, wd, eps = group["lr"], group["weight_decay"], group["eps"]
-        beta1, beta2 = self.betas
-        for p in group["params"]:
-            if p.grad is None:
-                continue
-            state = self.state[p]
+        """torch.optim.AdamW's update (foreach) on the group's params."""
+        params = [p for p in group["params"] if p.grad is not None]
+        states = [self.state[p] for p in params]
+        for p, state in zip(params, states):
             if "step" not in state:
                 state["step"] = torch.zeros((), dtype=torch.float32)
                 state["exp_avg"] = torch.zeros_like(p, dtype=torch.float32)
                 state["exp_avg_sq"] = torch.zeros_like(p, dtype=torch.float32)
-            state["step"] += 1
-            step = state["step"].item()
-            x, g = _local(p), _local(p.grad).float()
-            m, v = _local(state["exp_avg"]), _local(state["exp_avg_sq"])
-            m.lerp_(g, 1 - beta1)
-            v.mul_(beta2).addcmul_(g, g, value=1 - beta2)
-            denom = (v / (1 - beta2 ** step)).sqrt_().add_(eps)
-            x.mul_(1 - lr * wd).addcdiv_(m.to(x.dtype), denom.to(x.dtype), value=-lr / (1 - beta1 ** step))
+        adamw(params, [p.grad for p in params], [s["exp_avg"] for s in states], [s["exp_avg_sq"] for s in states],
+              [], [s["step"] for s in states], foreach=True, amsgrad=False, beta1=self.betas[0],
+              beta2=self.betas[1], lr=group["lr"], weight_decay=group["weight_decay"], eps=group["eps"],
+              maximize=False)
 
     @torch.no_grad()
     def step(self, closure=None):
@@ -306,10 +302,10 @@ class Muon(Optimizer):
 
 def build_muon(model: nn.Module, mesh: DeviceMesh, cfg: OptimConf) -> Optimizer:
     """`mesh` is the FSDP mesh; Muon works over its shard dimension."""
-    muon, groups, adamw = split_muon_params(model, cfg.muon_per_head)
+    muon_params, n_blocks, adamw_params = split_muon_params(model, cfg.muon_per_head)
     shard_mesh = mesh if mesh.ndim == 1 else mesh["dp"]
-    optimizer = Muon(muon, groups, adamw, shard_mesh, cfg)
-    logger.info(f"Muon: {len(muon)} matrices / {len(optimizer.blocks)} blocks (scale={cfg.muon_block_scale}) / "
-                f"{sum(p.numel() for p in muon)} params; AdamW: {len(adamw)} tensors / "
-                f"{sum(p.numel() for p in adamw)} params")
+    optimizer = Muon(muon_params, n_blocks, adamw_params, shard_mesh, cfg)
+    logger.info(f"Muon: {len(muon_params)} matrices / {len(optimizer.blocks)} blocks (scale={cfg.muon_block_scale}) / "
+                f"{sum(p.numel() for p in muon_params)} params; AdamW: {len(adamw_params)} tensors / "
+                f"{sum(p.numel() for p in adamw_params)} params")
     return optimizer

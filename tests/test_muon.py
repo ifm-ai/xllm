@@ -2,7 +2,7 @@
 
     torchrun --nproc_per_node=8 tests/test_muon.py
 
-Matrices are sharded on dim 0 like FSDP2 (uneven shards, empty shards, row groups
+Matrices are sharded on dim 0 like FSDP2 (uneven shards, empty shards, row blocks
 that span several ranks). After a few steps the sharded optimizer must match
 per-block Newton-Schulz on the full matrices; whole-matrix mode must match
 microsoft/dion, and the AdamW group must match torch.optim.AdamW.
@@ -20,13 +20,13 @@ from xllm.config import OptimConf
 from xllm.distributed.wrap import enable_wrap, wrap
 from xllm.optim.muon import Muon, newton_schulz5, split_muon_params
 
-# (shape, row groups with per-head): 1 = whole matrix
+# (shape, row blocks with per-head): 1 = whole matrix
 MATRICES = [
-    ((2048, 1536), 8),  # wq, one group per head
-    ((1024, 1536), 2),  # wk, groups of 2 heads
+    ((2048, 1536), 8),  # wq, one block per head
+    ((1024, 1536), 2),  # wk, blocks of 2 heads
     ((1536, 2048), 1),  # wo
     ((4096, 1536), 1),  # fc1
-    ((96, 64), 3),      # groups across shard boundaries
+    ((96, 64), 3),      # blocks across shard boundaries
     ((100, 37), 1),     # uneven shards
     ((6, 300), 3),      # fewer rows than ranks: empty shards
 ]
@@ -51,12 +51,12 @@ def make(mesh, seed):
     return full, vecs, grads, params
 
 
-def dense_muon(full, groups, grads, cfg):
+def dense_muon(full, n_blocks, grads, cfg):
     """Reference: every block orthogonalized on its own, on full matrices, scaled by its own
     shape (muon_block_scale=block) or by its matrix's shape (matrix)."""
     mom = [torch.zeros_like(x) for x in full]
     for step_grads in grads:
-        for x, m, g, n in zip(full, mom, step_grads, groups):
+        for x, m, g, n in zip(full, mom, step_grads, n_blocks):
             m.mul_(cfg.muon_momentum).add_(g)
             u = (g + cfg.muon_momentum * m if cfg.muon_nesterov else m).to(torch.bfloat16)
             size = x.shape[0] // n
@@ -108,11 +108,11 @@ def check_marks(mesh):
     with enable_wrap(mesh=mesh):
         model = wrap(nn.Sequential(wrap(Layer().cuda()), nn.Linear(64, 8)).cuda())
     for per_head, want in ((False, [1, 1, 1]), (True, [4, 1, 1])):
-        muon, groups, adamw = split_muon_params(model, per_head)
+        muon, n_blocks, adamw = split_muon_params(model, per_head)
         layer = model[0]
         assert muon == [layer.wq.weight, layer.wo.weight, layer.fc.weight], "wrong Muon params"
         assert all(hasattr(p, "to_local") for p in muon), "Muon params are not the sharded ones"
-        assert groups == want, (per_head, groups)
+        assert n_blocks == want, (per_head, n_blocks)
         assert len(adamw) == 3  # fc.bias, unmarked Linear weight and bias
     if dist.get_rank() == 0:
         print("muon marks survive fully_shard and .cuda() and split params as expected")
@@ -125,17 +125,17 @@ def main():
     n = len(MATRICES)
 
     for heads, cfg in ((True, CFG), (False, CFG), (True, CFG_NESTEROV_RMS), (True, CFG_MATRIX_SCALE)):
-        groups = [g if heads else 1 for _, g in MATRICES]
+        n_blocks = [b if heads else 1 for _, b in MATRICES]
         full, vecs, grads, params = make(mesh, seed=0)
         got = run_sharded(Muon, mesh, params[:n], [g[:n] for g in grads], muon_params=params[:n],
-                          groups=groups, adamw_params=[], mesh=mesh, cfg=cfg)
-        want = dense_muon([x.clone() for x in full], groups, [g[:n] for g in grads], cfg)
+                          n_blocks=n_blocks, adamw_params=[], mesh=mesh, cfg=cfg)
+        want = dense_muon([x.clone() for x in full], n_blocks, [g[:n] for g in grads], cfg)
         check(f"muon per_head={heads} scale={cfg.muon_block_scale} nesterov={cfg.muon_nesterov} "
               f"adjust={cfg.muon_adjust_lr} vs dense reference", got, want, full, 3e-2)
         if heads and cfg is CFG:
             # negative controls: per-head vs whole-matrix, and block vs matrix scale, must differ far beyond the tolerance
             whole = dense_muon([x.clone() for x in full], [1] * n, [g[:n] for g in grads], cfg)
-            other_scale = dense_muon([x.clone() for x in full], groups, [g[:n] for g in grads], CFG_MATRIX_SCALE)
+            other_scale = dense_muon([x.clone() for x in full], n_blocks, [g[:n] for g in grads], CFG_MATRIX_SCALE)
             err_whole = update_error(got[:4], whole[:4], full[:4])
             err_scale = update_error(got[:4], other_scale[:4], full[:4])
             if dist.get_rank() == 0:
@@ -144,7 +144,7 @@ def main():
             assert err_scale > 0.3, "block and matrix scales are indistinguishable"
 
     full, vecs, grads, params = make(mesh, seed=0)
-    got = run_sharded(Muon, mesh, params, grads, muon_params=params[:n], groups=[1] * n,
+    got = run_sharded(Muon, mesh, params, grads, muon_params=params[:n], n_blocks=[1] * n,
                       adamw_params=params[n:], mesh=mesh, cfg=CFG_ADAMW)
     ref = [nn.Parameter(v.clone()) for v in vecs]
     adamw = torch.optim.AdamW(ref, lr=CFG_ADAMW.lr, betas=(CFG_ADAMW.beta1, CFG_ADAMW.beta2),
@@ -162,7 +162,7 @@ def main():
     if DionMuon is not None:
         full, vecs, grads, params = make(mesh, seed=1)
         got = run_sharded(Muon, mesh, params[:n], [g[:n] for g in grads], muon_params=params[:n],
-                          groups=[1] * n, adamw_params=[], mesh=mesh, cfg=CFG)
+                          n_blocks=[1] * n, adamw_params=[], mesh=mesh, cfg=CFG)
         _, _, _, dparams = make(mesh, seed=1)
         want = run_sharded(
             lambda **kw: DionMuon(**kw), mesh, dparams[:n], [g[:n] for g in grads],
