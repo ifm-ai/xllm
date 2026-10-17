@@ -3,10 +3,9 @@
 Which weights use Muon: a model marks a linear layer with a `muon` attribute, and that
 layer's weight goes to Muon; everything unmarked goes to AdamW.
 
-    linear.muon = n    Muon; with per-head, its rows are cut into n equal blocks, each
-                       orthogonalized on its own: 1 = whole matrix, the number of heads =
-                       one block per head, in between = blocks of adjacent heads.
-                       Without per-head every matrix is one block.
+    linear.muon = n    Muon; its rows are cut into n equal blocks, each orthogonalized on
+                       its own: 1 = whole matrix, the number of heads = one block per head,
+                       in between = blocks of adjacent heads.
 
 The mark sits on the layer, not on the weight tensor: FSDP2 and Module._apply (.cuda(), .to())
 replace or swap DTensor parameters and drop attributes set on them.
@@ -17,15 +16,16 @@ Terminology, for one Muon matrix W of shape [rows, cols]:
 - Block: one of the n row ranges of W from its mark, orthogonalized by Newton-Schulz on
   its own; chosen from the model, not from the sharding (the whole matrix, or one or
   more heads of wq / wk / wv / wr).
-- owner: the rank a Block is assigned to; it gathers the block and runs NS on it.
-- Slice: the rows of one Block stored on one rank (Block intersected with
-  that rank's shard). Concatenating the slices in rank order gives the whole block.
+- owner: the rank that gathers a Block and runs NS on it: the rank that stores most of
+  its rows, then the least loaded one.
+- slice: the rows of a Block that one rank stores (the Block's overlap with that rank's
+  shard). A Block is the concatenation of its slices in rank order.
 
-Example: wk [8, 4] with wk.muon = 2 (2 heads of 4 rows) on 3 ranks (torch.chunk: rows 0-2, 3-5, 6-7):
+Example: wk [8, 4] with wk.muon = 2 on 3 ranks (torch.chunk: rows 0-2, 3-5, 6-7):
 
-    rank 0  rows 0-2  a          block 0 = rows 0-3 = cat(a, b1)
-    rank 1  rows 3-5  b1 | b2    block 1 = rows 4-7 = cat(b2, c)
-    rank 2  rows 6-7  c          a is block 0's Slice on rank 0; b1, b2 are rank 1's two Slices
+    rank 0  rows 0-2  a          block 0 = rows 0-3 = cat(a, b1), owner rank 0 (stores 3 rows)
+    rank 1  rows 3-5  b1 | b2    block 1 = rows 4-7 = cat(b2, c), owner rank 1 (tie with rank 2)
+    rank 2  rows 6-7  c          b1 and b2 are rank 1's slices of blocks 0 and 1
 """
 import math
 from collections import defaultdict
@@ -54,7 +54,6 @@ NS_COEFFS = (
     (2.8366, -3.0525, 1.2012),
 )
 
-
 @dataclass
 class Block:
     """Rows [r0, r1) of Muon matrix `param` (one or more heads, or the whole matrix), all
@@ -70,23 +69,10 @@ class Block:
         return self.r1 - self.r0, self.cols
 
 
-@dataclass
-class Slice:
-    """The rows of one Block that one rank stores: `rows` indexes that rank's local shard,
-    and `block_row` is the first row of the slice inside the block. May be empty."""
-    rows: slice
-    block_row: int
-
-    @property
-    def num_rows(self) -> int:
-        return self.rows.stop - self.rows.start
-
-
-def split_muon_params(model: nn.Module, per_head: bool):
+def split_muon_params(model: nn.Module):
     """Weights of layers marked with a `muon` attribute go to Muon; everything else goes to AdamW.
 
-    Returns the Muon params, the number of row blocks of each (1 without per_head), and
-    the AdamW params.
+    Returns the Muon params, the number of row blocks of each (its mark), and the AdamW params.
     """
     marks = {id(m.weight): m.muon for m in model.modules() if hasattr(m, "muon")}
     muon_params, n_blocks, adamw_params = [], [], []
@@ -96,7 +82,7 @@ def split_muon_params(model: nn.Module, per_head: bool):
             adamw_params.append(p)
             continue
         muon_params.append(p)
-        n_blocks.append(mark if per_head else 1)
+        n_blocks.append(mark)
     return muon_params, n_blocks, adamw_params
 
 
@@ -135,7 +121,7 @@ class Muon(Optimizer):
 
     Each step:
     1. update the momentum on the local shard;
-    2. gather: one all-to-all sends every Slice to its block's owner;
+    2. gather: one all-to-all sends every slice to its block's owner;
     3. each owner runs Newton-Schulz on its blocks;
     4. scatter: one all-to-all sends the slices back; each rank applies its update.
     """
@@ -174,32 +160,48 @@ class Muon(Optimizer):
         for i, ((rows, cols), n) in enumerate(zip(shapes, n_blocks)):
             assert rows % n == 0, (i, rows, n)
             size = rows // n
-            self.blocks += [Block(i, s, min(s + size, rows), cols) for s in range(0, rows, size)]
+            self.blocks += [Block(i, s, s + size, cols) for s in range(0, rows, size)]
 
-        # balance owners by size, largest blocks first
+        # shard_start[i][r]: first global row of matrix i on rank r (FSDP2 Shard(0) follows torch.chunk)
+        shard_start = [[min(r * math.ceil(rows / self.world), rows) for r in range(self.world + 1)]
+                       for rows, _ in shapes]
+        # slices[k]: (rank, global rows lo, hi) for every rank that stores rows of block k
+        slices = []
+        for b in self.blocks:
+            start = shard_start[b.param]
+            overlap = [(r, max(b.r0, start[r]), min(b.r1, start[r + 1])) for r in range(self.world)]
+            slices.append([(r, lo, hi) for r, lo, hi in overlap if lo < hi])
+
+        # owner: the rank that stores most of the block (no transfer for those rows), then the least
+        # loaded; blocks are placed by decreasing Newton-Schulz cost m * n * min(m, n)
         load = [0] * self.world
-        for b in sorted(self.blocks, key=lambda b: -math.prod(b.shape)):
-            b.owner = min(range(self.world), key=lambda r: load[r])
-            load[b.owner] += math.prod(b.shape)
+        for k in sorted(range(len(self.blocks)), key=lambda k: -self._ns_cost(self.blocks[k])):
+            stored = dict.fromkeys(range(self.world), 0)
+            for r, lo, hi in slices[k]:
+                stored[r] = hi - lo
+            b = self.blocks[k]
+            b.owner = min(range(self.world), key=lambda r: (-stored[r], load[r]))
+            load[b.owner] += self._ns_cost(b)
 
-        # slices[k][r]: the rows of block k stored on rank r
-        shard_rows = [[self._shard_rows(rows, r) for r in range(self.world)] for rows, _ in shapes]
-        self.slices = [[self._slice_on_shard(b, *shard_rows[b.param][r]) for r in range(self.world)]
-                       for b in self.blocks]
+        # my_slices[r]: my slices of the blocks rank r owns, as (matrix, rows of my shard)
+        # owned_slices[r]: rank r's slices of the blocks I own, as (index in self.owned, rows of the block)
+        # Both lists follow the block order, so a sender's list matches its receiver's.
         self.owned = [k for k, b in enumerate(self.blocks) if b.owner == self.rank]
-        self.owned_by = [[k for k, b in enumerate(self.blocks) if b.owner == r] for r in range(self.world)]
-
-    def _shard_rows(self, n: int, rank: int) -> Tuple[int, int]:
-        """Rows of an n-row matrix stored on `rank` (FSDP2 Shard(0) follows torch.chunk)."""
-        chunk = math.ceil(n / self.world)
-        return min(rank * chunk, n), min((rank + 1) * chunk, n)
+        index = {k: j for j, k in enumerate(self.owned)}
+        self.my_slices = [[] for _ in range(self.world)]
+        self.owned_slices = [[] for _ in range(self.world)]
+        for k, b in enumerate(self.blocks):
+            for r, lo, hi in slices[k]:
+                if r == self.rank:
+                    s0 = shard_start[b.param][r]
+                    self.my_slices[b.owner].append((b.param, slice(lo - s0, hi - s0)))
+                if b.owner == self.rank:
+                    self.owned_slices[r].append((index[k], slice(lo - b.r0, hi - b.r0)))
 
     @staticmethod
-    def _slice_on_shard(b: Block, s0: int, s1: int) -> Slice:
-        """The rows of block b inside the shard that holds global rows [s0, s1)."""
-        lo, hi = max(b.r0, s0), min(b.r1, s1)
-        hi = max(lo, hi)
-        return Slice(rows=slice(lo - s0, hi - s0), block_row=lo - b.r0)
+    def _ns_cost(b: Block) -> int:
+        m, n = b.shape
+        return m * n * min(m, n)
 
     def _scale(self, b: Block) -> float:
         """Update scale of block b, from its own shape or from its whole matrix's shape."""
@@ -238,31 +240,24 @@ class Muon(Optimizer):
         return u.to(torch.bfloat16)
 
     def _gather(self, updates: List[Tensor]) -> List[Tensor]:
-        """Send every shard slice to its block's owner; return the whole blocks this rank owns."""
-        send = [[] for _ in range(self.world)]
-        for b, slices in zip(self.blocks, self.slices):
-            mine = slices[self.rank]
-            send[b.owner].append(updates[b.param][mine.rows])
-        recv_shapes = [[(self.slices[k][src].num_rows, self.blocks[k].shape[1]) for k in self.owned]
-                       for src in range(self.world)]
-        recv = self._exchange(send, recv_shapes)
-        # slices arrive in rank order, which is the row order inside the block
-        return [torch.cat([recv[src][j] for src in range(self.world)]) for j in range(len(self.owned))]
+        """Send my slices to their blocks' owners; return the whole blocks I own."""
+        send = [[updates[i][rows] for i, rows in self.my_slices[r]] for r in range(self.world)]
+        recv = self._exchange(send, [[(rows.stop - rows.start, self.blocks[self.owned[j]].cols)
+                                      for j, rows in self.owned_slices[r]] for r in range(self.world)])
+        blocks = [torch.empty(self.blocks[k].shape, dtype=torch.bfloat16, device="cuda") for k in self.owned]
+        for r in range(self.world):
+            for (j, rows), t in zip(self.owned_slices[r], recv[r]):
+                blocks[j][rows] = t
+        return blocks
 
     def _scatter(self, results: List[Tensor], updates: List[Tensor]):
-        """Send each rank its rows of every owned block; write the received rows into `updates`."""
-        send = [[] for _ in range(self.world)]
-        for k, out in zip(self.owned, results):
-            for dst in range(self.world):
-                theirs = self.slices[k][dst]
-                send[dst].append(out[theirs.block_row:theirs.block_row + theirs.num_rows])
-        recv_shapes = [[(self.slices[k][self.rank].num_rows, self.blocks[k].shape[1]) for k in self.owned_by[src]]
-                       for src in range(self.world)]
-        recv = self._exchange(send, recv_shapes)
-        for src in range(self.world):
-            for k, rows in zip(self.owned_by[src], recv[src]):
-                mine = self.slices[k][self.rank]
-                updates[self.blocks[k].param][mine.rows] = rows
+        """Send each rank its slices of the blocks I own; write the slices I receive into `updates`."""
+        send = [[results[j][rows] for j, rows in self.owned_slices[r]] for r in range(self.world)]
+        recv = self._exchange(send, [[(rows.stop - rows.start, self.shapes[i][1])
+                                      for i, rows in self.my_slices[r]] for r in range(self.world)])
+        for r in range(self.world):
+            for (i, rows), t in zip(self.my_slices[r], recv[r]):
+                updates[i][rows] = t
 
     @torch.no_grad()
     def _muon_step(self, group: Dict):
@@ -302,7 +297,7 @@ class Muon(Optimizer):
 
 def build_muon(model: nn.Module, mesh: DeviceMesh, cfg: OptimConf) -> Optimizer:
     """`mesh` is the FSDP mesh; Muon works over its shard dimension."""
-    muon_params, n_blocks, adamw_params = split_muon_params(model, cfg.muon_per_head)
+    muon_params, n_blocks, adamw_params = split_muon_params(model)
     shard_mesh = mesh if mesh.ndim == 1 else mesh["dp"]
     optimizer = Muon(muon_params, n_blocks, adamw_params, shard_mesh, cfg)
     logger.info(f"Muon: {len(muon_params)} matrices / {len(optimizer.blocks)} blocks (scale={cfg.muon_block_scale}) / "
