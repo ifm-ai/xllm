@@ -3,9 +3,10 @@
 Which weights use Muon: a model marks a linear layer with a `muon` attribute, and that
 layer's weight goes to Muon; everything unmarked goes to AdamW.
 
-    linear.muon = True       Muon, orthogonalized as a whole matrix
-    linear.muon = (0, n)     Muon; with per-head, cut into heads of n rows (wq / wk / wv / wr)
-    linear.muon = (1, n)     Muon; with per-head and per-head-out, cut into heads of n columns (wo)
+    linear.muon = n    Muon; with per-head, its rows are cut into n equal groups, each
+                       orthogonalized on its own: 1 = whole matrix, the number of heads =
+                       one group per head, in between = groups of adjacent heads.
+                       Without per-head every matrix is one group.
 
 The mark sits on the layer, not on the weight tensor: FSDP2 and Module._apply (.cuda(), .to())
 replace or swap DTensor parameters and drop attributes set on them.
@@ -13,26 +14,24 @@ replace or swap DTensor parameters and drop attributes set on them.
 Terminology, for one Muon matrix W of shape [rows, cols]:
 
 - shard: FSDP2 Shard(0) stores W as contiguous row ranges, one per rank (torch.chunk).
-- Block: a submatrix that Newton-Schulz orthogonalizes on its own, chosen from the
-  model, not from the sharding. Whole matrix by default; with per-head, one head: a row
-  range of wq / wk / wv / wr, or a column range of wo.
+- Block: a row range of W that Newton-Schulz orthogonalizes on its own, chosen from the
+  model, not from the sharding: one of the matrix's groups (the whole matrix, or one or
+  more heads of wq / wk / wv / wr).
 - owner: the rank a Block is assigned to; it gathers the block and runs NS on it.
 - Slice: the rows of one Block stored on one rank (Block intersected with
   that rank's shard). Concatenating the slices in rank order gives the whole block.
 
-Example: wo [8, 8] with 2 heads of 4 columns on 4 ranks (2 rows each):
+Example: wk [8, 4] with 2 heads of 4 rows on 3 ranks (torch.chunk: rows 0-2, 3-5, 6-7):
 
-            block 0     block 1
-    rank 0  a a a a  |  e e e e      block 0 = cat(a, b, c, d), owner rank 0
-    rank 1  b b b b  |  f f f f      block 1 = cat(e, f, g, h), owner rank 1
-    rank 2  c c c c  |  g g g g      a is block 0's Slice on rank 0
-    rank 3  d d d d  |  h h h h
+    rank 0  rows 0-2  a          block 0 = rows 0-3 = cat(a, b1)
+    rank 1  rows 3-5  b1 | b2    block 1 = rows 4-7 = cat(b2, c)
+    rank 2  rows 6-7  c          a is block 0's Slice on rank 0; b1, b2 are rank 1's two Slices
 """
 import math
 from collections import defaultdict
 from dataclasses import dataclass
 from logging import getLogger
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Tuple
 
 import torch
 import torch.distributed as dist
@@ -54,33 +53,26 @@ NS_COEFFS = (
     (2.8366, -3.0525, 1.2012),
 )
 
-# How a Muon matrix is cut into blocks: None = whole matrix, (0, n) = row blocks of
-# n rows, (1, n) = column blocks of n columns.
-BlockSpec = Optional[Tuple[int, int]]
-
-
 @dataclass
 class Block:
-    """A submatrix that Newton-Schulz orthogonalizes on its own (one attention head, or a whole
-    matrix): rows [r0, r1) x columns [c0, c1) of Muon matrix `param`, in global coordinates."""
+    """Rows [r0, r1) of Muon matrix `param` (one group of heads, or the whole matrix), all
+    `cols` columns; Newton-Schulz orthogonalizes it on its own."""
     param: int
     r0: int
     r1: int
-    c0: int
-    c1: int
+    cols: int
     owner: int = 0  # rank that gathers the block and runs Newton-Schulz on it
 
     @property
     def shape(self) -> Tuple[int, int]:
-        return self.r1 - self.r0, self.c1 - self.c0
+        return self.r1 - self.r0, self.cols
 
 
 @dataclass
 class Slice:
-    """The rows of one Block that one rank stores: `rows`, `cols` index that rank's local
-    shard, and `block_row` is the first row of the slice inside the block. May be empty."""
+    """The rows of one Block that one rank stores: `rows` indexes that rank's local shard,
+    and `block_row` is the first row of the slice inside the block. May be empty."""
     rows: slice
-    cols: slice
     block_row: int
 
     @property
@@ -88,24 +80,22 @@ class Slice:
         return self.rows.stop - self.rows.start
 
 
-def split_muon_params(model: nn.Module, per_head: bool, per_head_out: bool = False):
+def split_muon_params(model: nn.Module, per_head: bool):
     """Weights of layers marked with a `muon` attribute go to Muon; everything else goes to AdamW.
 
-    Returns the Muon params, one BlockSpec per Muon param (None = whole matrix), and the
-    AdamW params. A head mark is used only with per_head, a column-head mark (wo) only
-    with per_head_out as well; otherwise the matrix stays whole.
+    Returns the Muon params, the number of row groups of each (1 without per_head), and
+    the AdamW params.
     """
     marks = {id(m.weight): m.muon for m in model.modules() if hasattr(m, "muon")}
-    muon, specs, adamw = [], [], []
+    muon, groups, adamw = [], [], []
     for p in model.parameters():
         mark = marks.get(id(p))
         if mark is None:
             adamw.append(p)
             continue
         muon.append(p)
-        heads = per_head and mark is not True and (mark[0] == 0 or per_head_out)
-        specs.append(mark if heads else None)
-    return muon, specs, adamw
+        groups.append(mark if per_head else 1)
+    return muon, groups, adamw
 
 
 def _local(t: Tensor) -> Tensor:
@@ -151,7 +141,7 @@ class Muon(Optimizer):
     def __init__(
         self,
         muon_params: List[nn.Parameter],
-        block_specs: List[BlockSpec],
+        groups: List[int],
         adamw_params: List[nn.Parameter],
         mesh: DeviceMesh,
         cfg: OptimConf,
@@ -167,26 +157,22 @@ class Muon(Optimizer):
         self.momentum = cfg.muon_momentum
         self.nesterov = cfg.muon_nesterov
         self.adjust_lr = cfg.muon_adjust_lr
-        self.block_scale = cfg.muon_block_scale          # row blocks and whole matrices
-        self.out_block_scale = cfg.muon_out_block_scale  # column blocks (wo heads)
+        self.block_scale = cfg.muon_block_scale
         self.betas = (cfg.beta1, cfg.beta2)
         self.group = mesh.get_group()
         self.world = mesh.size()
         self.rank = mesh.get_local_rank()
-        self._plan([tuple(p.shape) for p in muon_params], block_specs)
+        self._plan([tuple(p.shape) for p in muon_params], groups)
 
     # ---- plan: built once from the global shapes, identical on every rank ----
 
-    def _plan(self, shapes: List[Tuple[int, int]], specs: List[BlockSpec]):
+    def _plan(self, shapes: List[Tuple[int, int]], groups: List[int]):
         self.shapes = shapes
         self.blocks: List[Block] = []
-        for i, ((rows, cols), spec) in enumerate(zip(shapes, specs)):
-            if spec is None:
-                self.blocks.append(Block(i, 0, rows, 0, cols))
-            elif spec[0] == 0:
-                self.blocks += [Block(i, s, min(s + spec[1], rows), 0, cols) for s in range(0, rows, spec[1])]
-            else:
-                self.blocks += [Block(i, 0, rows, s, min(s + spec[1], cols)) for s in range(0, cols, spec[1])]
+        for i, ((rows, cols), n) in enumerate(zip(shapes, groups)):
+            assert rows % n == 0, (i, rows, n)
+            size = rows // n
+            self.blocks += [Block(i, s, min(s + size, rows), cols) for s in range(0, rows, size)]
 
         # balance owners by size, largest blocks first
         load = [0] * self.world
@@ -208,16 +194,14 @@ class Muon(Optimizer):
 
     @staticmethod
     def _slice_on_shard(b: Block, s0: int, s1: int) -> Slice:
-        """The rows of block b inside the shard that holds global rows [s0, s1) and all columns."""
+        """The rows of block b inside the shard that holds global rows [s0, s1)."""
         lo, hi = max(b.r0, s0), min(b.r1, s1)
         hi = max(lo, hi)
-        return Slice(rows=slice(lo - s0, hi - s0), cols=slice(b.c0, b.c1), block_row=lo - b.r0)
+        return Slice(rows=slice(lo - s0, hi - s0), block_row=lo - b.r0)
 
     def _scale(self, b: Block) -> float:
         """Update scale of block b, from its own shape or from its whole matrix's shape."""
-        is_column_block = b.shape[1] != self.shapes[b.param][1]
-        mode = self.out_block_scale if is_column_block else self.block_scale
-        fan_out, fan_in = b.shape if mode == "block" else self.shapes[b.param]
+        fan_out, fan_in = b.shape if self.block_scale == "block" else self.shapes[b.param]
         if self.adjust_lr == "spectral_norm":
             return math.sqrt(fan_out / fan_in)
         if self.adjust_lr == "rms_norm":
@@ -256,7 +240,7 @@ class Muon(Optimizer):
         send = [[] for _ in range(self.world)]
         for b, slices in zip(self.blocks, self.slices):
             mine = slices[self.rank]
-            send[b.owner].append(updates[b.param][mine.rows, mine.cols])
+            send[b.owner].append(updates[b.param][mine.rows])
         recv_shapes = [[(self.slices[k][src].num_rows, self.blocks[k].shape[1]) for k in self.owned]
                        for src in range(self.world)]
         recv = self._exchange(send, recv_shapes)
@@ -276,7 +260,7 @@ class Muon(Optimizer):
         for src in range(self.world):
             for k, rows in zip(self.owned_by[src], recv[src]):
                 mine = self.slices[k][self.rank]
-                updates[self.blocks[k].param][mine.rows, mine.cols] = rows
+                updates[self.blocks[k].param][mine.rows] = rows
 
     @torch.no_grad()
     def _muon_step(self, group: Dict):
@@ -322,11 +306,10 @@ class Muon(Optimizer):
 
 def build_muon(model: nn.Module, mesh: DeviceMesh, cfg: OptimConf) -> Optimizer:
     """`mesh` is the FSDP mesh; Muon works over its shard dimension."""
-    muon, specs, adamw = split_muon_params(model, cfg.muon_per_head, cfg.muon_per_head_out)
+    muon, groups, adamw = split_muon_params(model, cfg.muon_per_head)
     shard_mesh = mesh if mesh.ndim == 1 else mesh["dp"]
-    optimizer = Muon(muon, specs, adamw, shard_mesh, cfg)
-    logger.info(f"Muon: {len(muon)} matrices / {len(optimizer.blocks)} blocks (scale rows={cfg.muon_block_scale}, "
-                f"columns={cfg.muon_out_block_scale}) / "
+    optimizer = Muon(muon, groups, adamw, shard_mesh, cfg)
+    logger.info(f"Muon: {len(muon)} matrices / {len(optimizer.blocks)} blocks (scale={cfg.muon_block_scale}) / "
                 f"{sum(p.numel() for p in muon)} params; AdamW: {len(adamw)} tensors / "
                 f"{sum(p.numel() for p in adamw)} params")
     return optimizer

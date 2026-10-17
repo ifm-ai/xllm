@@ -91,7 +91,7 @@ class NormalizedFeedForwardNetwork(nn.Module):
 
         for fc in (self.fc1, self.fc2, self.fc3):
             if fc is not None:
-                fc.muon = True  # Muon (xllm/optim/muon.py)
+                fc.muon = 1  # Muon, one row group (xllm/optim/muon.py)
 
     def forward(
         self,

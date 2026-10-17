@@ -247,13 +247,12 @@ class GatedDeltaAttention(nn.Module):
             num_features=hdim, eps=rmsnorm_eps, init_std=init_std
         )
 
-        # Muon (xllm/optim/muon.py): a q head is nq * head_dim rows (both softdelta queries)
-        self.wq.muon = (0, nq * self.head_dim)
-        self.wk.muon = (0, self.head_dim)
-        self.wv.muon = self.wr.muon = (0, self.v_head_dim)
-        self.wo.muon = (1, self.v_head_dim)
+        # Muon row groups (xllm/optim/muon.py): one per head (a q head holds both softdelta queries)
+        self.wq.muon = self.wr.muon = self.local_heads
+        self.wk.muon = self.wv.muon = self.local_kv_heads
+        self.wo.muon = 1
         if self.wg is not None:
-            self.wg.muon = True
+            self.wg.muon = 1
 
     def _receive_prev_count(self, x, bos_mask):
         bsz, seq_len, _ = x.size()

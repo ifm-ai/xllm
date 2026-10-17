@@ -7,14 +7,16 @@
 `xllm/optim/muon.py`. Requires `--model.ddp_backend fsdp2`, TP = CP = 1, no MoE and
 `--dcp_for_optimizer true` (the optimizer state is sharded like the parameters).
 
-- **Parameters.** The weights of `ColumnParallelLinear` / `RowParallelLinear` inside
-  `model.layers` are updated by Muon with `--optim.muon_lr`. Everything else (embedding,
-  output layer, norms, biases, convolutions) uses AdamW with `--optim.lr`. Both groups
-  follow the same LR schedule and `--optim.weight_decay`.
-- **Blocks.** Each Muon matrix is a list of blocks that are orthogonalized independently.
-  By default a matrix is one block. With `--optim.muon_per_head true` the attention
-  projections are split into heads: rows of `wq` / `wk` (`head_dim`) and `wv` / `wr`
-  (`v_head_dim`), columns of `wo` (`v_head_dim`).
+- **Parameters.** A model marks the linear layers whose weights Muon updates with a
+  `muon` attribute (`layer.muon = n`); they use `--optim.muon_lr`. Everything else
+  (embedding, output layer, norms, biases, convolutions) uses AdamW with `--optim.lr`.
+  Both groups follow the same LR schedule and `--optim.weight_decay`. The attention
+  layers and the FFN mark their projections.
+- **Blocks.** `n` is the number of equal row groups the matrix is cut into, each
+  orthogonalized on its own: 1 = whole matrix, the number of heads = one group per head,
+  in between = groups of adjacent heads. Attention marks `wq` / `wr` with its heads and
+  `wk` / `wv` with its KV heads; `wo` and the FFN are 1. The groups are used only with
+  `--optim.muon_per_head true`; otherwise every matrix is one block.
 - **Mesh.** `train.py` builds the FSDP mesh once (`build_fsdp_mesh`) and passes the same
   mesh to `fully_shard` and to the optimizer. Muon works over the shard dimension.
 - **Step.**
@@ -23,7 +25,8 @@
   2. A fixed plan assigns every block to one rank (balanced by size). One all-to-all sends
      each block's pieces to its owner.
   3. The owner stacks its blocks by shape (tall blocks transposed) and runs one batched
-     Newton-Schulz 5 per shape, then scales each block by its own shape:
+     Newton-Schulz 5 per shape, then scales each block by its own shape
+     (`--optim.muon_block_scale block`, default) or its whole matrix's shape (`matrix`):
      `sqrt(rows / cols)` for `--optim.muon_adjust_lr spectral_norm` (default),
      `0.2 * sqrt(max(rows, cols))` for `rms_norm`.
   4. A second all-to-all returns the pieces; each rank applies
