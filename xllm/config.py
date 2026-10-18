@@ -84,6 +84,7 @@ class OptimConf(Config):
     lr: float = 1e-3  # AdamW learning rate after warmup
     warmup: int = 2000  # Num of steps for LR warmup. 0 means no warmup
     weight_decay: float = 0.1  # Decoupled weight decay
+    no_decay_embed_readout: bool = False  # Exclude the token embedding and the readout matrix from weight decay
     epsilon: float = 1e-8
     beta1: float = 0.9
     beta2: float = 0.98
