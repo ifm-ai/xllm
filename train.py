@@ -57,7 +57,7 @@ from xllm.utils import (
     collect_provenance,
 )
 from xllm.models import build_model
-from xllm.optim import build_optimizer, rescale_grads
+from xllm.optim import build_optimizer, get_group_hparams, rescale_grads, set_group_hparams
 from xllm.monitor import GPUMonitor, Timings
 from xllm.metrics import MetricLogger, build_mlogger
 from xllm.configuration import cfg_from_cli
@@ -170,16 +170,21 @@ def get_optim_state(
     return optim_state_dict, training_state_dict
 
 
+def get_clip_max_norm(clip: float, scale: float) -> float:
+    """Gradient clipping threshold for the scaled loss; clip <= 0 disables clipping."""
+    return clip * scale if clip > 0 else math.inf
+
+
 def set_optim_state(
     scheduler,
     reloaded_training_state_dict,
     state: State,
     data_iterator: MultiSourceDataLoader,
     timings: Timings,
-    opt_cfg: OptimConf
 ):
-    # setting LR manually to support overwriting during training from the same state
-    reloaded_training_state_dict["scheduler"]["base_lrs"] = [opt_cfg.lr]
+    # setting LRs from the config to support overwriting during training from the same state;
+    # one base LR per param group keeps per-role LR ratios
+    reloaded_training_state_dict["scheduler"]["base_lrs"] = list(scheduler.base_lrs)
     scheduler.load_state_dict(reloaded_training_state_dict["scheduler"])
     state.step, state.scale, state.scale_updates, state.clip_cumulative = (
         reloaded_training_state_dict["step"],
@@ -260,7 +265,9 @@ def main(cfg: TrainerConf):
     tflops_per_token = model.tflops_per_token(cfg.seq_len)
 
     # build optimizer / scheduler
-    optimizer, scheduler = build_optimizer(model, cfg.optim, cfg.steps, cfg.dtype)
+    optimizer, scheduler = build_optimizer(model, cfg.optim, cfg.steps, cfg.dtype, mup=cfg.mup)
+    # with mup, per-role eps / weight decay follow the config after a reload, like the LR
+    configured_group_hparams = get_group_hparams(optimizer) if cfg.mup is not None else None
 
     # setup loggers
     enable_loggers = cfg.slurm.is_master and not cfg.disable_logging
@@ -308,12 +315,14 @@ def main(cfg: TrainerConf):
             reloaded_optim_state_dict = torch.load(optim_path, map_location="cpu", weights_only=False)
         set_sharded_optimizer_state(model, optimizer, reloaded_optim_state_dict, cfg.dcp_for_optimizer)
         del reloaded_optim_state_dict
+        if configured_group_hparams is not None:
+            set_group_hparams(optimizer, configured_group_hparams)
         logger.info("Reloaded optimizer.")
 
         assert training_state_path is not None
         logger.info(f"Reloading training state checkpoint from {training_state_path} ...")
         reloaded_training_state_dict = torch.load(training_state_path, map_location="cpu", weights_only=False)
-        set_optim_state(scheduler, reloaded_training_state_dict, state, data_iterator, timings, cfg.optim)
+        set_optim_state(scheduler, reloaded_training_state_dict, state, data_iterator, timings)
     elif cfg.base_model_dir is not None:
         base_model_path, base_optim_path = get_base_model_checkpoint_path(
             cfg.base_model_dir, cfg.slurm.global_rank, cfg.fully_sharded_size, cfg.dcp_for_optimizer
@@ -337,6 +346,8 @@ def main(cfg: TrainerConf):
                 reloaded_optim_state_dict = torch.load(base_optim_path, map_location="cpu", weights_only=True)
             set_sharded_optimizer_state(model, optimizer, reloaded_optim_state_dict, cfg.dcp_for_optimizer)
             del reloaded_optim_state_dict
+            if configured_group_hparams is not None:
+                set_group_hparams(optimizer, configured_group_hparams)
 
     # check gpu nodes
     check_cluster(
@@ -425,7 +436,7 @@ def main(cfg: TrainerConf):
         s_clip = timer()
         timings.forward_backward += s_clip - s_fwd_bwd
 
-        clip_max_norm = cfg.optim.clip * state.scale
+        clip_max_norm = get_clip_max_norm(cfg.optim.clip, state.scale)
         grad_norm = clip_grad_norm_(fsdp_module=model, max_norm=clip_max_norm)
 
         # update scale / status
@@ -488,6 +499,8 @@ def main(cfg: TrainerConf):
             "avg_loss": reduce_scalar(curr_loss, op='mean'),
             "max_loss": reduce_scalar(curr_loss, op='max'),
         }
+        if cfg.mup is not None:
+            optim_metrics.update({f"lr/{group['name']}": float(group["lr"]) for group in optimizer.param_groups})
         if aux_loss is not None:
             optim_metrics.update({
                 "avg_aux_loss": reduce_scalar(aux_loss, op='mean'),

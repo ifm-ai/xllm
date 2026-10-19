@@ -64,6 +64,7 @@ class TransformerBlock(nn.Module):
 
         if self.fused_block:
             assert cfg.causal_attn_backend in ['flash', 'xattn'], f"flash or xattn attention backend is required for fused block."
+            assert cfg.residual_multiplier == 1.0, "fused block does not support a residual multiplier."
 
         self.attention = MultiheadAttention(
             layer_id=layer_id,
@@ -90,7 +91,10 @@ class TransformerBlock(nn.Module):
             residual_heads=cfg.residual_heads,
             init_mode=cfg.init_mode,
             init_std=cfg.init_std,
+            residual_multiplier=cfg.residual_multiplier,
         )
+        if cfg.zero_query_and_readout:
+            nn.init.zeros_(self.attention.wq.weight)
 
         self.nffn = NormalizedFeedForwardNetwork(
             layer_id=layer_id,
@@ -109,6 +113,7 @@ class TransformerBlock(nn.Module):
             residual_heads=cfg.residual_heads,
             init_mode=cfg.init_mode,
             init_std=cfg.init_std,
+            residual_multiplier=cfg.residual_multiplier,
         )
 
     def forward(
@@ -547,6 +552,8 @@ class TransformerOutputLayer(nn.Module):
             gather_output=False,
             init_method=init_fn
         )
+        if cfg.zero_query_and_readout:
+            nn.init.zeros_(self.output.weight)
 
     def forward(
         self,
