@@ -1,4 +1,5 @@
 from functools import partial
+from copy import deepcopy
 import math
 from torch.optim import lr_scheduler
 
@@ -120,3 +121,15 @@ def build_lr_scheduler(optimizer, cfg: OptimConf, total_steps: int):
     lr_fn = build_lr_fn(cfg, total_steps)
     scheduler = lr_scheduler.LambdaLR(optimizer, lr_fn)
     return scheduler
+
+
+def load_lr_scheduler_state(scheduler, state, cfg: OptimConf):
+    state = deepcopy(state)
+    if cfg.optimizer == 'dion_muon':
+        if len(state['base_lrs']) != 2:
+            raise ValueError('Dion checkpoint must contain Muon and AdamW learning rates')
+        # Preserve both saved group trajectories on normal resume.
+    else:
+        # Preserve the existing AdamW LR-override behavior.
+        state['base_lrs'] = [cfg.lr]
+    scheduler.load_state_dict(state)
