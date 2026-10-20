@@ -2,18 +2,23 @@
 
 Run on one GPU: pytest -q tests/test_train_fixes.py
 """
+import copy
 import math
 import os
 import socket
+from types import SimpleNamespace
 
 import pytest
 import torch
 import torch.distributed as dist
+from torch.optim import AdamW
 
 import train
-from xllm.config import ModelConf
+from xllm.config import ModelConf, OptimConf
 from xllm.distributed import initialize_model_parallel
 from xllm.models import build_model
+from xllm.monitor import Timings
+from xllm.optim import build_lr_scheduler
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -76,3 +81,36 @@ def test_infinite_clip_threshold_leaves_gradients_unchanged():
     norm = model.clip_grad_norm_(math.inf)
     assert norm == pytest.approx(expected_norm, rel=1e-5)
     assert all(torch.equal(local(p.grad), g) for p, g in zip(model.parameters(), grads))
+
+
+def test_resume_keeps_one_base_lr_per_param_group():
+    cfg = OptimConf(lr=1e-2, warmup=10, scheduler="cosine")
+    weights = [torch.nn.Parameter(torch.zeros(4)), torch.nn.Parameter(torch.zeros(4))]
+
+    def build_optim():
+        optimizer = AdamW([{"params": [weights[0]], "lr": 1e-2}, {"params": [weights[1]], "lr": 1e-3}])
+        return optimizer, build_lr_scheduler(optimizer, cfg, 100)
+
+    # uninterrupted: 20 scheduler steps
+    optimizer, scheduler = build_optim()
+    for _ in range(10):
+        optimizer.step()
+        scheduler.step()
+    training_state = {
+        "scheduler": copy.deepcopy(scheduler.state_dict()), "step": 10, "scale": 1.0, "scale_updates": 0,
+        "clip_cumulative": 0, "data_state": None, "timings": {},
+    }
+    for _ in range(10):
+        optimizer.step()
+        scheduler.step()
+    expected = [group["lr"] for group in optimizer.param_groups]
+
+    # resumed at step 10
+    optimizer, scheduler = build_optim()
+    data_iterator = SimpleNamespace(set_state=lambda state: None)
+    train.set_optim_state(scheduler, training_state, SimpleNamespace(), data_iterator, Timings())
+    for _ in range(10):
+        optimizer.step()
+        scheduler.step()
+    assert scheduler.base_lrs == [1e-2, 1e-3]
+    assert [group["lr"] for group in optimizer.param_groups] == pytest.approx(expected, rel=1e-12)

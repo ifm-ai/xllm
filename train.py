@@ -181,10 +181,10 @@ def set_optim_state(
     state: State,
     data_iterator: MultiSourceDataLoader,
     timings: Timings,
-    opt_cfg: OptimConf
 ):
-    # setting LR manually to support overwriting during training from the same state
-    reloaded_training_state_dict["scheduler"]["base_lrs"] = [opt_cfg.lr]
+    # setting LRs from the config to support overwriting during training from the same state;
+    # one base LR per param group keeps the groups' LR ratios
+    reloaded_training_state_dict["scheduler"]["base_lrs"] = list(scheduler.base_lrs)
     scheduler.load_state_dict(reloaded_training_state_dict["scheduler"])
     state.step, state.scale, state.scale_updates, state.clip_cumulative = (
         reloaded_training_state_dict["step"],
@@ -318,7 +318,7 @@ def main(cfg: TrainerConf):
         assert training_state_path is not None
         logger.info(f"Reloading training state checkpoint from {training_state_path} ...")
         reloaded_training_state_dict = torch.load(training_state_path, map_location="cpu", weights_only=False)
-        set_optim_state(scheduler, reloaded_training_state_dict, state, data_iterator, timings, cfg.optim)
+        set_optim_state(scheduler, reloaded_training_state_dict, state, data_iterator, timings)
     elif cfg.base_model_dir is not None:
         base_model_path, base_optim_path = get_base_model_checkpoint_path(
             cfg.base_model_dir, cfg.slurm.global_rank, cfg.fully_sharded_size, cfg.dcp_for_optimizer
