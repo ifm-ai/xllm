@@ -170,6 +170,11 @@ def get_optim_state(
     return optim_state_dict, training_state_dict
 
 
+def get_clip_max_norm(clip: float, scale: float) -> float:
+    """Gradient clipping threshold for the scaled loss; clip <= 0 disables clipping."""
+    return clip * scale if clip > 0 else math.inf
+
+
 def set_optim_state(
     scheduler,
     reloaded_training_state_dict,
@@ -425,7 +430,7 @@ def main(cfg: TrainerConf):
         s_clip = timer()
         timings.forward_backward += s_clip - s_fwd_bwd
 
-        clip_max_norm = cfg.optim.clip * state.scale
+        clip_max_norm = get_clip_max_norm(cfg.optim.clip, state.scale)
         grad_norm = clip_grad_norm_(fsdp_module=model, max_norm=clip_max_norm)
 
         # update scale / status
