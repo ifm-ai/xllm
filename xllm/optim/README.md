@@ -46,7 +46,10 @@ family, keep `head_dim` and the vocabulary fixed and scale `num_heads`,
 model configs, e.g. in a sweep script.
 
 **Options.**
-- `mup.zero_query_and_readout`: zero-init the query and readout weights.
+- `mup.zero_query`: zero-init the query weights. Not supported with
+  `model.qknorm`: QK-norm rescales each query head to unit size, so a zero-init
+  query is full size after the first step whatever the learning rate.
+- `mup.zero_readout`: zero-init the readout weights; works with QK-norm.
 - `optim.no_decay_embed_readout`: no weight decay on the token embedding and
   readout matrix; works with and without `mup`.
 - `optim.tau_epoch`: set the base weight decay to

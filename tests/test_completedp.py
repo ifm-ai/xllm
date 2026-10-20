@@ -139,7 +139,8 @@ def test_resolve_width():
     assert model_cfg.init_std == pytest.approx(0.04 / 2)
     assert model_cfg.init_logits_std == pytest.approx(0.04 / 4)
     assert model_cfg.residual_multiplier == 1.0
-    assert not model_cfg.zero_query_and_readout
+    assert not model_cfg.zero_query
+    assert not model_cfg.zero_readout
 
 
 def test_resolve_depth():
@@ -164,6 +165,7 @@ def test_resolve_depth():
     ({"residual_func": "ortho", "residual_heads": 4}, {}),
     ({"num_experts": 4, "num_activated_experts": 1, "expert_inter_dim": 32}, {}),
     ({"fused_block": True, "causal_attn_backend": "flash"}, {"base_num_layers": 2, "alpha": 1.0}),
+    ({"qknorm": True}, {"zero_query": True}),
 ])
 def test_resolve_rejects_unsupported(model_kwargs, mup_kwargs):
     with pytest.raises(ValueError):
@@ -203,14 +205,16 @@ def test_cli_with_mup():
         "--model.init_mode", "gaussian", "--model.model_dim", "1024", "--model.num_layers", "16",
         "--mup.base_model_dim", "256", "--mup.base_init_embed_std", "1.0",
         "--mup.base_init_hidden_std", "0.02", "--mup.base_init_unembed_std", "0.02",
-        "--mup.base_num_layers", "4", "--mup.alpha", "1.0", "--mup.zero_query_and_readout", "true",
+        "--mup.base_num_layers", "4", "--mup.alpha", "1.0",
+        "--mup.zero_query", "true", "--mup.zero_readout", "true",
     ])
     assert cfg.mup.width_multiplier == 4.0
     assert cfg.mup.depth_multiplier == 4.0
     assert cfg.model.init_std == pytest.approx(0.01)
     assert cfg.model.init_logits_std == pytest.approx(0.005)
     assert cfg.model.residual_multiplier == pytest.approx(0.25)
-    assert cfg.model.zero_query_and_readout
+    assert cfg.model.zero_query
+    assert cfg.model.zero_readout
 
 
 def test_width_family():
@@ -258,13 +262,22 @@ def test_init_std_scaling():
         assert torch.all(local(p) == 0)
 
 
-def test_zero_query_and_readout():
-    model_cfg, _ = resolved(model_conf(), mup_conf(zero_query_and_readout=True))
+def test_zero_query():
+    model_cfg, _ = resolved(model_conf(qknorm=False), mup_conf(zero_query=True))
     model = build(model_cfg)
-    assert torch.all(local(model.output.output.weight) == 0)
+    assert torch.any(local(model.output.output.weight) != 0)
     for layer in model.layers:
         assert torch.all(local(layer.attention.wq.weight) == 0)
         assert torch.any(local(layer.attention.wk.weight) != 0)
+
+
+@pytest.mark.parametrize("qknorm", [False, True])
+def test_zero_readout(qknorm):
+    model_cfg, _ = resolved(model_conf(qknorm=qknorm), mup_conf(zero_readout=True))
+    model = build(model_cfg)
+    assert torch.all(local(model.output.output.weight) == 0)
+    for layer in model.layers:
+        assert torch.any(local(layer.attention.wq.weight) != 0)
 
 
 def test_residual_multiplier():

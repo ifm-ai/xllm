@@ -93,7 +93,7 @@ class TransformerBlock(nn.Module):
             init_std=cfg.init_std,
             residual_multiplier=cfg.residual_multiplier,
         )
-        if cfg.zero_query_and_readout:
+        if cfg.zero_query:
             nn.init.zeros_(self.attention.wq.weight)
 
         self.nffn = NormalizedFeedForwardNetwork(
@@ -552,7 +552,7 @@ class TransformerOutputLayer(nn.Module):
             gather_output=False,
             init_method=init_fn
         )
-        if cfg.zero_query_and_readout:
+        if cfg.zero_readout:
             nn.init.zeros_(self.output.weight)
 
     def forward(

@@ -153,7 +153,8 @@ class ModelConf(Config):
     init_std: Optional[float] = None  # Init std for gaussian; If None, deriving from input dimensions. he/xavier requires None
     init_embed_std: Optional[float] = None  # Std used to truncate normal init of embedding weights. If None, = 1 / sqrt(model_dim)
     init_logits_std: Optional[float] = None  # Std used to truncate normal init of output projection weights. If None, = 1 / sqrt(model_dim)
-    zero_query_and_readout: bool = NOCLI(False)  # Zero-init query and readout weights. Set by the mup config.
+    zero_query: bool = NOCLI(False)  # Zero-init query weights. Set by the mup config.
+    zero_readout: bool = NOCLI(False)  # Zero-init readout weights. Set by the mup config.
     residual_multiplier: float = NOCLI(1.0)  # Multiplier on attention/FFN branch outputs before the residual add. Set by the mup config.
     # Input & output
     vocab_size: int = -1  # Defined later by tokenizer
@@ -279,7 +280,8 @@ class MuPConf(Config):
     base_init_embed_std: float  # Embedding init std, used at every width
     base_init_hidden_std: float  # Hidden-matrix init std at base width; scaled by m_N^-1/2
     base_init_unembed_std: float  # Readout init std at base width; scaled by m_N^-1
-    zero_query_and_readout: bool = False  # Zero-init query and readout weights
+    zero_query: bool = False  # Zero-init query weights; not supported with model.qknorm
+    zero_readout: bool = False  # Zero-init readout weights
     base_num_layers: Optional[int] = None  # num_layers of the base model. Set together with alpha to enable depth scaling
     alpha: Optional[float] = None  # Depth exponent in [0.5, 1]; residual branches are scaled by m_L^-alpha
     width_multiplier: Optional[float] = NOCLI()  # m_N = model_dim / base_model_dim, set by resolve()
@@ -306,6 +308,13 @@ class MuPConf(Config):
         ):
             if actual not in supported:
                 raise ValueError(f"mup requires model.{name} in {supported}, got {actual!r}")
+        if self.zero_query and model.qknorm:
+            # QK-norm rescales each query head to unit RMS, so a zero-init query is full size after the first step
+            raise ValueError(
+                "mup.zero_query does not work with model.qknorm: QK-norm rescales the query to unit size, "
+                "so zero init has no effect after the first step. Set mup.zero_query false or model.qknorm false; "
+                "mup.zero_readout can still be used."
+            )
 
         self.width_multiplier = model.model_dim / self.base_model_dim
         self.depth_multiplier = 1.0
@@ -332,7 +341,8 @@ class MuPConf(Config):
             if current is not None and current != value:
                 logger.warning(f"mup overrides model.{name}={current} with {value}")
             setattr(model, name, value)
-        model.zero_query_and_readout = self.zero_query_and_readout
+        model.zero_query = self.zero_query
+        model.zero_readout = self.zero_readout
         model.residual_multiplier = residual_multiplier
 
 
