@@ -199,24 +199,27 @@ class HealthMetricCollector:
         self.decoder_layer_activation_records[layer_idx] = self._local_stats(x)
 
     @torch.no_grad()
-    def record_query_key_stats(self, layer_idx: int, q: torch.Tensor, k: torch.Tensor) -> None:
+    def record_query_key_stats(
+        self, layer_idx: int, q: torch.Tensor, k: torch.Tensor, kq: Optional[torch.Tensor] = None,
+    ) -> None:
+        """Record Q/K; kq is softdelta's second query set and is logged as kq_stats when given."""
         if not self.recording or not self.enable_query_key_stats:
             return
         if layer_idx in self.query_key_stats_records:
             raise RuntimeError(f"Duplicate query/key statistics for layer {layer_idx}")
-        if q.numel() == 0 or k.numel() == 0:
+        tensors = {"q": q, "k": k} if kq is None else {"q": q, "k": k, "kq": kq}
+        if any(x.numel() == 0 for x in tensors.values()):
             raise RuntimeError(f"Empty query/key tensor for layer {layer_idx}")
-        if q.ndim == 0 or k.ndim == 0:
+        if any(x.ndim == 0 for x in tensors.values()):
             raise RuntimeError(f"Query/key tensors must have a head dimension for layer {layer_idx}")
 
-        q_vector_l2 = torch.linalg.vector_norm(q.detach(), dim=-1, dtype=torch.float32)
-        k_vector_l2 = torch.linalg.vector_norm(k.detach(), dim=-1, dtype=torch.float32)
-        self.query_key_stats_records[layer_idx] = {
-            "q": self._local_stats(q),
-            "q_vector_l2": self._local_stats(q_vector_l2),
-            "k": self._local_stats(k),
-            "k_vector_l2": self._local_stats(k_vector_l2),
-        }
+        layer_stats: Dict[str, _LocalStats] = {}
+        for name, x in tensors.items():
+            layer_stats[name] = self._local_stats(x)
+            layer_stats[f"{name}_vector_l2"] = self._local_stats(
+                torch.linalg.vector_norm(x.detach(), dim=-1, dtype=torch.float32)
+            )
+        self.query_key_stats_records[layer_idx] = layer_stats
 
     @torch.no_grad()
     def record_gekko_query_key_stats(
@@ -504,6 +507,13 @@ class HealthMetricCollector:
                 f"Expected {self.num_layers} query/key records at step {self.step}, "
                 f"got layers {sorted(self.query_key_stats_records)} at step {step}"
             )
+        elif self.enable_query_key_stats:
+            # kq is presence-driven; every rank packs the same layout only if every layer agrees.
+            with_kq = [i for i in layers if "kq" in self.query_key_stats_records[i]]
+            if with_kq and len(with_kq) != len(layers):
+                problems.append(
+                    f"Second-query (kq) records at step {step} cover layers {with_kq} only"
+                )
         if self.enable_logits_stats and self.logits_stats_record is None:
             problems.append(f"Missing logit statistics at step {step}")
         if (self.enable_weight_norms or self.enable_gradient_norms) and (
@@ -554,17 +564,14 @@ class HealthMetricCollector:
                 self.decoder_layer_activation_records[layer_idx],
             ))
             if self.enable_query_key_stats:
-                for name in ("q", "k"):
+                qk_stats = self.query_key_stats_records[layer_idx]
+                for name in ("q", "k", *(("kq",) if "kq" in qk_stats else ())):
                     prefix = f"{name}_stats/{layer}"
-                    entries.append((
-                        prefix,
-                        ("mean", "min", "max"),
-                        self.query_key_stats_records[layer_idx][name],
-                    ))
+                    entries.append((prefix, ("mean", "min", "max"), qk_stats[name]))
                     entries.append((
                         prefix,
                         ("vector_l2_mean", "vector_l2_min", "vector_l2_max"),
-                        self.query_key_stats_records[layer_idx][f"{name}_vector_l2"],
+                        qk_stats[f"{name}_vector_l2"],
                     ))
 
         if self.enable_gekko_stats:

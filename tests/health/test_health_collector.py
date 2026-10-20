@@ -69,6 +69,7 @@ def test_begin_step_discards_an_abandoned_step():
 # Record validation
 
 ONES = torch.ones(2, 2)
+HEADS = torch.ones(1, 1, 1, 2)
 SCALAR = torch.tensor(1.0)
 
 
@@ -138,6 +139,8 @@ def test_families_that_are_off_are_ignored():
 @pytest.mark.parametrize("flags, extra_records, flush_step, message", [
     ({}, lambda c: None, 1, "Expected 2 activation records"),  # layer 1 never recorded
     ({"enable_query_key_stats": True}, lambda c: c.record_activation(1, ONES), 1, "Expected 2 query/key records"),
+    ({"enable_query_key_stats": True}, lambda c: (c.record_activation(1, ONES), c.record_query_key_stats(0, HEADS, HEADS, kq=HEADS),
+                                                  c.record_query_key_stats(1, HEADS, HEADS)), 1, "cover layers [0] only"),  # kq on some layers
     ({"enable_logits_stats": True}, lambda c: c.record_activation(1, ONES), 1, "Missing logit statistics"),
     ({"enable_weight_norms": True}, lambda c: c.record_activation(1, ONES), 1, "matrix norm records"),  # norms never recorded
     ({}, lambda c: c.record_activation(1, ONES), 2, "at step 2"),  # flushed with the wrong step

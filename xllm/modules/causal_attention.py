@@ -27,10 +27,12 @@ def repeat_kv(x: Tensor, n_rep: int) -> Tensor:
     return repeat(x, 'b l h d -> b l (h n) d', n=n_rep)
 
 
-def _record_query_key_stats(layer_id: Optional[int], xq: Tensor, xk: Tensor) -> None:
+def _record_query_key_stats(
+    layer_id: Optional[int], xq: Tensor, xk: Tensor, kq: Optional[Tensor] = None,
+) -> None:
     collector = get_active_health_collector()
     if collector is not None and layer_id is not None:
-        collector.record_query_key_stats(layer_id, xq, xk)
+        collector.record_query_key_stats(layer_id, xq, xk, kq=kq)
 
 
 class CausalSoftmaxAttention(nn.Module):
@@ -226,8 +228,8 @@ class CausalSoftdeltaAttention(nn.Module):
             kq = torch.cat([kq_rope, kq_nope], dim=-1)
             xk = torch.cat([xk_rope, xk_nope], dim=-1)
 
-        # Record local post-RoPE heads before K is gathered across context ranks.
-        _record_query_key_stats(self.layer_id, xq, xk)
+        # Record both local post-RoPE query sets and K before K is gathered across context ranks.
+        _record_query_key_stats(self.layer_id, xq, xk, kq=kq)
 
         if cache is not None:
             assert segments is None
