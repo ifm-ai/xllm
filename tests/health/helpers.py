@@ -40,9 +40,16 @@ MATRICES = {
 }
 
 
+def grouped_rms_norm(x, weight, num_groups, eps):
+    """Plain-torch group RMSNorm with the kernels' convention that the stored weight is an offset from 1."""
+    groups = x.unflatten(-1, (num_groups, -1))
+    y = F.rms_norm(groups, groups.shape[-1:], None, eps).flatten(-2)
+    return y if weight is None else y * (weight + 1.0)
+
+
 def cpu_rms_norm_forward(self, x):
-    # GroupRMSNorm runs a CUDA kernel; torch's rms_norm keeps the forward on CPU. Parameters are untouched.
-    return F.rms_norm(x, x.shape[-1:], self.weight + 1.0 if self.elementwise_affine else None, self.eps)
+    # GroupRMSNorm runs a CUDA kernel; the torch version keeps the forward on CPU. Parameters are untouched.
+    return grouped_rms_norm(x, self.weight if self.elementwise_affine else None, self.groups_per_partition, self.eps)
 
 
 def tiny_transformer(num_layers, **overrides):
