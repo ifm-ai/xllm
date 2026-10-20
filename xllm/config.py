@@ -331,15 +331,20 @@ class MuPConf(Config):
             self.depth_multiplier = model.num_layers / self.base_num_layers
             residual_multiplier = self.depth_multiplier ** -self.alpha
 
+        # model init std -> (value at this width, mup setting it comes from)
         resolved = {
-            "init_embed_std": self.base_init_embed_std,
-            "init_std": self.base_init_hidden_std / math.sqrt(self.width_multiplier),
-            "init_logits_std": self.base_init_unembed_std / self.width_multiplier,
+            "init_embed_std": (self.base_init_embed_std, "base_init_embed_std"),
+            "init_std": (self.base_init_hidden_std / math.sqrt(self.width_multiplier), "base_init_hidden_std"),
+            "init_logits_std": (self.base_init_unembed_std / self.width_multiplier, "base_init_unembed_std"),
         }
-        for name, value in resolved.items():
+        for name, (value, base_name) in resolved.items():
             current = getattr(model, name)
-            if current is not None and current != value:
-                logger.warning(f"mup overrides model.{name}={current} with {value}")
+            # an equal value is allowed, e.g. a config.json saved by an earlier mup run
+            if current is not None and not math.isclose(current, value, rel_tol=1e-9):
+                raise ValueError(
+                    f"model.{name}={current} conflicts with mup, which sets it to {value} at this width. "
+                    f"Unset model.{name} and set mup.{base_name} (the value at the base width) instead."
+                )
             setattr(model, name, value)
         model.zero_query = self.zero_query
         model.zero_readout = self.zero_readout

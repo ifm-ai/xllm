@@ -172,6 +172,20 @@ def test_resolve_rejects_unsupported(model_kwargs, mup_kwargs):
         mup_conf(**mup_kwargs).resolve(model_conf(**model_kwargs))
 
 
+@pytest.mark.parametrize("name", ["init_embed_std", "init_std", "init_logits_std"])
+def test_resolve_rejects_conflicting_init_std(name):
+    with pytest.raises(ValueError, match=name):
+        mup_conf().resolve(model_conf(model_dim=256, **{name: 0.5}))
+
+
+def test_resolve_accepts_matching_init_std():
+    # a config saved by a mup run holds the resolved stds; resolving it again must work
+    model_cfg, _ = resolved(model_conf(model_dim=256), mup_conf())
+    again, _ = resolved(copy.deepcopy(model_cfg), mup_conf())
+    assert (again.init_embed_std, again.init_std, again.init_logits_std) == \
+        (model_cfg.init_embed_std, model_cfg.init_std, model_cfg.init_logits_std)
+
+
 def test_width_only_allows_fused_block_and_dropout():
     model_cfg, _ = resolved(model_conf(fused_block=True, causal_attn_backend="flash", dropout=0.1), mup_conf())
     assert model_cfg.residual_multiplier == 1.0

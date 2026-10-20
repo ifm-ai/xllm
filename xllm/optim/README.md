@@ -30,6 +30,11 @@ scaling. With `m_N = model_dim / base_model_dim` and
 | Final norm | `1` | `1` | `1` | `1` |
 | Readout | `base_init_unembed_std * m_N^-1` | `m_N^-1` | `1` | `m_N` |
 
+With `mup`, set the init through `mup.base_init_*` (values at the base width).
+`model.init_std`, `model.init_embed_std` and `model.init_logits_std` are set
+from them; passing a different value is an error, since a fixed std would undo
+the width scaling for that layer.
+
 Attention and FFN branch outputs are multiplied by `m_L^-alpha` before the
 residual add. Roles are assigned by `xllm.optim.param_roles`; the per-role LRs
 are logged as `lr/<role>` in the optim metrics. xLLM's QK-norm weights are per
