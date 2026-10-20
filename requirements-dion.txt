@@ -1,2 +1,2 @@
-# Optional distributed Muon dependency; qualified revision, no Triton/GNS extras.
+# Optional Muon dependency; Triton/GNS extras are opt-in (see docs/dion-muon.md).
 dion @ git+https://github.com/microsoft/dion.git@7692479288f928a3d61d1cc58137b4dbe4f71000

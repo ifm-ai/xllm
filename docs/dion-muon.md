@@ -1,5 +1,5 @@
 ---
-date: 2026-10-19
+date: 2026-10-20
 ---
 
 # Hybrid Gekko + Dion-based Muon
@@ -24,6 +24,8 @@ Arguments below are added by this stack; defaults are defined in [config.py](../
 | `--optim.muon_nesterov` | `false` | Enable Nesterov momentum. |
 | `--optim.muon_adjust_lr` | `spectral_norm` | Matrix-size LR adjustment: `spectral_norm` or `rms_norm`; unrelated to activation RMSNorm. |
 | `--optim.muon_orthogonalizer` | `newton_schulz5` | `newton_schulz5` or `polar_express`. |
+| `--optim.muon_use_gram_newton_schulz` | `false` | Select Dion's Gram Newton-Schulz backend; requires the optional GNS dependency. |
+| `--optim.muon_use_triton` | `false` | Enable accelerated orthogonalization kernels. With GNS, forwards to its `ns_use_kernels` setting. |
 
 ## Use
 
@@ -33,6 +35,20 @@ the optional pinned dependency:
 ```bash
 python -m pip install -r requirements-dion.txt
 ```
+
+For optional accelerated backends, install the matching extras:
+
+```bash
+python -m pip install "dion[gns,triton] @ git+https://github.com/microsoft/dion.git@7692479288f928a3d61d1cc58137b4dbe4f71000"
+```
+
+The GNS extra pins CUTLASS/Quack versions; check compatibility with the
+attention backend before changing an existing container.
+
+GNS takes precedence over `muon_orthogonalizer` in Dion; that setting selects
+Newton-Schulz5/Polar Express only when GNS is off. Both new flags default to
+`false`, including when loading older configs. Kernel compilation/autotuning can
+make the first steps slow; enabling a backend does not guarantee a speedup.
 
 Append these settings to an otherwise complete training command:
 
@@ -69,6 +85,8 @@ Training logs include `optim/lr_muon` and `optim/lr_adamw`.
   Packed generation with a cache is unsupported.
 - Normal Muon resume requires unchanged parameter groups, recipe, scheduler horizon
   and mesh layout. Both saved LR trajectories are preserved. Drift is rejected.
+  Older checkpoints without kernel flags resume with both flags `false`;
+  switching backends requires a fresh optimizer, not a normal resume.
 - To switch from AdamW, use a fresh `dump_dir` plus `base_model_dir`, with
   `reload_base_optim_state=false`. This loads weights, not the old optimizer/data cursor.
   Changing the hybrid layer pattern additionally requires model checkpoint conversion.

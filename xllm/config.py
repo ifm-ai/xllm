@@ -88,6 +88,8 @@ class OptimConf(Config):
     muon_nesterov: bool = False
     muon_adjust_lr: str = 'spectral_norm'  # spectral_norm or rms_norm
     muon_orthogonalizer: str = 'newton_schulz5'  # newton_schulz5 or polar_express
+    muon_use_gram_newton_schulz: bool = False  # Optional Dion GNS backend; overrides muon_orthogonalizer
+    muon_use_triton: bool = False  # Use Dion's accelerated orthogonalization kernels
     warmup: int = 2000  # Num of steps for LR warmup. 0 means no warmup
     weight_decay: float = 0.1  # Decoupled weight decay
     epsilon: float = 1e-8
