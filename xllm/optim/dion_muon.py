@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+from copy import deepcopy
 
 import torch
 import torch.distributed as dist
@@ -96,8 +97,8 @@ def build_dion_muon(model, cfg):
         nesterov=cfg.muon_nesterov,
         adjust_lr=cfg.muon_adjust_lr,
         use_polar_express=cfg.muon_orthogonalizer == 'polar_express',
-        use_gram_newton_schulz=False,
-        use_triton=False,
+        use_gram_newton_schulz=cfg.muon_use_gram_newton_schulz,
+        use_triton=cfg.muon_use_triton,
     )
     full_mesh = groups[0]['params'][0].device_mesh
     replicated = 'cp' in full_mesh.mesh_dim_names and full_mesh['cp'].size() > 1
@@ -121,6 +122,8 @@ def build_dion_muon(model, cfg):
                 'muon_momentum',
                 'muon_nesterov',
                 'muon_adjust_lr',
+                'muon_use_gram_newton_schulz',
+                'muon_use_triton',
                 'beta1',
                 'beta2',
                 'weight_decay',
@@ -134,6 +137,11 @@ def build_dion_muon(model, cfg):
 def validate_optimizer_contract(optimizer, training_state):
     current = getattr(optimizer, '_xllm_optimizer_contract', None)
     saved = training_state.get('optimizer_contract')
+    if saved is not None and 'recipe' in saved:
+        # Older checkpoints always used the unaccelerated path.
+        saved = deepcopy(saved)
+        for name in ('muon_use_gram_newton_schulz', 'muon_use_triton'):
+            saved['recipe'].setdefault(name, False)
     if current != saved:
         raise ValueError(
             'Optimizer checkpoint contract changed (optimizer, parameters or topology)'

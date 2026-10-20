@@ -175,3 +175,34 @@ def test_adamw_defaults_and_scheduler_lr_override_are_unchanged():
     load_lr_scheduler_state(scheduler, saved, cfg)
     assert scheduler.base_lrs == [cfg.lr]
     assert saved['base_lrs'] == [0.001]
+
+
+def test_optional_muon_kernels_default_off_and_accept_cli_flags():
+    cfg = OptimConf.from_dict({'optimizer': 'dion_muon'})
+    assert not cfg.muon_use_gram_newton_schulz and not cfg.muon_use_triton
+    args = OptimConf.to_cli().parse_args([
+        '--optimizer', 'dion_muon',
+        '--muon_use_gram_newton_schulz', 'true', '--muon_use_triton', 'true',
+    ])
+    cfg = OptimConf.from_cli(vars(args))
+    assert cfg.muon_use_gram_newton_schulz and cfg.muon_use_triton
+
+
+@pytest.mark.parametrize('gns,triton', [(False, False), (False, True), (True, False), (True, True)])
+def test_legacy_muon_contract_defaults_kernel_flags_without_hiding_drift(gns, triton):
+    legacy = {'optimizer_contract': {'optimizer': 'dion_muon', 'recipe': {'lr': 0.001}}}
+    saved = deepcopy(legacy)
+    current = deepcopy(legacy['optimizer_contract'])
+    current['recipe'].update(muon_use_gram_newton_schulz=gns, muon_use_triton=triton)
+    optimizer = SimpleNamespace(_xllm_optimizer_contract=current)
+    validate_optimizer_contract(optimizer, {'optimizer_contract': current})
+    if gns or triton:
+        with pytest.raises(ValueError, match='contract changed'):
+            validate_optimizer_contract(optimizer, legacy)
+    else:
+        validate_optimizer_contract(optimizer, legacy)
+    assert legacy == saved
+    changed = deepcopy(current)
+    changed['recipe']['muon_use_triton'] = not triton
+    with pytest.raises(ValueError, match='contract changed'):
+        validate_optimizer_contract(optimizer, {'optimizer_contract': changed})
