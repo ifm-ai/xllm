@@ -68,6 +68,14 @@ gradient norm grows with width (the readout dominates it), so a fixed
 `optim.clip` clips wide models more than narrow ones. Use `--optim.clip 0` to
 disable clipping, e.g. for learning-rate transfer sweeps.
 
+**Export and serving.** With depth scaling, the `m_L^-alpha` branch multiplier
+is part of the model's forward pass (`model.residual_multiplier` in
+`config.json`), but the xBridges Hugging Face and vLLM models add the attention
+and FFN outputs without it. Before serving a depth-scaled model, fold the
+multiplier into the attention output projection (`wo`) and the FFN down
+projection (`fc2`), which both feed the residual add and have no bias. Width-only
+models have multiplier 1 and export as is.
+
 **Resume.** On resume, the per-role learning rates follow the config (as the
 single learning rate does without `mup`), and with `mup` so do the per-role
 epsilon and weight decay. Optimizer state can only be reloaded with the param
