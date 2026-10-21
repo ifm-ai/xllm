@@ -1,5 +1,5 @@
 from logging import getLogger
-from typing import Optional
+from typing import Any, Dict, Optional
 
 import torch
 from torch import nn
@@ -81,6 +81,15 @@ def mup_param_groups(model: nn.Module, cfg: OptimConf, mup: MuPConf, weight_deca
             "weight_decay": role_weight_decay,
         })
     return groups
+
+
+def optimizer_layout(config: Dict[str, Any]) -> str:
+    """Param group layout that build_optimizer uses for a TrainerConf dict (as saved in config.json)."""
+    if config.get("mup") is not None:
+        return "mup"
+    if config["optim"].get("no_decay_embed_readout", False):
+        return "no_decay_embed_readout"
+    return "default"
 
 
 def get_group_hparams(optimizer):

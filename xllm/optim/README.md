@@ -70,4 +70,7 @@ disable clipping, e.g. for learning-rate transfer sweeps.
 
 **Resume.** On resume, the per-role learning rates follow the config (as the
 single learning rate does without `mup`), and with `mup` so do the per-role
-epsilon and weight decay.
+epsilon and weight decay. Optimizer state can only be reloaded with the param
+group layout it was saved with (`mup`, `optim.no_decay_embed_readout`, or
+neither); switching layouts raises an error. Model weights load across layouts,
+e.g. from `base_model_dir` with `reload_base_optim_state false`.

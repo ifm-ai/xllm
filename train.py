@@ -57,7 +57,7 @@ from xllm.utils import (
     collect_provenance,
 )
 from xllm.models import build_model
-from xllm.optim import build_optimizer, get_group_hparams, rescale_grads, set_group_hparams
+from xllm.optim import build_optimizer, get_group_hparams, optimizer_layout, rescale_grads, set_group_hparams
 from xllm.monitor import GPUMonitor, Timings
 from xllm.metrics import MetricLogger, build_mlogger
 from xllm.configuration import cfg_from_cli
@@ -173,6 +173,23 @@ def get_optim_state(
 def get_clip_max_norm(clip: float, scale: float) -> float:
     """Gradient clipping threshold for the scaled loss; clip <= 0 disables clipping."""
     return clip * scale if clip > 0 else math.inf
+
+
+def check_optimizer_layout(cfg: TrainerConf, checkpoint_dir: Path) -> None:
+    """Optimizer state can only be reloaded into the param group layout it was saved with."""
+    config_path = checkpoint_dir / "config.json"
+    if not config_path.exists():
+        logger.warning(f"No config.json in {checkpoint_dir}; cannot check the optimizer layout before reloading.")
+        return
+    with config_path.open() as f:
+        saved = optimizer_layout(json.load(f))
+    current = optimizer_layout(cfg.to_dict())
+    if saved != current:
+        raise ValueError(
+            f"Optimizer state in {checkpoint_dir} uses param group layout {saved!r}, but this run uses {current!r} "
+            f"(set by mup and optim.no_decay_embed_readout). Optimizer state cannot move between layouts; "
+            f"start a new run from the weights only (base_model_dir with reload_base_optim_state false)."
+        )
 
 
 def set_optim_state(
@@ -296,6 +313,7 @@ def main(cfg: TrainerConf):
 
     # reload model if available
     if model_path is not None:
+        check_optimizer_layout(cfg, model_path.parent)
         logger.info(f"Reloading model checkpoint from {model_path} ...")
         hsdp_group = get_hybrid_shard_data_parallel_group()
         # reload sharded model state
@@ -324,6 +342,8 @@ def main(cfg: TrainerConf):
         reloaded_training_state_dict = torch.load(training_state_path, map_location="cpu", weights_only=False)
         set_optim_state(scheduler, reloaded_training_state_dict, state, data_iterator, timings)
     elif cfg.base_model_dir is not None:
+        if cfg.reload_base_optim_state:
+            check_optimizer_layout(cfg, Path(cfg.base_model_dir))
         base_model_path, base_optim_path = get_base_model_checkpoint_path(
             cfg.base_model_dir, cfg.slurm.global_rank, cfg.fully_sharded_size, cfg.dcp_for_optimizer
         )

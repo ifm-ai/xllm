@@ -3,6 +3,7 @@
 Run on one GPU: pytest -q tests/test_completedp.py
 """
 import copy
+import json
 import math
 import os
 import socket
@@ -28,7 +29,7 @@ from xllm.distributed import initialize_model_parallel
 from xllm.models import build_model
 from xllm.modules.residual import BaseResidual
 from xllm.monitor import Timings
-from xllm.optim import build_optimizer, get_group_hparams, param_roles, set_group_hparams
+from xllm.optim import build_optimizer, get_group_hparams, optimizer_layout, param_roles, set_group_hparams
 from xllm.utils import set_sharded_optimizer_state
 
 # truncated normal at +-3 std has std ~0.9866 * std
@@ -481,3 +482,46 @@ def test_resume_uses_configured_group_hparams():
     groups = groups_by_name(optimizer)
     assert groups["hidden_matrix"]["weight_decay"] == pytest.approx(0.2 * 2)
     assert groups["embed"]["eps"] == pytest.approx(1e-10 / 2)
+
+
+MUP_ARGS = [
+    "--model.init_mode", "gaussian", "--model.model_dim", "256",
+    "--mup.base_model_dim", "64", "--mup.base_init_embed_std", "1.0",
+    "--mup.base_init_hidden_std", "0.02", "--mup.base_init_unembed_std", "0.02",
+]
+NO_DECAY_ARGS = ["--model.init_mode", "gaussian", "--optim.no_decay_embed_readout", "true"]
+
+
+def test_optimizer_layout():
+    assert optimizer_layout(trainer_conf_from_args(["--model.init_mode", "gaussian"]).to_dict()) == "default"
+    assert optimizer_layout(trainer_conf_from_args(NO_DECAY_ARGS).to_dict()) == "no_decay_embed_readout"
+    assert optimizer_layout(trainer_conf_from_args(MUP_ARGS + ["--optim.no_decay_embed_readout", "true"]).to_dict()) == "mup"
+    # config.json written before mup existed
+    assert optimizer_layout({"optim": {"lr": 1e-3}}) == "default"
+
+
+@pytest.mark.parametrize("saved_args, current_args, ok", [
+    ([], [], True),
+    (MUP_ARGS, MUP_ARGS, True),
+    ([], MUP_ARGS, False),
+    (MUP_ARGS, [], False),
+    (MUP_ARGS, NO_DECAY_ARGS, False),
+    (NO_DECAY_ARGS, [], False),
+])
+def test_check_optimizer_layout(tmp_path, saved_args, current_args, ok):
+    import train
+
+    saved = trainer_conf_from_args(["--model.init_mode", "gaussian"] + saved_args)
+    (tmp_path / "config.json").write_text(saved.to_json())
+    current = trainer_conf_from_args(["--model.init_mode", "gaussian"] + current_args)
+    if ok:
+        train.check_optimizer_layout(current, tmp_path)
+    else:
+        with pytest.raises(ValueError, match="param group layout"):
+            train.check_optimizer_layout(current, tmp_path)
+
+
+def test_check_optimizer_layout_without_config_json(tmp_path):
+    import train
+
+    train.check_optimizer_layout(trainer_conf_from_args(MUP_ARGS), tmp_path)
