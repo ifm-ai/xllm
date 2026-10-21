@@ -26,13 +26,6 @@ def build_optimizer(model: nn.Module, cfg: OptimConf, total_steps: int, param_dt
     logger.info("Starting build of optimizer...")
     if cfg.optimizer == 'dion_muon':
         optimizer = build_dion_muon(model, cfg)
-        optimizer._xllm_optimizer_contract['scheduler'] = {
-            'total_steps': total_steps,
-            **{name: getattr(cfg, name) for name in (
-                'scheduler', 'warmup', 'lr_init_ratio', 'lr_end_ratio', 'cycles',
-                'wsd_decay_duration_steps', 'wsd_decay_style',
-            )},
-        }
     else:
         optimizer = AdamW(
             model.parameters(),

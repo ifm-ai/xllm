@@ -90,8 +90,11 @@ class OptimConf(Config):
     muon_orthogonalizer: str = 'newton_schulz5'  # newton_schulz5 or polar_express
     muon_use_gram_newton_schulz: bool = False  # Optional Dion GNS backend; overrides muon_orthogonalizer
     muon_use_triton: bool = False  # Use Dion's accelerated orthogonalization kernels
+    muon_weight_decay: Optional[float] = None  # Muon decoupled weight decay; None uses weight_decay
+    muon_replica_sync: bool = False  # Broadcast weights and optimizer state across CP/HSDP replicas after each step
+    no_decay_embed_readout: bool = False  # dion_muon: also exclude the token embedding and readout from AdamW weight decay
     warmup: int = 2000  # Num of steps for LR warmup. 0 means no warmup
-    weight_decay: float = 0.1  # Decoupled weight decay
+    weight_decay: float = 0.1  # Decoupled weight decay (dion_muon: AdamW matrices; norms and biases get none)
     epsilon: float = 1e-8
     beta1: float = 0.9
     beta2: float = 0.98
@@ -112,8 +115,10 @@ class OptimConf(Config):
                 value = getattr(self, name)
                 if isinstance(value, bool) or not math.isfinite(value) or value <= 0:
                     raise ValueError(f'{name} must be finite and positive')
-            if not math.isfinite(self.weight_decay) or self.weight_decay < 0:
-                raise ValueError('weight_decay must be finite and nonnegative')
+            for name in ('weight_decay', 'muon_weight_decay'):
+                value = getattr(self, name)
+                if value is not None and (not math.isfinite(value) or value < 0):
+                    raise ValueError(f'{name} must be finite and nonnegative')
             for name in ('muon_momentum', 'beta1', 'beta2'):
                 if not 0 <= getattr(self, name) < 1:
                     raise ValueError(f'{name} must be in [0, 1)')

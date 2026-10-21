@@ -58,7 +58,7 @@ from xllm.utils import (
 )
 from xllm.models import build_model
 from xllm.optim import build_optimizer, rescale_grads
-from xllm.optim.dion_muon import validate_optimizer_contract
+from xllm.optim.dion_muon import get_group_hparams, set_group_hparams, validate_optimizer_contract
 from xllm.optim.lr_scheduler import load_lr_scheduler_state
 from xllm.monitor import GPUMonitor, Timings
 from xllm.metrics import MetricLogger, build_mlogger
@@ -306,6 +306,7 @@ def main(cfg: TrainerConf):
         # reload optimizer if available
         assert optim_path is not None
         logger.info(f"Reloading optimizer checkpoint from {optim_path} ...")
+        configured_hparams = get_group_hparams(optimizer)
         if cfg.dcp_for_optimizer:
             reloaded_optim_state_dict = get_sharded_optimizer_state(model, optimizer, cfg.dcp_for_optimizer)
             dist_ckpt.load(reloaded_optim_state_dict, checkpoint_id=optim_path, process_group=hsdp_group)
@@ -313,6 +314,8 @@ def main(cfg: TrainerConf):
             reloaded_optim_state_dict = torch.load(optim_path, map_location="cpu", weights_only=False)
         set_sharded_optimizer_state(model, optimizer, reloaded_optim_state_dict, cfg.dcp_for_optimizer)
         del reloaded_optim_state_dict
+        if cfg.optim.optimizer == 'dion_muon':
+            set_group_hparams(optimizer, configured_hparams)
         logger.info("Reloaded optimizer.")
 
         logger.info(f"Reloading training state checkpoint from {training_state_path} ...")
@@ -338,6 +341,7 @@ def main(cfg: TrainerConf):
                 validate_optimizer_contract(optimizer, base_state)
             assert base_optim_path is not None, base_optim_path
             logger.info(f"Reloading base optimizer checkpoint from {base_optim_path} ...")
+            configured_hparams = get_group_hparams(optimizer)
             if cfg.dcp_for_optimizer:
                 reloaded_optim_state_dict = get_sharded_optimizer_state(model, optimizer, cfg.dcp_for_optimizer)
                 dist_ckpt.load(reloaded_optim_state_dict, checkpoint_id=base_optim_path, process_group=hsdp_group)
@@ -345,6 +349,8 @@ def main(cfg: TrainerConf):
                 reloaded_optim_state_dict = torch.load(base_optim_path, map_location="cpu", weights_only=True)
             set_sharded_optimizer_state(model, optimizer, reloaded_optim_state_dict, cfg.dcp_for_optimizer)
             del reloaded_optim_state_dict
+            if cfg.optim.optimizer == 'dion_muon':
+                set_group_hparams(optimizer, configured_hparams)
 
     # check gpu nodes
     check_cluster(
