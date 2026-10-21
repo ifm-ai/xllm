@@ -95,6 +95,14 @@ python -m pip install -r requirements-build.txt
 python -m pip install --no-build-isolation .
 ```
 
+The following is the corresponding `xattn` versions.
+
+| `xllm`            | `xattn`      |
+| ------------------ | ------------------ |
+| `main` / `nightly` | `main` / `nightly` |
+| `1.0.0`             | `1.0.0`           |
+| `1.0.1`             | `1.1.1`           |
+
 </details>
 
 <details>

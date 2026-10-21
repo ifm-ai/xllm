@@ -462,7 +462,7 @@ class TransformerMoVABlock(nn.Module):
                 self.mova.router.bias,
                 self.mova.value_backend,
                 self.mova.attn_gate_fn,
-                self.mova.causal_attention,
+                self.mova.causal_attn_backend,
                 None,
                 self.moe.norm.weight,
                 self.moe.norm.bias,
