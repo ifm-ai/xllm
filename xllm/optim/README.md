@@ -30,6 +30,14 @@ scaling. With `m_N = model_dim / base_model_dim` and
 | Final norm | `1` | `1` | `1` | `1` |
 | Readout | `base_init_unembed_std * m_N^-1` | `m_N^-1` | `1` | `m_N` |
 
+The width factors cancel in `lr * weight_decay`, so the AdamW timescale
+`1 / (lr * weight_decay * steps)` of every role is the same at every width. With
+depth scaling, the hidden-matrix and hidden-norm learning rates carry
+`m_L^(alpha-1)` and their weight decay has no depth factor, so their timescale
+is depth-invariant only at `alpha = 1`; at `alpha < 1` it grows as
+`m_L^(1-alpha)`. A different number of steps changes the timescale of every
+role; `optim.tau_epoch` (below) keeps it fixed.
+
 With `mup`, set the init through `mup.base_init_*` (values at the base width).
 `model.init_std`, `model.init_embed_std` and `model.init_logits_std` are set
 from them; passing a different value is an error, since a fixed std would undo
