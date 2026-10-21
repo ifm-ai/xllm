@@ -63,8 +63,7 @@ class AdaptiveWorkingMemory(nn.Module):
         if seq_len >= self.chunk_size:
             out, mask, memory, log_norm_term = adaptive_working_memory(
                 xq, xqk, xkk, xv, self.chunk_size, memory, log_norm_term, prev_qk, prev_kk, prev_v,
-                segment_idx, prev_segment_count, self.ortho, self.eps,
-                health_layer_id=health_layer_id,
+                segment_idx, prev_segment_count, self.ortho, self.eps, health_layer_id,
             )
             prev_qk = xqk[:, :, seq_len - self.chunk_size:]
             prev_kk = xkk[:, :, seq_len - self.chunk_size:]
