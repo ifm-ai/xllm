@@ -181,6 +181,12 @@ Head dimensions and RoPE settings are shared; full-attention layers require
 Unpacked generation dispatches the cache per layer; packed generation with a
 cache is not supported. Changing the layer pattern requires checkpoint conversion.
 
+## Dion-based Muon
+
+Optional Muon support for Transformer, pure Gekko and hybrid Gekko with FSDP2.
+AdamW remains the default. See the [hybrid/Muon argument note](docs/dion-muon.md)
+for installation, settings, checkpoint rules and supported scope.
+
 ## Checkpoint Conversion & Serving
 Conversion and serving checkpoints of xLLM is supported by [xBridges](https://github.com/ifm-ai/xbridges).
 
