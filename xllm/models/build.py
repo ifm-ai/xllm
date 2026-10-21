@@ -169,6 +169,8 @@ def init_transformer_cache(model):
 
 def init_gekko_cache(model):
     cache_layers = [((None, None, 0), (None, None, None, None), (None, None, None), (None, None, None)) for _ in range(model.num_layers)]
+    for layer_id in model.full_attention_layers:
+        cache_layers[layer_id] = (None, None, 0)
     cache_norm = (None, None, None)
     cache_segment = (None, None, None)
     cache = (cache_layers, cache_norm, cache_segment)
