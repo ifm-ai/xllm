@@ -108,42 +108,24 @@ def test(B: int, L1: int, L2: int, H: int, D: int, multi_segment: bool, dtype: s
         print(f"B={B}, L=({L1}, {L2}), H={H}, D={D}, seg={multi_segment}, dtype={dtype}, flash: pass bwd test")
 
         # xattn
-        atol = {"fp32": 1e-6, "bf16": 4e-3, "fp16": 2e-4}[dtype]
-        rtol = {"fp32": 1e-5, "bf16": 1e-2, "fp16": 1e-3}[dtype]
-        y_xattn, y_bwd, lse = xattn_causal_flash_attn_fwd(
-            q, k, v, scale, bos_mask, k_segment_idx, False, True
-        )
-        torch.testing.assert_close(y_xattn, y_mannual.to(pt_dtype), rtol=rtol, atol=atol)
-        print(f"B={B}, L=({L1}, {L2}), H={H}, D={D}, seg={multi_segment}, dtype={dtype}, xattn: pass fwd test")
+        for level in range(5):
+            atol = {"fp32": 1e-6, "bf16": 4e-3, "fp16": 2e-4}[dtype]
+            rtol = {"fp32": 1e-5, "bf16": 1e-2, "fp16": 1e-3}[dtype]
+            y_xattn, y_bwd, lse = xattn_causal_flash_attn_fwd(
+                q, k, v, scale, bos_mask, k_segment_idx, level, True
+            )
+            torch.testing.assert_close(y_xattn, y_mannual.to(pt_dtype), rtol=rtol, atol=atol)
+            print(f"B={B}, L=({L1}, {L2}), H={H}, D={D}, seg={multi_segment}, dtype={dtype}, xattn-{level}: pass fwd test")
 
-        atol = {"fp32": 1e-6, "bf16": 4e-3, "fp16": 2e-4}[dtype]
-        rtol = {"fp32": 1e-5, "bf16": 1e-2, "fp16": 1e-3}[dtype]
-        q_grad_xattn, k_grad_xattn, v_grad_xattn = xattn_causal_flash_attn_bwd(
-            y_grad, q, k, v, y_bwd, lse, scale, bos_mask, k_segment_idx, False
-        )
-        torch.testing.assert_close(q_grad_xattn, q_grad, rtol=rtol, atol=atol)
-        torch.testing.assert_close(k_grad_xattn, k_grad, rtol=rtol, atol=atol)
-        torch.testing.assert_close(v_grad_xattn, v_grad, rtol=rtol, atol=atol)
-        print(f"B={B}, L=({L1}, {L2}), H={H}, D={D}, seg={multi_segment}, dtype={dtype}, xattn: pass bwd test")
-
-        # xattn-fp32
-        atol = {"fp32": 1e-6, "bf16": 4e-3, "fp16": 2e-4}[dtype]
-        rtol = {"fp32": 1e-5, "bf16": 1e-2, "fp16": 1e-3}[dtype]
-        y_xattn, y_bwd, lse = xattn_causal_flash_attn_fwd(
-            q, k, v, scale, bos_mask, k_segment_idx, True, True
-        )
-        torch.testing.assert_close(y_xattn, y_mannual.to(pt_dtype), rtol=rtol, atol=atol)
-        print(f"B={B}, L=({L1}, {L2}), H={H}, D={D}, seg={multi_segment}, dtype={dtype}, xattn-fp32: pass fwd test")
-
-        atol = {"fp32": 1e-6, "bf16": 4e-3, "fp16": 2e-4}[dtype]
-        rtol = {"fp32": 1e-5, "bf16": 1e-2, "fp16": 1e-3}[dtype]
-        q_grad_xattn, k_grad_xattn, v_grad_xattn = xattn_causal_flash_attn_bwd(
-            y_grad, q, k, v, y_bwd, lse, scale, bos_mask, k_segment_idx, False
-        )
-        torch.testing.assert_close(q_grad_xattn, q_grad, rtol=rtol, atol=atol)
-        torch.testing.assert_close(k_grad_xattn, k_grad, rtol=rtol, atol=atol)
-        torch.testing.assert_close(v_grad_xattn, v_grad, rtol=rtol, atol=atol)
-        print(f"B={B}, L=({L1}, {L2}), H={H}, D={D}, seg={multi_segment}, dtype={dtype}, xattn-fp32: pass bwd test")
+            atol = {"fp32": 1e-6, "bf16": 4e-3, "fp16": 2e-4}[dtype]
+            rtol = {"fp32": 1e-5, "bf16": 1e-2, "fp16": 1e-3}[dtype]
+            q_grad_xattn, k_grad_xattn, v_grad_xattn = xattn_causal_flash_attn_bwd(
+                y_grad, q, k, v, y_bwd, lse, scale, bos_mask, k_segment_idx, level,False
+            )
+            torch.testing.assert_close(q_grad_xattn, q_grad, rtol=rtol, atol=atol)
+            torch.testing.assert_close(k_grad_xattn, k_grad, rtol=rtol, atol=atol)
+            torch.testing.assert_close(v_grad_xattn, v_grad, rtol=rtol, atol=atol)
+            print(f"B={B}, L=({L1}, {L2}), H={H}, D={D}, seg={multi_segment}, dtype={dtype}, xattn-{level}: pass bwd test")
 
 
 def main(seed: int, dtype: str):

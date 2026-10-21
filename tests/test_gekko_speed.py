@@ -4,6 +4,8 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 import fire
+import flash_attn_3._C  # Registers operators with PyTorch
+flash_attn_gpu = torch.ops.flash_attn_3
 
 from xllm.modules.fused_ops import (
     sliding_chunk_attention_fwd,
@@ -218,20 +220,69 @@ def test_causal_conv1d(
             print(f'{backend} causal conv1d w. hx bwd: {delta:.2f}s')
 
 
-def test_sliding_chunk_attention(
-    query, key, value, out_grad, chunk_size, bos_mask, segment_idx, fp32_output, backend, epochs
+def test_flash_sliding_window_attention_speed(
+    query, key, value, out_grad, chunk_size, scale, epochs
 ):
+    with torch.no_grad():
+        window_size = (chunk_size, 0)
+        q_grad, k_grad, v_grad = torch.empty_like(query), torch.empty_like(key), torch.empty_like(value)
+        # warm up
+        for _ in range(100):
+            out, softmax_lse, *rest = flash_attn_gpu.fwd(
+                query, key, value,  None, None, None, None, None, None, None,
+                None, None, None, None, None, None, None,
+                None, None, None, None, None, None,
+                scale, True, window_size[0], window_size[1], 0, 0.0,
+                True, None, 1, None, 0,
+            )
+            flash_attn_gpu.bwd(
+                out_grad, query, key, value, out, softmax_lse, q_grad, k_grad, v_grad,
+                None, None, None, None, None, None,  # cu_seqlens_q/k, seqused_q/k, max_seqlen_q/k
+                scale, True, window_size[0], window_size[1], 0.0, False, 0,
+            )
+        torch.cuda.synchronize()
+
+        start = timer()
+        for _ in range(epochs):
+            out, softmax_lse, *rest = flash_attn_gpu.fwd(
+                query, key, value, None, None, None, None, None, None, None,
+                None, None, None, None, None, None, None,
+                None, None, None, None, None, None,
+                scale, True, window_size[0], window_size[1], 0, 0.0,
+                True, None, 1, None, 0,
+            )
+        torch.cuda.synchronize()
+
+        delta = timer() - start
+        print(f'flash3 SWA fwd: {delta:.2f}s')
+
+        start = timer()
+        for _ in range(epochs):
+            flash_attn_gpu.bwd(
+                out_grad, query, key, value, out, softmax_lse, q_grad, k_grad, v_grad,
+                None, None, None, None, None, None,  # cu_seqlens_q/k, seqused_q/k, max_seqlen_q/k
+                scale, True, window_size[0], window_size[1], 0.0, False, 0,
+            )
+        torch.cuda.synchronize()
+
+        delta = timer() - start
+        print(f'flash3 SWA bwd: {delta:.2f}s')
+
+
+def test_sliding_chunk_attention(
+    query, key, value, out_grad, chunk_size, bos_mask, segment_idx, level, backend, epochs
+):
+    deterministic = False
     with torch.no_grad():
         # warm up
         for i in range(100):
-            deterministic = i % 2 == 0
             _, y_bwd, aux = sliding_chunk_attention_fwd(
                 query, key, value, chunk_size, 1.0, None, None,
-                bos_mask, segment_idx, 0.0, fp32_output, backend, True
+                bos_mask, segment_idx, 0.0, level, backend, True
             )
             sliding_chunk_attention_bwd(
                 out_grad, query, key, value, y_bwd, aux, chunk_size, 1.0, None, None,
-                bos_mask, segment_idx, deterministic, backend
+                bos_mask, segment_idx, level, deterministic, backend
             )
         torch.cuda.synchronize()
 
@@ -239,38 +290,24 @@ def test_sliding_chunk_attention(
         for _ in range(epochs):
             _, y_bwd, aux = sliding_chunk_attention_fwd(
                 query, key, value, chunk_size, 1.0, None, None,
-                bos_mask, segment_idx, 0.0, fp32_output, backend, True
+                bos_mask, segment_idx, 0.0, level, backend, True
             )
         torch.cuda.synchronize()
 
-        suffix = "-fp32" if fp32_output else ""
+        suffix = f"-{level}"
         delta = timer() - start
         print(f'SCA-{backend}{suffix} fwd: {delta:.2f}s')
 
-        deterministic = True
         start = timer()
         for _ in range(epochs):
             sliding_chunk_attention_bwd(
                 out_grad, query, key, value, y_bwd, aux, chunk_size, 1.0, None, None,
-                bos_mask, segment_idx, deterministic, backend
+                bos_mask, segment_idx, level, deterministic, backend
             )
         torch.cuda.synchronize()
 
-        delta1 = timer() - start
-        if backend == 'swift':
-            print(f'SCA-{backend} bwd: {delta1:.2f}s')
-        else:
-            deterministic = False
-            start = timer()
-            for _ in range(epochs):
-                sliding_chunk_attention_bwd(
-                    out_grad, query, key, value, y_bwd, aux, chunk_size, 1.0, None, None,
-                    bos_mask, segment_idx, deterministic, backend
-                )
-            torch.cuda.synchronize()
-
-            delta = timer() - start
-            print(f'SCA-{backend}{suffix} bwd: {delta:.2f}s ({delta1:.2f}s)')
+        delta = timer() - start
+        print(f'SCA-{backend}{suffix} bwd: {delta:.2f}s')
 
 
 def test_adaptive_working_memory(
@@ -386,11 +423,14 @@ def test(B: int, L: int, D: int, W: int, H: int, HKV: int, S: int, V: int, chunk
     # test_causal_conv1d(x, init_states, conv_w, None, y_grad, final_state_grad, bos_mask, epochs, 'fla')
     #####################################################
     # test_sliding_chunk_attention(query, key, value, out_grad, chunk_size, bos_mask, segment_idx, 'swift', epochs)
+
     if S <= 256 and V <= 256:
-        test_sliding_chunk_attention(query, key, value, out_grad, chunk_size, bos_mask, segment_idx, False, 'xattn', epochs)
-        test_sliding_chunk_attention(query, key, value, out_grad, chunk_size, bos_mask, segment_idx, True, 'xattn', epochs)
+        test_sliding_chunk_attention(query, key, value, out_grad, chunk_size, bos_mask, segment_idx, 0, 'xattn', epochs)
+        if S == V and dtype in ['bf16', 'fp16']:
+            test_flash_sliding_window_attention_speed(query, key, value, out_grad, chunk_size * 2, 1.0 / math.sqrt(D), epochs)
+
     test_adaptive_working_memory(query, key, value, out_grad, mem_grad, lnt_grad, chunk_size, segment_idx, False, epochs)
-    test_adaptive_working_memory(query, key, value, out_grad, mem_grad, lnt_grad, chunk_size, segment_idx, True, epochs)
+    # test_adaptive_working_memory(query, key, value, out_grad, mem_grad, lnt_grad, chunk_size, segment_idx, True, epochs)
     print("*" * 70)
 
 
@@ -400,18 +440,18 @@ def main(seed: int, dtype: str):
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
     for B, L, D, H, K, S, V, C in [
-        [4, 65536, 1536, 8, 8, 128, 256, 4096],
+        # [4, 65536, 1536, 8, 8, 128, 256, 4096],
         # [4, 65536, 1536, 32, 16, 64, 64, 4096],
         # [4, 65536, 1536, 24, 12, 96, 96, 4096],
         [4, 65536, 1536, 16, 8, 128, 128, 4096],
         [4, 65536, 1536, 12, 6, 192, 192, 4096],
         [4, 65536, 1536, 8, 4, 256, 256, 4096],
-        [1, 16384, 4096, 16, 4, 256, 2048, 2048],
-        [1, 32768, 4096, 16, 4, 256, 2048, 4096],
-        [1, 32768, 4096, 16, 16, 128, 256, 4096],
-        [1, 65536, 2560, 32, 8, 128, 128, 4096],
+        # [1, 16384, 4096, 16, 4, 256, 2048, 2048],
+        # [1, 32768, 4096, 16, 4, 256, 2048, 4096],
+        # [1, 32768, 4096, 16, 16, 128, 256, 4096],
+        [1, 131072, 2560, 32, 8, 128, 128, 4096],
     ]:
-        for avg_len in [16000]:
+        for avg_len in [16000, 32000]:
             W = 4
             test(B, L, D, W, H, K, S, V, C, avg_len, dtype)
 

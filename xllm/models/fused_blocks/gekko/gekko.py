@@ -103,7 +103,6 @@ class GekkoBlockFunction(torch.autograd.Function):
         causal_conv_backend: str,
         causal_conv_weight_normalization: bool,
         qnorm_w: torch.Tensor,  # (s/MP)
-        knorm_w: torch.Tensor,  # (s/MP)
         local_heads: int,
         local_kv_heads: int,
         attention_chunk_size: int,
@@ -131,7 +130,7 @@ class GekkoBlockFunction(torch.autograd.Function):
         apply_rmsnorm: bool,
         residual_func: str,
         residual_heads: Optional[int],
-        fp32_attn_output: bool,
+        attn_stability_control: int,
         deterministic: bool,
         recompute_q: bool,
         recompute_kv: bool,
@@ -242,7 +241,7 @@ class GekkoBlockFunction(torch.autograd.Function):
             handle4 = None
             handle5 = None
 
-        sk, _ = rmsnorm_fwd(xk_, knorm_w, local_kv_heads, rmsnorm_eps)
+        sk, _ = rmsnorm_fwd(xk_, None, local_kv_heads, rmsnorm_eps)
         sk = rearrange(sk, 'b l (k s) -> b l k s', k=local_kv_heads)
         health_collector = get_active_health_collector()
         # Partial RoPE mutates sk; reduce its pre-RoPE vectors before that update.
@@ -332,14 +331,14 @@ class GekkoBlockFunction(torch.autograd.Function):
 
             sca_out, sca_for_save, sca_aux, attn_w_rng_state = sliding_chunk_attention_fwd(
                 sq, sk, xv_, attention_chunk_size, sca_scale, prev_sk, prev_sv,
-                bos_mask, segment_idx, attention_dropout, fp32_attn_output, sca_backend, not recompute_sca
+                bos_mask, segment_idx, attention_dropout, attn_stability_control, sca_backend, not recompute_sca
             )
             # B x L x E
             r = attn_gate_fn(F.linear(mx, wr, br))
         else:
             sca_out, sca_for_save, sca_aux, attn_w_rng_state = sliding_chunk_attention_fwd(
                 sq, sk, xv_, attention_chunk_size, sca_scale, prev_sk, prev_sv,
-                bos_mask, segment_idx, attention_dropout, fp32_attn_output, sca_backend, not recompute_sca
+                bos_mask, segment_idx, attention_dropout, attn_stability_control, sca_backend, not recompute_sca
             )
             # B x L x E
             r = attn_gate_fn(F.linear(mx, wr, br))
@@ -428,7 +427,6 @@ class GekkoBlockFunction(torch.autograd.Function):
             k_conv_w,  # (w, d/MP)
             v_conv_w,  # (w, v/MP)
             qnorm_w,  # (s/MP)
-            knorm_w,  # (s/MP)
             attn_res_w,  # (d/MP, c)
             ffn_norm_w,  # (d)
             ffn_norm_b,  # (d)
@@ -478,7 +476,7 @@ class GekkoBlockFunction(torch.autograd.Function):
         ctx.residual_heads = residual_heads
         ctx.sca_backend = sca_backend
         ctx.deterministic = deterministic
-        ctx.fp32_attn_output = fp32_attn_output
+        ctx.attn_stability_control = attn_stability_control
         ctx.recv_from_prev = recv_from_prev
         ctx.send_to_next = send_to_next
         ctx.timenorm_local_groups = timenorm_local_groups
@@ -519,7 +517,6 @@ class GekkoBlockFunction(torch.autograd.Function):
             k_conv_w,  # (w, d/MP)
             v_conv_w,  # (w, v/MP)
             qnorm_w,  # (s/MP)
-            knorm_w,  # (s/MP)
             attn_res_w,  # (d/MP, c)
             ffn_norm_w,  # (d)
             ffn_norm_b,  # (d)
@@ -586,7 +583,7 @@ class GekkoBlockFunction(torch.autograd.Function):
         apply_rmsnorm = ctx.apply_rmsnorm
         residual_func = ctx.residual_func
         residual_heads = ctx.residual_heads
-        fp32_attn_output = ctx.fp32_attn_output
+        attn_stability_control = ctx.attn_stability_control
         deterministic = ctx.deterministic
         sca_backend = ctx.sca_backend
 
@@ -689,10 +686,10 @@ class GekkoBlockFunction(torch.autograd.Function):
             causal_conv_weight_normalization, causal_conv_backend, deterministic
         )
 
-        sk, sk_rstd = rmsnorm_fwd(xk_, knorm_w, local_kv_heads, rmsnorm_eps)
+        sk_, sk_rstd = rmsnorm_fwd(xk_, None, local_kv_heads, rmsnorm_eps)
         sq, sq_rstd = rmsnorm_fwd(xq_, qnorm_w, local_heads, rmsnorm_eps)
         # B x L x H x S
-        sk = rearrange(sk, 'b l (k s) -> b l k s', k=local_kv_heads)
+        sk = rearrange(sk_, 'b l (k s) -> b l k s', k=local_kv_heads)
         sq = rearrange(sq, 'b l (h s) -> b l h s', h=local_heads)
         # apply rotary embeddings
         sq, sk = apply_ropes(sq, sk, freqs_cis, head_dim, rope_head_dim, False)
@@ -726,7 +723,7 @@ class GekkoBlockFunction(torch.autograd.Function):
             assert sca_aux is None
             sca_out, sca_for_save, sca_aux = recompute_sliding_chunk_attention(
                 sq, sk, xv_, attention_chunk_size, sca_scale, prev_sk, prev_sv, bos_mask, segment_idx,
-                attention_dropout, fp32_attn_output, sca_backend, attn_w_rng_state
+                attention_dropout, attn_stability_control, sca_backend, attn_w_rng_state
             )
         else:
             sca_out = sca_for_save.to(x.dtype)
@@ -807,7 +804,7 @@ class GekkoBlockFunction(torch.autograd.Function):
 
             sq_grad, sk_grad, xv_grad, prev_sk_grad, prev_sv_grad = sliding_chunk_attention_bwd(
                 sca_out_grad, sq, sk, xv_, sca_for_save, sca_aux, attention_chunk_size, sca_scale,
-                prev_sk, prev_sv, bos_mask, segment_idx, deterministic, sca_backend
+                prev_sk, prev_sv, bos_mask, segment_idx, attn_stability_control, deterministic, sca_backend
             )
             assert prev_aqk_grad is not None and prev_akk_grad is not None and prev_av_grad is not None
             assert prev_sk_grad is not None and prev_sv_grad is not None
@@ -819,7 +816,7 @@ class GekkoBlockFunction(torch.autograd.Function):
         else:
             sq_grad, sk_grad, xv_grad, prev_sk_grad, prev_sv_grad = sliding_chunk_attention_bwd(
                 sca_out_grad, sq, sk, xv_, sca_for_save, sca_aux, attention_chunk_size, sca_scale,
-                prev_sk, prev_sv, bos_mask, segment_idx, deterministic, sca_backend
+                prev_sk, prev_sv, bos_mask, segment_idx, attn_stability_control, deterministic, sca_backend
             )
 
             if handle_memory is not None:
@@ -890,7 +887,7 @@ class GekkoBlockFunction(torch.autograd.Function):
         # apply rotary embeddings
         sk_grad = apply_rope(sk_grad, freqs_cis, head_dim, rope_head_dim, True)
         # k norm grad
-        xk_grad, knorm_w_grad = rmsnorm_bwd(rearrange(sk_grad, 'b l k s -> b l (k s)'), xk_, sk_rstd, knorm_w, local_kv_heads)
+        xk_grad = mem_effn_rmsnorm_bwd(rearrange(sk_grad, 'b l k s -> b l (k s)'), sk_, sk_rstd, local_kv_heads)
 
         aqk_grad = torch.ops.aten._softmax_backward_data(
             aqk_grad.float(), aqk_fp32, -1, torch.float32
@@ -1037,7 +1034,6 @@ class GekkoBlockFunction(torch.autograd.Function):
             None,  # causal_conv_backend
             None,  # causal_conv_weight_normalization
             qnorm_w_grad,
-            knorm_w_grad,
             None,  # local heads
             None,  # local kv heads
             None,  # chunk size
@@ -1065,7 +1061,7 @@ class GekkoBlockFunction(torch.autograd.Function):
             None,  # apply_rmsnorm
             None,  # residual_func
             None,  # residual_heads
-            None,  # fp32_attn_output
+            None,  # attn_stability_control
             None,  # deterministic
             None,  # recompute_q
             None,  # recompute_kv

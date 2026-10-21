@@ -32,6 +32,10 @@ from xllm.modules.context_parallel import (
     recv_from_prev_context_parallel_region,
     gather_from_context_parallel_region,
 )
+from xllm.modules.utils import (
+    get_bos_mask,
+    get_segment_idx_from_bos_mask
+)
 from xllm.models.xllm import XLLModel
 from xllm.models.fused_blocks import (
     GekkoBlockFunction,
@@ -118,7 +122,7 @@ class GekkoBlock(nn.Module):
         segment_idx: Optional[Tensor] = None,
         prev_segment_count: Optional[Tensor] = None,
         moe_router_load_balancing_type: Optional[str] = None,
-        fp32_attn_output: bool = False,
+        attn_stability_control: int = 0,
         deterministic: bool = True,
         cache: Optional[Tuple[Tuple[Tensor, Tensor, int],
                               Tuple[Tensor, Tensor, Tensor],
@@ -156,7 +160,6 @@ class GekkoBlock(nn.Module):
                 self.gda.causal_conv_backend,
                 self.gda.q_conv.normalize_weight,
                 self.gda.query_norm.weight,
-                self.gda.key_norm.weight,
                 self.gda.local_heads,
                 self.gda.local_kv_heads,
                 self.gda.chunk_size,
@@ -184,7 +187,7 @@ class GekkoBlock(nn.Module):
                 self.apply_rmsnorm,
                 self.residual_func,
                 self.residual_heads,
-                fp32_attn_output,
+                attn_stability_control,
                 deterministic,
                 self.recompute_q,
                 self.recompute_kv,
@@ -196,7 +199,7 @@ class GekkoBlock(nn.Module):
             )
 
         y, cache = self.gda(
-            x, freqs_cis, bos_mask, segment_idx, prev_segment_count, fp32_attn_output, deterministic, cache
+            x, freqs_cis, bos_mask, segment_idx, prev_segment_count, attn_stability_control, deterministic, cache
         )
         out = self.nffn(y)
         return out, None, cache
@@ -207,7 +210,7 @@ class GekkoOutputLayer(nn.Module):
         super().__init__()
 
         self.model_dim = cfg.model_dim
-        self.output_size = cfg.vocab_size if cfg.output_size == -1 else cfg.output_size
+        self.output_size = cfg.vocab_size
         self.recompute_logits = cfg.recompute_logits
 
         self.final_norm = TimestepDecayNorm(
@@ -358,7 +361,7 @@ class Gekko(XLLModel):
         targets: Optional[Tensor] = None,
         token_mask: Optional[Tensor] = None,
         moe_router_load_balancing_type: Optional[str] = None,
-        fp32_attn_output: bool = False,
+        attn_stability_control: int = 0,
         deterministic: bool = True,
         cache: Optional[Tuple[List[Tuple[Tuple[Tensor, Tensor, int],
                                          Tuple[Tensor, Tensor, Tensor, Tensor],
@@ -374,8 +377,8 @@ class Gekko(XLLModel):
             assert token_mask is None
 
         if multi_segments:
-            bos_mask = torch.eq(tokens, self.bos_id)
-            segment_idx = torch.cumsum(bos_mask, dim=-1)
+            bos_mask = get_bos_mask(tokens, self.eos_id, use_eos=True)
+            segment_idx = get_segment_idx_from_bos_mask(bos_mask)
             prev_segment_count = None
         else:
             bos_mask = None
@@ -430,13 +433,13 @@ class Gekko(XLLModel):
             if self.layerwise_ckpt:
                 x, aux_loss, layer_cache = checkpoint(
                     layer, x, freq_cis, bos_mask, segment_idx, prev_segment_count,
-                    moe_router_load_balancing_type, fp32_attn_output, deterministic,
+                    moe_router_load_balancing_type, attn_stability_control, deterministic,
                     layer_cache, use_reentrant=False, preserve_rng_state=True
                 )
             else:
                 x, aux_loss, layer_cache = layer(
                     x, freq_cis, bos_mask, segment_idx, prev_segment_count,
-                    moe_router_load_balancing_type, fp32_attn_output, deterministic, layer_cache
+                    moe_router_load_balancing_type, attn_stability_control, deterministic, layer_cache
                 )
 
             if health_collector is not None:
@@ -486,7 +489,7 @@ class Gekko(XLLModel):
         # conv params
         conv_params_per_block = self.causal_conv_width * (self.num_heads * self.head_dim + self.num_kv_heads * (self.head_dim + self.v_head_dim))
         # norm params
-        norm_params_per_block = self.model_dim * (3 if self.apply_rmsnorm else 4) + self.head_dim * (self.num_heads + self.num_kv_heads)
+        norm_params_per_block = self.model_dim * (3 if self.apply_rmsnorm else 4) + self.head_dim * self.num_heads
         if self.attn_act_func == 'softdelta':
             gda_params_per_block += self.model_dim * self.num_heads * (self.head_dim + 1)
             conv_params_per_block += self.causal_conv_width * self.num_heads * self.head_dim
@@ -527,8 +530,8 @@ class Gekko(XLLModel):
         res_flops = 0.0
         conv_flops = self.causal_conv_width * (q_dim + k_dim + v_dim) * 2
         sca_flops = self.model_dim * (q_dim + k_dim + v_dim + h_dim)
-        sca_flops += (q_dim + h_dim) * self.chunk_size
-        awk_flops = (k_dim + q_dim) * self.v_head_dim
+        sca_flops += (q_dim + h_dim) * self.chunk_size * 1.5
+        awk_flops = (k_dim * 2 + q_dim) * self.v_head_dim
         attn_flops = sca_flops + awk_flops + self.model_dim * h_dim
         ffn_flops = self.model_dim * self.ffn_hidden_dim * (3 if self.swiglu else 2)
         moe_flops = self.model_dim * self.expert_inter_dim * (self.num_activated_experts + self.num_shared_experts) * 3

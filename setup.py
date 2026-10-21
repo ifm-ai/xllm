@@ -79,7 +79,7 @@ NVCC_FLAGS = [
 def main():
     setup(
         name='xllm',
-        version="1.0.0",
+        version="1.0.1",
         license_files=[
             "LICENSE",
             "xllm/csrc/transformer_engine/LICENSE",

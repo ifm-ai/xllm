@@ -92,7 +92,7 @@ def reload_config_and_tokenizer(ckpt_dir: Path, tokenizer_path: Optional[str] = 
     assert Path(new_tokenizer_path).exists(), new_tokenizer_path
     tokenizer_cfg.path = new_tokenizer_path
 
-    tokenizer = build_tokenizer(tokenizer_cfg=tokenizer_cfg)
+    tokenizer = build_tokenizer(cfg=tokenizer_cfg)
     model_cfg: ModelConf = ModelConf.from_dict(cfg["model"])
     model_cfg.fused_block = False
     model_cfg.init_mode = 'none'

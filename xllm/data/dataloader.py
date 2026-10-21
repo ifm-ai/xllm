@@ -289,14 +289,14 @@ class PPLDataLoader:
         self.world_rank = world_rank
         self.world_size = world_size
         self.keep_tail = keep_tail
-        self.reader = JSONLFileIterator(data, world_rank, world_size, infinite=False)
+        self.reader = JSONLFileIterator(data, world_rank, world_size)
 
     def __iter__(self) -> Iterator[Batch]:
         return self._batch_iterator()
 
     def _sample_to_tokens(self, sample: Any) -> List[int]:
         text = sample["text"]
-        return self.tokenizer.encode(text, bos=True, eos=True)
+        return self.tokenizer.encode(text, bos=None, eos=True)
 
     def _batch_iterator(self) -> Iterator[Batch]:
         n_buffer_toks = self.seq_len * self.batch_size

@@ -171,7 +171,6 @@ GEKKO_MATRICES = {
     "attention/k_conv": "gda.k_conv.weight",
     "attention/v_conv": "gda.v_conv.weight",
     "attention/query_norm": "gda.query_norm.weight",
-    "attention/key_norm": "gda.key_norm.weight",
     "attention/time_norm/weight": "gda.timenorm.weight",
     "attention/time_norm/bias": "gda.timenorm.bias",
     "mlp/gate_proj": "nffn.fc1.weight",
@@ -245,5 +244,5 @@ def test_a_missing_required_gekko_parameter_is_an_error(monkeypatch):
     block = _gekko_block()
     block.gda.q_conv.register_parameter("weight", None)
 
-    with pytest.raises(RuntimeError, match="Expected 17 matrix parameters for layer 0, found 16"):
+    with pytest.raises(RuntimeError, match="Expected 16 matrix parameters for layer 0, found 15"):
         _weight_norms(_shard_block(block, "fsdp2", monkeypatch))

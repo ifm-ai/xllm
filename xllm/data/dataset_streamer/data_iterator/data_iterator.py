@@ -2,9 +2,12 @@ from typing import Optional, Dict, Any
 from abc import ABC, abstractmethod
 import os
 import re
+from logging import getLogger
 
 from xllm.data.dataset_streamer.data_iterator.reader import JSONLReader
 from xllm.data.data_types import Instance
+
+logger = getLogger()
 
 
 class DataIterator(ABC):
@@ -41,11 +44,11 @@ class JSONLFileIterator(DataIterator):
         fpath: str,
         world_rank: int,
         world_size: int,
-        infinite: bool = False,
-        buffer_size: Optional[int] = None,
     ):
-        del buffer_size
-        self.reader = JSONLReader(fpath, world_rank, world_size, infinite)
+        self.fpath = fpath
+        self.world_rank = world_rank
+        self.world_size = world_size
+        self.reader = JSONLReader(fpath, world_rank, world_size)
 
     def start(self):
         pass
@@ -57,10 +60,21 @@ class JSONLFileIterator(DataIterator):
         return next(self.reader)
 
     def get_state(self) -> Dict[str, Any]:
-        return self.reader.get_state()
+        return {
+            "fpath": self.fpath,
+            "world_rank": self.world_rank,
+            "world_size": self.world_size,
+            "reader": self.reader.get_state(),
+        }
 
     def set_state(self, state: Optional[Dict[str, Any]]):
-        self.reader.set_state(state)
+        if not state:
+            return
+
+        assert self.fpath == state["fpath"]
+        assert self.world_rank == state["world_rank"]
+        assert self.world_size == state["world_size"]
+        self.reader.set_state(state["reader"])
 
     def close(self):
         self.reader.close()
@@ -82,9 +96,7 @@ class JSONLFolderIterator(DataIterator):
         world_rank: int,
         world_size: int,
         infinite: bool = False,
-        buffer_size: Optional[int] = None,
     ):
-        del buffer_size
         self.fdir = fdir
         self.world_rank = world_rank
         self.world_size = world_size
@@ -153,8 +165,8 @@ class JSONLFolderIterator(DataIterator):
                     self.files[self.file_idx],
                     self.reader_world_rank,
                     self.reader_world_size,
-                    infinite=False,
                 )
+                logger.debug(f"Starting iteration {self.repetition} over {self.reader.fpath} ...")
 
             try:
                 inst = next(self.reader)
@@ -201,7 +213,6 @@ class JSONLFolderIterator(DataIterator):
                 self.files[self.file_idx],
                 self.reader_world_rank,
                 self.reader_world_size,
-                infinite=False,
             )
             self.reader.set_state(reader_state)
 

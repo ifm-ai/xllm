@@ -1,6 +1,6 @@
 from sentencepiece import SentencePieceProcessor
 from logging import getLogger
-from typing import List, Union
+from typing import List, Optional
 
 from xllm.data.dataset_streamer.tokenizer.tokenizer import Tokenizer
 from xllm.config import TokenizerConf
@@ -15,46 +15,34 @@ class SentencePieceTokenizer(Tokenizer):
     Tokenizing and encoding/decoding text using sentencepiece.
     """
 
-    def __init__(self, tokenizer_cfg: TokenizerConf):
-        super().__init__(tokenizer_cfg)
+    def __init__(self, cfg: TokenizerConf):
+        super().__init__(cfg)
 
         # reload tokenizer
-        model_path = tokenizer_cfg.tokenizer_path
+        model_path = cfg.tokenizer_path
         assert os.path.isfile(model_path), model_path
         self.model = SentencePieceProcessor(model_file=model_path)
         logger.info(f"Reloaded SentencePiece model from {model_path}")
 
-        self.num_reserved_special_tokens = tokenizer_cfg.num_reserved_special_tokens
+        self.num_reserved_special_tokens = cfg.num_reserved_special_tokens
         self.sp_model_vocab_size = self.model.vocab_size()
         self.used_special_tokens = 0
 
-        assert tokenizer_cfg.num_reserved_special_tokens % 256 == 0, \
-            f"num. reserved special tokens is not multiple of 256: {tokenizer_cfg.num_reserved_special_tokens}"
+        assert cfg.num_reserved_special_tokens % 256 == 0, \
+            f"num. reserved special tokens is not multiple of 256: {cfg.num_reserved_special_tokens}"
 
         # BOS / EOS token IDs
         assert self.model.vocab_size() == self.model.get_piece_size()
-        self.vocab_size = self.model.vocab_size() + tokenizer_cfg.num_reserved_special_tokens
+        self.vocab_size = self.model.vocab_size() + cfg.num_reserved_special_tokens
         logger.info(
             f"#words: {self.vocab_size} - BOS ID: {self.bos_id} - EOS ID: {self.eos_id} - PAD ID: {self.pad_id}"
         )
 
-    def encode(self, s: Union[str, List[int]], bos: bool, eos: bool) -> List[int]:
-        assert type(s) is str
-        t = self.model.encode(s)
+    def _encode(self, text: str) -> List[int]:
+        tokens = self.model.encode(text)
+        return tokens
 
-        if bos:
-            t.insert(0, self.bos_id)
-        if eos:
-            t.append(self.eos_id)
-
-        return t
-
-    def decode(self, tokens: List[int], cut_at_eos: bool = True, remove_prefix_bos: bool = True) -> str:
-        if cut_at_eos:
-            tokens = self.cut_at_eos(tokens)
-        if remove_prefix_bos:
-            tokens = self.remove_prefix_bos(tokens)
-
+    def _decode(self, tokens: List[int]) -> str:
         return self.model.decode(tokens)
 
     @property

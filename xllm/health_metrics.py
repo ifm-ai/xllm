@@ -34,7 +34,6 @@ _GEKKO_MATRIX_PARAMETER_PATHS = (
     ("gda.k_conv.weight", "attention/k_conv"),
     ("gda.v_conv.weight", "attention/v_conv"),
     ("gda.query_norm.weight", "attention/query_norm"),
-    ("gda.key_norm.weight", "attention/key_norm"),
     ("gda.timenorm.weight", "attention/time_norm/weight"),
     ("gda.timenorm.bias", "attention/time_norm/bias"),
     ("nffn.fc1.weight", "mlp/gate_proj"),

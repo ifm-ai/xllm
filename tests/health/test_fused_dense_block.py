@@ -3,11 +3,12 @@ import torch.nn.functional as F
 
 import xllm.models.fused_blocks.mha as mha
 import xllm.models.fused_blocks.transformer.transformer as transformer_fused
+import xllm.models.fused_blocks.utils as fused_utils
 from tests.health.helpers import MASK, TARGETS, TOKENS, grouped_rms_norm, logged_metrics, tiny_transformer
 
-# Large runs use the fused dense block. Its forward (TransformerBlockFunction and multihead_attention_fwd)
-# runs here as-is; only the three CUDA kernels it calls are replaced by plain torch, so what its hooks
-# record is checked against the unfused path on the same weights.
+# Large runs use the fused dense block. Its forward (TransformerBlockFunction, multihead_attention_fwd and
+# the flash_attention_fwd wrapper) runs here as-is; only the three CUDA kernels it calls are replaced by
+# plain torch, so what its hooks record is checked against the unfused path on the same weights.
 
 FLAGS = dict(enable_query_key_stats=True, enable_logits_stats=True)
 
@@ -21,26 +22,26 @@ def _rmsnorm_fwd(x, weight, num_groups, eps):  # qk-norm: one group per head
     return grouped_rms_norm(x, weight, num_groups, eps), None
 
 
-def _flash_attention_fwd(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, scale, dropout=0.0,
-                         use_causal_mask=True):
-    assert cu_seqlens_q is None and dropout == 0.0 and use_causal_mask
+def _flash_fwd(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, scale, dropout, causal):
+    # The flash kernel: (batch, seq, heads, dim) in, (out, lse, rng_state) back.
+    assert cu_seqlens_q is None and dropout == 0.0 and causal
     out = F.scaled_dot_product_attention(
         q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), is_causal=True, scale=scale, enable_gqa=True,
     )
-    return out.transpose(1, 2), None, None, None
+    return out.transpose(1, 2), None, None
 
 
 @pytest.fixture
 def fused_attention_calls(monkeypatch):
     calls = []
 
-    def flash_attention_fwd(*args, **kwargs):
+    def flash_fwd(*args):
         calls.append(args[0].shape)
-        return _flash_attention_fwd(*args, **kwargs)
+        return _flash_fwd(*args)
 
     monkeypatch.setattr(transformer_fused, "layer_or_rmsnorm_fwd", _layer_or_rmsnorm_fwd)
     monkeypatch.setattr(mha, "rmsnorm_fwd", _rmsnorm_fwd)
-    monkeypatch.setattr(mha, "flash_attention_fwd", flash_attention_fwd)
+    monkeypatch.setattr(fused_utils, "flash_fwd", flash_fwd)
     return calls
 
 

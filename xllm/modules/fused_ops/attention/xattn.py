@@ -20,7 +20,7 @@ def xattn_causal_flash_attn(
     scale: Optional[float] = None,
     bos_mask: Optional[Tensor] = None,
     segment_idx: Optional[Tensor] = None,
-    high_precision_output: bool = False,
+    high_precision_level: int = 0,
     deterministic: bool = False
 ) -> Tensor:
     assert XATTN_FLASH_ATTN_ENABLED, "xattn was not installed."
@@ -31,7 +31,7 @@ def xattn_causal_flash_attn(
         q, k, v, scale,
         bos_mask=bos_mask,
         segment_idx=segment_idx,
-        high_precision_output=high_precision_output,
+        high_precision_level=high_precision_level,
         deterministic=deterministic
     )
 
@@ -43,22 +43,21 @@ def xattn_causal_flash_attn_fwd(
     scale: Optional[float] = None,
     bos_mask: Optional[Tensor] = None,
     segment_idx: Optional[Tensor] = None,
-    high_precision_output: bool = False,
+    high_precision_level: int = 0,
     requires_grad: bool = False
 ) -> Tuple[Tensor, Optional[Tensor], Tensor]:
     assert XATTN_FLASH_ATTN_ENABLED, "xattn was not installed."
     if bos_mask is not None:
         segment_idx = None
 
-    high_precision_output = high_precision_output and requires_grad
     y, y_fp32, lse = causal_flash_attn_fwd(
         q, k, v, scale,
         bos_mask=bos_mask,
         segment_idx=segment_idx,
-        high_precision_output=high_precision_output
+        high_precision_level=high_precision_level
     )
     lse = lse if requires_grad else None
-    y_for_bwd = y if requires_grad and (not high_precision_output) else y_fp32
+    y_for_bwd = (y if high_precision_level == 0 else y_fp32) if requires_grad else None
     return y, y_for_bwd, lse
 
 
@@ -72,6 +71,7 @@ def xattn_causal_flash_attn_bwd(
     scale: Optional[float] = None,
     bos_mask: Optional[Tensor] = None,
     segment_idx: Optional[Tensor] = None,
+    high_precision_level: int = 0,
     deterministic: bool = False
 ) -> Tuple[Tensor, Tensor, Tensor]:
     assert XATTN_FLASH_ATTN_ENABLED, "xattn was not installed."
@@ -81,5 +81,6 @@ def xattn_causal_flash_attn_bwd(
     return causal_flash_attn_bwd(
         y_grad, q, k, v, y, lse, scale,
         bos_mask=bos_mask, segment_idx=segment_idx,
+        high_precision_level=high_precision_level,
         deterministic=deterministic
     )

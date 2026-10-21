@@ -5,12 +5,12 @@ from xllm.data.dataset_streamer.tokenizer.llama3 import Llama3Tokenizer
 from xllm.data.dataset_streamer.tokenizer.huggingface import HuggingFaceTokenizer
 
 
-def build_tokenizer(tokenizer_cfg: TokenizerConf) -> Tokenizer:
-    if tokenizer_cfg.type in ['llama2', 'sentencepiece']:
-        return SentencePieceTokenizer(tokenizer_cfg)
-    elif tokenizer_cfg.type == 'llama3':
-        return Llama3Tokenizer(tokenizer_cfg)
-    elif tokenizer_cfg.type == 'huggingface':
-        return HuggingFaceTokenizer(tokenizer_cfg)
+def build_tokenizer(cfg: TokenizerConf) -> Tokenizer:
+    if cfg.type in ['llama2', 'sentencepiece']:
+        return SentencePieceTokenizer(cfg)
+    elif cfg.type == 'llama3':
+        return Llama3Tokenizer(cfg)
+    elif cfg.type == 'huggingface':
+        return HuggingFaceTokenizer(cfg)
     else:
-        raise ValueError(f"Unknown Tokenizer type: {tokenizer_cfg.type}")
+        raise ValueError(f"Unknown Tokenizer type: {cfg.type}")

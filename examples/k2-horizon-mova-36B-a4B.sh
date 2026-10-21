@@ -97,7 +97,6 @@ TRAINING_CFGS=(
   --moe_aux_loss_coeff 1e-4
   --multi_segments "true"
   --deterministic "false"
-  --fp32_attn_output "false"
   --nccl_timeout 1800
   --cluster_check_level 1
 )

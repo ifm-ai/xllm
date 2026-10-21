@@ -95,6 +95,14 @@ python -m pip install -r requirements-build.txt
 python -m pip install --no-build-isolation .
 ```
 
+The following is the corresponding `xattn` versions.
+
+| `xllm`            | `xattn`      |
+| ------------------ | ------------------ |
+| `main` / `nightly` | `main` / `nightly` |
+| `1.0.0`             | `1.0.0`           |
+| `1.0.1`             | `1.1.1`           |
+
 </details>
 
 <details>
@@ -181,7 +189,7 @@ xllm/
   modules/        Attention, expert layers, normalization, and operators
   distributed/    Parallelism and distributed training utilities
   optim/          Optimizers and learning-rate schedulers
-  eval/           Evaluation tasks and runnersxllm_bridges/     Hugging Face conversion and vLLM integration
+  eval/           Evaluation tasks
 examples/         Training launch scripts and benchmarks
 tests/            Tests and validation utilities
 ```

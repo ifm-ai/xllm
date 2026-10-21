@@ -3,6 +3,8 @@ import json
 import os
 from typing import Any, Dict, List, Optional
 
+from xllm.data.dataset_streamer.tokenizer import Tokenizer
+
 
 class Templator:
     def render(self, raw_record: Any) -> str:
@@ -259,7 +261,7 @@ class ChatTemplateError(RuntimeError):
 
 def apply_chat_template_randomized(
     conversation: List[Dict[str, Any]],
-    tokenizer: Any,
+    tokenizer: Tokenizer,
     text_format: str,
     rng: Optional[Any] = None,
 ) -> Any:
@@ -382,7 +384,7 @@ def apply_chat_template_randomized(
 
 def tokenize_multiturn_template(
     sample: Dict[str, Any],
-    tokenizer: Any,
+    tokenizer: Tokenizer,
     text_format: Optional[str] = None,
     conversation_key: str = "conversation",
     rng: Optional[Any] = None,
@@ -419,8 +421,14 @@ def tokenize_multiturn_template(
         token if mask == 1 else IGNORE_INDEX
         for token, mask in zip(input_ids, assistant_masks)
     ]
-    input_ids = [tokenizer.bos_id] + list(input_ids) + [tokenizer.eos_id]
-    labels = [IGNORE_INDEX] + labels + [tokenizer.eos_id]
+
+    # add BOS & EOS
+    input_ids = list(input_ids) + [tokenizer.eos_id]
+    labels = labels + [tokenizer.eos_id]
+    if tokenizer.use_bos:
+        input_ids.insert(0, tokenizer.bos_id)
+        labels.insert(0, IGNORE_INDEX)
+
     return {
         "input_ids": input_ids,
         "labels": labels,

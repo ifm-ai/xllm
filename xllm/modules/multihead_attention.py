@@ -42,8 +42,8 @@ class MultiheadAttention(nn.Module):
         rope_head_dim: Optional[int],
         attn_act_func: str,
         qknorm: bool,
-        norm_num_groups,
-        norm_affine,
+        norm_num_groups: int,
+        norm_affine: bool,
         layernorm_eps: float,
         rmsnorm_eps: float,
         memory_efficient_norm: bool,
@@ -154,15 +154,15 @@ class MultiheadAttention(nn.Module):
             num_groups=self.n_heads * nq,
             elementwise_affine=True,
             eps=rmsnorm_eps,
-            memory_efficient=True,  # for qknorm, always use efficient memory
+            memory_efficient=False,
         ) if self.qknorm else None
 
         self.key_norm = GroupRMSNorm(
             self.n_kv_heads * self.head_dim,
             num_groups=self.n_kv_heads,
-            elementwise_affine=True,
+            elementwise_affine=False,
             eps=rmsnorm_eps,
-            memory_efficient=True,  # for qknorm, always use efficient memory
+            memory_efficient=True,  # for knorm, always use efficient memory
         ) if self.qknorm else None
 
         if self.attn_act_func == "softmax":
@@ -202,8 +202,9 @@ class MultiheadAttention(nn.Module):
         self,
         x: Tensor,
         freqs_cis: Optional[Tensor],
+        bos_mask: Optional[Tensor] = None,
         segments: Optional[Any] = None,
-        fp32_attn_output: bool = False,
+        stability_control: int = 0,
         deterministic: bool = True,
         cache: Optional[Tuple[Tensor, Tensor]] = None,
     ) -> Tuple[Tensor, Optional[Any]]:
@@ -223,7 +224,7 @@ class MultiheadAttention(nn.Module):
             xk = self.key_norm(xk)
         # B x L x (H*S)
         attn, new_cache = self.causal_attention(
-            xq, xk, xv, g, freqs_cis, segments, fp32_attn_output, deterministic, cache
+            xq, xk, xv, g, freqs_cis, bos_mask, segments, stability_control, deterministic, cache
         )
         if self.apply_attn_gate:
             if self.attn_gate_fn == "silu":

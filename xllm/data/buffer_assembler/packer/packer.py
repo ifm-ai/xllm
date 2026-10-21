@@ -72,9 +72,10 @@ def _flatten_chunks(
             chunk_target_mask = [True] * len(chunk_tokens)
 
         # TODO: EOS should not predict BOS across packed document boundaries.
-        # if chunk_idx > 0 and chunk_target_mask:
-        #     chunk_target_mask[0] = False
-        #     has_mask = True
+        if chunk_idx > 0 and chunk_target_mask:
+            chunk_target_mask[0] = False
+            has_mask = True
+
         target_mask.extend(chunk_target_mask)
 
         spans.append((start, cursor, info))

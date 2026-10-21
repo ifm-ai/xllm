@@ -1,6 +1,6 @@
 import os
 from logging import getLogger
-from typing import List, Union, Dict, Iterator, cast
+from typing import List, Dict, Iterator, cast, Optional
 from pathlib import Path
 
 import tiktoken
@@ -26,11 +26,11 @@ class Llama3Tokenizer(Tokenizer):
 
     pat_str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+"  # noqa: E501
 
-    def __init__(self, tokenizer_cfg: TokenizerConf):
-        super().__init__(tokenizer_cfg)
+    def __init__(self, cfg: TokenizerConf):
+        super().__init__(cfg)
 
         # reload tokenizer
-        model_path = tokenizer_cfg.tokenizer_path
+        model_path = cfg.tokenizer_path
         assert os.path.isfile(model_path), model_path
 
         mergeable_ranks = load_tiktoken_bpe(model_path)
@@ -76,32 +76,20 @@ class Llama3Tokenizer(Tokenizer):
             f"#words: {self.vocab_size} - BOS ID: {self.bos_id} - EOS ID: {self.eos_id} - PAD ID: {self.pad_id}"
         )
 
-    def encode(self, s: Union[str, List[int]], bos: bool, eos: bool) -> List[int]:
-        assert type(s) is str
+    def _encode(self, text: str) -> List[int]:
         substrs = (
             substr
-            for i in range(0, len(s), TIKTOKEN_MAX_ENCODE_CHARS)
+            for i in range(0, len(text), TIKTOKEN_MAX_ENCODE_CHARS)
             for substr in self._split_whitespaces_or_nonwhitespaces(
-                s[i: i + TIKTOKEN_MAX_ENCODE_CHARS], MAX_NO_WHITESPACES_CHARS
+                text[i: i + TIKTOKEN_MAX_ENCODE_CHARS], MAX_NO_WHITESPACES_CHARS
             )
         )
-        t: List[int] = []
+        tokens: List[int] = []
         for substr in substrs:
-            t.extend(self.model.encode(substr, allowed_special='all'))
+            tokens.extend(self.model.encode(substr, allowed_special='all'))
+        return tokens
 
-        if bos:
-            t.insert(0, self.bos_id)
-        if eos:
-            t.append(self.eos_id)
-
-        return t
-
-    def decode(self, tokens: List[int], cut_at_eos: bool = True, remove_prefix_bos: bool = True) -> str:
-        if cut_at_eos:
-            tokens = self.cut_at_eos(tokens)
-        if remove_prefix_bos:
-            tokens = self.remove_prefix_bos(tokens)
-
+    def _decode(self, tokens: List[int]) -> str:
         return self.model.decode(cast(List[int], tokens))
 
     @staticmethod

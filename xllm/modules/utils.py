@@ -5,17 +5,21 @@ from torch import Tensor
 import torch.nn.functional as F
 
 
-def get_bos_mask(tokens: Tensor, bos_id: int) -> Tensor:
+def get_bos_mask(tokens: Tensor, special_id: int, use_eos: bool) -> Tensor:
     """
     Get bos mask from BOS id
     Args:
         tokens: LongTensor with token ids (shape [B, T])
-        bos_id: int
+        special_id: int: bos id if use_eos is False else eos_id
+        use_eos: bool: True if use eos_id
 
     Return:
         out: BoolTensor for bos masks (shape [B, T])
     """
-    return torch.eq(tokens, bos_id)
+    if use_eos:
+        return get_bos_mask_from_eos(tokens, eos_id=special_id)
+
+    return torch.eq(tokens, special_id)
 
 
 def get_bos_mask_from_eos(tokens: Tensor, eos_id: int) -> Tensor:

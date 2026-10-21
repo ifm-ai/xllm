@@ -25,6 +25,7 @@ class TokenizerConf(Config):
     # Config for processing different types of data
     type: str = 'llama2'  # Supports llama2/sentencepiece, llama3, or huggingface
     path: Optional[str] = None  # Path to the tokenizer folder
+    use_bos: bool = False  # True adds the BOS token at beginning of each sequence
     num_reserved_special_tokens: int = 0  # Reserved tokens used by SentencePiece tokenizer, multiples of 256
     template_dict_json: Optional[str] = None  # Allows different chat templates to be used in runtime for HF tokenizer. The json str should have a template name to template file relative path mapping.
 
@@ -43,7 +44,7 @@ class DataLoaderConfig(Config):
     buffer_size: int = 512  # The num of tokens in buffer is buffer_size * seq_len
     num_workers: int = 1  # Tokenizer worker threads during buffer refill
     packing_type: str = "simple"  # Sequence packing strategy: simple = concatenation, bestfit = find best sequence to pack into to reduce truncations
-    skip_long_docs: bool = False  # True skips overlong non-text docs; otherwise they are split into seq_len chunks.
+    skip_long_docs: bool = False  # True skips overlong non-text docs; otherwise they are split into seq_len chunks
     max_consecutive_skips: int = 10000  # Fail a source that repeatedly produces no tokenized sample
 
 
@@ -104,7 +105,7 @@ class OptimConf(Config):
 @dataclass
 class ModelConf(Config):
     arch: str = "transformer"  # Architecture: transformer or gekko
-    ddp_backend: str = 'fsdp1'  # Distributed parameter sharding implementation: fsdp1 or fsdp2
+    ddp_backend: str = 'fsdp2'  # Distributed parameter sharding implementation: fsdp1 or fsdp2
     num_layers: int = 8
     model_dim: int = 1024  # Dimensions of token hidden state and residual stream
     # Attention
@@ -149,7 +150,6 @@ class ModelConf(Config):
     init_logits_std: Optional[float] = None  # Std used to truncate normal init of output projection weights. If None, = 1 / sqrt(model_dim)
     # Input & output
     vocab_size: int = -1  # Defined later by tokenizer
-    output_size: int = -1  # Output size. -1 means using vocab_size
     # Normalization
     timenorm_num_groups: int = 32  # Num of groups of features used in timestep decay normalization in Gekko.
     timenorm_beta1: float = 0.999  # Used in timestep decay normalization.
@@ -233,8 +233,6 @@ class ModelConf(Config):
         if self.arch == 'transformer':
             if self.fused_block:
                 assert self.causal_attn_backend is not None, 'requiring efficient attention when using fused block'
-                if self.qknorm:
-                    assert self.recompute_v and self.recompute_q, "QK-norm w. fused block requires qkv re-computation."
 
 
 @dataclass
@@ -247,7 +245,6 @@ class ValidConf(Config):
     batch_size: int = 32  # Eval batch size per DP process.
     seq_len: int = 8192  # Input seq_len in tokens for PPL eval.
     n_batches: int = -1  # Max batches per PPL file per DP process used for PPL eval (<= 0 for full evaluation).
-    add_template: bool = False  # Applies chat template when tokenizing eval examples.
 
     # Decoding parameters
     use_sampling: bool = False  # Whether to sample during generations. False uses argmax greedy decoding.
@@ -347,7 +344,7 @@ class TrainerConf(Config):
     seq_len: int = 8192  # Num of tokens in each sequence. Must be divisible by context_parallel_size * model.chunk_size.
     multi_segments: bool = True  # Whether to segment docs using BOS token. This will prevent attention across document boundaries.
     deterministic: bool = False  # Whether to request deterministic computations when supported.
-    fp32_attn_output: bool = False # Whether to use high precision attention output (only supported in xattn backend).
+    attn_stability_control: int = 0 # The high precision level for attention (only supported in xattn backend).
 
     steps: int = 100000  # Total number of training steps.
     dtype: str = get_default_training_half()  # Training compute dtype: bf16 (default), fp16, or fp32.
