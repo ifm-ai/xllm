@@ -27,7 +27,10 @@ pulls the biases back to that start. Coefficient math and stream mixing run in F
 branch input and the streams keep the model dtype.
 
 The model expands the streams from the embedding (every stream = x0) and sums them
-before the final norm.
+before the final norm. On CUDA BF16 / FP16 streams the projection, read, write, oHC
+coefficients and (N = 4) Sinkhorn run as fused Triton ops
+(xllm/modules/fused_ops/hyper_connection.py); the torch code below is the reference
+path (CPU, FP32 / FP64).
 """
 
 import math
@@ -37,6 +40,7 @@ import torch
 from torch import Tensor, nn
 
 from xllm.distributed import get_model_parallel_world_size
+from xllm.modules.fused_ops import hyper_connection as fused
 
 
 def rms_normalize(x: Tensor, eps: float) -> Tensor:
@@ -76,7 +80,7 @@ def _right_conj(r: Tensor) -> Tensor:
     ], -2)
 
 
-def quaternion_transport(logits: Tensor, eps: float = 1e-12) -> Tensor:
+def quaternion_transport(logits: Tensor, eps: float = fused.OHC_EPS) -> Tensor:
     """logits [..., 8] -> H [..., 4, 4] in SO(4): x -> q x conj(r) for unit quaternions
     q = (1 + l0, l1, l2, l3) / |.| and r = (1 + l4, l5, l6, l7) / |.|. Zero logits give H = I."""
     one = torch.zeros_like(logits[..., :4])
@@ -89,6 +93,8 @@ def quaternion_transport(logits: Tensor, eps: float = 1e-12) -> Tensor:
 
 def hc_read(streams: Tensor, a: Tensor) -> Tensor:
     """h [B, L, D] = sum_n a_n X_n in FP32, returned in the streams' dtype. a [B, L, N] or [B, L, G, N]."""
+    if fused.supported(streams):
+        return fused.hc_read(streams, a)
     x = streams.to(a.dtype)
     if a.ndim == 3:
         h = (a.unsqueeze(-1) * x).sum(dim=-2)
@@ -102,6 +108,8 @@ def hc_read(streams: Tensor, a: Tensor) -> Tensor:
 
 def hc_write(streams: Tensor, R: Optional[Tensor], b: Tensor, y: Tensor) -> Tensor:
     """X' = R X + b y in FP32, returned in the streams' dtype. R None is the identity transport."""
+    if fused.supported(streams):
+        return fused.hc_write(streams, R, b, y)
     x = streams.to(b.dtype)
     yf = y.to(b.dtype)
     if b.ndim == 3:
@@ -146,6 +154,8 @@ class HyperConnection(nn.Module):
         """[B, L, n_logits] in FP32 from the RMS-normalized, flattened streams."""
         bsz, slen, n, dim = streams.shape
         assert n == self.num_streams and dim == self.dim, f"expected [B, L, {self.num_streams}, {self.dim}] streams, got {tuple(streams.shape)}"
+        if fused.supported(streams):
+            return fused.hc_logits(streams.flatten(-2), self.weight, self.norm_eps)
         flat = rms_normalize(streams.float().flatten(-2), self.norm_eps)
         return flat @ self.weight.float()
 
@@ -205,7 +215,10 @@ class ManifoldHyperConnection(HyperConnection):
         r_logits = self.scale.float()[2] * logits[..., 2 * n:] + bias[2 * n:]
         eye = torch.eye(n, device=r_logits.device, dtype=r_logits.dtype)
         r_logits = r_logits.view(*r_logits.shape[:-1], n, n) + self.IDENTITY_LOGIT * eye
-        R = sinkhorn_knopp(r_logits, self.sinkhorn_iterations)
+        if n == 4 and fused.supported(streams):
+            R = fused.sinkhorn(r_logits, self.sinkhorn_iterations)
+        else:
+            R = sinkhorn_knopp(r_logits, self.sinkhorn_iterations)
         return a, R, b
 
     def extra_repr(self) -> str:
@@ -246,6 +259,12 @@ class OrthogonalHyperConnection(HyperConnection):
         n = self.num_streams
         logits = self.logits(streams)
         bias = self.bias.float()
+        if fused.supported(streams):
+            a, R, b = fused.ohc_coefficients(logits, self.scale.float(), bias.view(self.groups, -1),
+                                             self.rates.float(), self.rotation_scale.float())
+            if self.groups == 1:
+                a, R, b = a.squeeze(-2), R.squeeze(-3), b.squeeze(-2)
+            return a, R, b
         if self.groups > 1:
             # shared logits [B, L, 1, k] against per-group biases [G, k]
             logits = logits.unsqueeze(-2)

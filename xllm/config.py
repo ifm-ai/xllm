@@ -164,7 +164,7 @@ class ModelConf(Config):
     apply_rmsnorm: bool = False  # True = RMSNorm, False = LayerNorm
     residual_func: str = "base"  # Residual connection type: base/add means standard addition, ortho for orthogonal residuals; ihc/mhc/ohc for hyper-connections (N residual streams, identity / Sinkhorn / SO(4) transport, see xllm/modules/residual/README.md).
     residual_heads: Optional[int] = None  # Num of feature groups for orthogonal residuals. Required when using residual_func='ortho'.
-    residual_streams: int = 4  # Num of residual streams for hyper-connections (ihc/mhc/ohc), 2 to 4. ohc requires 4.
+    residual_streams: int = 4  # Num of residual streams for hyper-connections (ihc/mhc/ohc), 2 to 4 (the fused kernels). ohc requires 4.
     residual_groups: int = 1  # ohc only: num of channel groups with their own rotation and gate biases (multi-frequency oHC). Must divide model_dim.
     residual_freq_base: float = 2.0  # ohc with residual_groups > 1: channel group g turns at rate freq_base^(-g/(G-1)) of the shared per-token rotation logits. Must be >= 1.
     residual_sinkhorn_iterations: int = 20  # mhc: Sinkhorn-Knopp iterations of the transport (rows sum to one, columns approximately).

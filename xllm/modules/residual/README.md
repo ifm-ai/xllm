@@ -55,10 +55,20 @@ Config: `residual_streams` (4, from 2 to 4), `residual_groups` (1, `ohc` only), 
 `residual_sinkhorn_iterations` (20, `mhc`). Parameter and FLOP counts (`num_parameters`,
 `tflops_per_token`) include the controllers.
 
-### Limits
+### Kernels and limits
 
-The coefficients and the stream read / write are torch ops (`hyper_connection.py`) that keep FP32
-copies of the `[B, L, N, D]` streams alive until backward.
+On CUDA BF16 / FP16 streams every stream op is a fused Triton kernel
+(`xllm/modules/fused_ops/hyper_connection.py`) that reads and writes the streams directly and keeps FP32
+in registers: read, write (with or without a transport, any channel grouping), the oHC gates and SO(4)
+transport of every group (stored component-major), and, for `N = 4`, the mHC Sinkhorn iterations; each
+with its backward. The controller projection `rstd * (X @ W)` is a Triton rstd kernel and a cuBLAS BF16
+matmul with FP32 accumulate and output; its backward is one Triton kernel. The torch code in
+`hyper_connection.py` is the reference path (CPU, FP32 / FP64 models); it keeps FP32 copies of the
+`[B, L, N, D]` streams alive until backward, so on GPU it needs several times the memory.
+
+Throughput (k2-horizon-0.9B, 8 x H200, FSDP2, bsz 32 x 8192, `layerwise_ckpt`): `ihc`, `mhc` and `ohc`
+run at 0.81-0.83 times the wps of the plain residual with the same unfused, checkpointed layers, `ohc`
+with 64 groups at 0.77.
 
 - `fused_block` must be off (asserted in `ModelConf`); long sequences need `layerwise_ckpt`.
 - No model parallelism, and so no MoE expert parallelism (it runs over the model-parallel group): the
@@ -74,5 +84,7 @@ copies of the `[B, L, N, D]` streams alive until backward.
 
 ```bash
 python -m pytest -q tests/residual/test_hyper_connection.py   # CPU: reference coefficients, read / write, gradients, config checks
+python tests/residual/test_hyper_connection_triton.py         # 1 GPU: every fused op vs the FP64 reference, fwd + grads;
+                                                              #        fused vs reference path of whole models
 python tests/residual/test_hyper_connection_model.py          # 1 GPU: Transformer (dense / MoE / MoVA) + Gekko smoke
 ```
