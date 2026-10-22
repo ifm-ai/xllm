@@ -30,6 +30,7 @@
 #   EVAL_TPP        eval interval in TPP; every eval checkpoint is kept (20)
 #   CKPTS_PER_EVAL  rolling checkpoints per eval interval, bounds work lost to preemption (3)
 #   WANDB_PROJECT   (residual_gekko)
+#   CAUSAL_ATTN_BACKEND  global causal attention backend (flash = FA2; xattn)
 #   PYTHON          interpreter (.venv/bin/python)
 
 : "${SAVE:?set SAVE}"
@@ -43,6 +44,7 @@ TPP=${TPP:-200}
 EVAL_TPP=${EVAL_TPP:-20}
 CKPTS_PER_EVAL=${CKPTS_PER_EVAL:-3}
 WANDB_PROJECT=${WANDB_PROJECT:-residual_gekko}
+CAUSAL_ATTN_BACKEND=${CAUSAL_ATTN_BACKEND:-flash}  # global causal attention: flash | xattn (xattn measured 13% slower here)
 
 # run this checkout's xllm, not the one the venv was installed from
 export PYTHONPATH="${SLURM_SUBMIT_DIR:-$PWD}${PYTHONPATH:+:$PYTHONPATH}"
@@ -157,7 +159,7 @@ DISTRIBUTED_CFGS=(
 MODEL_CFGS=(
   --model "gekko-0.9B"
   --model.ddp_backend "fsdp2"
-  --model.causal_attn_backend "flash"
+  --model.causal_attn_backend ${CAUSAL_ATTN_BACKEND}
   --model.sca_backend "xattn"
   --model.timenorm_backend "cub"
   --model.causal_conv_backend "triton"
