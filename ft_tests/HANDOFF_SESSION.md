@@ -51,3 +51,5 @@ projections to 128/256/1024 nodes with error bands and plots, memory bounds, no-
 - PR #11 (Complete(d)P, ifm-ai/xllm) under review by Aditya; PR #17 (clip/base_lrs fixes). Replies were drafted earlier.
 - xBridges commit dafa74b (fold residual multiplier at export) is local on the first cluster; needs write access.
 - Confirmed review findings not yet fixed in xLLM: fp16 overflow skipping zero_grad (train.py:453), eval_freq=0 ZeroDivision.
+- state/other/pr11_description_draft.md: updated PR #11 description draft (local only so far; Ahmad pastes it).
+- state/other/xbridges_residual_fold.patch: the xBridges commit as a patch (apply with `git am` once there is write access).

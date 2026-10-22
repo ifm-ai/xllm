@@ -1,0 +1,214 @@
+From dafa74b70de6423263f69e0b5f01cc4374aba4b0 Mon Sep 17 00:00:00 2001
+From: Ahmad Chamma <ahmad.chamma723@gmail.com>
+Date: Wed, 21 Oct 2026 13:35:57 +0400
+Subject: [PATCH] Fold xLLM residual_multiplier into o_proj and down_proj on
+ export
+
+xLLM mup depth scaling multiplies each attention and FFN output by
+model.residual_multiplier (m_L^-alpha) before the residual add. K2Horizon
+adds the outputs unscaled, so depth-scaled checkpoints converted without
+errors but gave wrong outputs. Conversion now reads the multiplier from the
+checkpoint config and folds it into o_proj and down_proj, which have no
+bias; MoE and MoVA layers are rejected when it is not 1. Checkpoints with
+multiplier 1 (no mup, or width-only mup) convert unchanged.
+---
+ tests/huggingface/test_conversion.py        | 37 +++++++++++++++++++++
+ xbridges/huggingface/README.md              |  9 +++++
+ xbridges/huggingface/validate.py            |  6 ++--
+ xbridges/huggingface/xllm_to_hf_main.py     | 24 +++++++++++--
+ xbridges/huggingface/xllm_to_hf_parallel.py |  2 ++
+ 5 files changed, 73 insertions(+), 5 deletions(-)
+
+diff --git a/tests/huggingface/test_conversion.py b/tests/huggingface/test_conversion.py
+index 0cdb189..19bbf70 100644
+--- a/tests/huggingface/test_conversion.py
++++ b/tests/huggingface/test_conversion.py
+@@ -147,6 +147,43 @@ def test_unsupported_semantics_rejected(field, value):
+         bridge.convert_config_xllm_to_hf(config, SimpleNamespace(pad_token_id=31, bos_token_id=0, eos_token_id=1))
+ 
+ 
++def test_residual_multiplier_folded_into_branch_outputs():
++    cfg, model, sd, _ = fixture_model('dense')
++    plain = bridge.convert_state_dict_xllm_to_hf(model.state_dict(), cfg, dict(sd))
++    folded = bridge.convert_state_dict_xllm_to_hf(model.state_dict(), cfg, dict(sd), residual_multiplier=0.25)
++    for key, value in plain.items():
++        if key.endswith(('self_attn.o_proj.weight', 'mlp.down_proj.weight')):
++            torch.testing.assert_close(folded[key], 0.25 * value, rtol=0, atol=0)
++        else:
++            torch.testing.assert_close(folded[key], value, rtol=0, atol=0)
++
++
++def test_folded_residual_multiplier_matches_scaled_branches():
++    # x + m * W h computed with unscaled weights equals x + (m W) h after folding
++    cfg, model, sd, _ = fixture_model('dense')
++    folded = bridge.convert_state_dict_xllm_to_hf(model.state_dict(), cfg, dict(sd), residual_multiplier=0.25)
++    model.load_state_dict(folded)
++    plain_model = bridge.K2HorizonForCausalLM(cfg).eval()
++    plain_model.load_state_dict(bridge.convert_state_dict_xllm_to_hf(model.state_dict(), cfg, dict(sd)))
++    layer, plain_layer = model.model.layers[0], plain_model.model.layers[0]
++    h = torch.randn(1, 5, cfg.hidden_size)
++    torch.testing.assert_close(layer.mlp(h), 0.25 * plain_layer.mlp(h))
++
++
++def test_residual_multiplier_config():
++    config = source_config('dense')
++    assert bridge.residual_multiplier(config) == 1.0
++    config['model']['residual_multiplier'] = 0.25
++    assert bridge.residual_multiplier(config) == 0.25
++    tokenizer = SimpleNamespace(pad_token_id=31, bos_token_id=0, eos_token_id=1)
++    bridge.convert_config_xllm_to_hf(config, tokenizer)
++    for kind in ('moe', 'mova'):
++        sparse = source_config(kind)
++        sparse['model']['residual_multiplier'] = 0.25
++        with pytest.raises(ValueError, match='residual_multiplier'):
++            bridge.convert_config_xllm_to_hf(sparse, tokenizer)
++
++
+ @pytest.mark.parametrize('fault', ['missing', 'unused', 'shape', 'extra_expert', 'extra_value'])
+ def test_invalid_checkpoint_rejected(fault):
+     cfg, model, sd, _ = fixture_model('mova')
+diff --git a/xbridges/huggingface/README.md b/xbridges/huggingface/README.md
+index 16854a6..f4f9232 100644
+--- a/xbridges/huggingface/README.md
++++ b/xbridges/huggingface/README.md
+@@ -20,6 +20,11 @@ python -m xbridges.huggingface.xllm_to_hf_main \
+   directory; existing nonempty directories are never overwritten.
+ * RoPE is derived from the source checkpoint. Conversion does not implicitly
+   apply the additional YaRN context extension used by the published 0.9B model.
++* Checkpoints trained with xLLM `mup` depth scaling scale each attention and
++  FFN output by `model.residual_multiplier` before the residual add.
++  K2Horizon adds them unscaled, so conversion folds the multiplier into
++  `o_proj` and `down_proj` (dense layers only). Checkpoints with multiplier 1
++  (no `mup`, or width-only `mup`) convert unchanged.
+ 
+ ### Parallel Conversion
+ For large models, `xllm_to_hf_parallel` converts layers in parallel and writes
+@@ -44,6 +49,10 @@ python -m xbridges.huggingface.hf_to_xllm_main \
+ * Run with `--help` for dtype, rank batching, Slurm-array, and resume options.
+ * Output is one `full_model.tpNN` directory per TP rank plus `config.json`. Load
+   it in xLLM with `--base_model_dir`; it is not a resumable training checkpoint.
++* A model exported from an xLLM `mup` depth-scaled checkpoint has the residual
++  multiplier folded into its weights and converts back with multiplier 1. Do
++  not load it into a run with `mup` depth scaling, which would apply the
++  multiplier a second time.
+ 
+ ## Validating Conversion
+ 
+diff --git a/xbridges/huggingface/validate.py b/xbridges/huggingface/validate.py
+index f432724..86ea0b7 100644
+--- a/xbridges/huggingface/validate.py
++++ b/xbridges/huggingface/validate.py
+@@ -14,7 +14,8 @@ from xbridges.huggingface.xllm_to_hf_main import (
+     get_total_params,
+     load_xllm_state_dict,
+     convert_config_xllm_to_hf,
+-    convert_state_dict_xllm_to_hf)
++    convert_state_dict_xllm_to_hf,
++    residual_multiplier)
+ 
+ 
+ TEXT = """LONDON, England (Reuters) -- Harry Potter star Daniel Radcliffe gains access to a reported £20 million ($41.1 million) fortune as he turns 18 on Monday, but he insists the money won't cast a spell on him. Daniel Radcliffe as Harry Potter in "Harry Potter and the Order of the Phoenix" To the disappointment of gossip columnists around the world, the young actor says he has no plans to fritter his cash away on fast cars, drink and celebrity parties. "I don't plan to be one of those people who, as soon as they turn 18, suddenly buy themselves a massive sports car collection or something similar," he told an Australian interviewer earlier this month. "I don't think I'll be particularly extravagant. "The things I like buying are things that cost about 10 pounds -- books and CDs and DVDs." At 18, Radcliffe will be able to gamble in a casino, buy a drink in a pub or see the horror film "Hostel: Part II," currently six places below his number one movie on the UK box office chart. Details of how he'll mark his landmark birthday are under wraps. His agent and publicist had no comment on his plans. "I'll definitely have some sort of party," he said in an interview. "Hopefully none of you will be reading about it." Radcliffe's earnings from the first five Potter films have been held in a trust fund which he has not been able to touch. Despite his growing fame and riches, the actor says he is keeping his feet firmly on the ground. "People are always looking to say 'kid star goes off the rails,'" he told reporters last month. "But I try very hard not to go that way because it would be too easy for them." His latest outing as the boy wizard in "Harry Potter and the Order of the Phoenix" is breaking records on both sides of the Atlantic and he will reprise the role in the last two films. Watch I-Reporter give her review of Potter's latest » . There is life beyond Potter, however. The Londoner has filmed a TV movie called "My Boy Jack," about author Rudyard Kipling and his son, due for release later this year. He will also appear in "December Boys," an Australian film about four boys who escape an orphanage. Earlier this year, he made his stage debut playing a tortured teenager in Peter Shaffer's "Equus." Meanwhile, he is braced for even closer media scrutiny now that he's legally an adult: "I just think I'm going to be more sort of fair game," he told Reuters. E-mail to a friend . Copyright 2007 Reuters. All rights reserved.This material may not be published, broadcast, rewritten, or redistributed."""
+@@ -102,7 +103,8 @@ def main(xllm_dir='ckpts/xllm-30b-a3b',
+     state_dict = convert_state_dict_xllm_to_hf(
+         hf_state_dict=hf_model.state_dict(),
+         hf_config=hf_model.config,
+-        xllm_state_dict=xllm_state_dict)
++        xllm_state_dict=xllm_state_dict,
++        residual_multiplier=residual_multiplier(xllm_config))
+ 
+     print(f'Loading HF state_dict...')
+     hf_model.load_state_dict(state_dict, assign=True)
+diff --git a/xbridges/huggingface/xllm_to_hf_main.py b/xbridges/huggingface/xllm_to_hf_main.py
+index aa26da8..5140598 100644
+--- a/xbridges/huggingface/xllm_to_hf_main.py
++++ b/xbridges/huggingface/xllm_to_hf_main.py
+@@ -100,6 +100,11 @@ def _resolve_attention_norm_key(key, state_dict, layer, hf_config):
+     return present[0] if present else legacy
+ 
+ 
++def residual_multiplier(xllm_config):
++    """Multiplier on attention/FFN outputs before the residual add (xLLM mup depth scaling)."""
++    return float(xllm_config['model'].get('residual_multiplier', 1.0))
++
++
+ def convert_config_xllm_to_hf(xllm_config, tokenizer):
+     assert xllm_config['model']['apply_rmsnorm'] == True
+     assert xllm_config['model']['swiglu'] == True
+@@ -115,6 +120,8 @@ def convert_config_xllm_to_hf(xllm_config, tokenizer):
+     for option in ('two_hop_residual', 'rescale_nffn', 'causal_norm_weight'):
+         if model.get(option, False):
+             raise ValueError(f'IFM K2Horizon does not implement {option}')
++    if residual_multiplier(xllm_config) != 1.0 and (model['num_experts'] > 0 or model.get('num_values', 0) > 0):
++        raise ValueError('Folding residual_multiplier is only implemented for dense attention and FFN layers')
+ 
+     if xllm_config['model'].get('head_dim', None) is not None:
+         head_dim = xllm_config['model']['head_dim']
+@@ -224,7 +231,13 @@ def _restore_expert_axis(key, weight, hf_config):
+ 
+ 
+ def convert_state_dict_xllm_to_hf(
+-        hf_state_dict, hf_config, xllm_state_dict, layers=None, include_output=True):
++        hf_state_dict, hf_config, xllm_state_dict, layers=None, include_output=True, residual_multiplier=1.0):
++    """Map xLLM weights to K2Horizon weights.
++
++    K2Horizon adds attention and FFN outputs to the residual stream unscaled, so an
++    xLLM residual_multiplier (mup depth scaling) is folded into the last projection
++    of each branch (o_proj and down_proj), which have no bias.
++    """
+     num_layers = hf_config.num_hidden_layers
+     num_experts = hf_config.num_experts
+     hidden_size = hf_config.hidden_size
+@@ -287,6 +300,9 @@ def convert_state_dict_xllm_to_hf(
+                 for expert in range(mova_num_experts):
+                     state_dict[hf_key.format(layer=layer, expert=expert)] = \
+                         weight[expert]
++            elif residual_multiplier != 1.0 and xllm_key.endswith(('.attention.wo.weight', '.nffn.fc2.weight')):
++                weight = xllm_state_dict[xllm_key]
++                state_dict[hf_key] = (weight.float() * residual_multiplier).to(weight.dtype)
+             elif '.moe.experts.' in xllm_key:
+                 weight = _restore_expert_axis(xllm_key, xllm_state_dict[xllm_key], hf_config)
+                 expected_shape = (num_experts, *hf_state_dict[hf_key.format(layer=layer, expert=0)].shape)
+@@ -433,8 +449,9 @@ def main(xllm_dir='ckpts/xllm-30b-a3b',
+         raise ValueError(f'Refusing to overwrite nonempty output directory: {save_dir}')
+     hf_tokenizer = AutoTokenizer.from_pretrained(
+         tokenizer_dir, trust_remote_code=True)
++    xllm_config = json.load(open(f'{xllm_dir}/config.json'))
+     hf_config = convert_config_xllm_to_hf(
+-        xllm_config=json.load(open(f'{xllm_dir}/config.json')),
++        xllm_config=xllm_config,
+         tokenizer=hf_tokenizer)
+     hf_config.dtype = output_dtype
+     with torch.device('meta'):
+@@ -472,7 +489,8 @@ def main(xllm_dir='ckpts/xllm-30b-a3b',
+             hf_config=hf_model.config,
+             xllm_state_dict=xllm_state_dict,
+             layers=range(layer_l, layer_r),
+-            include_output=layer_r == hf_config.num_hidden_layers)
++            include_output=layer_r == hf_config.num_hidden_layers,
++            residual_multiplier=residual_multiplier(xllm_config))
+ 
+         del xllm_state_dict
+         gc.collect()
+diff --git a/xbridges/huggingface/xllm_to_hf_parallel.py b/xbridges/huggingface/xllm_to_hf_parallel.py
+index a77cf29..bd0d7d2 100644
+--- a/xbridges/huggingface/xllm_to_hf_parallel.py
++++ b/xbridges/huggingface/xllm_to_hf_parallel.py
+@@ -28,6 +28,7 @@ from xbridges.huggingface.xllm_to_hf_main import (
+     convert_config_xllm_to_hf,
+     convert_state_dict_xllm_to_hf,
+     load_xllm_state_dict,
++    residual_multiplier,
+ )
+ 
+ 
+@@ -292,6 +293,7 @@ def _convert_one_layer(request: WorkerRequest) -> WorkerResult:
+         xllm_state_dict=_load_layer_state(xllm_dir=xllm_dir, hf_config=hf_config, layer=request.layer),
+         layers=[request.layer],
+         include_output=request.layer == request.num_layers - 1,
++        residual_multiplier=residual_multiplier(json.loads((xllm_dir / "config.json").read_text())),
+     )
+     layer_state = {
+         key: value for key, value in converted.items() if f"layers.{request.layer}." in key
+-- 
+2.34.1
+
