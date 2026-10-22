@@ -77,8 +77,9 @@ DATA_CFGS=(
 
 | Setting | Meaning |
 | --- | --- |
-| `batch_size` | Batch size per data-parallel rank. |
-| `global_batch_size` | Alternative to `batch_size`: total batch size across data-parallel ranks; must be divisible by the data-parallel size. |
+| `batch_size` | Batch size per data-parallel rank and micro-batch. |
+| `global_batch_size` | Alternative to `batch_size`: total batch size per step across data-parallel ranks and micro-batches; must be divisible by the data-parallel size times `gradient_accumulation_steps`. |
+| `gradient_accumulation_steps` | Micro-batches per optimizer step (default 1). The loss of every micro-batch is normalized by the token count of the whole step, so `batch_size B` with `N` micro-batches gives the token-loss gradient of `batch_size N*B`; the MoE aux loss and router-bias update are per micro-batch. |
 | `buffer_size` | Controls the shuffle window: approximately `buffer_size * seq_len` tokens per rank per refill. |
 | `num_workers` | Threads reading and tokenizing different sources; one source is not split across workers. |
 | `packing_type` | `simple` concatenates tokens; `bestfit` uses length-aware packing to reduce padding, keeping documents intact when they fit in one sequence. |
