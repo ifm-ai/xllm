@@ -88,6 +88,7 @@ class OptimConf(Config):
     muon_nesterov: bool = True  # Nesterov momentum (Keller Jordan Muon, Moonlight)
     muon_adjust_lr: Optional[str] = "spectral_norm"  # Muon update scaling: spectral_norm, rms_norm or None
     muon_block_scale: str = "block"  # Update scale of a row block (from the layers' `muon` marks): block (its own shape) or matrix (its whole matrix's shape)
+    muon_weight_decay: Optional[float] = None  # Decoupled weight decay of the Muon matrices; None = weight_decay
     warmup: int = 2000  # Num of steps for LR warmup. 0 means no warmup
     weight_decay: float = 0.1  # Decoupled weight decay
     epsilon: float = 1e-8
@@ -104,6 +105,7 @@ class OptimConf(Config):
     def __post_init__(self):
         assert self.optimizer in ['adamw', 'muon']
         assert self.muon_block_scale in ['block', 'matrix']
+        assert self.muon_weight_decay is None or self.muon_weight_decay >= 0
         assert self.scheduler in ['linear', 'cosine', 'constant', 'wsd']
         assert self.warmup >= 0
         if self.scheduler == 'wsd':
