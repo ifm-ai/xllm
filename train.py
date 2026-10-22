@@ -178,10 +178,13 @@ def set_optim_state(
     timings: Timings,
     opt_cfg: OptimConf
 ):
-    # setting LR manually to support overwriting during training from the same state
-    base_lrs = [opt_cfg.muon_lr, opt_cfg.lr] if opt_cfg.optimizer == "muon" else [opt_cfg.lr]
-    reloaded_training_state_dict["scheduler"]["base_lrs"] = base_lrs
-    scheduler.load_state_dict(reloaded_training_state_dict["scheduler"])
+    # base LRs come from the config (one per param group), so LRs can change on resume;
+    # the scheduler keeps its position
+    scheduler_state = dict(reloaded_training_state_dict["scheduler"])
+    assert len(scheduler_state["base_lrs"]) == len(scheduler.base_lrs), \
+        f"checkpoint has {len(scheduler_state['base_lrs'])} param groups, the optimizer {len(scheduler.base_lrs)}"
+    scheduler_state["base_lrs"] = list(scheduler.base_lrs)
+    scheduler.load_state_dict(scheduler_state)
     state.step, state.scale, state.scale_updates, state.clip_cumulative = (
         reloaded_training_state_dict["step"],
         reloaded_training_state_dict["scale"],

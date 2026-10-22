@@ -33,6 +33,10 @@
      `p = p * (1 - lr * wd) - lr * update` to its shard.
 - **Checkpoints.** Momentum and AdamW moments are DTensors like the parameters, so DCP
   reshards them if the mesh changes; the block plan is rebuilt from the global shapes.
+- **Resume.** The config wins over the checkpoint: the scheduler keeps its position, but its
+  base LRs (`--optim.muon_lr`, `--optim.lr`) and the groups' weight decay and epsilon come from
+  the config, so a run can be continued with new values. Momentum, Nesterov, betas and the
+  update scale are always taken from the config.
 
 ```bash
 --optim.optimizer muon --optim.muon_lr 0.01 --optim.lr 2e-3 \

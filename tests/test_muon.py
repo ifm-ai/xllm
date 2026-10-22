@@ -7,6 +7,7 @@ that span several ranks). After a few steps the sharded optimizer must match
 per-block Newton-Schulz on the full matrices; whole-matrix mode must match
 microsoft/dion, and the AdamW group must match torch.optim.AdamW.
 """
+import copy
 import math
 import os
 
@@ -117,6 +118,33 @@ def check_marks(mesh):
         print("muon marks survive fully_shard and .cuda() and split params as expected")
 
 
+def check_resume_config_wins(mesh):
+    """load_state_dict keeps the checkpoint's momentum and AdamW moments but the configured
+    weight decay and epsilon (the path DCP's set_optimizer_state_dict ends in)."""
+    n = len(MATRICES)
+    _, _, grads, params = make(mesh, seed=2)
+    old = Muon(params[:n], [1] * n, params[n:], mesh, CFG_ADAMW)  # weight decay 0.1, eps 1e-8
+    for step_grads in grads:
+        for p, g in zip(params, step_grads):
+            p.grad = distribute_tensor(g, mesh, [Shard(0)])
+        old.step()
+    saved = copy.deepcopy(old.state_dict())
+    assert [g["weight_decay"] for g in saved["param_groups"]] == [0.1, 0.1]
+    cfg = OptimConf(optimizer="muon", lr=1e-3, muon_lr=0.02, weight_decay=0.05, muon_weight_decay=0.2,
+                    beta1=0.9, beta2=0.95, epsilon=1e-6)
+    new = Muon(params[:n], [1] * n, params[n:], mesh, cfg)
+    new.load_state_dict(saved)
+    assert [g["weight_decay"] for g in new.param_groups] == [0.2, 0.05], new.param_groups
+    assert [g["eps"] for g in new.param_groups] == [1e-6, 1e-6]
+    for p in params[:n]:
+        assert torch.equal(new.state[p]["momentum"].to_local(), old.state[p]["momentum"].to_local())
+    for p in params[n:]:
+        for k in ("exp_avg", "exp_avg_sq"):
+            assert torch.equal(new.state[p][k].to_local(), old.state[p][k].to_local()), k
+    if dist.get_rank() == 0:
+        print("resume: momentum and moments reloaded, configured weight decay and eps kept")
+
+
 def main():
     torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
     dist.init_process_group("nccl")
@@ -172,6 +200,7 @@ def main():
         check("muon whole-matrix vs dion.Muon", got, want, full, 3e-2)
 
     check_marks(mesh)
+    check_resume_config_wins(mesh)
 
     if dist.get_rank() == 0:
         print("MUON_TEST_OK")
