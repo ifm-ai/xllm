@@ -12,14 +12,15 @@ replace or swap DTensor parameters and drop attributes set on them.
 
 Terminology, for one Muon matrix W of shape [rows, cols]:
 
-- shard: FSDP2 Shard(0) stores W as contiguous row ranges, one per rank (torch.chunk).
-- Block: one of the n row ranges of W from its mark, orthogonalized by Newton-Schulz on
-  its own; chosen from the model, not from the sharding (the whole matrix, or one or
-  more heads of wq / wk / wv / wr).
+- Block: a box W[r0:r1, c0:c1] that Newton-Schulz orthogonalizes on its own; the Blocks of
+  a matrix tile it exactly once. Chosen from the model, not from the sharding (the whole
+  matrix, or one or more heads of wq / wk / wv / wr; a mark gives row Blocks).
+- region: the box of W that one rank stores. FSDP2 Shard(0) stores contiguous row ranges
+  with all columns, one per rank (torch.chunk).
 - owner: the rank that gathers a Block and runs NS on it: the rank that stores most of
-  its rows, then the least loaded one.
-- slice: the rows of a Block that one rank stores (the Block's overlap with that rank's
-  shard). A Block is the concatenation of its slices in rank order.
+  it, then the least loaded one.
+- slice: the overlap of a Block with one rank's region, a box. A Block is assembled from
+  its slices.
 
 Example: wk [8, 4] with wk.muon = 2 on 3 ranks (torch.chunk: rows 0-2, 3-5, 6-7):
 
@@ -27,6 +28,7 @@ Example: wk [8, 4] with wk.muon = 2 on 3 ranks (torch.chunk: rows 0-2, 3-5, 6-7)
     rank 1  rows 3-5  b1 | b2    block 1 = rows 4-7 = cat(b2, c), owner rank 1 (tie with rank 2)
     rank 2  rows 6-7  c          b1 and b2 are rank 1's slices of blocks 0 and 1
 """
+import itertools
 import math
 from collections import defaultdict
 from dataclasses import dataclass
@@ -54,19 +56,31 @@ NS_COEFFS = (
     (2.8366, -3.0525, 1.2012),
 )
 
+Box = Tuple[int, int, int, int]  # rows [r0, r1) x cols [c0, c1) of a matrix
+
+
 @dataclass
 class Block:
-    """Rows [r0, r1) of Muon matrix `param` (one or more heads, or the whole matrix), all
-    `cols` columns; Newton-Schulz orthogonalizes it on its own."""
+    """Box [r0, r1) x [c0, c1) of Muon matrix `param` (one or more heads, or the whole matrix);
+    Newton-Schulz orthogonalizes it on its own."""
     param: int
     r0: int
     r1: int
-    cols: int
+    c0: int
+    c1: int
     owner: int = 0  # rank that gathers the block and runs Newton-Schulz on it
 
     @property
     def shape(self) -> Tuple[int, int]:
-        return self.r1 - self.r0, self.cols
+        return self.r1 - self.r0, self.c1 - self.c0
+
+
+def row_blocks(shape: Tuple[int, int], n: int) -> List[Box]:
+    """The Blocks of a mark n: n equal row ranges, all columns."""
+    rows, cols = shape
+    assert rows % n == 0, (shape, n)
+    size = rows // n
+    return [(s, s + size, 0, cols) for s in range(0, rows, size)]
 
 
 def split_muon_params(model: nn.Module):
@@ -88,6 +102,22 @@ def split_muon_params(model: nn.Module):
 
 def _local(t: Tensor) -> Tensor:
     return t.to_local() if hasattr(t, "to_local") else t
+
+
+def _overlap(a: Box, b: Box):
+    """The box both a and b cover, or None."""
+    box = (max(a[0], b[0]), min(a[1], b[1]), max(a[2], b[2]), min(a[3], b[3]))
+    return box if box[0] < box[1] and box[2] < box[3] else None
+
+
+def _local_box(box: Box, origin: Box) -> Tuple[slice, slice]:
+    """`box` as an index into the tensor whose top-left corner is `origin`'s."""
+    return slice(box[0] - origin[0], box[1] - origin[0]), slice(box[2] - origin[2], box[3] - origin[2])
+
+
+def _shape(index: Tuple[slice, slice]) -> Tuple[int, int]:
+    rows, cols = index
+    return rows.stop - rows.start, cols.stop - cols.start
 
 
 @torch.compile(fullgraph=True)
@@ -129,11 +159,13 @@ class Muon(Optimizer):
     def __init__(
         self,
         muon_params: List[nn.Parameter],
-        n_blocks: List[int],
+        blocks: List[List[Box]],
         adamw_params: List[nn.Parameter],
         mesh: DeviceMesh,
         cfg: OptimConf,
     ):
+        """blocks[i]: the boxes of muon_params[i] (global coordinates) that tile it, each
+        orthogonalized on its own; row_blocks(shape, n) for a mark n."""
         defaults = dict(weight_decay=cfg.weight_decay, eps=cfg.epsilon)
         super().__init__(
             [
@@ -151,7 +183,7 @@ class Muon(Optimizer):
         self.process_group = mesh.get_group()
         self.world = mesh.size()
         self.rank = mesh.get_local_rank()
-        self._plan([tuple(p.shape) for p in muon_params], n_blocks)
+        self._plan([tuple(p.shape) for p in muon_params], blocks)
 
     def load_state_dict(self, state_dict):
         """Reload momentum and AdamW moments, but keep the configured hyperparameters: the groups'
@@ -169,49 +201,56 @@ class Muon(Optimizer):
 
     # ---- plan: built once from the global shapes, identical on every rank ----
 
-    def _plan(self, shapes: List[Tuple[int, int]], n_blocks: List[int]):
+    def _plan(self, shapes: List[Tuple[int, int]], boxes: List[List[Box]]):
         self.shapes = shapes
-        self.blocks: List[Block] = []
-        for i, ((rows, cols), n) in enumerate(zip(shapes, n_blocks)):
-            assert rows % n == 0, (i, rows, n)
-            size = rows // n
-            self.blocks += [Block(i, s, s + size, cols) for s in range(0, rows, size)]
+        for i, ((rows, cols), matrix_boxes) in enumerate(zip(shapes, boxes)):
+            for r0, r1, c0, c1 in matrix_boxes:
+                assert 0 <= r0 < r1 <= rows and 0 <= c0 < c1 <= cols, (i, shapes[i], (r0, r1, c0, c1))
+            assert sum((r1 - r0) * (c1 - c0) for r0, r1, c0, c1 in matrix_boxes) == rows * cols and not any(
+                _overlap(a, b) for a, b in itertools.combinations(matrix_boxes, 2)
+            ), f"the blocks of Muon matrix {i} {shapes[i]} must tile it exactly once"
+        self.blocks: List[Block] = [Block(i, *box) for i, matrix_boxes in enumerate(boxes) for box in matrix_boxes]
 
-        # shard_start[i][r]: first global row of matrix i on rank r (FSDP2 Shard(0) follows torch.chunk)
-        shard_start = [[min(r * math.ceil(rows / self.world), rows) for r in range(self.world + 1)]
-                       for rows, _ in shapes]
-        # slices[k]: (rank, global rows lo, hi) for every rank that stores rows of block k
+        # regions[i][r]: the box of matrix i that rank r stores
+        regions = [self._regions(shape) for shape in shapes]
+        # slices[k]: (rank, box in global coordinates) for every rank that stores part of block k
         slices = []
         for b in self.blocks:
-            start = shard_start[b.param]
-            overlap = [(r, max(b.r0, start[r]), min(b.r1, start[r + 1])) for r in range(self.world)]
-            slices.append([(r, lo, hi) for r, lo, hi in overlap if lo < hi])
+            block = (b.r0, b.r1, b.c0, b.c1)
+            overlaps = [(r, _overlap(block, region)) for r, region in enumerate(regions[b.param])]
+            slices.append([(r, box) for r, box in overlaps if box is not None])
 
-        # owner: the rank that stores most of the block (no transfer for those rows), then the least
+        # owner: the rank that stores most of the block (no transfer for that part), then the least
         # loaded; blocks are placed by decreasing Newton-Schulz cost m * n * min(m, n)
         load = [0] * self.world
         for k in sorted(range(len(self.blocks)), key=lambda k: -self._ns_cost(self.blocks[k])):
             stored = dict.fromkeys(range(self.world), 0)
-            for r, lo, hi in slices[k]:
-                stored[r] = hi - lo
+            for r, (r0, r1, c0, c1) in slices[k]:
+                stored[r] = (r1 - r0) * (c1 - c0)
             b = self.blocks[k]
             b.owner = min(range(self.world), key=lambda r: (-stored[r], load[r]))
             load[b.owner] += self._ns_cost(b)
 
-        # my_slices[r]: my slices of the blocks rank r owns, as (matrix, rows of my shard)
-        # owned_slices[r]: rank r's slices of the blocks I own, as (index in self.owned, rows of the block)
+        # my_slices[r]: my slices of the blocks rank r owns, as (matrix, box of my region)
+        # owned_slices[r]: rank r's slices of the blocks I own, as (index in self.owned, box of the block)
         # Both lists follow the block order, so a sender's list matches its receiver's.
         self.owned = [k for k, b in enumerate(self.blocks) if b.owner == self.rank]
         index = {k: j for j, k in enumerate(self.owned)}
         self.my_slices = [[] for _ in range(self.world)]
         self.owned_slices = [[] for _ in range(self.world)]
         for k, b in enumerate(self.blocks):
-            for r, lo, hi in slices[k]:
+            for r, box in slices[k]:
                 if r == self.rank:
-                    s0 = shard_start[b.param][r]
-                    self.my_slices[b.owner].append((b.param, slice(lo - s0, hi - s0)))
+                    self.my_slices[b.owner].append((b.param, _local_box(box, regions[b.param][r])))
                 if b.owner == self.rank:
-                    self.owned_slices[r].append((index[k], slice(lo - b.r0, hi - b.r0)))
+                    self.owned_slices[r].append((index[k], _local_box(box, (b.r0, b.r1, b.c0, b.c1))))
+
+    def _regions(self, shape: Tuple[int, int]) -> List[Box]:
+        """The box of a matrix that each rank stores: FSDP2 Shard(0) follows torch.chunk
+        (contiguous rows, all columns; trailing ranks may get none)."""
+        rows, cols = shape
+        step = math.ceil(rows / self.world)
+        return [(min(r * step, rows), min((r + 1) * step, rows), 0, cols) for r in range(self.world)]
 
     @staticmethod
     def _ns_cost(b: Block) -> int:
@@ -256,23 +295,21 @@ class Muon(Optimizer):
 
     def _gather(self, updates: List[Tensor]) -> List[Tensor]:
         """Send my slices to their blocks' owners; return the whole blocks I own."""
-        send = [[updates[i][rows] for i, rows in self.my_slices[r]] for r in range(self.world)]
-        recv = self._exchange(send, [[(rows.stop - rows.start, self.blocks[self.owned[j]].cols)
-                                      for j, rows in self.owned_slices[r]] for r in range(self.world)])
+        send = [[updates[i][box] for i, box in self.my_slices[r]] for r in range(self.world)]
+        recv = self._exchange(send, [[_shape(box) for _, box in self.owned_slices[r]] for r in range(self.world)])
         blocks = [torch.empty(self.blocks[k].shape, dtype=torch.bfloat16, device="cuda") for k in self.owned]
         for r in range(self.world):
-            for (j, rows), t in zip(self.owned_slices[r], recv[r]):
-                blocks[j][rows] = t
+            for (j, box), t in zip(self.owned_slices[r], recv[r]):
+                blocks[j][box] = t
         return blocks
 
     def _scatter(self, results: List[Tensor], updates: List[Tensor]):
         """Send each rank its slices of the blocks I own; write the slices I receive into `updates`."""
-        send = [[results[j][rows] for j, rows in self.owned_slices[r]] for r in range(self.world)]
-        recv = self._exchange(send, [[(rows.stop - rows.start, self.shapes[i][1])
-                                      for i, rows in self.my_slices[r]] for r in range(self.world)])
+        send = [[results[j][box] for j, box in self.owned_slices[r]] for r in range(self.world)]
+        recv = self._exchange(send, [[_shape(box) for _, box in self.my_slices[r]] for r in range(self.world)])
         for r in range(self.world):
-            for (i, rows), t in zip(self.my_slices[r], recv[r]):
-                updates[i][rows] = t
+            for (i, box), t in zip(self.my_slices[r], recv[r]):
+                updates[i][box] = t
 
     @torch.no_grad()
     def _muon_step(self, group: Dict):
@@ -313,8 +350,9 @@ class Muon(Optimizer):
 def build_muon(model: nn.Module, mesh: DeviceMesh, cfg: OptimConf) -> Optimizer:
     """`mesh` is the FSDP mesh; Muon works over its shard dimension."""
     muon_params, n_blocks, adamw_params = split_muon_params(model)
+    blocks = [row_blocks(tuple(p.shape), n) for p, n in zip(muon_params, n_blocks)]
     shard_mesh = mesh if mesh.ndim == 1 else mesh["dp"]
-    optimizer = Muon(muon_params, n_blocks, adamw_params, shard_mesh, cfg)
+    optimizer = Muon(muon_params, blocks, adamw_params, shard_mesh, cfg)
     logger.info(f"Muon: {len(muon_params)} matrices / {len(optimizer.blocks)} blocks (scale={cfg.muon_block_scale}) / "
                 f"{sum(p.numel() for p in muon_params)} params; AdamW: {len(adamw_params)} tensors / "
                 f"{sum(p.numel() for p in adamw_params)} params")
