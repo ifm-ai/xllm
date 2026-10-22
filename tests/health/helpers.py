@@ -80,7 +80,7 @@ def shard(model, backend):
 
 
 def logged_metrics(model, tokens=TOKENS, targets=None, token_mask=None, train=False,
-                   loss_scale=None, gradient_scale=1.0, **flags):
+                   loss_scale=None, gradient_scale=1.0, load_balancing_type=None, **flags):
     """Run one sampled training step with a real collector and return everything flush logs.
 
     Forward with the collector active; if loss_scale is given, backward on loss_scale * mean(output^2);
@@ -90,7 +90,10 @@ def logged_metrics(model, tokens=TOKENS, targets=None, token_mask=None, train=Fa
     collector.begin_step(1)
     try:
         with torch.set_grad_enabled(loss_scale is not None):
-            output, _, _ = model.train(train)(tokens, multi_segments=False, targets=targets, token_mask=token_mask)
+            output, _, _ = model.train(train)(
+                tokens, multi_segments=False, targets=targets, token_mask=token_mask,
+                moe_router_load_balancing_type=load_balancing_type,
+            )
     finally:
         collector.end_forward()
     if loss_scale is not None:
