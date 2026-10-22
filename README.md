@@ -150,8 +150,9 @@ torchrun --standalone --nproc_per_node=1 train.py \
   --dump_dir saved_models/quickstart
 ```
 
-`batch_size` is per data-parallel rank. Alternatively, set `global_batch_size`,
-divisible by the data-parallel size; do not set both. Use a fresh `dump_dir` for
+`batch_size` is per data-parallel rank and micro-batch; `gradient_accumulation_steps`
+(default 1) micro-batches make one optimizer step. Alternatively, set `global_batch_size`,
+divisible by the data-parallel size times `gradient_accumulation_steps`; do not set both. Use a fresh `dump_dir` for
 a new run; an existing checkpoint in that directory is resumed automatically.
 
 When changing these values, keep the constraints checked in
