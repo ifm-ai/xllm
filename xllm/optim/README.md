@@ -10,7 +10,8 @@
 - **Parameters.** A model marks the linear layers whose weights Muon updates with a
   `muon` attribute (`layer.muon = n`); they use `--optim.muon_lr`. Everything else
   (embedding, output layer, norms, biases, convolutions) uses AdamW with `--optim.lr`.
-  Both groups follow the same LR schedule and `--optim.weight_decay`. The attention
+  Both groups follow the same LR schedule. AdamW uses `--optim.weight_decay`; the Muon
+  matrices use `--optim.muon_weight_decay` (default: the same value). The attention
   layers and the FFN mark their projections.
 - **Blocks.** `n` is the number of equal row blocks the matrix is cut into, each
   orthogonalized on its own: 1 = whole matrix, the number of heads = one block per head,

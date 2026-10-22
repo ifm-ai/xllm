@@ -137,7 +137,8 @@ class Muon(Optimizer):
         defaults = dict(weight_decay=cfg.weight_decay, eps=cfg.epsilon)
         super().__init__(
             [
-                dict(params=muon_params, lr=cfg.muon_lr, algorithm="muon"),
+                dict(params=muon_params, lr=cfg.muon_lr, algorithm="muon",
+                     weight_decay=cfg.weight_decay if cfg.muon_weight_decay is None else cfg.muon_weight_decay),
                 dict(params=adamw_params, lr=cfg.lr, algorithm="adamw"),
             ],
             defaults,
