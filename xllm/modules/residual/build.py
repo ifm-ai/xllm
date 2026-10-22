@@ -2,7 +2,7 @@ from typing import Optional
 
 from torch import nn
 
-from .base import BaseResidual
+from .base import BaseResidual, NoResidual
 from .delta import DeltaResidual
 from .ortho import OrthoResidual
 
@@ -18,6 +18,8 @@ def build_residual(
 ) -> nn.Module:
     if residual_func in ['base', 'add']:
         return BaseResidual(rc_id, model_dim)
+    elif residual_func == 'none':
+        return NoResidual(rc_id, model_dim)
     elif residual_func == 'ortho':
         assert num_heads is not None
         return OrthoResidual(rc_id, model_dim, num_heads, eps)
