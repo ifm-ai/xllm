@@ -594,8 +594,6 @@ def main(cfg: TrainerConf):
             s_logging = timer()  # update logging time
             mloggers["timings"].log(timings.get_stats(), state.step)
 
-            checkpointer.check_ok()  # check if background checkpointing is ok
-
             last_nw = 0
             losses.clear()
             if aux_losses is not None:
@@ -604,6 +602,10 @@ def main(cfg: TrainerConf):
             padding_ratios.clear()
             truncation_ratios.clear()
             t0 = timer()
+
+        # Check every iteration (not only on log steps) so that a failed background
+        # save surfaces promptly. check_ok() is non-collective, so this is safe here.
+        checkpointer.check_ok()
 
         # checkpoint
         s_checkpointing = timer()
