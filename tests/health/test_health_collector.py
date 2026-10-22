@@ -246,17 +246,26 @@ def _rank(rank, world_size, rendezvous, out_dir):
     result = {"logged": []}
     logger = SimpleNamespace(log=lambda metrics, step: result["logged"].append((step, metrics)))
     try:
-        collector = HealthMetricCollector(enabled=True, freq=1, num_layers=1, enable_logits_stats=True, enable_weight_norms=True)
+        collector = HealthMetricCollector(
+            enabled=True, freq=1, num_layers=1, enable_logits_stats=True, enable_weight_norms=True,
+            router_stats_layers={"moe": [0]},
+        )
         model = tiny_transformer(1)
         result["full_norms"] = {f"weight_norms/layer_000/{p}/l2": model.layers[0].get_parameter(f).norm().item() for p, f in MATRICES.items()}
         model = shard(model, "fsdp2")
         activations = {1: ([1.0, 3.0], [-5.0, 9.0, 10.0]), 2: ([1.0], None), 3: ([1.0], [1.0])}  # step -> per-rank
         logits = {1: ((6.0, 3, -1.0, 4.0), (2.0, 1, 0.0, 9.0))}  # step -> per-rank (sum, count, min, max)
+        routing = (  # per-rank (loads, top-k scores, aux loss)
+            ([3, 1, 0, 4], [[0.75, 0.25], [0.5, 0.5]], 0.3),
+            ([1, 1, 0, 0], [[1.0, 0.0]], 0.5),
+        )
         for step in (1, 2, 3):
             collector.begin_step(step)
             if activations[step][rank] is not None:  # rank 1 drops its record at step 2
                 collector.record_activation(0, torch.tensor(activations[step][rank]))
             collector.record_logits_stats(*(torch.tensor(v) for v in logits.get(step, ((1.0, 1, 1.0, 1.0),) * 2)[rank]))
+            loads, scores, aux_loss = routing[rank]
+            collector.record_router_stats("moe", 0, torch.tensor(loads), torch.tensor(scores), aux_loss=torch.tensor(aux_loss))
             collector.end_forward()
             collector.record_matrix_norms(model)
             collector.flush(logger, step)
@@ -282,3 +291,12 @@ def test_two_ranks_reduce_globally_log_on_rank_zero_and_skip_together(tmp_path):
     assert [step1[f"activation_stats/layer_000/{s}"] for s in STATS] == pytest.approx([18 / 5, -5.0, 10.0])
     assert [step1[f"logits_stats/{s}"] for s in STATS] == pytest.approx([8 / 4, -1.0, 9.0])
     assert {k: v for k, v in step1.items() if k.startswith("weight_norms/")} == pytest.approx(rank0["full_norms"], rel=1e-5)
+    # Router loads sum to [4, 2, 0, 4]; entropy averages over all 3 tokens; aux loss averages over ranks.
+    entropy = lambda p: -sum(x * math.log(x) for x in p if x > 0)  # noqa: E731
+    assert {k: v for k, v in step1.items() if k.startswith("moe_")} == pytest.approx({
+        "moe_utilization_stats/layer_000/load_max_over_mean": 4 / 2.5,
+        "moe_utilization_stats/layer_000/load_entropy_normalized": entropy([0.4, 0.2, 0.4]) / math.log(4),
+        "moe_utilization_stats/layer_000/zero_experts": 1.0,
+        "moe_router_confidence_stats/layer_000/topk_entropy_mean": (entropy([0.75, 0.25]) + math.log(2)) / 3,
+        "moe_auxiliary_loss/layer_000/value": 0.4,
+    })

@@ -1,10 +1,12 @@
 import math
 from logging import getLogger
-from typing import Any, Dict, Optional, Tuple, TYPE_CHECKING
+from typing import Any, Dict, NamedTuple, Optional, Tuple, TYPE_CHECKING
 
 import torch
 import torch.distributed as dist
 from torch.distributed.tensor import DTensor, Replicate, Shard
+
+from xllm.distributed.initialize import get_model_parallel_rank
 
 if TYPE_CHECKING:
     from xllm.metrics import MetricLogger
@@ -50,6 +52,29 @@ _GEKKO_OPTIONAL_MATRIX_PARAMETER_PATHS = (
 )
 
 _MatrixParameterPaths = Tuple[Tuple[str, str], ...]
+
+
+class _RouterFamily(NamedTuple):
+    utilization: str
+    inactive_routes: str
+    confidence: str
+    bias: str
+    auxiliary_loss: str
+
+
+_ROUTER_FAMILIES = {
+    "moe": _RouterFamily(
+        "moe_utilization_stats", "zero_experts", "moe_router_confidence_stats",
+        "moe_router_bias_stats", "moe_auxiliary_loss",
+    ),
+}
+
+
+class _RouterRecord(NamedTuple):
+    packet: torch.Tensor
+    num_routes: int
+    has_auxiliary_loss: bool
+    bias: Optional[torch.Tensor]
 
 
 def _matrix_parameter_paths(layer: Any, fqns: list[str]) -> _MatrixParameterPaths:
@@ -144,6 +169,7 @@ class HealthMetricCollector:
         enable_gradient_norms: bool = False,
         enable_logits_stats: bool = False,
         enable_gekko_stats: bool = False,
+        router_stats_layers: Optional[Dict[str, list[int]]] = None,
     ):
         self.enabled = enabled
         self.freq = freq
@@ -153,6 +179,12 @@ class HealthMetricCollector:
         self.enable_gradient_norms = enable_gradient_norms
         self.enable_logits_stats = enable_logits_stats
         self.enable_gekko_stats = enable_gekko_stats
+        self.router_stats_layers = {
+            family: sorted(layers) for family, layers in (router_stats_layers or {}).items()
+        }
+        unknown = set(self.router_stats_layers) - set(_ROUTER_FAMILIES)
+        if unknown:
+            raise ValueError(f"Unknown router statistics families: {sorted(unknown)}")
         self.step: Optional[int] = None
         self.recording = False
         self.decoder_layer_activation_records: Dict[int, _LocalStats] = {}
@@ -163,6 +195,7 @@ class HealthMetricCollector:
         self.logits_stats_record: Optional[Tuple[
             torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor,
         ]] = None
+        self.router_stats_records: Dict[str, Dict[int, _RouterRecord]] = {}
 
     def begin_step(self, step: int) -> None:
         global _ACTIVE_COLLECTOR
@@ -173,6 +206,7 @@ class HealthMetricCollector:
         self.matrix_squared_l2_records = {}
         self.expected_matrix_norm_records = None
         self.logits_stats_record = None
+        self.router_stats_records = {}
         self.recording = self.enabled and step % self.freq == 0
         _ACTIVE_COLLECTOR = self if self.recording else None
 
@@ -346,6 +380,92 @@ class HealthMetricCollector:
         self.expected_matrix_norm_records = expected_records
 
     @torch.no_grad()
+    def record_router_stats(
+        self,
+        family: str,
+        layer_idx: int,
+        tokens_per_route: torch.Tensor,
+        topk_scores: torch.Tensor,
+        router_bias: Optional[torch.Tensor] = None,
+        aux_loss: Optional[torch.Tensor] = None,
+    ) -> None:
+        if not self.recording or family not in self.router_stats_layers:
+            return
+        records = self.router_stats_records.setdefault(family, {})
+        if layer_idx in records:
+            raise RuntimeError(f"Duplicate {family} router statistics for layer {layer_idx}")
+        if tokens_per_route.ndim != 1 or tokens_per_route.numel() == 0:
+            raise RuntimeError(
+                f"Expected 1-D {family} route loads for layer {layer_idx}, "
+                f"got shape {tuple(tokens_per_route.shape)}"
+            )
+        if topk_scores.ndim == 0 or topk_scores.numel() == 0:
+            raise RuntimeError(f"Empty {family} top-k router scores for layer {layer_idx}")
+        if aux_loss is not None and aux_loss.numel() != 1:
+            raise RuntimeError(f"{family} auxiliary loss must be a scalar for layer {layer_idx}")
+
+        # Renormalizing makes the entropy independent of any positive routing scale.
+        scores = topk_scores.detach().double().reshape(-1, topk_scores.shape[-1])
+        probabilities = scores / scores.sum(dim=-1, keepdim=True)
+        entropy_sum = -(
+            probabilities * probabilities.clamp_min(torch.finfo(torch.float64).tiny).log()
+        ).sum()
+        # The packet and bias are copies: backward all-reduces the loads and updates the bias in place.
+        parts = [
+            tokens_per_route.detach().to(torch.float64),
+            torch.stack((entropy_sum, entropy_sum.new_tensor(float(scores.shape[0])))),
+        ]
+        if aux_loss is not None:
+            aux = aux_loss.detach().to(torch.float64).reshape(1)
+            parts.append(torch.cat((aux, aux.new_ones(1))))
+        packet = torch.cat([part.to(parts[0].device) for part in parts])
+        if get_model_parallel_rank() != 0:
+            packet.zero_()
+        is_output_rank = not (dist.is_available() and dist.is_initialized()) or dist.get_rank() == 0
+        records[layer_idx] = _RouterRecord(
+            packet,
+            tokens_per_route.numel(),
+            aux_loss is not None,
+            router_bias.detach().float().clone() if router_bias is not None and is_output_rank else None,
+        )
+
+    @staticmethod
+    def _router_metrics(
+        names: _RouterFamily, layer_idx: int, record: _RouterRecord, values: torch.Tensor,
+    ) -> Dict[str, torch.Tensor]:
+        layer = f"layer_{layer_idx:03d}"
+        loads = values[:record.num_routes]
+        entropy_sum, token_count = values[record.num_routes:record.num_routes + 2]
+        # No routed tokens anywhere gives 0/0 = NaN rather than invented numbers.
+        probabilities = loads / loads.sum()
+        if record.num_routes > 1:
+            load_entropy = -(
+                probabilities * probabilities.clamp_min(torch.finfo(torch.float64).tiny).log()
+            ).sum() / math.log(record.num_routes)
+        else:
+            load_entropy = probabilities.sum()
+        metrics = {
+            f"{names.utilization}/{layer}/load_max_over_mean": loads.max() / loads.mean(),
+            f"{names.utilization}/{layer}/load_entropy_normalized": load_entropy,
+            f"{names.utilization}/{layer}/{names.inactive_routes}": (loads == 0).sum().double(),
+            f"{names.confidence}/{layer}/topk_entropy_mean": entropy_sum / token_count,
+        }
+        if record.has_auxiliary_loss:
+            aux_sum, aux_count = values[record.num_routes + 2:record.num_routes + 4]
+            metrics[f"{names.auxiliary_loss}/{layer}/value"] = aux_sum / aux_count
+        if record.bias is not None:
+            bias = record.bias.double()
+            minimum, maximum = torch.aminmax(bias)
+            metrics.update({
+                f"{names.bias}/{layer}/mean": bias.mean(),
+                f"{names.bias}/{layer}/rms": bias.square().mean().sqrt(),
+                f"{names.bias}/{layer}/min": minimum,
+                f"{names.bias}/{layer}/max": maximum,
+                f"{names.bias}/{layer}/max_abs": torch.maximum(minimum.abs(), maximum.abs()),
+            })
+        return metrics
+
+    @torch.no_grad()
     def record_logits_stats(
         self,
         logits_sum: torch.Tensor,
@@ -488,6 +608,7 @@ class HealthMetricCollector:
         self.matrix_squared_l2_records = {}
         self.expected_matrix_norm_records = None
         self.logits_stats_record = None
+        self.router_stats_records = {}
 
     def flush(self, mlogger: "MetricLogger", step: int) -> None:
         if not self.recording:
@@ -533,6 +654,17 @@ class HealthMetricCollector:
                     for layer_idx in layers
                     if "output_gate" not in self.gekko_stats_records[layer_idx]
                 )
+
+        for family, expected in self.router_stats_layers.items():
+            records = self.router_stats_records.get(family, {})
+            if sorted(records) != expected:
+                problems.append(
+                    f"Expected {family} router statistics for layers {expected} at step {self.step}, "
+                    f"got layers {sorted(records)} at step {step}"
+                )
+            elif len({record.has_auxiliary_loss for record in records.values()}) > 1:
+                # The aux loss rides in the shared packet, so every layer must agree on it.
+                problems.append(f"{family} auxiliary loss recorded for only some layers at step {step}")
 
         # Every rank must skip together, or the reductions below would hang.
         skip_step = bool(problems)
@@ -605,6 +737,14 @@ class HealthMetricCollector:
                 self.matrix_squared_l2_records[name] for name in matrix_metric_names
             ]).double()
             sums = torch.cat((sums, matrix_squared_l2_values))
+        router_start = sums.numel()
+        router_records = [
+            (family, layer_idx, self.router_stats_records[family][layer_idx])
+            for family in sorted(self.router_stats_layers)
+            for layer_idx in self.router_stats_layers[family]
+        ]
+        if router_records:
+            sums = torch.cat((sums, *(record.packet.to(sums.device) for _, _, record in router_records)))
         num_sum_values = sums.numel()
         sum_packet = torch.cat((sums, counts))
         mins = _pack_extrema([stats[1] for _, _, stats in entries])
@@ -678,11 +818,22 @@ class HealthMetricCollector:
             metrics["logits_stats/max"] = logit_maximum
         if matrix_metric_names:
             matrix_norm_values = (
-                reduced_sums[matrix_squared_l2_start:]
+                reduced_sums[matrix_squared_l2_start:router_start]
                 .clamp_min(0)
                 .sqrt()
                 .cpu()
                 .tolist()
             )
             metrics.update(dict(zip(matrix_metric_names, matrix_norm_values)))
+        if router_records:
+            router_metrics = {}
+            offset = router_start
+            for family, layer_idx, record in router_records:
+                end = offset + record.packet.numel()
+                router_metrics.update(self._router_metrics(
+                    _ROUTER_FAMILIES[family], layer_idx, record, reduced_sums[offset:end],
+                ))
+                offset = end
+            values = torch.stack(list(router_metrics.values())).cpu().tolist()
+            metrics.update(zip(router_metrics, values))
         mlogger.log(metrics, step)
