@@ -31,6 +31,7 @@ class TransformerMoVABlockFunction(torch.autograd.Function):
     @staticmethod
     def forward(
         ctx: Any,
+        layer_id: int,
         x: torch.Tensor,  # (bsz, slen, d/MP)
         freqs_cis: Optional[torch.Tensor],  # (slen, d)
         bos_mask: Optional[torch.Tensor],
@@ -125,7 +126,7 @@ class TransformerMoVABlockFunction(torch.autograd.Function):
             routing_score_func, routing_scaling_factor, router_load_balancing_type,
             n_values, mova_topk, value_backend, moe_permutation_backend,
             attn_gate_func, dropout, attention_dropout, hidden_dropout,
-            causal_attn_backend, attn_stability_control, recompute_attention
+            causal_attn_backend, attn_stability_control, recompute_attention, layer_id,
         )
         xq, xk, xv, xk_rstd = xqkv
         attn_for_save, attn_lse = attn_out
@@ -527,6 +528,7 @@ class TransformerMoVABlockFunction(torch.autograd.Function):
         x_grad = torch.add(x_grad, residual_grad, out=x_grad)
 
         return (
+            None,  # layer_id
             x_grad,
             None,  # freqs_cis
             None,  # bos mask

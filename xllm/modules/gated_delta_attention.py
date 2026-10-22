@@ -9,6 +9,7 @@ from xllm.distributed import (
     get_context_parallel_rank,
 )
 from xllm.distributed.utils import divide_and_check_no_remainder
+from xllm.health_metrics import get_active_health_collector
 from xllm.modules.rms_norm import GroupRMSNorm
 from xllm.modules.timestep_decay_norm import TimestepDecayNorm
 from xllm.modules.causal_conv import CausalConv1d
@@ -215,6 +216,7 @@ class GatedDeltaAttention(nn.Module):
             sca_backend
         )
         self.adaptive_working_memory = AdaptiveWorkingMemory(
+            self.layer_id,
             self.local_heads,
             self.local_kv_heads,
             self.head_dim,
@@ -389,6 +391,20 @@ class GatedDeltaAttention(nn.Module):
         # qk-norm
         sq = self.query_norm(xq)
         sk = self.key_norm(xk)
+        health_collector = get_active_health_collector()
+        if health_collector is not None:
+            sca_key_l2 = None
+            if health_collector.enable_gekko_stats:
+                sca_key_l2 = torch.linalg.vector_norm(
+                    sk.detach().unflatten(-1, (self.local_kv_heads, self.head_dim)),
+                    dim=-1, dtype=torch.float32,
+                )
+            health_collector.record_gekko_query_key_stats(
+                self.layer_id, xq.unflatten(-1, (self.local_heads, self.head_dim)),
+                xk.unflatten(-1, (self.local_kv_heads, self.head_dim)),
+                sq.unflatten(-1, (self.local_heads, self.head_dim)),
+                sca_key_l2=sca_key_l2,
+            )
 
         # B x L x E/TP
         if self.attn_gate_fn == "silu":
@@ -407,8 +423,10 @@ class GatedDeltaAttention(nn.Module):
         )
         awk, awk_mask, memory, log_norm_term, prev_aqk, prev_akk, _ = self.adaptive_working_memory(
             xq, xk, xk, v, memory, log_norm_term, prev_aqk, prev_akk, prev_av,
-            segment_idx, prev_segment_count
+            segment_idx, prev_segment_count,
         )
+        if health_collector is not None:
+            health_collector.record_gekko_branches(self.layer_id, sca, awk, r, awk_mask)
         # B x L x E/TP
         attn = self.attn_norm(sca + awk) * r
         attn = memory_efficient_dropout(attn, self.hidden_dropout, self.training)

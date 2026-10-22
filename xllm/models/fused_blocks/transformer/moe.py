@@ -31,6 +31,7 @@ class TransformerMoEBlockFunction(torch.autograd.Function):
     @staticmethod
     def forward(
         ctx: Any,
+        layer_id: int,
         x: torch.Tensor,  # (bsz, slen, d/MP)
         freqs_cis: Optional[torch.Tensor],  # (slen, d)
         bos_mask: Optional[torch.Tensor],
@@ -119,7 +120,7 @@ class TransformerMoEBlockFunction(torch.autograd.Function):
             mx, freqs_cis, bos_mask, segments, wq, wk, wv, wr, wo, q_norm_w,
             head_dim, rope_head_dim, local_heads, local_kv_heads, rmsnorm_eps,
             attn_gate_func, dropout, attention_dropout, hidden_dropout,
-            causal_attn_backend, attn_stability_control, recompute_attention
+            causal_attn_backend, attn_stability_control, recompute_attention, layer_id,
         )
         xq, xk, xv, xk_rstd = xqkv
         attn_for_save, attn_lse = attn_out
@@ -482,6 +483,7 @@ class TransformerMoEBlockFunction(torch.autograd.Function):
         x_grad = torch.add(x_grad, residual_grad, out=x_grad)
 
         return (
+            None,  # layer_id
             x_grad,
             None,  # freqs_cis
             None,  # bos mask
