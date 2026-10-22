@@ -19,3 +19,13 @@ class BaseResidual(nn.Module):
 
     def extra_repr(self) -> str:
         return 'dim={}'.format(self.num_features)
+
+
+class NoResidual(BaseResidual):
+    """
+    No residual inside the sublayer: Y = H. The block owns the residual (hyper-connections).
+    """
+    def forward(
+        self, h, residual, *args, **kwargs
+    ) -> Tensor:
+        return h

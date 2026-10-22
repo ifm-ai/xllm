@@ -16,7 +16,14 @@ from xllm.modules import (
     GroupLayerNorm,
     GroupRMSNorm,
 )
-from xllm.modules.residual import num_params_in_residual
+from xllm.modules.residual import (
+    num_params_in_residual,
+    num_params_in_hyper_connection,
+    flops_in_hyper_connection,
+    build_hyper_connections,
+    hc_read,
+    hc_write,
+)
 from xllm.modules.fused_ops import memory_efficient_dropout
 from xllm.modules.model_parallel import (
     ParallelEmbedding,
@@ -52,6 +59,9 @@ class TransformerBlock(nn.Module):
         self.residual_func = cfg.residual_func
         self.residual_heads = cfg.residual_heads
         self.fused_block = cfg.fused_block
+        # hyper-connections: the block reads / writes the residual streams, the sublayers add no residual
+        self.attn_hc, self.ffn_hc = build_hyper_connections(cfg)
+        sublayer_residual_func = 'none' if self.attn_hc is not None else cfg.residual_func
         self.recompute_q = cfg.recompute_q
         self.recompute_kv = cfg.recompute_v
         self.recompute_attention = cfg.recompute_attention
@@ -86,7 +96,7 @@ class TransformerBlock(nn.Module):
             dropout=cfg.dropout,
             attention_dropout=cfg.attention_dropout,
             hidden_dropout=cfg.hidden_dropout,
-            residual_func=cfg.residual_func,
+            residual_func=sublayer_residual_func,
             residual_heads=cfg.residual_heads,
             init_mode=cfg.init_mode,
             init_std=cfg.init_std,
@@ -105,7 +115,7 @@ class TransformerBlock(nn.Module):
             rmsnorm_eps=cfg.rmsnorm_eps,
             memory_efficient_norm=cfg.memory_efficient_norm,
             apply_rmsnorm=cfg.apply_rmsnorm,
-            residual_func=cfg.residual_func,
+            residual_func=sublayer_residual_func,
             residual_heads=cfg.residual_heads,
             init_mode=cfg.init_mode,
             init_std=cfg.init_std,
@@ -171,6 +181,17 @@ class TransformerBlock(nn.Module):
                 self.recompute_fc3_out
             )
 
+        if self.attn_hc is not None:
+            # x: residual streams (bsz, slen, streams, d)
+            a, R, b = self.attn_hc(x)
+            y, cache = self.attention(
+                hc_read(x, a), freqs_cis, bos_mask, segments, attn_stability_control, deterministic, cache
+            )
+            x = hc_write(x, R, b, y)
+            a, R, b = self.ffn_hc(x)
+            out = hc_write(x, R, b, self.nffn(hc_read(x, a)))
+            return out, None, cache
+
         y, cache = self.attention(
             x, freqs_cis, bos_mask, segments, attn_stability_control, deterministic, cache
         )
@@ -188,6 +209,9 @@ class TransformerMoEBlock(nn.Module):
         self.residual_func = cfg.residual_func
         self.residual_heads = cfg.residual_heads
         self.fused_block = cfg.fused_block
+        # hyper-connections: the block reads / writes the residual streams, the sublayers add no residual
+        self.attn_hc, self.ffn_hc = build_hyper_connections(cfg)
+        sublayer_residual_func = 'none' if self.attn_hc is not None else cfg.residual_func
         self.recompute_q = cfg.recompute_q
         self.recompute_kv = cfg.recompute_v
         self.recompute_attention = cfg.recompute_attention
@@ -223,7 +247,7 @@ class TransformerMoEBlock(nn.Module):
             dropout=cfg.dropout,
             attention_dropout=cfg.attention_dropout,
             hidden_dropout=cfg.hidden_dropout,
-            residual_func=cfg.residual_func,
+            residual_func=sublayer_residual_func,
             residual_heads=cfg.residual_heads,
             init_mode=cfg.init_mode,
             init_std=cfg.init_std,
@@ -250,7 +274,7 @@ class TransformerMoEBlock(nn.Module):
             rmsnorm_eps=cfg.rmsnorm_eps,
             memory_efficient_norm=cfg.memory_efficient_norm,
             apply_rmsnorm=cfg.apply_rmsnorm,
-            residual_func=cfg.residual_func,
+            residual_func=sublayer_residual_func,
             residual_heads=cfg.residual_heads,
             init_mode=cfg.init_mode,
             init_std=cfg.init_std
@@ -332,6 +356,17 @@ class TransformerMoEBlock(nn.Module):
                 self.recompute_router,
             )
 
+        if self.attn_hc is not None:
+            # x: residual streams (bsz, slen, streams, d)
+            a, R, b = self.attn_hc(x)
+            y, cache = self.attention(
+                hc_read(x, a), freqs_cis, bos_mask, segments, attn_stability_control, deterministic, cache
+            )
+            x = hc_write(x, R, b, y)
+            a, R, b = self.ffn_hc(x)
+            y, aux_loss = self.moe(hc_read(x, a), moe_router_load_balancing_type)
+            return hc_write(x, R, b, y), aux_loss, cache
+
         y, cache = self.attention(
             x, freqs_cis, bos_mask, segments, attn_stability_control, deterministic, cache
         )
@@ -349,6 +384,9 @@ class TransformerMoVABlock(nn.Module):
         self.residual_func = cfg.residual_func
         self.residual_heads = cfg.residual_heads
         self.fused_block = cfg.fused_block
+        # hyper-connections: the block reads / writes the residual streams, the sublayers add no residual
+        self.attn_hc, self.ffn_hc = build_hyper_connections(cfg)
+        sublayer_residual_func = 'none' if self.attn_hc is not None else cfg.residual_func
         self.recompute_q = cfg.recompute_q
         self.recompute_kv = cfg.recompute_v
         self.recompute_attention = cfg.recompute_attention
@@ -392,7 +430,7 @@ class TransformerMoVABlock(nn.Module):
             router_bias=cfg.moe_router_bias,
             router_bias_update_rate=cfg.moe_router_bias_update_rate,
             router_scaling_factor=cfg.moe_router_scaling_factor,
-            residual_func=cfg.residual_func,
+            residual_func=sublayer_residual_func,
             residual_heads=cfg.residual_heads,
             init_mode=cfg.init_mode,
             init_std=cfg.init_std,
@@ -419,7 +457,7 @@ class TransformerMoVABlock(nn.Module):
             rmsnorm_eps=cfg.rmsnorm_eps,
             memory_efficient_norm=cfg.memory_efficient_norm,
             apply_rmsnorm=cfg.apply_rmsnorm,
-            residual_func=cfg.residual_func,
+            residual_func=sublayer_residual_func,
             residual_heads=cfg.residual_heads,
             init_mode=cfg.init_mode,
             init_std=cfg.init_std
@@ -505,6 +543,19 @@ class TransformerMoVABlock(nn.Module):
                 self.recompute_fc3_out,
                 self.recompute_router,
             )
+
+        if self.attn_hc is not None:
+            # x: residual streams (bsz, slen, streams, d)
+            a, R, b = self.attn_hc(x)
+            y, aux_loss_mova, cache = self.mova(
+                hc_read(x, a), freqs_cis, bos_mask, segments, attn_stability_control, deterministic, cache,
+                moe_router_load_balancing_type
+            )
+            x = hc_write(x, R, b, y)
+            a, R, b = self.ffn_hc(x)
+            y, aux_loss_moe = self.moe(hc_read(x, a), moe_router_load_balancing_type)
+            aux_loss = None if aux_loss_mova is None else (aux_loss_mova + aux_loss_moe) * 0.5
+            return hc_write(x, R, b, y), aux_loss, cache
 
         y, aux_loss_mova, cache = self.mova(
             x, freqs_cis, bos_mask, segments, attn_stability_control, deterministic, cache, moe_router_load_balancing_type
@@ -665,6 +716,9 @@ class Transformer(XLLModel):
         # embeddings
         emb = self.embed(tokens)
         x = memory_efficient_dropout(emb, self.dropout, self.training)
+        if self.residual_streams > 1:
+            # hyper-connections: every residual stream starts as the embedding
+            x = x.unsqueeze(-2).expand(-1, -1, self.residual_streams, -1).contiguous()
         # rope frequencies
         freq_cis = None if self.rope is None else self.rope.get_freqs_cis(cache_len, cache_len + seq_len, x.device)
 
@@ -688,6 +742,10 @@ class Transformer(XLLModel):
 
             if cache is not None:
                 cache[i] = layer_cache
+
+        if self.residual_streams > 1:
+            # hyper-connections: the output reads the sum of the streams, accumulated in FP32 without an FP32 copy
+            x = x.sum(dim=-2, dtype=torch.float32).to(emb.dtype)
 
         logits_or_loss = self.output(x, targets, token_mask)
         if targets is not None and self.context_parallel_size > 1:
@@ -753,19 +811,20 @@ class Transformer(XLLModel):
 
     def num_parameters(self):
         embed_params = self.model_dim * self.vocab_size * 2
+        hc_params = num_params_in_hyper_connection(self.residual_func, self.model_dim, self.residual_streams, self.residual_groups)
         attn_params_per_block = self.model_dim * (self.num_heads + self.num_kv_heads) * self.head_dim * 2
         if self.attn_act_func == 'softdelta':
             attn_params_per_block += self.model_dim * self.num_heads * (self.head_dim + 1)
         if self.apply_attn_gate:
             attn_params_per_block += self.model_dim * self.num_heads * self.head_dim
-        attn_params_per_block += num_params_in_residual(self.residual_func, self.model_dim, self.residual_heads, self.num_heads * self.head_dim)
+        attn_params_per_block += num_params_in_residual(self.residual_func, self.model_dim, self.residual_heads, self.num_heads * self.head_dim) + hc_params
         # Norm
         norm_params_per_block = self.model_dim * (2 if self.apply_rmsnorm else 4)
         if self.qknorm:
             norm_params_per_block += self.head_dim * self.num_heads
         # FFN
         ffn_params_per_block = self.model_dim * self.ffn_hidden_dim * (3 if self.swiglu else 2)
-        ffn_params_per_block += num_params_in_residual(self.residual_func, self.model_dim, self.residual_heads, self.ffn_hidden_dim)
+        ffn_params_per_block += num_params_in_residual(self.residual_func, self.model_dim, self.residual_heads, self.ffn_hidden_dim) + hc_params
 
         activated_params = norm_params_per_block * self.num_layers
         activated_params += (attn_params_per_block + ffn_params_per_block) * self.num_dense_layers + embed_params
@@ -776,7 +835,7 @@ class Transformer(XLLModel):
                 mova_qko_params += self.model_dim * self.num_heads * (self.head_dim + 1)
             if self.apply_attn_gate:
                 mova_qko_params += self.model_dim * self.num_heads * self.head_dim
-            mova_qko_params += num_params_in_residual(self.residual_func, self.model_dim, self.residual_heads, self.num_heads * self.head_dim)
+            mova_qko_params += num_params_in_residual(self.residual_func, self.model_dim, self.residual_heads, self.num_heads * self.head_dim) + hc_params
             # Value
             routed_value_params = self.model_dim * self.num_kv_heads * self.head_dim * self.num_values
             activated_value_params = self.model_dim * self.num_kv_heads * self.head_dim * self.num_activated_values
@@ -791,9 +850,9 @@ class Transformer(XLLModel):
             routed_expert_params = self.model_dim * self.expert_inter_dim * self.num_experts * 3
             activated_expert_params = self.model_dim * self.expert_inter_dim * self.num_activated_experts * 3
             router_params = self.model_dim * self.num_experts
-            residual_params = num_params_in_residual(self.residual_func, self.model_dim, self.residual_heads, self.model_dim)
+            residual_params = num_params_in_residual(self.residual_func, self.model_dim, self.residual_heads, self.model_dim) + hc_params
             activated_params += (shared_expert_params + activated_expert_params + router_params + residual_params) * (self.num_layers - self.num_dense_layers)
-            total_params += (shared_expert_params + routed_expert_params + router_params) * (self.num_layers - self.num_dense_layers)
+            total_params += (shared_expert_params + routed_expert_params + router_params + residual_params) * (self.num_layers - self.num_dense_layers)
         # final norm
         activated_params += self.model_dim * (1 if self.apply_rmsnorm else 2)
         total_params += self.model_dim * (1 if self.apply_rmsnorm else 2)
@@ -811,9 +870,8 @@ class Transformer(XLLModel):
         # FFN
         ffn_flops = self.model_dim * self.ffn_hidden_dim * (3 if self.swiglu else 2)
 
-        # residual
-        # TODO
-        res_flops = 0.0
+        # residual: two hyper-connection sublayers per layer (0 without hyper-connections)
+        res_flops = 2 * flops_in_hyper_connection(self.residual_func, self.model_dim, self.residual_streams)
 
         # MoVA
         mova_flops = self.model_dim * (self.num_heads * 2 + self.num_kv_heads) * self.head_dim

@@ -12,7 +12,14 @@ from xllm.modules import (
     RotaryEmbedding,
     TimestepDecayNorm,
 )
-from xllm.modules.residual import num_params_in_residual
+from xllm.modules.residual import (
+    num_params_in_residual,
+    num_params_in_hyper_connection,
+    flops_in_hyper_connection,
+    build_hyper_connections,
+    hc_read,
+    hc_write,
+)
 from xllm.modules.fused_ops import memory_efficient_dropout
 from xllm.modules.model_parallel import (
     ParallelEmbedding,
@@ -50,6 +57,9 @@ class GekkoBlock(nn.Module):
         self.residual_func = cfg.residual_func
         self.residual_heads = cfg.residual_heads
         self.fused_block = cfg.fused_block
+        # hyper-connections: the block reads / writes the residual streams, the sublayers add no residual
+        self.attn_hc, self.ffn_hc = build_hyper_connections(cfg)
+        sublayer_residual_func = 'none' if self.attn_hc is not None else cfg.residual_func
         self.recompute_q = cfg.recompute_q
         self.recompute_kv = cfg.recompute_v
         self.recompute_sca = cfg.recompute_attention
@@ -88,7 +98,7 @@ class GekkoBlock(nn.Module):
             rmsnorm_eps=cfg.rmsnorm_eps,
             apply_bias_term=cfg.apply_bias_term,
             memory_efficient_norm=cfg.memory_efficient_norm,
-            residual_func=cfg.residual_func,
+            residual_func=sublayer_residual_func,
             residual_heads=cfg.residual_heads,
             init_mode=cfg.init_mode,
             init_std=cfg.init_std,
@@ -107,7 +117,7 @@ class GekkoBlock(nn.Module):
             rmsnorm_eps=cfg.rmsnorm_eps,
             apply_rmsnorm=cfg.apply_rmsnorm,
             memory_efficient_norm=cfg.memory_efficient_norm,
-            residual_func=cfg.residual_func,
+            residual_func=sublayer_residual_func,
             residual_heads=cfg.residual_heads,
             init_mode=cfg.init_mode,
             init_std=cfg.init_std,
@@ -195,6 +205,18 @@ class GekkoBlock(nn.Module):
                 self.recompute_fc1_out,
                 self.recompute_fc3_out
             )
+
+        if self.attn_hc is not None:
+            # x: residual streams (bsz, slen, streams, d)
+            a, R, b = self.attn_hc(x)
+            y, cache = self.gda(
+                hc_read(x, a), freqs_cis, bos_mask, segment_idx, prev_segment_count, attn_stability_control,
+                deterministic, cache
+            )
+            x = hc_write(x, R, b, y)
+            a, R, b = self.ffn_hc(x)
+            out = hc_write(x, R, b, self.nffn(hc_read(x, a)))
+            return out, None, cache
 
         y, cache = self.gda(
             x, freqs_cis, bos_mask, segment_idx, prev_segment_count, attn_stability_control, deterministic, cache
@@ -421,6 +443,9 @@ class Gekko(XLLModel):
         # embeddings
         emb = self.embed(tokens)
         x = memory_efficient_dropout(emb, self.dropout, self.training)
+        if self.residual_streams > 1:
+            # hyper-connections: every residual stream starts as the embedding
+            x = x.unsqueeze(-2).expand(-1, -1, self.residual_streams, -1).contiguous()
         # rope frequencies
         freq_cis = None if self.rope is None else self.rope.get_freqs_cis(start, end, x.device)
 
@@ -444,6 +469,10 @@ class Gekko(XLLModel):
 
             if cache is not None:
                 cache_layers[i] = layer_cache
+
+        if self.residual_streams > 1:
+            # hyper-connections: the output reads the sum of the streams, accumulated in FP32 without an FP32 copy
+            x = x.sum(dim=-2, dtype=torch.float32).to(emb.dtype)
 
         logits_or_loss, cache_output = self.output(x, targets, token_mask, bos_mask, cache_output)
         if targets is not None and self.context_parallel_size > 1:
@@ -479,7 +508,8 @@ class Gekko(XLLModel):
             gda_params_per_block += (self.num_kv_heads + self.num_heads) * self.v_head_dim
         else:
             gda_params_per_block += self.num_kv_heads * self.v_head_dim
-        gda_params_per_block += num_params_in_residual(self.residual_func, self.model_dim, self.residual_heads, self.num_heads * self.v_head_dim)
+        hc_params = num_params_in_hyper_connection(self.residual_func, self.model_dim, self.residual_streams, self.residual_groups)
+        gda_params_per_block += num_params_in_residual(self.residual_func, self.model_dim, self.residual_heads, self.num_heads * self.v_head_dim) + hc_params
         # conv params
         conv_params_per_block = self.causal_conv_width * (self.num_heads * self.head_dim + self.num_kv_heads * (self.head_dim + self.v_head_dim))
         # norm params
@@ -490,7 +520,7 @@ class Gekko(XLLModel):
             norm_params_per_block += self.head_dim * self.num_heads
         # FFN
         ffn_params_per_block = self.model_dim * self.ffn_hidden_dim * (3 if self.swiglu else 2)
-        ffn_params_per_block += num_params_in_residual(self.residual_func, self.model_dim, self.residual_heads, self.ffn_hidden_dim)
+        ffn_params_per_block += num_params_in_residual(self.residual_func, self.model_dim, self.residual_heads, self.ffn_hidden_dim) + hc_params
 
         activated_params = (gda_params_per_block + conv_params_per_block + norm_params_per_block) * self.num_layers
         activated_params += ffn_params_per_block * self.num_dense_layers + embed_params
@@ -500,8 +530,8 @@ class Gekko(XLLModel):
             routed_expert_params = self.model_dim * self.expert_inter_dim * self.num_experts * 3
             activated_expert_params = self.model_dim * self.expert_inter_dim * self.num_activated_experts * 3
             router_params = self.model_dim * self.num_experts
-            activated_params += (shared_expert_params + activated_expert_params + router_params) * (self.num_layers - self.num_dense_layers)
-            total_params += (shared_expert_params + routed_expert_params + router_params) * (self.num_layers - self.num_dense_layers)
+            activated_params += (shared_expert_params + activated_expert_params + router_params + hc_params) * (self.num_layers - self.num_dense_layers)
+            total_params += (shared_expert_params + routed_expert_params + router_params + hc_params) * (self.num_layers - self.num_dense_layers)
         # final norm
         activated_params += self.model_dim * 2
         total_params += self.model_dim * 2
@@ -519,9 +549,8 @@ class Gekko(XLLModel):
         norm_flops = self.model_dim * (2 if self.apply_rmsnorm else 4) + h_dim * 2
         norm_flops += (q_dim + k_dim) * 2
         timestep_norm_flops = self.model_dim * 8
-        # residual flops
-        # TODO
-        res_flops = 0.0
+        # residual: two hyper-connection sublayers per layer (0 without hyper-connections)
+        res_flops = 2 * flops_in_hyper_connection(self.residual_func, self.model_dim, self.residual_streams)
         conv_flops = self.causal_conv_width * (q_dim + k_dim + v_dim) * 2
         sca_flops = self.model_dim * (q_dim + k_dim + v_dim + h_dim)
         sca_flops += (q_dim + h_dim) * self.chunk_size * 1.5

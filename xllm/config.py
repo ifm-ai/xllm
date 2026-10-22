@@ -162,8 +162,12 @@ class ModelConf(Config):
     layernorm_eps: float = 1e-5
     rmsnorm_eps: float = 1e-6
     apply_rmsnorm: bool = False  # True = RMSNorm, False = LayerNorm
-    residual_func: str = "base"  # Residual connection type: base/add means standard addition, ortho for orthogonal residuals.
+    residual_func: str = "base"  # Residual connection type: base/add means standard addition, ortho for orthogonal residuals; ihc/mhc/ohc for hyper-connections (N residual streams, identity / Sinkhorn / SO(4) transport, see xllm/modules/residual/README.md).
     residual_heads: Optional[int] = None  # Num of feature groups for orthogonal residuals. Required when using residual_func='ortho'.
+    residual_streams: int = 4  # Num of residual streams for hyper-connections (ihc/mhc/ohc), 2 to 4 (the fused kernels). ohc requires 4.
+    residual_groups: int = 1  # ohc only: num of channel groups with their own rotation and gate biases (multi-frequency oHC). Must divide model_dim.
+    residual_freq_base: float = 2.0  # ohc with residual_groups > 1: channel group g turns at rate freq_base^(-g/(G-1)) of the shared per-token rotation logits. Must be >= 1.
+    residual_sinkhorn_iterations: int = 20  # mhc: Sinkhorn-Knopp iterations of the transport (rows sum to one, columns approximately).
     # Rope base
     rope_base: float = 100000  # RoPE frequency base
     rope_head_dim: Optional[int] = None  # RoPE dimensions per Q/K head. None means full head_dim, 0 disables RoPE.
@@ -208,7 +212,19 @@ class ModelConf(Config):
 
         assert self.attn_act_func in ['softmax', 'softdelta']
         assert self.attn_gate_func in ['silu', 'softplus']
-        assert self.residual_func in ['base', 'add', 'ortho']
+        hyper_connections = ['ihc', 'mhc', 'ohc']  # xllm.modules.residual.HYPER_CONNECTIONS
+        assert self.residual_func in ['base', 'add', 'ortho'] + hyper_connections
+        if self.residual_func in hyper_connections:
+            assert 2 <= self.residual_streams <= 4, "hyper-connections need 2 to 4 residual_streams"
+            assert not self.fused_block, "hyper-connections have no fused block yet"
+            assert self.residual_groups >= 1 and self.model_dim % self.residual_groups == 0, "residual_groups must divide model_dim"
+            if self.residual_func == 'ohc':
+                assert self.residual_streams == 4, "ohc parameterizes SO(4): residual_streams must be 4"
+                assert self.residual_groups == 1 or self.residual_freq_base >= 1.0, "residual_freq_base must be >= 1"
+            else:
+                assert self.residual_groups == 1, "residual_groups is an ohc option"
+            if self.residual_func == 'mhc':
+                assert self.residual_sinkhorn_iterations >= 1, "residual_sinkhorn_iterations must be >= 1"
 
         if self.num_values > 0:
             assert 0 < self.num_activated_values <= self.num_values
