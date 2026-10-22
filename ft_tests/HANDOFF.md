@@ -28,3 +28,14 @@ Later, if nodes allow: 70B multi-node, xLLM's real data loader across a swap, tw
 - Commits: one change each, plain messages, no AI attribution lines. No other pushes, no PRs.
 - Cancel only jobs you submitted, by job id; never user-wide scancel.
 - Keep replies short; record every number with its job id; never present an estimate as a measurement.
+
+## Full project state (for a session resuming this work on m4)
+- state/final_plan_v4.md: the converged plan (two models, 5 rounds). Under independent verification: its GPU-memory section cites
+  FSDP1 code (build_model_fsdp1, _flat_param.py) although xLLM's default and all tests use FSDP2; the 16 B/param figure is
+  nevertheless confirmed for FSDP2 during a step by measurement (state/measured_all.md). Other citations are being checked.
+- state/measured_all.md: every measured number (first cluster). Treat m4 numbers separately; do not mix them in one fit.
+- state/parley_improvements.md: improvements to the Parley debate tool (separate work, in progress elsewhere).
+- Report (shareable, claude.ai doc): https://claude.ai/artifact/LjKhxkzkyg3bD7ondo7D4d - only verified content goes in.
+- The two debate models (Kimi K3, DeepSeek V4.1 Flash) are hosted on the first cluster and are not reachable from m4.
+- Open items: 4/8/16+ node process-group scaling; 70B multi-node; real data loader across a swap; two close failures;
+  spare requested from the queue; agent and store crash paths; meta-device rebuild; chunked GPU packing buffers.
