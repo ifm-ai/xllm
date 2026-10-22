@@ -153,6 +153,20 @@ class Muon(Optimizer):
         self.rank = mesh.get_local_rank()
         self._plan([tuple(p.shape) for p in muon_params], n_blocks)
 
+    def load_state_dict(self, state_dict):
+        """Reload momentum and AdamW moments, but keep the configured hyperparameters: the groups'
+        weight decay and epsilon come from the config, not the checkpoint, so a run can resume with
+        new values. LRs follow the scheduler, whose base LRs also come from the config (train.py
+        set_optim_state); momentum, Nesterov, betas and the update scale are set from the config
+        and never saved. DCP's set_optimizer_state_dict ends in this method too."""
+        configured = [{k: g[k] for k in ("weight_decay", "eps", "initial_lr") if k in g} for g in self.param_groups]
+        super().load_state_dict(state_dict)
+        for group, values in zip(self.param_groups, configured):
+            changed = {k: (group.get(k), v) for k, v in values.items() if group.get(k) != v}
+            if changed:
+                logger.info(f"Muon {group['algorithm']} group: configured values replace the checkpoint's (old, new): {changed}")
+            group.update(values)
+
     # ---- plan: built once from the global shapes, identical on every rank ----
 
     def _plan(self, shapes: List[Tuple[int, int]], n_blocks: List[int]):
