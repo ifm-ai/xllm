@@ -1,0 +1,72 @@
+task: 'Correction round. An independent verifier checked your converged final_plan_v4.md against the code, the torch sources
+  and measured_all.md and found 34 problems (5 blocking): see v4_verification.md. Fix EVERY problem in it: correct the claim
+  with the verifier''s cited fact, or withdraw the claim; do not reopen a verifier correction unless you cite new evidence
+  (a code line) that it is wrong. In particular: rewrite the GPU-memory section for FSDP2 (12 B/param resident, 16 during
+  backward/step, 20 peak in optimizer.step, measured 12.2/16.2 at 8B in measured_all.md); complete the replica contents (LR
+  scheduler, data-loader state, AdamW per-parameter step, MoE router bias and any other buffer, loss-scale state); make the
+  default cadence and the goodput numbers consistent and show every input; include replacement-node acquisition in node-death
+  recovery and fix the ''spares impossible'' row; source or remove the 41 s kill term; fix destroy_model_parallel, CP memory,
+  NaN-skip conditions, skip-init sites, NCCL 3600 s detection, PG-init measurement range, and the FS-independence claim. Every
+  number must be measured (from measured_all.md, cite the line), derived with inputs shown, or a cited code line. Deliver
+  the full corrected plan v5 (not a diff) plus a table mapping each verifier item to its fix. Both members propose and critique
+  every turn and must agree.'
+max_rounds: 4
+role_assignment: fixed
+authority: Atlas
+scheduler: round_robin
+role_pool:
+  Architect:
+    brief: proposes the plan, owns the final write-up, and must answer every objection with code evidence
+    tools:
+    - read_file
+    - list_dir
+    - grep
+  Challenger:
+    brief: attacks each proposal on compatibility with the code, cost, complexity and scale (3T), checks claims against the
+      code, proposes cheaper alternatives
+    tools:
+    - read_file
+    - list_dir
+    - grep
+synthesizer_role: Architect
+governance:
+  stop_policy: reviewer
+  allow_peer_steering: true
+  done_needs_agreement: true
+budgets:
+  wall_clock_s: 10800
+  session_tokens: 6000000
+per_turn:
+  max_tokens: 12288
+  max_tool_calls: 20
+  thinking_tokens: 4096
+permissions:
+  mode: auto
+workspace: /lustre/users/ahmad.chamma/xllm-review
+output_dir: /lustre/users/ahmad.chamma/parley_runs/teamruns_faulttol9
+interruption:
+  tripwires:
+  - (\b\w+\b)( \1){12,}
+team:
+- name: Atlas
+  role: Architect
+  capability_hint: Kimi K3, a large hybrid reasoning model
+  model:
+    kind: external
+    model: kimi-k3
+    base_url: http://127.0.0.1:18005/v1
+    temperature: 0.6
+    max_tokens: 8192
+- name: Delta
+  role: Challenger
+  capability_hint: DeepSeek V4.1 Flash, a fast reasoning MoE
+  model:
+    kind: external
+    model: deepseek-v4.1-flash
+    base_url: http://127.0.0.1:18006/v1
+    temperature: 0.6
+    max_tokens: 8192
+keep_alive: true
+reference_paths:
+- /lustre/users/ahmad.chamma/parley_runs/ft_round8
+- /lustre/users/joshua.ong/miniforge3/envs/hht/lib/python3.12/site-packages/torch
