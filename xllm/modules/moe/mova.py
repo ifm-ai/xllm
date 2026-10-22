@@ -197,6 +197,7 @@ class MOVAttention(nn.Module):
             raise ValueError(f"Unknown attention activation function: {self.attn_act_func}")
 
         self.causal_attention = causal_attention_cls(
+            layer_id,
             self.local_heads,
             self.local_kv_heads,
             self.head_dim,
@@ -204,7 +205,6 @@ class MOVAttention(nn.Module):
             None,
             self.attention_dropout,
             self.causal_attn_backend,
-            layer_id,
         )
 
         self.wo = RowParallelLinear(

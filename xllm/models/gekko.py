@@ -132,6 +132,7 @@ class GekkoBlock(nn.Module):
         if self.fused_block and self.training:
             fn = GekkoBlockFunction
             return fn.apply(
+                self.layer_id,
                 x,
                 freqs_cis,
                 bos_mask,
@@ -195,7 +196,6 @@ class GekkoBlock(nn.Module):
                 self.recompute_awk,
                 self.recompute_fc1_out,
                 self.recompute_fc3_out,
-                self.layer_id,
             )
 
         y, cache = self.gda(

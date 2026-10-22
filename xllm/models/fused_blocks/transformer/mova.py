@@ -31,6 +31,7 @@ class TransformerMoVABlockFunction(torch.autograd.Function):
     @staticmethod
     def forward(
         ctx: Any,
+        layer_id: int,
         x: torch.Tensor,  # (bsz, slen, d/MP)
         freqs_cis: Optional[torch.Tensor],  # (slen, d)
         bos_mask: Optional[torch.Tensor],
@@ -96,7 +97,6 @@ class TransformerMoVABlockFunction(torch.autograd.Function):
         recompute_fc1_out: bool,
         recompute_fc3_out: bool,
         recompute_router: bool,
-        layer_id: int,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], None]:
 
         bsz, seq_len, _ = x.size()
@@ -528,6 +528,7 @@ class TransformerMoVABlockFunction(torch.autograd.Function):
         x_grad = torch.add(x_grad, residual_grad, out=x_grad)
 
         return (
+            None,  # layer_id
             x_grad,
             None,  # freqs_cis
             None,  # bos mask
@@ -593,5 +594,4 @@ class TransformerMoVABlockFunction(torch.autograd.Function):
             None,  # recompute_fc1_out
             None,  # recompute_fc3_out
             None,  # recompute_router
-            None,  # layer_id
         )

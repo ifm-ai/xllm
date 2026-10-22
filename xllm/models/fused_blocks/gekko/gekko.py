@@ -75,6 +75,7 @@ class GekkoBlockFunction(torch.autograd.Function):
     @staticmethod
     def forward(
         ctx: Any,
+        layer_id: int,
         x: torch.Tensor,  # (bsz, slen, d/MP)
         freqs_cis: Optional[torch.Tensor],  # (slen, d)
         bos_mask: Optional[torch.Tensor],  # (bsz, slen)
@@ -138,7 +139,6 @@ class GekkoBlockFunction(torch.autograd.Function):
         recompute_awk: bool,
         recompute_fc1_out: bool,
         recompute_fc3_out: bool,
-        layer_id: int,
     ) -> Tuple[torch.Tensor, None, None]:
 
         assert timenorm_local_groups is not None
@@ -1006,6 +1006,7 @@ class GekkoBlockFunction(torch.autograd.Function):
             handle1.wait()
 
         return (
+            None,  # layer_id
             x_grad,
             None,  # freqs_cis
             None,  # bos mask
@@ -1069,7 +1070,6 @@ class GekkoBlockFunction(torch.autograd.Function):
             None,  # recompute_awk
             None,  # recompute_fc1_out
             None,  # recompute_fc3_out
-            None,  # layer_id
         )
 
 

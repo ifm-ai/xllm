@@ -43,6 +43,7 @@ class CausalSoftmaxAttention(nn.Module):
 
     def __init__(
         self,
+        layer_id: Optional[int],
         n_heads: int,
         n_kv_heads: int,
         head_dim: int,
@@ -50,16 +51,15 @@ class CausalSoftmaxAttention(nn.Module):
         scale: Optional[float],
         dropout: float,
         backend: Optional[str],
-        layer_id: Optional[int],
     ):
         super().__init__()
+        self.layer_id = layer_id
         self.n_heads = n_heads
         self.n_kv_heads = n_kv_heads
         self.head_dim = head_dim
         self.rope_head_dim = rope_head_dim
         self.dropout = dropout
         self.backend = backend
-        self.layer_id = layer_id
         self.scale = 1.0 / math.sqrt(self.head_dim) if scale is None else scale
 
         if backend == 'xattn':
@@ -193,6 +193,7 @@ class CausalSoftdeltaAttention(nn.Module):
 
     def __init__(
         self,
+        layer_id: Optional[int],
         n_heads: int,
         n_kv_heads: int,
         head_dim: int,
@@ -200,16 +201,15 @@ class CausalSoftdeltaAttention(nn.Module):
         scale: Optional[float],
         dropout: float,
         backend: Optional[str],
-        layer_id: Optional[int],
     ):
         super().__init__()
+        self.layer_id = layer_id
         self.n_heads = n_heads
         self.n_kv_heads = n_kv_heads
         self.head_dim = head_dim
         self.rope_head_dim = rope_head_dim
         self.dropout = dropout
         self.backend = backend
-        self.layer_id = layer_id
         self.scale = 1.0 / math.sqrt(self.head_dim)  if scale is None else scale
 
     def forward(

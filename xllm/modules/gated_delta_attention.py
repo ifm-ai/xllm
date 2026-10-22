@@ -216,6 +216,7 @@ class GatedDeltaAttention(nn.Module):
             sca_backend
         )
         self.adaptive_working_memory = AdaptiveWorkingMemory(
+            self.layer_id,
             self.local_heads,
             self.local_kv_heads,
             self.head_dim,
@@ -423,7 +424,6 @@ class GatedDeltaAttention(nn.Module):
         awk, awk_mask, memory, log_norm_term, prev_aqk, prev_akk, _ = self.adaptive_working_memory(
             xq, xk, xk, v, memory, log_norm_term, prev_aqk, prev_akk, prev_av,
             segment_idx, prev_segment_count,
-            health_layer_id=self.layer_id,
         )
         if health_collector is not None:
             health_collector.record_gekko_branches(self.layer_id, sca, awk, r, awk_mask)
