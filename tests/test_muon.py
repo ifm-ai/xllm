@@ -207,6 +207,60 @@ def check_resume_config_wins(mesh):
         print("resume: momentum and moments reloaded, configured weight decay and eps kept")
 
 
+def check_tensor_parallel():
+    """TP=2 x FSDP: each TP rank holds its TP-local shard of every weight, sharded on dim 0 over its dp group.
+    Weights TP cuts through the matrix (wo, FFN) are assembled over the TP group; per-head weights stay local.
+    The result must match the dense reference on the whole (TP=1) weights."""
+    tp = 2
+    torch._dynamo.config.cache_size_limit = 64  # this test compiles Newton-Schulz for many more shapes
+    mesh2 = init_device_mesh("cuda", (dist.get_world_size() // tp, tp), mesh_dim_names=("dp", "tp"))
+    dp_mesh, tp_group, tp_rank = mesh2["dp"], mesh2["tp"].get_group(), mesh2["tp"].get_local_rank()
+    # (shape, TP-split dim, layout kwargs): a spec with and without the TP declaration
+    cases = [
+        ((2048, 1536), 0, dict(layout="(h d) m", fan_out="d", fan_in="m", d=256)),      # wq: whole heads per TP rank
+        ((1536, 2048), 1, dict(layout="o (h i)", fan_out="o", fan_in="i", i=256)),      # wo per head: heads per TP rank
+        ((1536, 2048), 1, dict()),                                                       # wo whole: TP cuts the matrix
+        ((4096, 1536), 0, dict()),                                                       # fc1: TP cuts the matrix
+        ((1536, 4096), 1, dict()),                                                       # fc2: TP cuts the matrix
+        ((2048, 1536), 0, dict(layout="(h d) m", fan_out="h d", fan_in="m", d=256)),    # all heads one matrix, TP cuts it
+    ]
+    local_specs = [muon_spec(tp_dim=d, **kw) for _, d, kw in cases]
+    global_specs = [muon_spec(**kw) for _, _, kw in cases]
+    assert [s.tp_cuts_matrix for s in local_specs] == [False, False, True, True, True, True]
+    for cfg in (CFG, CFG_MATRIX_SCALE):
+        torch.manual_seed(3)
+        full = [torch.randn(s, device="cuda") for s, _, _ in cases]
+        grads = [[torch.randn_like(t) for t in full] for _ in range(STEPS)]
+        shard = lambda t, d: t.chunk(tp, dim=d)[tp_rank].contiguous()
+        params = [nn.Parameter(distribute_tensor(shard(t, d), dp_mesh, [Shard(0)])) for t, (_, d, _) in zip(full, cases)]
+        opt = Muon(params, local_specs, [], dp_mesh, cfg, tp_group=tp_group)
+        for step_grads in grads:
+            for p, g, (_, d, _) in zip(params, step_grads, cases):
+                p.grad = distribute_tensor(shard(g, d), dp_mesh, [Shard(0)])
+            opt.step()
+        got = []
+        for p, (_, d, _) in zip(params, cases):
+            parts = [torch.empty_like(p.full_tensor()) for _ in range(tp)]
+            dist.all_gather(parts, p.full_tensor().contiguous(), group=tp_group)
+            got.append(torch.cat(parts, dim=d))
+        want = dense_muon([x.clone() for x in full], global_specs, grads, cfg)
+        check(f"muon TP={tp} scale={cfg.muon_block_scale} vs dense reference", got, want, full, 3e-2)
+        if cfg is CFG:  # negative control: orthogonalizing each rank's half on its own is a different update
+            cut = [i for i, s in enumerate(local_specs) if s.tp_cuts_matrix]
+            ref_whole_halves = []
+            for i in cut:
+                d = cases[i][1]
+                ref_whole_halves.append(torch.cat([
+                    dense_muon([full[i].chunk(tp, dim=d)[t].clone()], [global_specs[i]],
+                               [[g[i].chunk(tp, dim=d)[t]] for g in grads], cfg)[0] for t in range(tp)], dim=d))
+            err = update_error([got[i] for i in cut], ref_whole_halves, [full[i] for i in cut])
+            if dist.get_rank() == 0:
+                print(f"negative control: TP halves orthogonalized separately differ by {err:.2e}")
+            assert err > 0.3, "TP assembly is indistinguishable from per-half Newton-Schulz"
+    if dist.get_rank() == 0:
+        print("tensor parallel: per-head and TP-assembled weights match the dense reference")
+
+
 def main():
     torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
     dist.init_process_group("nccl")
@@ -273,6 +327,7 @@ def main():
     initialize_model_parallel(1, 1, timeout=600)
     check_model_blocks()
     check_resume_config_wins(mesh)
+    check_tensor_parallel()
 
     if dist.get_rank() == 0:
         print("MUON_TEST_OK")

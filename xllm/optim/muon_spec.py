@@ -60,6 +60,13 @@ class MuonSpec:
         d = 0 if self.fan_out[0] in self.dims[0] else 1
         return shape[d], shape[1 - d]
 
+    @property
+    def tp_cuts_matrix(self) -> bool:
+        """True when tensor parallelism cuts the Newton-Schulz matrix itself: the outermost axis of the
+        split dim is a fan axis (wo, FFN), so the Blocks need the TP group to be assembled. False when
+        it splits a Block axis (whole heads or experts per rank) or nothing, so every Block is local."""
+        return self.tp_dim is not None and self.dims[self.tp_dim][0] in self.fan_out + self.fan_in
+
     def global_shape(self, shape: Tuple[int, int], tp: int) -> Tuple[int, int]:
         """The shape of the whole weight, from one tensor-parallel rank's shape."""
         return tuple(n * tp if d == self.tp_dim else n for d, n in enumerate(shape))
