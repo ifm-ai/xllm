@@ -46,3 +46,23 @@ def test_discover_node(tmp_path):
     assert node.gpus >= 0
     assert 0 < node.shm_free_bytes <= node.shm_bytes
     assert node.ram_bytes > 0
+
+
+def test_log_dir_is_dump_dir_when_off_and_local_when_on(monkeypatch):
+    monkeypatch.setenv("SLURM_JOB_ID", "77")
+    assert make_cfg(dump_dir="/shared/run").log_dir == "/shared/run"
+    cfg = make_cfg(dump_dir="/shared/run", ft_enabled=True, ft_mtbf_sys=3600.0, ft_log_dir="/local/logs")
+    assert cfg.log_dir == "/local/logs/job_77"
+
+
+def test_every_dump_dir_logger_uses_log_dir():
+    """Under ft every logger must write to the per-host log_dir; with ft off log_dir is dump_dir."""
+    import ast
+    from pathlib import Path
+
+    tree = ast.parse((Path(__file__).parent.parent / "train.py").read_text())
+    calls = [n for n in ast.walk(tree) if isinstance(n, ast.Call)]
+    for name in ("add_logger_file_handler", "build_mlogger", "log_restart_infos", "check_cluster"):
+        found = [c for c in calls if ast.unparse(c.func) == name]
+        assert found, name
+        assert all("cfg.log_dir" in ast.unparse(c) for c in found), name

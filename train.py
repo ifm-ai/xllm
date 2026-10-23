@@ -60,7 +60,7 @@ from xllm.models import build_model
 from xllm.optim import build_optimizer, rescale_grads
 from xllm.monitor import GPUMonitor, Timings
 from xllm.metrics import MetricLogger, build_mlogger
-from xllm.ft.trainer import FtTrainer
+from xllm.ft.trainer import FtTrainer, prepare_log_dir as ft_prepare_log_dir
 from xllm.health_metrics import HealthMetricCollector
 from xllm.configuration import cfg_from_cli
 try:
@@ -94,9 +94,12 @@ def initialize_run(cfg: TrainerConf):
     dump_dir = Path(cfg.dump_dir)
     mkdir([dump_dir], global_rank == 0, exist_ok=True)
 
+    if cfg.ft.enabled:  # logs and metrics go to a per-host local dir (cfg.log_dir)
+        ft_prepare_log_dir(cfg)
+
     # log restart infos before doing anything
     restart_infos = log_restart_infos(
-        dump_dir=cfg.dump_dir,
+        dump_dir=cfg.log_dir,
         global_rank=global_rank,
         step=get_last_restart_step(cfg.dump_dir, global_rank),
     )
@@ -125,7 +128,7 @@ def initialize_run(cfg: TrainerConf):
     if cfg.slurm.is_master:
         with open(Path(cfg.dump_dir) / "config.json", "w") as f:
             json.dump(cfg.to_dict(), f, sort_keys=True, indent=4)
-        add_logger_file_handler(os.path.join(cfg.dump_dir, "train.log"))
+        add_logger_file_handler(os.path.join(cfg.log_dir, "train.log"))
 
     # print env info
     if cfg.slurm.is_slurm_job:
@@ -278,7 +281,7 @@ def main(cfg: TrainerConf):
 
     mloggers: Dict[str, MetricLogger] = {
         k: build_mlogger(
-            cfg.dump_dir, k, enable_loggers, enable_wandb, enable_prefix_keys=k != "health"
+            cfg.log_dir, k, enable_loggers, enable_wandb, enable_prefix_keys=k != "health"
         ) for k in to_log
     }
     health_collector = HealthMetricCollector(
@@ -359,7 +362,7 @@ def main(cfg: TrainerConf):
 
     # check gpu nodes
     check_cluster(
-        dump_dir=Path(cfg.dump_dir), global_rank=cfg.slurm.global_rank, check_level=cfg.cluster_check_level, step=0
+        dump_dir=Path(cfg.log_dir), global_rank=cfg.slurm.global_rank, check_level=cfg.cluster_check_level, step=0
     )
 
     # build batch iterator
@@ -686,6 +689,8 @@ def main(cfg: TrainerConf):
     checkpointer.close()
     for mlogger in mloggers.values():
         mlogger.close()
+    if ft is not None:
+        ft.close(cfg)  # also copies rank 0's local logs back to dump_dir
     torch.distributed.destroy_process_group()
 
 

@@ -388,6 +388,13 @@ class TrainerConf(Config):
     ft: FtConf = field(default_factory=FtConf)  # In-band fault tolerance (hot swap), off by default: xllm/ft/config.py
 
     @property
+    def log_dir(self) -> str:
+        """Where logs and metrics go: dump_dir, or with ft on a per-host local dir that a shared-FS outage cannot block."""
+        if not self.ft.enabled:
+            return self.dump_dir
+        return os.path.join(self.ft.local_log_dir, f"job_{os.environ.get('SLURM_JOB_ID', 'local')}")
+
+    @property
     def data_parallel_size(self) -> int:
         assert model_parallel_is_initialized()
         total_model_parallel_size = self.context_parallel_size * self.model_parallel_size

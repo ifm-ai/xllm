@@ -25,9 +25,10 @@ class FtConf(Config):
     dump_dir: Optional[str] = None  # Root of the agent dumps. None = <dump_dir>/ft_checkpoints.
     refill_wait_s: float = 0.0  # Seconds to wait for a refill node before requeueing. 0 = auto from the first measured refill.
     spare_health: bool = True  # Whether spares pass a local GPU and NCCL health check before admission.
-    spares: int = 0  # Number of idle spare nodes. 0 = auto (at least 1).
+    spares: int = 0  # Number of the allocated nodes kept as idle spares (the last ones). 0 = none: a lost node is not replaced.
     retries: int = 2  # Failed recoveries from memory before falling back to disk.
     slot_dir: str = "/dev/shm/xllm_ft"  # Directory holding the in-memory copies (must be RAM-backed).
+    local_log_dir: str = "/tmp/xllm_ft_logs"  # Per-host local directory for logs and metrics when enabled (a job subfolder is used).
 
     def __post_init__(self):
         if self.enabled:
