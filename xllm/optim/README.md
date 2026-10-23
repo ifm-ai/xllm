@@ -4,7 +4,7 @@
 
 ## Muon on FSDP2
 
-`xllm/optim/muon.py`. Requires `--model.ddp_backend fsdp2`, TP = CP = 1, no MoE (experts are registered, not yet run) and
+`xllm/optim/muon.py`. Requires `--model.ddp_backend fsdp2`, CP = 1, no MoE (experts are registered, not yet run) and
 `--dcp_for_optimizer true` (the optimizer state is sharded like the parameters).
 
 - **Parameters.** A module registers the weights Muon updates in its `__init__` with
@@ -14,7 +14,7 @@
   `--optim.muon_weight_decay` (default: the same value). Attention, the FFN, MoE experts and
   shared experts register their projections; linear layers in the blocks that are not
   registered are listed in a warning when the optimizer is built.
-- **Registration API.** Import `register_muon` from `xllm.optim.muon_spec`; model construction does not import the optimizer runtime. TP metadata, expert layouts and arbitrary block grids describe internal geometry; this release only supports dense training with TP=CP=1.
+- **Registration API.** Import `register_muon` from `xllm.optim.muon_spec`; model construction does not import the optimizer runtime. Expert layouts and arbitrary block grids describe internal geometry; this release supports dense training with CP=1 and any TP.
 - **Blocks.** A registration names the axes of the weight's two dims as the forward
   rearranges them, which axes form the Newton-Schulz matrix, and the sizes of the inner axes:
 
@@ -35,6 +35,14 @@
   linear layers and the experts do); registering a weight without it is an error. The spec
   is kept on the module (FSDP2 replaces the parameter tensors);
   the optimizer resolves it once into boxes and logs one line per weight.
+- **Tensor parallelism.** Each TP rank holds its TP-local weights (FSDP2 shards them over its own
+  data-parallel group), and a weight's `tp_dim` says which dim TP splits. If that dim's outermost
+  axis is a Block axis (whole heads per rank: `wq`/`wk`/`wv`, per-head `wo`), every Block is local
+  and nothing extra happens. If it is a fan axis (the whole-matrix `wo`, FFN `fc1`/`fc2`/`fc3`), TP
+  cuts the Newton-Schulz matrix: the TP peers own the same Blocks, all-gather them along `tp_dim`
+  (one all-gather per step for all such Blocks), each runs Newton-Schulz on the whole Block (the TP
+  peers repeat it) and keeps its part. Update scales use the whole (global) weight's shape. Optimizer
+  state is per TP rank, like the parameters.
 - **Mesh.** `train.py` builds the FSDP mesh once (`build_fsdp_mesh`) and passes the same
   mesh to `fully_shard` and to the optimizer. Muon works over the shard dimension.
 - **Step.**
