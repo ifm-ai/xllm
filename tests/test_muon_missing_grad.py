@@ -133,8 +133,8 @@ def test_closure_computes_gradients_and_returns_loss(cpu_transport):
     assert not torch.equal(p, torch.ones_like(p))
 
 
-def test_muon_factory_requires_mesh():
-    with pytest.raises(ValueError, match="FSDP2 device mesh"):
+def test_muon_factory_requires_fsdp2_model():
+    with pytest.raises(ValueError, match="wrapped with FSDP2"):
         build_optimizer(nn.Linear(3, 2), OptimConf(optimizer="muon"), 10, "bf16")
 
 
