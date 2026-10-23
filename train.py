@@ -267,7 +267,7 @@ def main(cfg: TrainerConf):
     # build optimizer / scheduler
     optimizer, scheduler = build_optimizer(model, cfg.optim, cfg.steps, cfg.dtype)
 
-    ft = FtTrainer(cfg, model, optimizer) if cfg.ft.enabled else None  # sizing gate
+    ft = FtTrainer(cfg, model, optimizer) if cfg.ft.enabled else None  # in-memory copies, sizing gate
 
     # setup loggers
     enable_loggers = cfg.slurm.is_master and not cfg.disable_logging
@@ -496,6 +496,9 @@ def main(cfg: TrainerConf):
         optimizer.step()
         scheduler.step()
         optimizer.zero_grad()
+
+        if ft is not None:  # in-memory copy every k steps
+            ft.step_end(optimizer, scheduler, state, data_iterator)
 
         # logging
         s_logging = timer()

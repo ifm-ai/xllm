@@ -19,6 +19,11 @@ class NodeResources:
     ram_bytes: int
 
 
+def gpus_per_node() -> int:
+    """The launcher's ranks per node (the ft agent and torchrun set LOCAL_WORLD_SIZE), else the visible GPUs."""
+    return int(os.environ.get("LOCAL_WORLD_SIZE", torch.cuda.device_count()))
+
+
 def existing_ancestor(path: Path) -> Path:
     path = path.absolute()
     while not path.exists():
@@ -29,7 +34,7 @@ def existing_ancestor(path: Path) -> Path:
 def discover_node(slot_dir: str) -> NodeResources:
     st = os.statvfs(existing_ancestor(Path(slot_dir)))
     return NodeResources(
-        gpus=torch.cuda.device_count(),
+        gpus=gpus_per_node(),
         shm_bytes=st.f_frsize * st.f_blocks,
         shm_free_bytes=st.f_frsize * st.f_bavail,
         ram_bytes=os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES"),
