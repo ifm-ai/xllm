@@ -104,6 +104,7 @@ class OptimConf(Config):
 
     def __post_init__(self):
         assert self.optimizer in ['adamw', 'muon']
+        assert self.muon_adjust_lr in [None, "spectral_norm", "rms_norm"]
         assert self.muon_block_scale in ['block', 'matrix']
         assert self.muon_weight_decay is None or self.muon_weight_decay >= 0
         assert self.scheduler in ['linear', 'cosine', 'constant', 'wsd']

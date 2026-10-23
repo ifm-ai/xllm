@@ -21,7 +21,7 @@ from xllm.modules.layer_norm import GroupLayerNorm
 from xllm.modules.rms_norm import GroupRMSNorm
 from xllm.modules.residual import build_residual
 from xllm.utils import get_init_fn
-from xllm.optim.muon import register_muon
+from xllm.optim.muon_spec import register_muon
 from .router import TopKRouter
 from .expert import Expert
 from .permute import fused_permute_y

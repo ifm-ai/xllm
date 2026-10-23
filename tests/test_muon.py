@@ -20,7 +20,9 @@ from torch.distributed.tensor import Shard, distribute_tensor
 from xllm.config import OptimConf
 from xllm.distributed import initialize_model_parallel
 from xllm.distributed.wrap import enable_wrap, wrap
-from xllm.optim.muon import Muon, muon_spec, newton_schulz5, register_muon, split_muon_params
+from xllm.optim.muon import Muon, newton_schulz5, split_muon_params
+from xllm.optim.muon_spec import muon_spec, register_muon
+from xllm.optim import restore_optimizer_config
 
 # (shape, how the test weight is cut into Newton-Schulz blocks)
 MATRICES = [
@@ -67,8 +69,8 @@ def make(mesh, seed):
 
 
 def dense_muon(full, specs, grads, cfg):
-    """Reference: every block orthogonalized on its own, on full matrices, scaled by its own fans
-    (muon_block_scale=block) or by its whole weight's (matrix)."""
+    """Reference: every block orthogonalized on its own, on full matrices; the update is scaled in
+    fp32 by a block's fans (muon_block_scale=block) or by the whole weight's (matrix)."""
     mom = [torch.zeros_like(x) for x in full]
     for step_grads in grads:
         for x, m, g, spec in zip(full, mom, step_grads, specs):
@@ -78,11 +80,10 @@ def dense_muon(full, specs, grads, cfg):
             for b in spec.blocks(tuple(x.shape)):
                 blk = u[b.r0:b.r1, b.c0:b.c1]
                 o = newton_schulz5((blk if blk.shape[0] <= blk.shape[1] else blk.mT)[None], cfg.epsilon)[0]
-                o = o if blk.shape[0] <= blk.shape[1] else o.mT
-                fan_out, fan_in = (b.fan_out, b.fan_in) if cfg.muon_block_scale == "block" else spec.fans(tuple(x.shape))
-                scale = 0.2 * math.sqrt(max(fan_out, fan_in)) if cfg.muon_adjust_lr == "rms_norm" else math.sqrt(fan_out / fan_in)
-                out[b.r0:b.r1, b.c0:b.c1] = o * scale
-            x.mul_(1 - cfg.muon_lr * cfg.weight_decay).add_(out.float(), alpha=-cfg.muon_lr)
+                out[b.r0:b.r1, b.c0:b.c1] = o if blk.shape[0] <= blk.shape[1] else o.mT
+            fan_out, fan_in = spec.fans(tuple(x.shape), per_block=cfg.muon_block_scale == "block")
+            scale = 0.2 * math.sqrt(max(fan_out, fan_in)) if cfg.muon_adjust_lr == "rms_norm" else math.sqrt(fan_out / fan_in)
+            x.mul_(1 - cfg.muon_lr * cfg.weight_decay).add_(out.float(), alpha=-cfg.muon_lr * scale)
     return full
 
 
@@ -170,7 +171,7 @@ def check_model_blocks():
                 shape = tuple(getattr(owner, pname).shape)
                 blocks = spec.blocks(shape)
                 assert [(b.r0, b.r1, b.c0, b.c1) for b in blocks] == expected(parent, attr, shape), (name, overrides, attr, spec)
-                assert all((b.fan_out, b.fan_in) == b.shape for b in blocks), (name, attr, spec)  # all stored [out, in]
+                assert spec.fans(shape, per_block=True) == blocks[0].shape, (name, attr, spec)  # all stored [out, in]
                 checked.append(attr)
         n_specs = sum(len(getattr(m, "muon_specs", None) or {}) for m in block.modules())
         assert len(checked) == n_specs == n_registered, (name, overrides, checked, n_specs)
@@ -179,8 +180,7 @@ def check_model_blocks():
 
 
 def check_resume_config_wins(mesh):
-    """load_state_dict keeps the checkpoint's momentum and AdamW moments but the configured
-    weight decay and epsilon (the path DCP's set_optimizer_state_dict ends in)."""
+    """State loading restores checkpoint settings; training explicitly applies config overrides."""
     n = len(MATRICES)
     _, _, grads, params = make(mesh, seed=2)
     old = Muon(params[:n], [WHOLE] * n, params[n:], mesh, CFG_ADAMW)  # weight decay 0.1, eps 1e-8
@@ -194,6 +194,8 @@ def check_resume_config_wins(mesh):
                     beta1=0.9, beta2=0.95, epsilon=1e-6)
     new = Muon(params[:n], [WHOLE] * n, params[n:], mesh, cfg)
     new.load_state_dict(saved)
+    assert [g["weight_decay"] for g in new.param_groups] == [0.1, 0.1]
+    restore_optimizer_config(new, cfg)
     assert [g["weight_decay"] for g in new.param_groups] == [0.2, 0.05], new.param_groups
     assert [g["eps"] for g in new.param_groups] == [1e-6, 1e-6]
     for p in params[:n]:

@@ -12,7 +12,7 @@ from xllm.distributed import (
 )
 from xllm.distributed.utils import divide_and_check_no_remainder
 from xllm.utils import get_init_fn
-from xllm.optim.muon import register_muon
+from xllm.optim.muon_spec import register_muon
 from xllm.modules.fused_ops import memory_efficient_dropout
 from xllm.modules.fused_ops import mgmm
 
