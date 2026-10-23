@@ -388,8 +388,8 @@ def _warn_unregistered(model: nn.Module, muon_ids: set):
         logger.warning(f"Muon: unregistered weights use AdamW: {dict(missed)}")
 
 
-def build_muon(model: nn.Module, mesh: DeviceMesh, cfg: OptimConf) -> Optimizer:
-    """`mesh` is the FSDP mesh; Muon works over its shard dimension."""
+def build_muon(model: nn.Module, cfg: OptimConf) -> Optimizer:
+    """The model must be wrapped with FSDP2; Muon works over the shard dimension of the mesh its parameters live on."""
     from xllm.distributed import get_model_parallel_group, get_model_parallel_world_size
     tp = get_model_parallel_world_size()
     muon_params, specs, names, adamw_params = split_muon_params(model)
@@ -401,6 +401,9 @@ def build_muon(model: nn.Module, mesh: DeviceMesh, cfg: OptimConf) -> Optimizer:
     for line in dict.fromkeys(lines):  # one line per kind of weight, e.g. layers.*.attention.wq.weight
         logger.info(line)
     _warn_unregistered(model, {id(p) for p in muon_params})
+    if not muon_params or not hasattr(muon_params[0], "device_mesh"):
+        raise ValueError("Muon requires a model wrapped with FSDP2 and at least one registered weight.")
+    mesh = muon_params[0].device_mesh
     shard_mesh = mesh if mesh.ndim == 1 else mesh["dp"]
     tp_group = get_model_parallel_group() if tp > 1 else None
     optimizer = Muon(muon_params, specs, adamw_params, shard_mesh, cfg, tp_group=tp_group)

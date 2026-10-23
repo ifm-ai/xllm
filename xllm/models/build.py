@@ -3,7 +3,6 @@ from logging import getLogger
 
 import torch
 from torch import nn
-from torch.distributed.device_mesh import DeviceMesh
 
 from xllm.config import ModelConf
 from xllm.distributed import FullyShardedDataParallel
@@ -42,7 +41,6 @@ def build_model(
     reshard_after_forward: bool,
     forward_prefetch: bool,
     tokenizer: Tokenizer,
-    device_mesh: Optional[DeviceMesh] = None,
 ) -> nn.Module:
     if model_cfg.ddp_backend == 'fsdp1':
         return build_model_fsdp1(
@@ -52,7 +50,7 @@ def build_model(
     elif model_cfg.ddp_backend == 'fsdp2':
         return build_model_fsdp2(
             model_cfg, dtype, fully_sharded_size, fp32_reduce_scatter,
-            reshard_after_forward, forward_prefetch, tokenizer, device_mesh
+            reshard_after_forward, forward_prefetch, tokenizer
         )
     else:
         raise ValueError(f"Unknown DDP backend: {model_cfg.ddp_backend}")
@@ -108,17 +106,6 @@ def build_model_fsdp1(
         return model
 
 
-def build_fsdp_mesh(fully_sharded_size: Optional[int]) -> DeviceMesh:
-    data_parallel_size = get_data_parallel_world_size()
-    context_parallel_size = get_context_parallel_world_size()
-    fully_sharded_size = data_parallel_size if fully_sharded_size is None else fully_sharded_size
-    assert data_parallel_size % fully_sharded_size == 0
-    assert fully_sharded_size > 1 or context_parallel_size == 1
-
-    replicated_size = data_parallel_size // fully_sharded_size * context_parallel_size
-    return get_device_mesh(fully_sharded_size, replicated_size, get_model_parallel_world_size())
-
-
 def build_model_fsdp2(
     model_cfg: ModelConf,
     dtype: str,
@@ -127,7 +114,6 @@ def build_model_fsdp2(
     reshard_after_forward: bool,
     forward_prefetch: bool,
     tokenizer: Tokenizer,
-    device_mesh: Optional[DeviceMesh] = None,
 ) -> nn.Module:
     from torch.distributed.fsdp import MixedPrecisionPolicy
     from xllm.distributed.wrap import enable_wrap, wrap
@@ -135,8 +121,15 @@ def build_model_fsdp2(
     if forward_prefetch:
         logger.warning("forward prefetch is not supported yet for FSDP2.")
 
-    if device_mesh is None:
-        device_mesh = build_fsdp_mesh(fully_sharded_size)
+    data_parallel_size = get_data_parallel_world_size()
+    context_parallel_size = get_context_parallel_world_size()
+    fully_sharded_size = data_parallel_size if fully_sharded_size is None else fully_sharded_size
+    assert data_parallel_size % fully_sharded_size == 0
+    assert fully_sharded_size > 1 or context_parallel_size == 1
+
+    replicated_size = data_parallel_size // fully_sharded_size * context_parallel_size
+
+    device_mesh = get_device_mesh(fully_sharded_size, replicated_size, get_model_parallel_world_size())
     compute_dtype = get_torch_dtype(dtype)
     assert compute_dtype is not None, f"Unknown dtype: {dtype}"
     mixed_precision = MixedPrecisionPolicy(

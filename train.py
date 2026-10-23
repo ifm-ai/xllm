@@ -56,7 +56,7 @@ from xllm.utils import (
     set_sharded_optimizer_state,
     collect_provenance,
 )
-from xllm.models import build_model, build_fsdp_mesh
+from xllm.models import build_model
 from xllm.optim import build_optimizer, rescale_grads, restore_optimizer_config
 from xllm.monitor import GPUMonitor, Timings
 from xllm.metrics import MetricLogger, build_mlogger
@@ -251,15 +251,12 @@ def main(cfg: TrainerConf):
 
     logger.info("Start building of model...")
     cfg.model.vocab_size = tokenizer.vocab_size
-    # the FSDP mesh is fixed here and shared by the model and the optimizer
-    device_mesh = build_fsdp_mesh(cfg.fully_sharded_size) if cfg.model.ddp_backend == "fsdp2" else None
     model = build_model(
         cfg.model, dtype=cfg.dtype,
         fully_sharded_size=cfg.fully_sharded_size,
         fp32_reduce_scatter=cfg.fp32_reduce_scatter,
         reshard_after_forward=cfg.reshard_after_forward,
-        forward_prefetch=cfg.forward_prefetch, tokenizer=tokenizer,
-        device_mesh=device_mesh,
+        forward_prefetch=cfg.forward_prefetch, tokenizer=tokenizer
     )
     torch.cuda.empty_cache()
     gc.collect(2)
@@ -276,7 +273,7 @@ def main(cfg: TrainerConf):
     tflops_per_token = model.tflops_per_token(cfg.seq_len)
 
     # build optimizer / scheduler
-    optimizer, scheduler = build_optimizer(model, cfg.optim, cfg.steps, cfg.dtype, device_mesh)
+    optimizer, scheduler = build_optimizer(model, cfg.optim, cfg.steps, cfg.dtype)
 
     # setup loggers
     enable_loggers = cfg.slurm.is_master and not cfg.disable_logging
