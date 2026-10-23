@@ -156,7 +156,6 @@ class ParallelEmbedding(torch.nn.Module):
 
         # Allocate weights.
         self.weight = Parameter(torch.empty(self.num_embeddings, self.embedding_dim_per_partition))
-        self.tp_dims = {"weight": 1}  # dim split over the tensor-parallel group
         # And initialize.
         _initialize_affine_weight(
             self.weight,
@@ -258,7 +257,6 @@ class ColumnParallelLinear(torch.nn.Module):
         # Note: torch.nn.functional.linear performs XA^T + b and as a result
         # we allocate the transpose.
         self.weight = Parameter(torch.empty(self.output_size_per_partition, self.in_features))
-        self.tp_dims = {"weight": 0}  # dim split over the tensor-parallel group
         if bias:
             self.bias = Parameter(torch.empty(self.output_size_per_partition))
             # Always initialize bias to zero.
@@ -364,7 +362,6 @@ class RowParallelLinear(torch.nn.Module):
         # Note: torch.nn.functional.linear performs XA^T + b and as a result
         # we allocate the transpose.
         self.weight = Parameter(torch.empty(self.out_features, self.input_size_per_partition))
-        self.tp_dims = {"weight": 1}  # dim split over the tensor-parallel group
         if bias:
             self.bias = Parameter(torch.empty(self.output_size_per_partition))
             # Always initialize bias to zero.
@@ -470,7 +467,6 @@ class GroupColumnParallelLinear(torch.nn.Module):
         # Note: torch.nn.functional.linear performs XA^T + b and as a result
         # we allocate the transpose.
         self.weight = Parameter(torch.empty(self.num_groups * self.in_features, self.output_size_per_partition))
-        self.tp_dims = {"weight": 1}  # dim split over the tensor-parallel group
 
         # Initialize weight.
         self.master_weight = _initialize_group_weight(
@@ -573,7 +569,6 @@ class GroupRowParallelLinear(torch.nn.Module):
         # Note: torch.nn.functional.linear performs XA^T + b and as a result
         # we allocate the transpose.
         self.weight = Parameter(torch.empty(self.num_groups * self.out_features, self.input_size_per_partition))
-        self.tp_dims = {"weight": 1}  # dim split over the tensor-parallel group
 
         # Initialize weight.
         self.master_weight = _initialize_group_weight(

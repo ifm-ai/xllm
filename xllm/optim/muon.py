@@ -378,12 +378,11 @@ def _pattern(fqn: str) -> str:
 
 def _warn_unregistered(model: nn.Module, muon_ids: set):
     """2-D weights of tensor-parallel layers in the blocks that are not registered use AdamW: say which."""
+    from xllm.modules.model_parallel import ColumnParallelLinear, RowParallelLinear
     missed = defaultdict(int)
     for fqn, m in model.named_modules():
-        for name in getattr(m, "tp_dims", None) or {}:
-            p = getattr(m, name, None)
-            if "layers." in fqn and isinstance(p, nn.Parameter) and p.dim() == 2 and id(p) not in muon_ids:
-                missed[_pattern(f"{fqn}.{name}")] += 1
+        if "layers." in fqn and isinstance(m, (ColumnParallelLinear, RowParallelLinear)) and id(m.weight) not in muon_ids:
+            missed[_pattern(f"{fqn}.weight")] += 1
     if missed:
         logger.warning(f"Muon: unregistered weights use AdamW: {dict(missed)}")
 

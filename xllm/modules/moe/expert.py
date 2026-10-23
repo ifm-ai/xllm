@@ -73,8 +73,6 @@ class Expert(nn.Module):
         self.weight1 = Parameter(torch.empty(self.n_local_experts * self.inter_dim, self.model_dim))
         self.weight2 = Parameter(torch.empty(self.n_local_experts * self.model_dim, self.inter_dim))
         self.weight3 = Parameter(torch.empty(self.n_local_experts * self.inter_dim, self.model_dim))
-        # experts are split over the tensor-parallel group along dim 0
-        self.tp_dims = {"weight1": 0, "weight2": 0, "weight3": 0}
 
         # init w1 & w3
         init_fn = get_init_fn(init_mode, dim=model_dim, std=init_std)
@@ -85,9 +83,10 @@ class Expert(nn.Module):
         _init_affine_weight(self.weight2, num_experts, self.model_dim, self.inter_dim, init_fn)
 
         # Muon (xllm/optim/muon.py): one Newton-Schulz block per expert, named as forward rearranges them
-        register_muon(self, "weight1", "(n s) d", fan_out="s", fan_in="d", s=self.inter_dim)
-        register_muon(self, "weight3", "(n s) d", fan_out="s", fan_in="d", s=self.inter_dim)
-        register_muon(self, "weight2", "(n s) d", fan_out="s", fan_in="d", s=self.model_dim)  # s = model dim here
+        # (experts are split over the tensor-parallel group along dim 0)
+        register_muon(self, "weight1", "(n s) d", fan_out="s", fan_in="d", s=self.inter_dim, tp_dim=0)
+        register_muon(self, "weight3", "(n s) d", fan_out="s", fan_in="d", s=self.inter_dim, tp_dim=0)
+        register_muon(self, "weight2", "(n s) d", fan_out="s", fan_in="d", s=self.model_dim, tp_dim=0)  # s = model dim here
 
     def forward(self, x: torch.Tensor, group_sizes: List[int]) -> torch.Tensor:
         w1 = rearrange(self.weight1, '(n s) d -> n s d', n=self.n_local_experts)

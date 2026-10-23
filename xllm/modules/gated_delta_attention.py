@@ -252,13 +252,13 @@ class GatedDeltaAttention(nn.Module):
 
         # Muon (xllm/optim/muon.py): one Newton-Schulz block per head (a q head holds both softdelta
         # queries); wo and wg are whole matrices
-        register_muon(self.wq, layout="(h k d) m", fan_out="k d", fan_in="m", k=nq, d=self.head_dim)
-        register_muon(self.wk, layout="(h d) m", fan_out="d", fan_in="m", d=self.head_dim)
+        register_muon(self.wq, layout="(h k d) m", fan_out="k d", fan_in="m", k=nq, d=self.head_dim, tp_dim=0)
+        register_muon(self.wk, layout="(h d) m", fan_out="d", fan_in="m", d=self.head_dim, tp_dim=0)
         for w in (self.wv, self.wr):
-            register_muon(w, layout="(h d) m", fan_out="d", fan_in="m", d=self.v_head_dim)
-        register_muon(self.wo)
+            register_muon(w, layout="(h d) m", fan_out="d", fan_in="m", d=self.v_head_dim, tp_dim=0)
+        register_muon(self.wo, tp_dim=1)
         if self.wg is not None:
-            register_muon(self.wg)
+            register_muon(self.wg, tp_dim=1)
 
     def _receive_prev_count(self, x, bos_mask):
         bsz, seq_len, _ = x.size()

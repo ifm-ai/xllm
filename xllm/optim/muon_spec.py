@@ -100,8 +100,11 @@ def muon_spec(layout: str = "o i", *, fan_out: str = "o", fan_in: str = "i", tp_
     return MuonSpec(_parse_layout(layout), tuple(fan_out.split()), tuple(fan_in.split()), sizes, tp_dim)
 
 
+_UNSET = object()
+
+
 def register_muon(module: nn.Module, name: str = "weight", layout: str = "o i", *,
-                  fan_out: str = "o", fan_in: str = "i", **sizes: int):
+                  fan_out: str = "o", fan_in: str = "i", tp_dim=_UNSET, **sizes: int):
     """Mark module.<name> as a Muon weight; call it in the module's __init__.
 
     layout: the axes of the weight's two dims, named as the forward rearranges them (parentheses
@@ -109,17 +112,22 @@ def register_muon(module: nn.Module, name: str = "weight", layout: str = "o i", 
     fan_out / fan_in: the axes of the Newton-Schulz matrix rows / columns, innermost in their dim;
         every other axis indexes separate Blocks.
     sizes: the sizes of the inner axes; each dim's outermost axis is inferred from the shape.
-
-    The module declares the dim tensor parallelism splits: module.tp_dims[name] (None: not split).
+    tp_dim: the dim of the weight that tensor parallelism splits (0 or 1; None: not split). Required when
+        the tensor-parallel size is above 1: the weight is then this rank's chunk along tp_dim, and the
+        whole weight is tp times larger there.
     """
+    import xllm.distributed as xd
     param = getattr(module, name)
     where = f"{type(module).__name__}.{name} {list(param.shape)} {layout!r}"
     assert param.dim() == 2, f"{where}: Muon needs a 2-D parameter"
-    assert name in getattr(module, "tp_dims", {}), f"{where}: the module must declare tp_dims[{name!r}] (None if not split)"
+    tp = xd.get_model_parallel_world_size()
+    if tp_dim is _UNSET:
+        assert tp == 1, f"{where}: with tensor parallelism, say which dim it splits: tp_dim=0, 1 or None"
+        tp_dim = None
+    assert tp_dim in (None, 0, 1), f"{where}: tp_dim must be 0, 1 or None, not {tp_dim!r}"
     try:
-        spec = muon_spec(layout, fan_out=fan_out, fan_in=fan_in, tp_dim=module.tp_dims[name], **sizes)
-        spec.blocks(tuple(param.shape))
+        spec = muon_spec(layout, fan_out=fan_out, fan_in=fan_in, tp_dim=tp_dim, **sizes)
+        spec.blocks(spec.global_shape(tuple(param.shape), tp))  # check the layout on the whole weight
     except AssertionError as e:
         raise AssertionError(f"{where}: {e}") from None
     vars(module).setdefault("muon_specs", {})[name] = spec
-

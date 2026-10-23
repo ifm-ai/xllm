@@ -137,9 +137,9 @@ class NormalizedMoE(nn.Module):
             init_method=init_fn
         ) if ffn_hidden_dim > 0 else None
 
-        for fc in (self.fc1, self.fc2, self.fc3):
+        for fc, tp_dim in ((self.fc1, 1), (self.fc2, 0), (self.fc3, 1)):  # row, column, row parallel
             if fc is not None:
-                register_muon(fc)  # Muon, shared experts as whole matrices (xllm/optim/muon.py)
+                register_muon(fc, tp_dim=tp_dim)  # Muon, shared experts as whole matrices (xllm/optim/muon.py)
         self.residual = build_residual(
             residual_func, 2 * layer_id + 2, model_dim, num_heads=residual_heads,
             num_features=model_dim, eps=rmsnorm_eps, init_std=init_std

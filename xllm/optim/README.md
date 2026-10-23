@@ -19,9 +19,9 @@
   rearranges them, which axes form the Newton-Schulz matrix, and the sizes of the inner axes:
 
   ```python
-  register_muon(self.wo)                                     # a linear layer: one matrix
-  register_muon(self.wq, layout="(h k d) m", fan_out="k d", fan_in="m", k=nq, d=self.head_dim)
-  register_muon(self, "weight2", "(n s) d", fan_out="s", fan_in="d", s=self.model_dim)
+  register_muon(self.wo, tp_dim=1)                           # a linear layer: one matrix
+  register_muon(self.wq, layout="(h k d) m", fan_out="k d", fan_in="m", k=nq, d=self.head_dim, tp_dim=0)
+  register_muon(self, "weight2", "(n s) d", fan_out="s", fan_in="d", s=self.model_dim, tp_dim=0)
   ```
 
   Parentheses flatten several axes into one dim, outer first. The `fan_out` / `fan_in` axes
@@ -30,14 +30,14 @@
   queries of a head together) and one per expert. Each dim's outermost axis is inferred from
   the global shape and cannot be given, so a tensor-parallel local count cannot slip in.
   Putting an axis in `fan_out` / `fan_in` makes it part of the matrix (`fan_out="h d"` on `wq`:
-  all heads as one matrix). A module that splits a weight over the tensor-parallel group
-  declares the split dim (`self.tp_dims = {"weight": 0}`, None if not split; the parallel
-  linear layers and the experts do); registering a weight without it is an error. The spec
-  is kept on the module (FSDP2 replaces the parameter tensors);
+  all heads as one matrix). `tp_dim` is the dim tensor parallelism splits (0 for a
+  column-parallel layer, 1 for a row-parallel one, 0 for experts, None if not split); it is
+  required when TP > 1 and ignored otherwise. The spec is kept on the module (FSDP2 replaces the parameter tensors);
   the optimizer resolves it once into boxes and logs one line per weight.
 - **Tensor parallelism.** TP is one more way the weight is sharded, independent of the block
   layout. Each TP rank holds its TP-local weights (FSDP2 shards them over its own data-parallel
-  group); a weight's `tp_dim` (declared by the parallel layer) says which dim TP splits. Blocks
+  group); a weight's `tp_dim`, passed to `register_muon` (0 for column-parallel layers, 1 for row-parallel ones,
+  required when TP > 1), says which dim TP splits. Blocks
   are defined on the whole weight and each rank's region is a box of it, so a block may sit inside
   one TP rank (whole heads), be cut by TP (the whole-matrix `wo`, FFN) or straddle a TP boundary.
   The same two all-to-alls run over the plane of the dp mesh x TP group, every block is
