@@ -6,11 +6,13 @@ at fixed points of the run; with ft off none of this is created or called.
 import logging
 import os
 import shutil
+import signal
 import socket
 from pathlib import Path
 from typing import Any, Dict
 
 from xllm.ft.node import gpus_per_node
+from xllm.ft.progress import Progress
 from xllm.ft.replica import Replica
 from xllm.ft.sizing import startup_gate
 
@@ -40,19 +42,35 @@ def training_state(optimizer, scheduler, state, data_iterator) -> Dict[str, Any]
     }
 
 
+def ignore_requeue_signal():
+    """The sbatch script owns the requeue: xLLM's SIGUSR1 handler (rank 0 requeues and exits) must not run."""
+    signal.signal(signal.SIGUSR1, signal.SIG_IGN)
+
+
 class FtTrainer:
     def __init__(self, cfg, model, optimizer):
+        ignore_requeue_signal()  # already done at startup by train.py; also for a trainer built another way
         # sizing gate: host memory now, GPU memory after the first steps
         self.gpu_peak = startup_gate(model, cfg.ft.slot_dir, cfg.dcp_for_optimizer)
         self.replica = Replica(model, optimizer, cfg.ft.slot_dir, cfg.ft.k, cfg.ft.mtbf_sys, gpus_per_node(),
                                self.gpu_peak)
+        self.progress = Progress.for_trainer()  # None when ft runs without the agent
 
     def step_start(self, step: int):
         self.gpu_peak.record(step)
+        if self.progress is not None:
+            self.progress.pause(False)  # the save or eval of the previous step is over
 
     def step_end(self, optimizer, scheduler, state, data_iterator):
-        """After the optimizer and scheduler steps: the in-memory copy every k steps."""
+        """After the optimizer and scheduler steps: the in-memory copy every k steps, progress for the agent."""
         self.replica.maybe_copy(state.step, lambda: training_state(optimizer, scheduler, state, data_iterator))
+        if self.progress is not None:
+            self.progress.step(state.step)
+
+    def pause(self, paused: bool):
+        """A long save, eval or the shutdown is not a hang."""
+        if self.progress is not None:
+            self.progress.pause(paused)
 
     def close(self, cfg):
         self.replica.close()

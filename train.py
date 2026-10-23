@@ -61,6 +61,7 @@ from xllm.optim import build_optimizer, rescale_grads
 from xllm.monitor import GPUMonitor, Timings
 from xllm.metrics import MetricLogger, build_mlogger
 from xllm.ft.trainer import FtTrainer, prepare_log_dir as ft_prepare_log_dir
+from xllm.ft.trainer import ignore_requeue_signal as ft_ignore_requeue_signal
 from xllm.health_metrics import HealthMetricCollector
 from xllm.configuration import cfg_from_cli
 try:
@@ -105,8 +106,11 @@ def initialize_run(cfg: TrainerConf):
     )
     logger.warning(f"restart infos: {restart_infos}")
 
-    # initialize signal handler
-    init_signal_handler()
+    # initialize signal handler (under ft from the start: the sbatch script owns the requeue)
+    if cfg.ft.enabled:
+        ft_ignore_requeue_signal()
+    else:
+        init_signal_handler()
 
     # initialize distributed mode / model parallel
     logger.info("Starting init of torch.distributed...")
@@ -267,7 +271,7 @@ def main(cfg: TrainerConf):
     # build optimizer / scheduler
     optimizer, scheduler = build_optimizer(model, cfg.optim, cfg.steps, cfg.dtype)
 
-    ft = FtTrainer(cfg, model, optimizer) if cfg.ft.enabled else None  # in-memory copies, sizing gate
+    ft = FtTrainer(cfg, model, optimizer) if cfg.ft.enabled else None  # in-memory copies, sizing gate, progress
 
     # setup loggers
     enable_loggers = cfg.slurm.is_master and not cfg.disable_logging
@@ -497,7 +501,7 @@ def main(cfg: TrainerConf):
         scheduler.step()
         optimizer.zero_grad()
 
-        if ft is not None:  # in-memory copy every k steps
+        if ft is not None:  # in-memory copy every k steps; progress for the agent's hang deadline
             ft.step_end(optimizer, scheduler, state, data_iterator)
 
         # logging
@@ -646,6 +650,8 @@ def main(cfg: TrainerConf):
 
         should_checkpoint = state.step % cfg.dump_freq == 0 or state.step == cfg.steps
         should_eval = cfg.eval_freq > 0 and (state.step % cfg.eval_freq == 0 or state.step == cfg.steps)
+        if ft is not None and (should_checkpoint or should_eval):
+            ft.pause(True)
 
         if should_checkpoint:
             gc.collect()
@@ -687,6 +693,8 @@ def main(cfg: TrainerConf):
         timings.eval += timer() - s_eval
 
     # end of training
+    if ft is not None:
+        ft.pause(True)
     logger.info(f"Reached {cfg.steps} steps.")
     data_iterator.close()
     checkpointer.close()
