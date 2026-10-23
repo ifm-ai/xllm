@@ -283,20 +283,31 @@ class Muon(Optimizer):
             out.append([t.view(shape) for t, shape in zip(chunk.split([m * n for m, n in shapes]), shapes)])
         return out
 
-    def _momentum(self, p: Tensor, group: Dict) -> Tensor:
-        """Momentum update on the local shard; returns the bf16 update direction."""
+    def _momentum(self, params: List[Tensor], group: Dict) -> List[Tensor]:
+        """Momentum update on the local shards (one batched call per step); returns the bf16 update directions."""
         # Keep the fixed communication plan, but do not create or decay state for
         # a parameter without a gradient (the same semantics as AdamW).
-        if p.grad is None:
-            return torch.zeros_like(_local(p), dtype=torch.bfloat16)
-        state = self.state[p]
-        if "momentum" not in state:
-            state["momentum"] = torch.zeros_like(p, dtype=torch.float32)
-        m = _local(state["momentum"])
-        g = _local(p.grad)
-        m.mul_(group["momentum"]).add_(g)
-        u = g + group["momentum"] * m if group["nesterov"] else m
-        return u.to(torch.bfloat16)
+        mu = group["momentum"]
+        updates = [None] * len(params)
+        live = []
+        for i, p in enumerate(params):
+            if p.grad is None:
+                updates[i] = torch.zeros_like(_local(p), dtype=torch.bfloat16)
+                continue
+            state = self.state[p]
+            if "momentum" not in state:
+                state["momentum"] = torch.zeros_like(p, dtype=torch.float32)
+            live.append(i)
+        ms = [_local(self.state[params[i]]["momentum"]) for i in live]
+        gs = [_local(params[i].grad) for i in live]
+        torch._foreach_mul_(ms, mu)
+        torch._foreach_add_(ms, gs)
+        us = torch._foreach_add(gs, ms, alpha=mu) if group["nesterov"] else ms
+        out = [torch.empty_like(u, dtype=torch.bfloat16) for u in us]
+        torch._foreach_copy_(out, us)
+        for i, u in zip(live, out):
+            updates[i] = u
+        return updates
 
     def _gather(self, updates: List[Tensor]) -> List[Tensor]:
         """Send my slices to their blocks' owners; return the whole blocks I own."""
@@ -319,15 +330,17 @@ class Muon(Optimizer):
     @torch.no_grad()
     def _muon_step(self, group: Dict):
         params, lr, wd = group["params"], group["lr"], group["weight_decay"]
-        updates = [self._momentum(p, group) for p in params]                      # 1. local shards
+        updates = self._momentum(params, group)                            # 1. local shards
         gathered = self._gather(updates)                                   # 2. whole owned blocks
         self._scatter(orthogonalize(gathered, group["eps"]), updates)      # 3. Newton-Schulz, 4. back
         scales = [self._scale(*fans, group["adjust_lr"]) for fans in self._fans[group["block_scale"]]]
-        for p, u, scale in zip(params, updates, scales):              # 5. scaled update in fp32
-            if p.grad is None:
-                continue
-            x = _local(p)
-            x.mul_(1 - lr * wd).add_(u.to(x.dtype), alpha=-lr * scale)
+        live = [i for i, p in enumerate(params) if p.grad is not None]
+        xs = [_local(params[i]) for i in live]
+        step = [torch.empty_like(x) for x in xs]                           # 5. scaled update in fp32
+        torch._foreach_copy_(step, [updates[i] for i in live])
+        torch._foreach_mul_(step, [-lr * scales[i] for i in live])
+        torch._foreach_mul_(xs, 1 - lr * wd)
+        torch._foreach_add_(xs, step)
 
     @torch.no_grad()
     def _adamw_step(self, group: Dict):
