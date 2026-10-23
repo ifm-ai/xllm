@@ -14,7 +14,7 @@ from typing import Any, Dict
 
 from xllm.ft.node import gpus_per_node
 from xllm.ft.progress import Progress
-from xllm.ft.replica import NO_COMMON_STEP_EXIT, Replica, restore
+from xllm.ft.replica import DUMP_LOAD_EXIT, NO_COMMON_STEP_EXIT, Replica, restore, restore_from_dump
 from xllm.ft.sizing import startup_gate
 
 logger = logging.getLogger()
@@ -23,6 +23,11 @@ logger = logging.getLogger()
 def memory_restart(cfg) -> bool:
     """An ft restart that restores from the in-memory copies: it must not wait on the shared filesystem."""
     return cfg.ft.enabled and os.environ.get("FT_RESTORE") == "memory"
+
+
+def dump_restart(cfg) -> bool:
+    """An ft restart from disk for which the leader chose one of the agent dumps (FT_DUMP)."""
+    return cfg.ft.enabled and os.environ.get("FT_RESTORE") == "disk" and bool(os.environ.get("FT_DUMP"))
 
 
 def prepare_log_dir(cfg):
@@ -64,10 +69,16 @@ class FtTrainer:
 
     def restore(self, cfg) -> Dict[str, Any]:
         """The training state of a memory or agent-dump restart; exits with the code the agent acts on if none."""
-        restored = restore(self.replica)
-        if restored is None:
-            sys.exit(NO_COMMON_STEP_EXIT)  # the agent restarts this generation from disk
-        return restored
+        if memory_restart(cfg):
+            restored = restore(self.replica)
+            if restored is None:
+                sys.exit(NO_COMMON_STEP_EXIT)  # the agent restarts this generation from disk
+            return restored
+        try:
+            return restore_from_dump(self.replica, Path(os.environ["FT_DUMP"]))
+        except Exception as e:
+            logger.error(f"ft: the agent dump {os.environ['FT_DUMP']} cannot be loaded: {e}")
+            sys.exit(DUMP_LOAD_EXIT)  # the agent marks it bad and uses the next candidate
 
     def step_start(self, step: int):
         self.gpu_peak.record(step)

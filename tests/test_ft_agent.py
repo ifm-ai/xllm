@@ -28,7 +28,8 @@ def test_hang_deadline_auto_and_configured():
     agent.gpus = 2
     agent.conf = AgentConf(slot_dir="", node_deadline=10, hb_interval=0.2, hb_deadline=0, hb_margin=0.5,
                            retries=2, release_timeout=0, nccl_timeout=3600, xid_replace="", spares=0,
-                           spare_health=True, refill_wait=0, dump_dir="")
+                           spare_health=True, refill_wait=0, dump_dir="", dump_enabled=False,
+                           dump_keep=2, ft_dump_dir=None)
     assert agent.hang_deadline([1.0] * 19) == 0.9 * 3600  # not measured yet: just below the NCCL timeout
     assert agent.hang_deadline([1.0] * 19 + [2.0]) == 30.0  # floor
     assert agent.hang_deadline([1.0] * 19 + [40.0]) == 60.0  # (1 + m) * longest gap
@@ -41,7 +42,8 @@ def test_startup_deadline_uses_the_last_measured_startup():
     agent = Agent.__new__(Agent)
     agent.conf = AgentConf(slot_dir="", node_deadline=10, hb_interval=0.2, hb_deadline=20, hb_margin=0.5,
                            retries=2, release_timeout=0, nccl_timeout=3600, xid_replace="", spares=0,
-                           spare_health=True, refill_wait=0, dump_dir="")
+                           spare_health=True, refill_wait=0, dump_dir="", dump_enabled=False,
+                           dump_keep=2, ft_dump_dir=None)
     agent.startup_s = None
     assert agent.startup_deadline() == 0.9 * 3600  # first generation: not measured yet
     agent.startup_s = 30.0
@@ -166,6 +168,33 @@ def test_holds_copies_sees_own_and_held_copies_of_this_run(tmp_path, monkeypatch
     assert not agent.holds_copies(1)
     copy("peer", 1, run_epoch())  # node 1 holds node 0's ranks 0-1
     assert agent.holds_copies(1)
+
+
+def test_child_launcher_keeps_unbuffered_output_and_runs_the_script(tmp_path):
+    import os
+    import subprocess
+    import sys
+
+    script = tmp_path / "train.py"
+    script.write_text("import sys\nprint(sys.stdout.write_through, sys.argv[1:])\n")
+    from pathlib import Path
+
+    repo = str(Path(__file__).resolve().parent.parent)
+    path = repo + os.pathsep + os.environ.get("PYTHONPATH", "")
+    env = dict(os.environ, FT_AGENT_PID=str(os.getpid()), PYTHONPATH=path)
+    out = subprocess.run([sys.executable, "-u", "-m", "xllm.ft.child", str(script), "--a", "1"], env=env,
+                         capture_output=True, text=True, check=True).stdout
+    assert out.strip() == "True ['--a', '1']"  # -u kept across the exec, arguments passed as given
+    env.pop("FT_AGENT_PID")
+    assert subprocess.run([sys.executable, "-m", "xllm.ft.child", str(script)], env=env,
+                          capture_output=True, text=True).returncode == 0  # by hand: works, with a warning
+
+
+def test_hang_deadline_must_fire_before_nccl_timeout():
+    import pytest
+
+    with pytest.raises(AssertionError):
+        agent_conf(["train.py", "--ft.hb_deadline", "4000", "--nccl_timeout", "3600"])
 
 
 def test_a_follower_keeps_trying_to_join_a_late_leader(monkeypatch):

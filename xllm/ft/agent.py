@@ -31,6 +31,7 @@ import datetime
 import glob
 import logging
 import os
+import shutil
 import signal
 import socket
 import subprocess
@@ -42,10 +43,11 @@ from typing import Dict, List, Optional
 
 from torch.distributed import TCPStore
 
+from xllm.ft import dumper
 from xllm.ft.gpu_faults import GpuFaultLane
 from xllm.ft.inject import InjectionReader
 from xllm.ft.progress import PROGRESS_ENV, Progress, progress_path
-from xllm.ft.replica import NO_COMMON_STEP_EXIT, slot_path, valid_steps
+from xllm.ft.replica import DUMP_LOAD_EXIT, NO_COMMON_STEP_EXIT, dump_files, meta_path, slot_path, valid_steps
 from xllm.ft.scheduler import SlurmMailbox, mailbox_dir
 from xllm.ft.spare_check import run_spare_check
 
@@ -78,6 +80,9 @@ class AgentConf:
     spare_health: bool
     refill_wait: float
     dump_dir: str
+    dump_enabled: bool
+    dump_keep: int
+    ft_dump_dir: Optional[str]
 
 
 def agent_conf(train_args: List[str]) -> AgentConf:
@@ -92,11 +97,13 @@ def agent_conf(train_args: List[str]) -> AgentConf:
         "hb_deadline": "ft.hb_deadline", "hb_margin": "ft.hb_margin", "retries": "ft.retries",
         "release_timeout": "ft.release_timeout", "nccl_timeout": "nccl_timeout", "xid_replace": "ft.xid_replace",
         "spares": "ft.spares", "spare_health": "ft.spare_health", "refill_wait": "ft.refill_wait_s",
-        "dump_dir": "dump_dir",
+        "dump_dir": "dump_dir", "dump_enabled": "ft.dump_enabled", "dump_keep": "ft.dump_keep",
+        "ft_dump_dir": "ft.dump_dir",
     }
     parser = argparse.ArgumentParser(allow_abbrev=False)
     for field in dataclasses.fields(AgentConf):
         kind = (lambda v: str(v).lower() in ("1", "true", "yes")) if field.type is bool else field.type
+        kind = str if field.type == Optional[str] else kind
         parser.add_argument(f"--{names[field.name]}", type=kind, default=defaults[names[field.name]],
                             dest=names[field.name])
     known, _ = parser.parse_known_args(train_args)
@@ -175,10 +182,16 @@ class Agent:
         os.environ["FT_EPOCH"] = self.store.get("epoch").decode()  # slot names and run identity of the main job
         self.phys = int(os.environ.get("SLURM_NODEID", "0")) if not self.refill else self.store.add("next_phys", 1) - 1
         self.store.set(f"host/{self.phys}", socket.gethostname())
+        self.dump_root = Path(self.conf.ft_dump_dir or os.path.join(self.conf.dump_dir, "ft_checkpoints"))
+        if self.is_leader:
+            dumper.clean_staging(self.dump_root)
         self.hb_seen: Dict[int, tuple] = {}
+        self.dump_abort = threading.Event()  # set by the dump_kill test injection
         self.stopping = threading.Event()
         self.hb_thread = threading.Thread(target=self._heartbeat, daemon=True)
         self.hb_thread.start()
+        if self.conf.dump_enabled:
+            threading.Thread(target=self._dumps, daemon=True).start()
         signal.signal(signal.SIGTERM, self._on_sigterm)
         signal.signal(signal.SIGUSR1, signal.SIG_IGN)  # the sbatch script owns the requeue
 
@@ -238,6 +251,84 @@ class Agent:
         """Leader: no heartbeat silence longer than the node deadline seen for this node (quiet lost_node)."""
         count, seen = int(self.store.add(f"hb/{n}", 0)), self.hb_seen.get(n)
         return seen is None or count != seen[0] or time.monotonic() - seen[1] <= self.conf.node_deadline
+
+    # ------------------------------------------------------------------ agent dumps and the disk fallback
+    def disk_candidate(self) -> str:
+        """Leader: the newest complete agent dump not marked bad, if newer than xLLM's checkpoint ('' = xLLM)."""
+        try:
+            bad = dumper.bad_dumps(self.dump_root)
+            dumps = [(step, d) for step, d in dumper.committed_dumps(self.dump_root, self.ntrain * self.gpus)
+                     if (d.name, step) not in bad and not self.store.check([f"baddump/{d.name}"])]
+            if dumps and dumps[0][0] > dumper.newest_xllm_checkpoint_step(self.conf.dump_dir):
+                return str(dumps[0][1])
+        except OSError as e:  # the shared filesystem is down: the trainers' own load then fails or waits
+            logger.error(f"ft leader: cannot list the agent dumps ({e}); falling back to xLLM's checkpoints")
+        return ""
+
+    def set_mode(self, gen: int, mode: str):
+        """Leader: the restore mode of generation gen, and for disk the candidate to load."""
+        self.store.set(f"mode/{gen}", mode)  # a disk candidate is chosen in wait_go, right before the start
+
+    def _dumps(self):
+        """Background agent dumps from the RAM slots, on their own store connection (see xllm/ft/dumper.py)."""
+        store, done = None, set()
+        while not self.stopping.is_set():
+            time.sleep(1.0)
+            try:
+                store = store or self._connect(False)
+                logical = self.logical
+                if logical is None or self.procs == [] or any(p.poll() is not None for p in self.procs):
+                    continue
+                ranks = list(range(logical * self.gpus, (logical + 1) * self.gpus))
+                newest = dumper.newest_common_own_step(self.conf.slot_dir, ranks)
+                if newest is not None:
+                    store.set(f"newest/{logical}", str(newest))
+                current = store.get("dump/current").decode() if store.check(["dump/current"]) else ""
+                if current and (current, logical) not in done:
+                    step, gen, _ = (int(x) for x in current.split(":"))
+                    staging = dumper.staging_dir(self.dump_root, gen, step)
+                    done.add((current, logical))
+                    try:
+                        ok = all(dumper.write_rank(self.conf.slot_dir, staging, r, gen, step, self.dump_abort)
+                                 for r in ranks)
+                    except OSError as e:
+                        logger.warning(f"ft agent {self.phys}: dump of step {step} failed ({e})")
+                        ok = False
+                    store.set(f"dumped/{current}/{logical}" if ok else f"dumpfail/{current}", "1")
+                if self.is_leader:
+                    self._lead_dumps(store, current)
+            except Exception as e:  # dumps are best effort: training and recovery never depend on them
+                logger.warning(f"ft agent {self.phys}: dump step failed ({type(e).__name__}: {e})")
+                store = None
+
+    def _lead_dumps(self, store, current: str):
+        if current:
+            step, gen, _ = (int(x) for x in current.split(":"))
+            staging = dumper.staging_dir(self.dump_root, gen, step)
+            # a failed round, or one of an earlier generation whose nodes changed since (a part may be gone)
+            now = int(store.get("gen"))
+            replaced = any(store.check([f"new/{g}/{lg}"]) for g in range(gen + 1, now + 1) for lg in range(self.ntrain))
+            if store.check([f"dumpfail/{current}"]) or replaced:
+                logger.warning(f"ft leader: agent dump round of step {step} dropped")
+                shutil.rmtree(staging, ignore_errors=True)
+                store.set("dump/current", "")
+            elif all(store.check([f"dumped/{current}/{lg}"]) for lg in range(self.ntrain)):
+                in_use = self.get_or(f"dumpdir/{int(store.get('gen'))}", "")  # the dump this generation loads
+                if dumper.commit(self.dump_root, staging, gen, step, self.ntrain * self.gpus, self.conf.dump_keep,
+                                 protect=in_use):
+                    store.set("dump/last", str(step))
+                else:  # incomplete or mixed markers: drop this round, the next one starts clean
+                    shutil.rmtree(staging, ignore_errors=True)
+                store.set("dump/current", "")
+            return
+        newest = [store.get(f"newest/{lg}").decode() if store.check([f"newest/{lg}"]) else None
+                  for lg in range(self.ntrain)]
+        if None in newest:
+            return
+        step = min(int(n) for n in newest)
+        last = int(store.get("dump/last")) if store.check(["dump/last"]) else -1
+        if step > last:  # each round has its own id, so a retried step is never mistaken for a finished one
+            store.set("dump/current", f"{step}:{int(store.get('gen'))}:{store.add('dump/round', 1)}")
 
     def get_or(self, key: str, default: str) -> str:
         """A read that never waits: TCPStore.get on a missing key blocks for the whole store timeout."""
@@ -316,7 +407,7 @@ class Agent:
             return "end"
         if not self.take_spare(gen + 1, logical, phys, reason):
             return "end"
-        self.store.set(f"mode/{gen + 1}", mode)
+        self.set_mode(gen + 1, mode)
         self.store.set("gen", str(gen + 1))
         return "restart"
 
@@ -363,9 +454,13 @@ class Agent:
                 RANK=str(rank), SLURM_PROCID=str(rank), WORLD_SIZE=str(self.ntrain * self.gpus),
                 LOCAL_RANK=str(local), LOCAL_WORLD_SIZE=str(self.gpus), MASTER_ADDR=master,
                 MASTER_PORT=str(self.store_port + 1 + gen), FT_AGENT_PID=str(os.getpid()), FT_GEN=str(gen),
-                FT_RESTORE=self.restore_mode(gen), FT_REPLACED=replaced, **{PROGRESS_ENV: str(path)},
+                FT_RESTORE=self.restore_mode(gen), FT_REPLACED=replaced, FT_DUMP=self.get_or(f"dumpdir/{gen}", ""),
+                **{PROGRESS_ENV: str(path)},
             )
-            self.procs.append(subprocess.Popen([sys.executable, "-m", "xllm.ft.child"] + self.train_args, env=env))
+            # the trainers' output as the agent's (python -u); xllm/ft/child.py passes it on from its own write_through
+            unbuffered = ["-u"] if sys.stdout.write_through else []
+            self.procs.append(subprocess.Popen([sys.executable, *unbuffered, "-m", "xllm.ft.child"] + self.train_args,
+                                               env=env))
         self.state("running", gen)
         logger.info(f"ft agent {self.phys}: generation {gen}, logical node {logical}, {self.gpus} trainers started")
 
@@ -488,6 +583,8 @@ class Agent:
             # nodes without their own copies (new ones, or not copied since they joined) restore from their holder
             fresh = [lg for lg in range(self.ntrain) if lg in new or self.store.check([f"fresh/{gen}/{lg}"])]
             self.store.set(f"replaced/{gen}", ",".join(str(lg) for lg in fresh))
+            if gen == 0 or self.restore_mode(gen) == "disk":  # the newest dump committed by now, set before go
+                self.store.set(f"dumpdir/{gen}", self.disk_candidate())
             self.store.set(f"go/{gen}", "1")
         else:
             while not self.store.check([f"go/{gen}"]):
@@ -525,6 +622,13 @@ class Agent:
             if failed:
                 if any(c == NO_COMMON_STEP_EXIT for _, c in failed):
                     self.store.set(f"nocommon/{gen}", "1")  # memory cannot restore: next generation from disk
+                if any(c == DUMP_LOAD_EXIT for _, c in failed):
+                    self.store.set(f"dumpfail/{gen}", "1")
+                    bad = self.get_or(f"dumpdir/{gen}", "")  # this dump cannot be loaded: the next candidate is used
+                    if bad:
+                        self.store.set(f"baddump/{Path(bad).name}", "1")  # even when .bad cannot be written
+                        dumper.mark_bad(self.dump_root, Path(bad))
+                    self.store.set(f"nocommon/{gen}", "1")
                 self.request(gen, f"trainer exit codes {failed}")
             deadline = self.hang_deadline(gaps)
             now = time.monotonic()
@@ -561,7 +665,7 @@ class Agent:
             time.sleep(self.conf.hb_interval)
 
     def inject(self, step: int):
-        """Carry out the test injections addressed to this node (tests/ft_inject.py); the rest come with later lanes."""
+        """Carry out the test injections addressed to this node (tests/ft_inject.py)."""
         self.injections.poll(self.store)
         for inj in self.injections.due(step, self.store):
             logger.warning(f"ft agent {self.phys}: injecting {inj}")
@@ -579,8 +683,35 @@ class Agent:
                 self.gpu_faults.inject(inj.gpu, None)
             elif inj.kind == "fail_spare_health":
                 self.store.set(f"fail_health/{self.phys}", "1")
-            else:
-                logger.warning(f"ft agent {self.phys}: injection {inj.kind} not handled yet")
+            elif inj.kind == "torn_write":
+                self.torn_write(inj.rank)
+            elif inj.kind == "bitflip":
+                self.bitflip(inj.rank)
+            elif inj.kind == "dump_kill":
+                self.dump_abort.set()
+
+    def torn_write(self, rank: int):
+        """Injection: the trainer dies halfway through overwriting its newest own slot (metadata removed first,
+        half of the payload overwritten, a stale .tmp left), as a crash in the middle of a copy would leave it."""
+        steps = valid_steps(lambda s: slot_path(self.conf.slot_dir, "own", rank, s), rank)
+        if steps:
+            path = slot_path(self.conf.slot_dir, "own", rank, steps[max(steps)])
+            meta_path(path).unlink()
+            with open(path, "r+b") as f:
+                f.write(bytes(path.stat().st_size // 2))
+            meta_path(path).with_suffix(".tmp").write_bytes(b"torn")
+        self.procs[rank - self.logical * self.gpus].send_signal(signal.SIGKILL)
+
+    def bitflip(self, rank: int):
+        """Injection: flip one bit of this rank's payload in the newest committed agent dump (its crc32 must catch it)."""
+        dumps = dumper.committed_dumps(self.dump_root, None)
+        if dumps:
+            payload = dump_files(dumps[0][1], rank)[0]
+            with open(payload, "r+b") as f:
+                f.seek(payload.stat().st_size // 2)
+                byte = f.read(1)
+                f.seek(-1, os.SEEK_CUR)
+                f.write(bytes([byte[0] ^ 1]))
 
     def startup_deadline(self) -> Optional[float]:
         """Before a generation's first step: (1 + m) times the last measured startup, at least 60 s; unknown at first."""
@@ -620,7 +751,7 @@ class Agent:
                 mode = self.account(gen, reason)
                 return "end" if mode is None else self.replace(gen, logical, phys, reason, mode)
             failed = int(self.get_or(f"reqnode/{gen}", "-1"))
-            restore = self.store.check([f"nocommon/{gen}"])
+            restore = self.store.check([f"nocommon/{gen}"]) or self.store.check([f"dumpfail/{gen}"])
             if failed in mapped and self.store.check([f"new/{gen}/{failed}"]) and not self.store.check(
                     [f"warm/{gen}/{failed}"]) and not restore and self.new_failures < NEW_NODE_FAILURES:
                 # a newly admitted node failed before its first step: bar it, take the next spare, no retry used
@@ -633,7 +764,7 @@ class Agent:
             if mode is None:
                 return "end"
             logger.warning(f"ft leader: restarting all trainers from {mode}, generation {gen} -> {gen + 1} ({reason})")
-            self.store.set(f"mode/{gen + 1}", mode)
+            self.set_mode(gen + 1, mode)
             self.store.set("gen", str(gen + 1))
             return "restart"
         return None

@@ -16,6 +16,7 @@ import math
 import os
 import pickle
 import threading
+import time
 from pathlib import Path
 from timeit import default_timer as timer
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
@@ -26,6 +27,8 @@ import torch.distributed as dist
 from xllm.ft.sizing import GpuPeakRecorder
 
 logger = logging.getLogger()
+
+PROBE_TRIES = 3  # failed probe copies (auto k) before copies are turned off
 
 
 def run_epoch() -> Tuple[str, str]:
@@ -47,6 +50,22 @@ def slot_path(slot_dir: str, kind: str, rank: int, slot: int) -> Path:
 
 def meta_path(path: Path) -> Path:
     return path.with_suffix(".meta")
+
+
+LEASE_MAX_S = 600.0  # a lease older than this was left by a dumper that died: ignored
+
+
+def lease_path(path: Path) -> Path:
+    """Set by the agent's dumper while it reads a slot: the trainer does not overwrite a leased slot."""
+    return path.with_suffix(".lease")
+
+
+def leased(path: Path) -> bool:
+    lease = lease_path(path)
+    try:
+        return time.time() - lease.stat().st_mtime < LEASE_MAX_S
+    except FileNotFoundError:
+        return False
 
 
 def local_tensor(t: torch.Tensor) -> torch.Tensor:
@@ -105,25 +124,28 @@ class Replica:
         self.gpu_mine = self.gpu_recv = self.host_mine = self.host_recv = None
         self.recv_nbytes = 0
         self.probe: Optional[Dict[str, float]] = None  # auto k: timings of the first copy
+        self.probe_failures = 0
         Path(slot_dir).mkdir(parents=True, exist_ok=True)
 
     def maybe_copy(self, step: int, training_state: Callable[[], Dict[str, Any]]):
         """Call after the optimizer and scheduler steps. Collective over all ranks."""
-        if not self.gpu_peak.copies_allowed:
+        if not self.gpu_peak.copies_allowed or self.k < 0:
             return
-        forced = self.force_copy
-        if forced:
-            self.force_copy = False
-        elif self.k == 0 and not self._set_auto_k(step):
-            return
-        elif self.k > 0 and step % self.k != 0:
-            return
-        busy = torch.tensor([int(self.busy)], device="cuda")
+        forced = self.force_copy  # pending until the copy starts: the GPU gate and a busy slot only defer it
+        if not forced:
+            if self.k == 0 and not self._set_auto_k(step):
+                return
+            if self.k > 0 and step % self.k != 0:
+                return
+        slot = self._slot_for(step, forced)
+        busy = torch.tensor([int(self.busy or leased(slot_path(self.slot_dir, "own", self.rank, slot)))],
+                            device="cuda")
         dist.all_reduce(busy, op=dist.ReduceOp.MAX, group=self.group)
         if busy.item():
-            logger.warning(f"ft: copy at step {step} skipped, the previous copy is still being written")
+            logger.warning(f"ft: copy at step {step} skipped, the previous copy is still being written or dumped")
             return
-        self._start_copy(step, training_state(), forced)
+        self.force_copy = False
+        self._start_copy(step, training_state(), slot)
 
     def _set_auto_k(self, step: int) -> bool:
         """Auto k: copy once at the first allowed step, then k* = sqrt(2 C MTBF) / t from its measured cost."""
@@ -138,8 +160,12 @@ class Replica:
         cost = torch.tensor([self.probe["copy_s"], t], device="cuda", dtype=torch.float64)
         dist.all_reduce(cost, op=dist.ReduceOp.MAX, group=self.group)
         c, t = cost.tolist()
-        if c < 0:  # the probe copy failed on some rank: probe again
+        if c < 0:  # the probe copy failed on some rank: probe again, at most PROBE_TRIES times
+            self.probe_failures += 1
             self.probe = None
+            if self.probe_failures >= PROBE_TRIES:
+                self.k = -1
+                logger.error(f"ft: {PROBE_TRIES} copies failed in a row; in-memory copies are off for this run")
             return False
         self.k = max(1, int(math.sqrt(2 * c * self.mtbf_sys) / t))
         logger.info(f"ft: copy cost {c:.2f} s, step {t:.3f} s, MTBF {self.mtbf_sys:.0f} s -> copy every {self.k} steps")
@@ -164,11 +190,12 @@ class Replica:
                 self.gpu_recv = torch.empty(self.recv_nbytes, dtype=torch.uint8, device="cuda")
                 self.host_recv = torch.empty(self.recv_nbytes, dtype=torch.uint8, pin_memory=True)
 
-    def _start_copy(self, step: int, training_state: Dict[str, Any], forced: bool = False):
+    def _slot_for(self, step: int, forced: bool) -> int:
         if forced and self.restored_slot is not None:
-            slot = 1 - self.restored_slot  # keep the restored copy until the new one is complete
-        else:
-            slot = (step // self.k) % 2 if self.k > 0 else 0
+            return 1 - self.restored_slot  # keep the restored copy until the new one is complete
+        return (step // self.k) % 2 if self.k > 0 else 0
+
+    def _start_copy(self, step: int, training_state: Dict[str, Any], slot: int):
         tensors = state_tensors(self.model, self.optimizer)
         nbytes = sum(t.numel() * t.element_size() for t in tensors)
         self.prepare(nbytes)
@@ -381,4 +408,44 @@ def restore(replica: Replica) -> Optional[Dict[str, Any]]:
     replica.restored_slot = None if node_replaced else own[step]
     replica.force_copy = True  # after the first good step, copy at once: fresh copies everywhere
     logger.info(f"ft: restored step {step} from memory{' (state received from its holder)' if node_replaced else ''}")
+    return meta["training_state"]
+
+
+# ---------------------------------------------------------------------- agent dumps on disk
+DUMP_LOAD_EXIT = 77  # loading the chosen agent dump failed: the agent marks it bad and the next candidate is used
+
+
+def dump_files(dump_dir: Path, rank: int) -> Tuple[Path, Path, Path]:
+    """A rank's payload, metadata and completion marker inside an agent dump."""
+    return dump_dir / f"rank{rank:06d}.slot", dump_dir / f"rank{rank:06d}.meta", dump_dir / f"rank{rank:06d}.ok"
+
+
+def restore_from_dump(replica: Replica, dump_dir: Path) -> Dict[str, Any]:
+    """
+    Loads this rank's state from a committed agent dump (the slot payload byte for byte, written by the agent
+    from the in-memory copies) with the same unpack as a memory restore, after checking its size and crc32.
+    Raises on any mismatch; the caller exits with DUMP_LOAD_EXIT.
+    """
+    import json
+    import zlib
+
+    payload_path, meta_file, ok_file = dump_files(dump_dir, replica.rank)
+    ok = json.loads(ok_file.read_text())
+    data = payload_path.read_bytes()
+    if len(data) != ok["bytes"] or zlib.crc32(data) != ok["crc32"]:
+        raise RuntimeError(f"ft dump {payload_path} is damaged (size or crc32 does not match its marker)")
+    meta_bytes = meta_file.read_bytes()
+    if zlib.crc32(meta_bytes) != ok["meta_crc32"]:
+        raise RuntimeError(f"ft dump {meta_file} is damaged (crc32 does not match its marker)")
+    meta = pickle.loads(meta_bytes)
+    if meta["step"] != ok["step"]:
+        raise RuntimeError(f"ft dump {dump_dir}: metadata of step {meta['step']}, marker of step {ok['step']}")
+    init_optimizer_state(replica.model, replica.optimizer)
+    tensors = state_tensors(replica.model, replica.optimizer)
+    nbytes = sum(t.numel() * t.element_size() for t in tensors)
+    if meta["rank"] != replica.rank or meta["nbytes"] != nbytes or len(data) != nbytes:
+        raise RuntimeError(f"ft dump {dump_dir} does not match this run's training state")
+    unpack(tensors, torch.frombuffer(bytearray(data), dtype=torch.uint8).cuda())
+    replica.force_copy = True
+    logger.info(f"ft: restored step {meta['step']} from the agent dump {dump_dir}")
     return meta["training_state"]

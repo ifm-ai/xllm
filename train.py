@@ -62,8 +62,7 @@ from xllm.monitor import GPUMonitor, Timings
 from xllm.metrics import MetricLogger, build_mlogger
 from xllm.ft.trainer import FtTrainer, prepare_log_dir as ft_prepare_log_dir
 from xllm.ft.trainer import ignore_requeue_signal as ft_ignore_requeue_signal
-from xllm.ft.trainer import ignore_requeue_signal as ft_ignore_requeue_signal
-from xllm.ft.trainer import memory_restart as ft_memory_restart
+from xllm.ft.trainer import dump_restart as ft_dump_restart, memory_restart as ft_memory_restart
 from xllm.health_metrics import HealthMetricCollector
 from xllm.configuration import cfg_from_cli
 try:
@@ -246,8 +245,8 @@ def main(cfg: TrainerConf):
         logger.info(f"No print for worker {cfg.slurm.global_rank}")
         logger.disabled = True
 
-    # model / optimizer paths (a memory restart does not look at the disk checkpoints)
-    if ft_memory_restart(cfg):
+    # model / optimizer paths (memory and agent-dump restarts do not look at xLLM's checkpoints)
+    if ft_memory_restart(cfg) or ft_dump_restart(cfg):
         model_path = optim_path = training_state_path = None
     else:
         model_path, optim_path, training_state_path = get_latest_checkpoint_paths_for_sharded_states(
@@ -323,8 +322,8 @@ def main(cfg: TrainerConf):
         async_checkpointing=cfg.async_checkpointing,
     )
 
-    # reload: from the in-memory copies on an ft memory restart, else from disk if available
-    if ft_memory_restart(cfg):
+    # reload: from the in-memory copies on an ft memory restart, from an agent dump or xLLM's checkpoint on disk
+    if ft_memory_restart(cfg) or ft_dump_restart(cfg):
         restored = ft.restore(cfg)
         for group, saved in zip(optimizer.param_groups, restored["param_groups"]):
             group.update(saved)

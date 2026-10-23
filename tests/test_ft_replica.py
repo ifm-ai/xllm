@@ -60,6 +60,26 @@ def test_a_failed_copy_is_logged_and_does_not_stop_later_copies():
     assert replica.busy is False
 
 
+def test_a_forced_copy_stays_pending_while_the_slot_is_busy(monkeypatch):
+    import types
+
+    import xllm.ft.replica as rep
+
+    replica = rep.Replica.__new__(rep.Replica)
+    replica.gpu_peak = types.SimpleNamespace(copies_allowed=True)
+    replica.k, replica.force_copy, replica.busy, replica.restored_slot = 10, True, True, 0
+    replica.slot_dir, replica.rank, replica.group = "/nonexistent", 0, None
+    started = []
+    replica._start_copy = lambda step, state, slot: started.append((step, slot))
+    monkeypatch.setattr(rep.torch, "tensor", lambda v, device=None: types.SimpleNamespace(item=lambda: v[0]))
+    monkeypatch.setattr(rep.dist, "all_reduce", lambda t, op=None, group=None: None)
+    replica.maybe_copy(3, dict)
+    assert started == [] and replica.force_copy  # busy: deferred, not dropped
+    replica.busy = False
+    replica.maybe_copy(4, dict)
+    assert started == [(4, 1)] and not replica.force_copy  # copied at the next step, into the other slot
+
+
 def run_ranks(candidates):
     """agree_step on every rank at once, with an all-reduce MIN over threads."""
     import threading
