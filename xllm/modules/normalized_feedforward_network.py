@@ -90,9 +90,9 @@ class NormalizedFeedForwardNetwork(nn.Module):
             num_features=ffn_hidden_dim, eps=rmsnorm_eps, init_std=init_std
         )
 
-        for fc in (self.fc1, self.fc2, self.fc3):
+        for fc, tp_dim in ((self.fc1, 0), (self.fc2, 1), (self.fc3, 0)):  # column, row, column parallel
             if fc is not None:
-                register_muon(fc)  # Muon, one matrix (xllm/optim/muon.py)
+                register_muon(fc, tp_dim=tp_dim)  # Muon, one matrix (xllm/optim/muon.py)
 
     def forward(
         self,
