@@ -87,7 +87,7 @@ class OptimConf(Config):
     epsilon: float = 1e-8
     beta1: float = 0.9
     beta2: float = 0.98
-    clip: float = 1.0  # Global gradient L2 norm clipping threshold, before applying loss scale.
+    clip: float = 1.0  # Global gradient L2 norm clipping threshold, before applying loss scale. <= 0 disables clipping.
     scheduler: str = "cosine"  # LR scheduler: linear, cosine, constant, or wsd (warmup-stable-decay)
     lr_init_ratio: float = 1e-4  # The initial LR = lr_init_ratio * lr
     lr_end_ratio: float = 0.01  # The ending LR = lr_end_ratio * lr. Also the end value if using a cosine scheduler
