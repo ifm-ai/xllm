@@ -118,6 +118,15 @@ def orthogonalize(mats: List[Tensor], eps: float) -> List[Tensor]:
     return out
 
 
+def group_hparams(cfg: OptimConf, algorithm: str) -> Dict:
+    """Param-group hyperparameters that OptimConf sets for "muon" or "adamw" (single source of truth)."""
+    if algorithm == "muon":
+        return dict(momentum=cfg.muon_momentum, nesterov=cfg.muon_nesterov, adjust_lr=cfg.muon_adjust_lr,
+                    block_scale=cfg.muon_block_scale,
+                    weight_decay=cfg.weight_decay if cfg.muon_weight_decay is None else cfg.muon_weight_decay)
+    return dict(betas=(cfg.beta1, cfg.beta2), weight_decay=cfg.weight_decay)
+
+
 class Muon(Optimizer):
     """Muon for FSDP2 parameters sharded on dim 0, with AdamW for the rest.
 
@@ -140,11 +149,8 @@ class Muon(Optimizer):
         defaults = dict(weight_decay=cfg.weight_decay, eps=cfg.epsilon)
         super().__init__(
             [
-                dict(params=muon_params, lr=cfg.muon_lr, algorithm="muon",
-                     momentum=cfg.muon_momentum, nesterov=cfg.muon_nesterov,
-                     adjust_lr=cfg.muon_adjust_lr, block_scale=cfg.muon_block_scale,
-                     weight_decay=cfg.weight_decay if cfg.muon_weight_decay is None else cfg.muon_weight_decay),
-                dict(params=adamw_params, lr=cfg.lr, algorithm="adamw", betas=(cfg.beta1, cfg.beta2)),
+                dict(params=muon_params, lr=cfg.muon_lr, algorithm="muon", **group_hparams(cfg, "muon")),
+                dict(params=adamw_params, lr=cfg.lr, algorithm="adamw", **group_hparams(cfg, "adamw")),
             ],
             defaults,
         )
@@ -152,23 +158,6 @@ class Muon(Optimizer):
         self.world = mesh.size()
         self.rank = mesh.get_local_rank()
         self._plan([tuple(p.shape) for p in muon_params], specs)
-
-    def load_state_dict(self, state_dict):
-        """Restore checkpoint hyperparameters; fill metadata absent from legacy checkpoints."""
-        migrated = dict(state_dict)
-        migrated["param_groups"] = []
-        for saved in state_dict["param_groups"]:
-            group = dict(saved)
-            # Older Muon checkpoints did not serialize these hyperparameters.
-            configured = next(g for g in self.param_groups if g["algorithm"] == group["algorithm"])
-            keys = ("momentum", "nesterov", "adjust_lr", "block_scale") if group["algorithm"] == "muon" else ("betas",)
-            missing = [key for key in keys if key not in group]
-            if missing:
-                logger.warning(f"Legacy Muon {group['algorithm']} checkpoint lacks {missing}; using configured values.")
-            for key in missing:
-                group[key] = configured[key]
-            migrated["param_groups"].append(group)
-        return super().load_state_dict(migrated)
 
     # ---- plan: built once from the global shapes, identical on every rank ----
 

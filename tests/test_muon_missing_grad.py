@@ -115,22 +115,6 @@ def test_state_roundtrip_restores_algorithm_and_next_update(cpu_transport):
     torch.testing.assert_close(new.state[q]["momentum"], momentum * 0.6 + q.grad)
 
 
-def test_legacy_checkpoint_uses_defaults_only_for_missing_metadata(caplog):
-    cfg = OptimConf(optimizer="muon", weight_decay=0.2)
-    opt = muon.Muon([nn.Parameter(torch.ones(2, 3))], [muon.muon_spec()], [], LocalMesh(), cfg)
-    saved = copy.deepcopy(opt.state_dict())
-    for group in saved["param_groups"]:
-        for key in ("momentum", "nesterov", "adjust_lr", "block_scale", "betas"):
-            group.pop(key, None)
-    new = muon.Muon([nn.Parameter(torch.ones(2, 3))], [muon.muon_spec()], [], LocalMesh(),
-                    OptimConf(optimizer="muon", muon_momentum=0.6, weight_decay=0.01))
-    new.load_state_dict(saved)
-    assert new.param_groups[0]["momentum"] == 0.6
-    assert new.param_groups[0]["weight_decay"] == 0.2
-    assert "Legacy Muon" in caplog.text
-    assert "momentum" not in saved["param_groups"][0]  # loading must not mutate the caller's dict
-
-
 def test_closure_computes_gradients_and_returns_loss(cpu_transport):
     p = nn.Parameter(torch.ones(2, 3))
     opt = muon.Muon([p], [muon.muon_spec()], [], LocalMesh(), OptimConf(optimizer="muon"))
@@ -189,11 +173,9 @@ def test_first_resumed_lr_uses_new_base_at_restored_position():
     assert new_sched.last_epoch == 3 and new_sched._step_count == old_sched._step_count
 
 
-@pytest.mark.parametrize("legacy", [False, True])
-def test_dcp_checkpoint_roundtrip(cpu_transport, tmp_path, legacy):
+def test_dcp_checkpoint_roundtrip(cpu_transport, tmp_path):
     import torch.distributed.checkpoint as dcp
     from torch.distributed.checkpoint.state_dict import get_optimizer_state_dict, set_optimizer_state_dict
-    from xllm.optim import MuonLoadPlanner
 
     cfg = OptimConf(optimizer="muon", muon_momentum=0.8, weight_decay=0.2)
     model = nn.Linear(3, 2)
@@ -204,34 +186,14 @@ def test_dcp_checkpoint_roundtrip(cpu_transport, tmp_path, legacy):
     opt.step()
     opt.zero_grad(set_to_none=True)
     saved = get_optimizer_state_dict(model, opt)
-    if legacy:
-        for group in saved["param_groups"]:
-            for key in ("momentum", "nesterov", "adjust_lr", "block_scale", "betas"):
-                group.pop(key, None)
     dcp.save(saved, checkpoint_id=tmp_path / "optimizer")
     new = muon.Muon([model.weight], [muon.muon_spec()], [model.bias], LocalMesh(),
                     OptimConf(optimizer="muon", muon_momentum=0.6, weight_decay=0.01))
     cpu_transport(new)
     template = get_optimizer_state_dict(model, new)
-    dcp.load(template, checkpoint_id=tmp_path / "optimizer", planner=MuonLoadPlanner())
+    dcp.load(template, checkpoint_id=tmp_path / "optimizer")
     set_optimizer_state_dict(model, new, template)
-    assert new.param_groups[0]["momentum"] == (0.6 if legacy else 0.8)
+    assert new.param_groups[0]["momentum"] == 0.8
     assert [group["weight_decay"] for group in new.param_groups] == [0.2, 0.2]
     torch.testing.assert_close(new.state[model.weight]["momentum"], opt.state[model.weight]["momentum"])
     torch.testing.assert_close(new.state[model.bias]["exp_avg"], opt.state[model.bias]["exp_avg"])
-
-
-def test_legacy_planner_still_rejects_missing_state_tensors():
-    from torch.distributed.checkpoint import DefaultSavePlanner
-    from xllm.optim import MuonLoadPlanner
-
-    saved = {"state": {"weight": {"momentum": torch.ones(2, 3)}}, "param_groups": [{"algorithm": "muon"}]}
-    saver = DefaultSavePlanner()
-    saver.set_up_planner(saved, is_coordinator=True)
-    _, metadata = saver.create_global_plan([saver.create_local_plan()])
-    template = {"state": {"weight": {"momentum": torch.ones(2, 3), "missing": torch.ones(2, 3)}},
-                "param_groups": [{"algorithm": "muon", "momentum": 0.95}]}
-    loader = MuonLoadPlanner()
-    loader.set_up_planner(template, metadata, is_coordinator=True)
-    with pytest.raises(RuntimeError, match="Missing key"):
-        loader.create_local_plan()
