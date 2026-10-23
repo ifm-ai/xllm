@@ -133,6 +133,11 @@ class TransformerMoVABlockFunction(torch.autograd.Function):
         attn_for_save, attn_lse = attn_out
         flash_rng_state, attn_rng_state, attn_out_rng_state, xh_rng_state = rng_states
         v_original_scores, v_routing_indices, v_org_topk_scores, v_tokens_per_expert, v_group_sizes = routing_state
+        health_collector = get_active_health_collector()
+        if health_collector is not None:
+            health_collector.record_router_stats(
+                "mova", layer_id, v_tokens_per_expert, v_org_topk_scores, mova_router_bias, aux_loss_mova,
+            )
 
         if segments is not None:
             if causal_attn_backend == 'flash':

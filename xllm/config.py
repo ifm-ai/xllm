@@ -338,6 +338,7 @@ class TrainerConf(Config):
     health_logits_stats: bool = False
     health_gekko_stats: bool = False
     health_moe_stats: bool = False
+    health_mova_stats: bool = False
 
     # Training hyperparameters
     batch_size: Optional[int] = None  # Num of sequences per DP rank per step. Set either this or global_batch_size.
@@ -444,6 +445,9 @@ class TrainerConf(Config):
         if self.health_moe_stats:
             assert self.health_metrics, "MoE statistics require health_metrics=true"
             assert self.model.num_experts > 0, "MoE statistics require model.num_experts > 0"
+        if self.health_mova_stats:
+            assert self.health_metrics, "MoVA statistics require health_metrics=true"
+            assert self.model.num_values > 0, "MoVA statistics require model.num_values > 0"
         if self.health_logits_stats:
             assert self.health_metrics, "Logit statistics require health_metrics=true"
         if self.health_weight_norms or self.health_gradient_norms:

@@ -84,6 +84,17 @@ def test_optional_parts_are_omitted_when_absent():
     assert not any("bias" in name or "auxiliary" in name for name in metrics)
 
 
+def test_moe_and_mova_log_under_their_own_names_in_one_step():
+    metrics = flush(
+        [("moe", 1, BASE), ("mova", 1, BASE | dict(tokens_per_route=torch.tensor([0, 0, 5, 1])))],
+        layers={"moe": [1], "mova": [1]},
+    )
+    assert metrics["moe_utilization_stats/layer_001/zero_experts"] == 1.0
+    assert metrics["mova_value_utilization/layer_001/dead_values"] == 2.0
+    assert metrics["mova_value_utilization/layer_001/load_max_over_mean"] == pytest.approx(5 / 1.5)
+    assert metrics["mova_router_confidence_stats/layer_001/topk_entropy_mean"] == pytest.approx(TOPK_ENTROPY)
+
+
 def test_families_that_are_off_ignore_records():
     metrics = flush([("moe", 1, BASE)], layers={})
     assert not any(name.startswith("moe") for name in metrics)

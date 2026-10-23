@@ -67,6 +67,10 @@ _ROUTER_FAMILIES = {
         "moe_utilization_stats", "zero_experts", "moe_router_confidence_stats",
         "moe_router_bias_stats", "moe_auxiliary_loss",
     ),
+    "mova": _RouterFamily(
+        "mova_value_utilization", "dead_values", "mova_router_confidence_stats",
+        "mova_router_bias_stats", "mova_auxiliary_loss",
+    ),
 }
 
 
