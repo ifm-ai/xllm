@@ -33,6 +33,7 @@ from typing import List, Optional
 
 from torch.distributed import TCPStore
 
+from xllm.ft.gpu_faults import GpuFaultLane
 from xllm.ft.inject import InjectionReader
 from xllm.ft.progress import PROGRESS_ENV, Progress, progress_path
 from xllm.ft.replica import NO_COMMON_STEP_EXIT
@@ -58,6 +59,7 @@ class AgentConf:
     retries: int
     release_timeout: float
     nccl_timeout: int
+    xid_replace: str
 
 
 def agent_conf(train_args: List[str]) -> AgentConf:
@@ -70,7 +72,7 @@ def agent_conf(train_args: List[str]) -> AgentConf:
     names = {
         "slot_dir": "ft.slot_dir", "node_deadline": "ft.node_deadline", "hb_interval": "ft.hb_interval",
         "hb_deadline": "ft.hb_deadline", "hb_margin": "ft.hb_margin", "retries": "ft.retries",
-        "release_timeout": "ft.release_timeout", "nccl_timeout": "nccl_timeout",
+        "release_timeout": "ft.release_timeout", "nccl_timeout": "nccl_timeout", "xid_replace": "ft.xid_replace",
     }
     parser = argparse.ArgumentParser(allow_abbrev=False)
     for field in dataclasses.fields(AgentConf):
@@ -123,6 +125,10 @@ class Agent:
         self.failed_at = 0  # highest step reached by the last failed generation
         local_ranks = [self.node * self.gpus + i for i in range(self.gpus)]
         self.injections = InjectionReader(node=self.node, ranks=local_ranks)
+        self.faults: List = []  # (gpu, xid) reported by the GPU-fault lane's thread
+        self.faults_lock = threading.Lock()
+        self.xids_to_replace = {int(x) for x in self.conf.xid_replace.split(",") if x}
+        self.gpu_faults = GpuFaultLane(self._on_gpu_fault)
         self.store = self._connect(self.is_leader)
         self.hb_seen = {n: (-1, time.monotonic()) for n in range(self.nnodes)}
         self.stopping = threading.Event()
@@ -241,6 +247,22 @@ class Agent:
         self.cleanup()
         os._exit(EXIT_REQUEUE)
 
+    def _on_gpu_fault(self, gpu: int, xid: Optional[int]):
+        with self.faults_lock:
+            self.faults.append((gpu, xid))
+
+    def check_gpu_faults(self, gen: int):
+        """A critical Xid or a lost GPU is a crash of this node's trainers; some need the node replaced."""
+        with self.faults_lock:
+            faults, self.faults = self.faults, []
+        for gpu, xid in faults:
+            what = "GPU lost" if xid is None else f"Xid {xid}"
+            if xid is None or xid in self.xids_to_replace:
+                logger.error(f"ft agent {self.node}: {what} on GPU {gpu}: this node must be replaced")
+                self.store.set("end", f"node {self.node}: {what} on GPU {gpu}, no spare")  # spares: later commit
+            else:
+                self.request(gen, f"{what} on GPU {gpu}")
+
     # ------------------------------------------------------------------ control store
     def state(self, name: str, gen: int):
         self.store.set(f"state/{self.node}", f"{name}:{gen}")
@@ -299,6 +321,7 @@ class Agent:
             codes = [p.poll() for p in self.procs]
             if all(c == 0 for c in codes):
                 return "finished"
+            self.check_gpu_faults(gen)
             failed = [(i, c) for i, c in enumerate(codes) if c not in (None, 0)]
             if failed:
                 if any(c == NO_COMMON_STEP_EXIT for _, c in failed):
@@ -351,6 +374,10 @@ class Agent:
                 os._exit(9)  # the agent dies; its trainers follow through PR_SET_PDEATHSIG
             elif inj.kind == "kill_node":
                 os.killpg(os.getpgid(0), signal.SIGKILL)
+            elif inj.kind == "xid":
+                self.gpu_faults.inject(inj.gpu, inj.xid)
+            elif inj.kind == "gpu_lost":
+                self.gpu_faults.inject(inj.gpu, None)
             else:
                 logger.warning(f"ft agent {self.node}: injection {inj.kind} not handled yet")
 
