@@ -14,6 +14,7 @@
   `--optim.muon_weight_decay` (default: the same value). Attention, the FFN, MoE experts and
   shared experts register their projections; linear layers in the blocks that are not
   registered are listed in a warning when the optimizer is built.
+- **Registration API.** Import `register_muon` from `xllm.optim.muon_spec`; model construction does not import the optimizer runtime. TP metadata, expert layouts and arbitrary block grids describe internal geometry; this release only supports dense training with TP=CP=1.
 - **Blocks.** A registration names the axes of the weight's two dims as the forward
   rearranges them, which axes form the Newton-Schulz matrix, and the sizes of the inner axes:
 
@@ -50,10 +51,15 @@
      `p = p * (1 - lr * wd) - lr * update` to its shard.
 - **Checkpoints.** Momentum and AdamW moments are DTensors like the parameters, so DCP
   reshards them if the mesh changes; the block plan is rebuilt from the global shapes.
-- **Resume.** The config wins over the checkpoint: the scheduler keeps its position, but its
-  base LRs (`--optim.muon_lr`, `--optim.lr`) and the groups' weight decay and epsilon come from
-  the config, so a run can be continued with new values. Momentum, Nesterov, betas and the
-  update scale are always taken from the config.
+- **Resume.** `state_dict()` includes momentum, moments and algorithm hyperparameters in
+  the parameter groups. `load_state_dict()` restores checkpoint values. Legacy checkpoints
+  without the new metadata fall back to configured values with a warning. The training
+  entry point explicitly reapplies the configured hyperparameters via
+  `restore_optimizer_config`; the scheduler keeps its position and uses configured base
+  LRs, including on the first resumed step. Loading a base model with optimizer state
+  uses the new schedule's initial LR. Standalone AdamW retains upstream's resume policy.
+- **Missing gradients.** `grad=None` skips momentum, parameter updates and weight decay;
+  an actual zero gradient still updates state. The fixed collective sequence is preserved.
 
 ```bash
 --optim.optimizer muon --optim.muon_lr 0.01 --optim.lr 2e-3 \

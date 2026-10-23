@@ -3,7 +3,7 @@
     PYTHONPATH=. pytest -q tests/test_muon_register.py
 
 A weight is built from a stack of Block matrices with einops, so Block j must read back as
-matrix j, with its fans as matrix j's [fan_out, fan_in]; together the Blocks must cover the
+matrix j, and the per-Block fans must be matrix j's [fan_out, fan_in]; together the Blocks cover the
 weight exactly once. No case has a square Block, so its orientation is unambiguous.
 """
 import math
@@ -13,7 +13,7 @@ import torch
 from einops import rearrange
 from torch import nn
 
-from xllm.optim.muon import muon_spec, register_muon
+from xllm.optim.muon_spec import muon_spec, register_muon
 
 
 def boxes(blocks):
@@ -56,11 +56,10 @@ def test_blocks_match_einops(layout, fan_out, fan_in, sizes, all_sizes):
     spec = m.muon_specs["weight"]
     assert spec == muon_spec(layout, fan_out=fan_out, fan_in=fan_in, **sizes)
     blocks = spec.blocks(tuple(w.shape))
-    assert len(blocks) == n
+    assert len(blocks) == n and spec.fans(tuple(w.shape), per_block=True) == tuple(mats[0].shape)
     cover = torch.zeros(w.shape, dtype=torch.int32)
     for j, b in enumerate(blocks):
         block = w[b.r0:b.r1, b.c0:b.c1]
-        assert (b.fan_out, b.fan_in) == tuple(mats[j].shape), (layout, j)
         assert torch.equal(block if block.shape == mats[j].shape else block.mT, mats[j]), (layout, j)
         cover[b.r0:b.r1, b.c0:b.c1] += 1
     assert bool((cover == 1).all())
@@ -81,7 +80,7 @@ def test_linear_default_is_one_matrix():
     register_muon(lin)
     spec = lin.muon_specs["weight"]
     assert str(spec) == "o i" and spec.tp_dim is None
-    assert [(b.r0, b.r1, b.c0, b.c1, b.fan_out, b.fan_in) for b in spec.blocks((4, 6))] == [(0, 4, 0, 6, 4, 6)]
+    assert boxes(spec.blocks((4, 6))) == [(0, 4, 0, 6)] and spec.fans((4, 6), per_block=True) == (4, 6)
 
 
 def test_tensor_parallel_global_shape():
