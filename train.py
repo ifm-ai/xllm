@@ -57,7 +57,7 @@ from xllm.utils import (
     collect_provenance,
 )
 from xllm.models import build_model, build_fsdp_mesh
-from xllm.optim import build_optimizer, rescale_grads, restore_optimizer_config, MuonLoadPlanner
+from xllm.optim import build_optimizer, rescale_grads, restore_optimizer_config
 from xllm.monitor import GPUMonitor, Timings
 from xllm.metrics import MetricLogger, build_mlogger
 from xllm.configuration import cfg_from_cli
@@ -318,8 +318,7 @@ def main(cfg: TrainerConf):
         logger.info(f"Reloading optimizer checkpoint from {optim_path} ...")
         if cfg.dcp_for_optimizer:
             reloaded_optim_state_dict = get_sharded_optimizer_state(model, optimizer, cfg.dcp_for_optimizer)
-            dist_ckpt.load(reloaded_optim_state_dict, checkpoint_id=optim_path, process_group=hsdp_group,
-                           planner=MuonLoadPlanner() if cfg.optim.optimizer == "muon" else None)
+            dist_ckpt.load(reloaded_optim_state_dict, checkpoint_id=optim_path, process_group=hsdp_group)
         else:
             reloaded_optim_state_dict = torch.load(optim_path, map_location="cpu", weights_only=False)
         set_sharded_optimizer_state(model, optimizer, reloaded_optim_state_dict, cfg.dcp_for_optimizer)
@@ -348,8 +347,7 @@ def main(cfg: TrainerConf):
             logger.info(f"Reloading base optimizer checkpoint from {base_optim_path} ...")
             if cfg.dcp_for_optimizer:
                 reloaded_optim_state_dict = get_sharded_optimizer_state(model, optimizer, cfg.dcp_for_optimizer)
-                dist_ckpt.load(reloaded_optim_state_dict, checkpoint_id=base_optim_path, process_group=hsdp_group,
-                               planner=MuonLoadPlanner() if cfg.optim.optimizer == "muon" else None)
+                dist_ckpt.load(reloaded_optim_state_dict, checkpoint_id=base_optim_path, process_group=hsdp_group)
             else:
                 reloaded_optim_state_dict = torch.load(base_optim_path, map_location="cpu", weights_only=True)
             set_sharded_optimizer_state(model, optimizer, reloaded_optim_state_dict, cfg.dcp_for_optimizer)

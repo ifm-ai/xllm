@@ -4,7 +4,6 @@ from typing import Optional
 import torch
 from torch import nn
 from torch.distributed.device_mesh import DeviceMesh
-from torch.distributed.checkpoint import DefaultLoadPlanner
 from torch.optim import AdamW
 
 from xllm.config import OptimConf
@@ -57,33 +56,11 @@ def restore_optimizer_config(optimizer, cfg: OptimConf):
     """
     if cfg.optimizer != "muon":
         return
+    from .muon import group_hparams
     for group in optimizer.param_groups:
-        if group["algorithm"] == "muon":
-            values = dict(momentum=cfg.muon_momentum, nesterov=cfg.muon_nesterov,
-                          adjust_lr=cfg.muon_adjust_lr, block_scale=cfg.muon_block_scale,
-                          weight_decay=cfg.weight_decay if cfg.muon_weight_decay is None else cfg.muon_weight_decay,
-                          eps=cfg.epsilon, initial_lr=cfg.muon_lr)
-        else:
-            values = dict(betas=(cfg.beta1, cfg.beta2), weight_decay=cfg.weight_decay,
-                          eps=cfg.epsilon, initial_lr=cfg.lr)
+        lr = cfg.muon_lr if group["algorithm"] == "muon" else cfg.lr
+        values = dict(group_hparams(cfg, group["algorithm"]), eps=cfg.epsilon, initial_lr=lr)
         changed = {key: (group.get(key), value) for key, value in values.items() if group.get(key) != value}
         if changed:
             logger.info(f"Resume {group['algorithm']}: configured values replace checkpoint values (old, new): {changed}")
         group.update(values)
-
-
-class MuonLoadPlanner(DefaultLoadPlanner):
-    """Read legacy Muon DCP metadata without permitting missing optimizer tensors."""
-
-    def set_up_planner(self, state_dict, metadata=None, is_coordinator=False):
-        super().set_up_planner(state_dict, metadata, is_coordinator)
-        if metadata is None:
-            return
-        legacy_fields = {"momentum", "nesterov", "adjust_lr", "block_scale", "betas"}
-        for key, path in self.mappings.items():
-            if (len(path) >= 3 and path[0] == "param_groups" and path[2] in legacy_fields
-                    and key not in metadata.state_dict_metadata):
-                # The template's configured value remains in original_state_dict.
-                # All state tensors and pre-existing metadata remain strict.
-                logger.warning(f"Legacy Muon checkpoint lacks {key}; using configured value.")
-                self.state_dict.pop(key, None)

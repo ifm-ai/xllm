@@ -52,8 +52,7 @@
 - **Checkpoints.** Momentum and AdamW moments are DTensors like the parameters, so DCP
   reshards them if the mesh changes; the block plan is rebuilt from the global shapes.
 - **Resume.** `state_dict()` includes momentum, moments and algorithm hyperparameters in
-  the parameter groups. `load_state_dict()` restores checkpoint values. Legacy checkpoints
-  without the new metadata fall back to configured values with a warning. The training
+  the parameter groups. `load_state_dict()` restores checkpoint values. The training
   entry point explicitly reapplies the configured hyperparameters via
   `restore_optimizer_config`; the scheduler keeps its position and uses configured base
   LRs, including on the first resumed step. Loading a base model with optimizer state

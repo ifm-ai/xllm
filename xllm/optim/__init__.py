@@ -2,7 +2,7 @@
 from importlib import import_module
 
 
-__all__ = ["rescale_grads", "build_optimizer", "build_lr_scheduler", "restore_optimizer_config", "MuonLoadPlanner"]
+__all__ = ["rescale_grads", "build_optimizer", "build_lr_scheduler", "restore_optimizer_config"]
 
 
 def __getattr__(name):
