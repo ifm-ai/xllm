@@ -30,7 +30,6 @@ Example: wk [8, 4] in 2 row Blocks of 4 rows on 3 ranks (torch.chunk: rows 0-2, 
 """
 import math
 from collections import defaultdict
-from dataclasses import dataclass
 from logging import getLogger
 import re
 from typing import Dict, List, Optional, Tuple
@@ -43,11 +42,12 @@ from torch.optim import Optimizer
 from torch.optim.adamw import adamw
 
 from xllm.config import OptimConf
+from .muon_spec import Block, MuonSpec, muon_spec, register_muon
 
 
 logger = getLogger()
 
-# Newton-Schulz 5 steps with per-step coefficients (same as microsoft/dion)
+# Newton-Schulz 5 steps with per-step coefficients (microsoft/dion's zeropower_via_newtonschulz5; dion's default is Polar Express)
 NS_COEFFS = (
     (4.0848, -6.8946, 2.9270),
     (3.9505, -6.3029, 2.6377),
@@ -58,114 +58,6 @@ NS_COEFFS = (
 
 Box = Tuple[int, int, int, int]  # rows [r0, r1) x cols [c0, c1) of a matrix
 
-
-@dataclass
-class Block:
-    """Box [r0, r1) x [c0, c1) of a Muon weight that Newton-Schulz orthogonalizes on its own (one or
-    more heads, one expert, or the whole weight), and the fan_out x fan_in of the matrix it is."""
-    r0: int
-    r1: int
-    c0: int
-    c1: int
-    fan_out: int
-    fan_in: int
-    param: int = -1  # index of its weight in the optimizer
-    owner: int = 0  # rank that gathers the block and runs Newton-Schulz on it
-
-    @property
-    def shape(self) -> Tuple[int, int]:
-        return self.r1 - self.r0, self.c1 - self.c0
-
-
-# ---- registration: which weights use Muon, and how their dims map to Newton-Schulz matrices ----
-
-@dataclass
-class MuonSpec:
-    """How a weight maps to Newton-Schulz matrices (see register_muon)."""
-    dims: Tuple[Tuple[str, ...], ...]  # axis names of tensor dims 0 and 1, outer first
-    fan_out: Tuple[str, ...]  # axes of the matrix rows, innermost in their dim
-    fan_in: Tuple[str, ...]  # axes of the matrix columns, innermost in their dim
-    sizes: Dict[str, int]  # sizes of the inner axes; each dim's outermost axis is inferred
-    tp_dim: Optional[int] = None  # dim split over the tensor-parallel group, at its outermost axis
-
-    def __post_init__(self):
-        axes = [a for dim in self.dims for a in dim]
-        assert len(self.dims) == 2 and all(self.dims), f"names {len(self.dims)} dims, needs 2"
-        assert len(set(axes)) == len(axes), "repeated axis name"
-        fan_dims = [d for fan in (self.fan_out, self.fan_in) for d, dim in enumerate(self.dims)
-                    if dim[len(dim) - len(fan):] == fan]
-        assert sorted(fan_dims) == [0, 1], "fan_out and fan_in must be the innermost axes of different dims"
-        assert set(self.sizes) <= set(axes), f"sizes of unknown axes {sorted(set(self.sizes) - set(axes))}"
-        for d, dim in enumerate(self.dims):
-            assert dim[0] not in self.sizes, f"{dim[0]!r} is the outer axis of dim {d} and is inferred; give inner sizes"
-            assert set(dim[1:]) <= set(self.sizes), f"give the sizes of {[a for a in dim[1:] if a not in self.sizes]}"
-
-    def __str__(self) -> str:
-        return " ".join(f"({' '.join(dim)})" if len(dim) > 1 else dim[0] for dim in self.dims)
-
-    def fans(self, shape: Tuple[int, int]) -> Tuple[int, int]:
-        """fan_out x fan_in of the whole weight, Block axes included."""
-        d = 0 if self.fan_out[0] in self.dims[0] else 1
-        return shape[d], shape[1 - d]
-
-    def global_shape(self, shape: Tuple[int, int], tp: int) -> Tuple[int, int]:
-        """The shape of the whole weight, from one tensor-parallel rank's shape."""
-        return tuple(n * tp if d == self.tp_dim else n for d, n in enumerate(shape))
-
-    def blocks(self, shape: Tuple[int, int]) -> List[Block]:
-        """The Blocks of a weight of this shape, row-major over the Block axes."""
-        size = dict(self.sizes)
-        for d, dim in enumerate(self.dims):
-            inner = math.prod(self.sizes[a] for a in dim[1:])
-            assert shape[d] % inner == 0, f"dim {d} ({shape[d]}) is not a multiple of {[self.sizes[a] for a in dim[1:]]}"
-            size[dim[0]] = shape[d] // inner
-        fans = self.fan_out + self.fan_in
-        ranges = []
-        for dim in self.dims:
-            span = math.prod(size[a] for a in dim if a in fans)
-            starts = [0]
-            for a in (a for a in dim if a not in fans):
-                starts = [s * size[a] + i for s in starts for i in range(size[a])]
-            ranges.append([(s * span, (s + 1) * span) for s in starts])
-        fan_out, fan_in = math.prod(size[a] for a in self.fan_out), math.prod(size[a] for a in self.fan_in)
-        return [Block(r0, r1, c0, c1, fan_out, fan_in) for r0, r1 in ranges[0] for c0, c1 in ranges[1]]
-
-
-def _parse_layout(layout: str) -> Tuple[Tuple[str, ...], ...]:
-    """"(h d) m" -> (("h", "d"), ("m",))"""
-    groups = re.findall(r"\(([^()]*)\)|([^\s()]+)", layout)
-    assert layout.count("(") == layout.count(")") == sum(bool(g) for g, _ in groups), "unbalanced parentheses"
-    return tuple(tuple((group or axis).split()) for group, axis in groups)
-
-
-def muon_spec(layout: str = "o i", *, fan_out: str = "o", fan_in: str = "i", tp_dim: Optional[int] = None,
-              **sizes: int) -> MuonSpec:
-    """A MuonSpec from a layout (see register_muon), e.g. muon_spec("(h d) m", fan_out="d", fan_in="m", d=64)."""
-    return MuonSpec(_parse_layout(layout), tuple(fan_out.split()), tuple(fan_in.split()), sizes, tp_dim)
-
-
-def register_muon(module: nn.Module, name: str = "weight", layout: str = "o i", *,
-                  fan_out: str = "o", fan_in: str = "i", **sizes: int):
-    """Mark module.<name> as a Muon weight; call it in the module's __init__.
-
-    layout: the axes of the weight's two dims, named as the forward rearranges them (parentheses
-        flatten several axes into one dim, outer first). Default: an [out, in] weight, one matrix.
-    fan_out / fan_in: the axes of the Newton-Schulz matrix rows / columns, innermost in their dim;
-        every other axis indexes separate Blocks.
-    sizes: the sizes of the inner axes; each dim's outermost axis is inferred from the shape.
-
-    The module declares the dim tensor parallelism splits: module.tp_dims[name] (None: not split).
-    """
-    param = getattr(module, name)
-    where = f"{type(module).__name__}.{name} {list(param.shape)} {layout!r}"
-    assert param.dim() == 2, f"{where}: Muon needs a 2-D parameter"
-    assert name in getattr(module, "tp_dims", {}), f"{where}: the module must declare tp_dims[{name!r}] (None if not split)"
-    try:
-        spec = muon_spec(layout, fan_out=fan_out, fan_in=fan_in, tp_dim=module.tp_dims[name], **sizes)
-        spec.blocks(tuple(param.shape))
-    except AssertionError as e:
-        raise AssertionError(f"{where}: {e}") from None
-    vars(module).setdefault("muon_specs", {})[name] = spec
 
 
 def split_muon_params(model: nn.Module):
@@ -249,39 +141,44 @@ class Muon(Optimizer):
         super().__init__(
             [
                 dict(params=muon_params, lr=cfg.muon_lr, algorithm="muon",
+                     momentum=cfg.muon_momentum, nesterov=cfg.muon_nesterov,
+                     adjust_lr=cfg.muon_adjust_lr, block_scale=cfg.muon_block_scale,
                      weight_decay=cfg.weight_decay if cfg.muon_weight_decay is None else cfg.muon_weight_decay),
-                dict(params=adamw_params, lr=cfg.lr, algorithm="adamw"),
+                dict(params=adamw_params, lr=cfg.lr, algorithm="adamw", betas=(cfg.beta1, cfg.beta2)),
             ],
             defaults,
         )
-        self.momentum = cfg.muon_momentum
-        self.nesterov = cfg.muon_nesterov
-        self.adjust_lr = cfg.muon_adjust_lr
-        self.block_scale = cfg.muon_block_scale
-        self.betas = (cfg.beta1, cfg.beta2)
         self.process_group = mesh.get_group()
         self.world = mesh.size()
         self.rank = mesh.get_local_rank()
         self._plan([tuple(p.shape) for p in muon_params], specs)
 
     def load_state_dict(self, state_dict):
-        """Reload momentum and AdamW moments, but keep the configured hyperparameters: the groups'
-        weight decay and epsilon come from the config, not the checkpoint, so a run can resume with
-        new values. LRs follow the scheduler, whose base LRs also come from the config (train.py
-        set_optim_state); momentum, Nesterov, betas and the update scale are set from the config
-        and never saved. DCP's set_optimizer_state_dict ends in this method too."""
-        configured = [{k: g[k] for k in ("weight_decay", "eps", "initial_lr") if k in g} for g in self.param_groups]
-        super().load_state_dict(state_dict)
-        for group, values in zip(self.param_groups, configured):
-            changed = {k: (group.get(k), v) for k, v in values.items() if group.get(k) != v}
-            if changed:
-                logger.info(f"Muon {group['algorithm']} group: configured values replace the checkpoint's (old, new): {changed}")
-            group.update(values)
+        """Restore checkpoint hyperparameters; fill metadata absent from legacy checkpoints."""
+        migrated = dict(state_dict)
+        migrated["param_groups"] = []
+        for saved in state_dict["param_groups"]:
+            group = dict(saved)
+            # Older Muon checkpoints did not serialize these hyperparameters.
+            configured = next(g for g in self.param_groups if g["algorithm"] == group["algorithm"])
+            keys = ("momentum", "nesterov", "adjust_lr", "block_scale") if group["algorithm"] == "muon" else ("betas",)
+            missing = [key for key in keys if key not in group]
+            if missing:
+                logger.warning(f"Legacy Muon {group['algorithm']} checkpoint lacks {missing}; using configured values.")
+            for key in missing:
+                group[key] = configured[key]
+            migrated["param_groups"].append(group)
+        return super().load_state_dict(migrated)
 
     # ---- plan: built once from the global shapes, identical on every rank ----
 
     def _plan(self, shapes: List[Tuple[int, int]], specs: List[MuonSpec]):
-        self.fans = [spec.fans(shape) for spec, shape in zip(specs, shapes)]
+        # Geometry is fixed; scale policy comes from the current param group,
+        # including after a checkpoint restore or an explicit config override.
+        self._fans = {
+            mode: [spec.fans(shape, per_block=mode == "block") for spec, shape in zip(specs, shapes)]
+            for mode in ("block", "matrix")
+        }
         self.blocks: List[Block] = []
         for i, (spec, shape) in enumerate(zip(specs, shapes)):
             for b in spec.blocks(shape):
@@ -334,12 +231,12 @@ class Muon(Optimizer):
         m, n = b.shape
         return m * n * min(m, n)
 
-    def _scale(self, b: Block) -> float:
-        """Update scale of block b, from its own fans or from its whole weight's."""
-        fan_out, fan_in = (b.fan_out, b.fan_in) if self.block_scale == "block" else self.fans[b.param]
-        if self.adjust_lr == "spectral_norm":
+    @staticmethod
+    def _scale(fan_out: int, fan_in: int, adjust_lr: Optional[str]) -> float:
+        """Update scale of a fan_out x fan_in matrix (one Block's, or with muon_block_scale=matrix the weight's)."""
+        if adjust_lr == "spectral_norm":
             return math.sqrt(fan_out / fan_in)
-        if self.adjust_lr == "rms_norm":
+        if adjust_lr == "rms_norm":
             return 0.2 * math.sqrt(max(fan_out, fan_in))
         return 1.0
 
@@ -358,16 +255,19 @@ class Muon(Optimizer):
             out.append([t.view(shape) for t, shape in zip(chunk.split([m * n for m, n in shapes]), shapes)])
         return out
 
-    def _momentum(self, p: Tensor) -> Tensor:
+    def _momentum(self, p: Tensor, group: Dict) -> Tensor:
         """Momentum update on the local shard; returns the bf16 update direction."""
+        # Keep the fixed communication plan, but do not create or decay state for
+        # a parameter without a gradient (the same semantics as AdamW).
+        if p.grad is None:
+            return torch.zeros_like(_local(p), dtype=torch.bfloat16)
         state = self.state[p]
         if "momentum" not in state:
             state["momentum"] = torch.zeros_like(p, dtype=torch.float32)
         m = _local(state["momentum"])
-        # every rank must take part in the exchange, so a missing grad counts as zero
-        g = _local(p.grad) if p.grad is not None else torch.zeros_like(m)
-        m.mul_(self.momentum).add_(g)
-        u = g + self.momentum * m if self.nesterov else m
+        g = _local(p.grad)
+        m.mul_(group["momentum"]).add_(g)
+        u = g + group["momentum"] * m if group["nesterov"] else m
         return u.to(torch.bfloat16)
 
     def _gather(self, updates: List[Tensor]) -> List[Tensor]:
@@ -391,14 +291,15 @@ class Muon(Optimizer):
     @torch.no_grad()
     def _muon_step(self, group: Dict):
         params, lr, wd = group["params"], group["lr"], group["weight_decay"]
-        updates = [self._momentum(p) for p in params]                      # 1. local shards
+        updates = [self._momentum(p, group) for p in params]                      # 1. local shards
         gathered = self._gather(updates)                                   # 2. whole owned blocks
-        results = [o * self._scale(self.blocks[k])                         # 3. Newton-Schulz + scale
-                   for k, o in zip(self.owned, orthogonalize(gathered, group["eps"]))]
-        self._scatter(results, updates)                                    # 4. back to the shards
-        for p, u in zip(params, updates):
+        self._scatter(orthogonalize(gathered, group["eps"]), updates)      # 3. Newton-Schulz, 4. back
+        scales = [self._scale(*fans, group["adjust_lr"]) for fans in self._fans[group["block_scale"]]]
+        for p, u, scale in zip(params, updates, scales):              # 5. scaled update in fp32
+            if p.grad is None:
+                continue
             x = _local(p)
-            x.mul_(1 - lr * wd).add_(u.to(x.dtype), alpha=-lr)
+            x.mul_(1 - lr * wd).add_(u.to(x.dtype), alpha=-lr * scale)
 
     @torch.no_grad()
     def _adamw_step(self, group: Dict):
@@ -411,17 +312,22 @@ class Muon(Optimizer):
                 state["exp_avg"] = torch.zeros_like(p, dtype=torch.float32)
                 state["exp_avg_sq"] = torch.zeros_like(p, dtype=torch.float32)
         adamw(params, [p.grad for p in params], [s["exp_avg"] for s in states], [s["exp_avg_sq"] for s in states],
-              [], [s["step"] for s in states], foreach=True, amsgrad=False, beta1=self.betas[0],
-              beta2=self.betas[1], lr=group["lr"], weight_decay=group["weight_decay"], eps=group["eps"],
+              [], [s["step"] for s in states], foreach=True, amsgrad=False, beta1=group["betas"][0],
+              beta2=group["betas"][1], lr=group["lr"], weight_decay=group["weight_decay"], eps=group["eps"],
               maximize=False)
 
     @torch.no_grad()
     def step(self, closure=None):
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
         for group in self.param_groups:
             if group["algorithm"] == "muon":
                 self._muon_step(group)
             else:
                 self._adamw_step(group)
+        return loss
 
 
 def _pattern(fqn: str) -> str:
@@ -446,9 +352,9 @@ def build_muon(model: nn.Module, mesh: DeviceMesh, cfg: OptimConf) -> Optimizer:
     muon_params, specs, names, adamw_params = split_muon_params(model)
     lines = []
     for name, spec, p in zip(names, specs, muon_params):
-        b = spec.blocks(tuple(p.shape))
-        lines.append(f"Muon {name} {list(p.shape)} {str(spec)!r}: {len(b)} blocks of fan_out {b[0].fan_out} x "
-                     f"fan_in {b[0].fan_in}, tp_dim {spec.tp_dim}")
+        fan_out, fan_in = spec.fans(tuple(p.shape), per_block=True)
+        lines.append(f"Muon {name} {list(p.shape)} {str(spec)!r}: {len(spec.blocks(tuple(p.shape)))} blocks of "
+                     f"fan_out {fan_out} x fan_in {fan_in}, tp_dim {spec.tp_dim}")
     for line in dict.fromkeys(lines):  # one line per kind of weight, e.g. layers.*.attention.wq.weight
         logger.info(line)
     _warn_unregistered(model, {id(p) for p in muon_params})
