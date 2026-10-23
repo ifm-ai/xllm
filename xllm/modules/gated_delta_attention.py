@@ -30,6 +30,7 @@ from xllm.modules.fused_ops import (
     memory_efficient_dropout,
 )
 from xllm.utils import get_init_fn
+from xllm.optim.muon import register_muon
 
 
 class GatedDeltaAttention(nn.Module):
@@ -247,12 +248,15 @@ class GatedDeltaAttention(nn.Module):
             num_features=hdim, eps=rmsnorm_eps, init_std=init_std
         )
 
-        # Muon row blocks (xllm/optim/muon.py): one per head (a q head holds both softdelta queries)
-        self.wq.muon = self.wr.muon = self.local_heads
-        self.wk.muon = self.wv.muon = self.local_kv_heads
-        self.wo.muon = 1
+        # Muon (xllm/optim/muon.py): one Newton-Schulz block per head (a q head holds both softdelta
+        # queries); wo and wg are whole matrices
+        register_muon(self.wq, layout="(h k d) m", fan_out="k d", fan_in="m", k=nq, d=self.head_dim)
+        register_muon(self.wk, layout="(h d) m", fan_out="d", fan_in="m", d=self.head_dim)
+        for w in (self.wv, self.wr):
+            register_muon(w, layout="(h d) m", fan_out="d", fan_in="m", d=self.v_head_dim)
+        register_muon(self.wo)
         if self.wg is not None:
-            self.wg.muon = 1
+            register_muon(self.wg)
 
     def _receive_prev_count(self, x, bos_mask):
         bsz, seq_len, _ = x.size()

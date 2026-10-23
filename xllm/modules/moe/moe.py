@@ -21,6 +21,7 @@ from xllm.modules.layer_norm import GroupLayerNorm
 from xllm.modules.rms_norm import GroupRMSNorm
 from xllm.modules.residual import build_residual
 from xllm.utils import get_init_fn
+from xllm.optim.muon import register_muon
 from .router import TopKRouter
 from .expert import Expert
 from .permute import fused_permute_y
@@ -136,6 +137,9 @@ class NormalizedMoE(nn.Module):
             init_method=init_fn
         ) if ffn_hidden_dim > 0 else None
 
+        for fc in (self.fc1, self.fc2, self.fc3):
+            if fc is not None:
+                register_muon(fc)  # Muon, shared experts as whole matrices (xllm/optim/muon.py)
         self.residual = build_residual(
             residual_func, 2 * layer_id + 2, model_dim, num_heads=residual_heads,
             num_features=model_dim, eps=rmsnorm_eps, init_std=init_std

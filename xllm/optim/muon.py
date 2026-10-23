@@ -1,20 +1,20 @@
 """Muon on FSDP2 with per-head orthogonalization.
 
-Which weights use Muon: a model marks a linear layer with a `muon` attribute, and that
-layer's weight goes to Muon; everything unmarked goes to AdamW.
+Modules register their Muon weights in __init__; everything else goes to AdamW:
 
-    linear.muon = n    Muon; its rows are cut into n equal blocks, each orthogonalized on
-                       its own: 1 = whole matrix, the number of heads = one block per head,
-                       in between = blocks of adjacent heads.
+    register_muon(self.wo)                                                                 # one matrix
+    register_muon(self.wk, layout="(h d) m", fan_out="d", fan_in="m", d=self.head_dim)    # one block per head
+    register_muon(self.wk, layout="(h d) m", fan_out="h d", fan_in="m", d=self.head_dim)  # all heads, one matrix
+    register_muon(self, "weight1", "(n s) d", fan_out="s", fan_in="d", s=self.inter_dim)   # one block per expert
 
-The mark sits on the layer, not on the weight tensor: FSDP2 and Module._apply (.cuda(), .to())
+The spec sits on the module, not on the weight tensor: FSDP2 and Module._apply (.cuda(), .to())
 replace or swap DTensor parameters and drop attributes set on them.
 
 Terminology, for one Muon matrix W of shape [rows, cols]:
 
 - Block: a box W[r0:r1, c0:c1] that Newton-Schulz orthogonalizes on its own; the Blocks of
   a matrix tile it exactly once. Chosen from the model, not from the sharding (the whole
-  matrix, or one or more heads of wq / wk / wv / wr; a mark gives row Blocks).
+  matrix, one or more heads of wq / wk / wv / wr, one expert).
 - region: the box of W that one rank stores. FSDP2 Shard(0) stores contiguous row ranges
   with all columns, one per rank (torch.chunk).
 - owner: the rank that gathers a Block and runs NS on it: the rank that stores most of
@@ -22,18 +22,18 @@ Terminology, for one Muon matrix W of shape [rows, cols]:
 - slice: the overlap of a Block with one rank's region, a box. A Block is assembled from
   its slices.
 
-Example: wk [8, 4] with wk.muon = 2 on 3 ranks (torch.chunk: rows 0-2, 3-5, 6-7):
+Example: wk [8, 4] in 2 row Blocks of 4 rows on 3 ranks (torch.chunk: rows 0-2, 3-5, 6-7):
 
     rank 0  rows 0-2  a          block 0 = rows 0-3 = cat(a, b1), owner rank 0 (stores 3 rows)
     rank 1  rows 3-5  b1 | b2    block 1 = rows 4-7 = cat(b2, c), owner rank 1 (tie with rank 2)
     rank 2  rows 6-7  c          b1 and b2 are rank 1's slices of blocks 0 and 1
 """
-import itertools
 import math
 from collections import defaultdict
 from dataclasses import dataclass
 from logging import getLogger
-from typing import Dict, List, Tuple
+import re
+from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.distributed as dist
@@ -61,13 +61,15 @@ Box = Tuple[int, int, int, int]  # rows [r0, r1) x cols [c0, c1) of a matrix
 
 @dataclass
 class Block:
-    """Box [r0, r1) x [c0, c1) of Muon matrix `param` (one or more heads, or the whole matrix);
-    Newton-Schulz orthogonalizes it on its own."""
-    param: int
+    """Box [r0, r1) x [c0, c1) of a Muon weight that Newton-Schulz orthogonalizes on its own (one or
+    more heads, one expert, or the whole weight), and the fan_out x fan_in of the matrix it is."""
     r0: int
     r1: int
     c0: int
     c1: int
+    fan_out: int
+    fan_in: int
+    param: int = -1  # index of its weight in the optimizer
     owner: int = 0  # rank that gathers the block and runs Newton-Schulz on it
 
     @property
@@ -75,29 +77,107 @@ class Block:
         return self.r1 - self.r0, self.c1 - self.c0
 
 
-def row_blocks(shape: Tuple[int, int], n: int) -> List[Box]:
-    """The Blocks of a mark n: n equal row ranges, all columns."""
-    rows, cols = shape
-    assert rows % n == 0, (shape, n)
-    size = rows // n
-    return [(s, s + size, 0, cols) for s in range(0, rows, size)]
+# ---- registration: which weights use Muon, and how their dims map to Newton-Schulz matrices ----
+
+@dataclass
+class MuonSpec:
+    """How a weight maps to Newton-Schulz matrices (see register_muon)."""
+    dims: Tuple[Tuple[str, ...], ...]  # axis names of tensor dims 0 and 1, outer first
+    fan_out: Tuple[str, ...]  # axes of the matrix rows, innermost in their dim
+    fan_in: Tuple[str, ...]  # axes of the matrix columns, innermost in their dim
+    sizes: Dict[str, int]  # sizes of the inner axes; each dim's outermost axis is inferred
+    tp_dim: Optional[int] = None  # dim split over the tensor-parallel group, at its outermost axis
+
+    def __post_init__(self):
+        axes = [a for dim in self.dims for a in dim]
+        assert len(self.dims) == 2 and all(self.dims), f"names {len(self.dims)} dims, needs 2"
+        assert len(set(axes)) == len(axes), "repeated axis name"
+        fan_dims = [d for fan in (self.fan_out, self.fan_in) for d, dim in enumerate(self.dims)
+                    if dim[len(dim) - len(fan):] == fan]
+        assert sorted(fan_dims) == [0, 1], "fan_out and fan_in must be the innermost axes of different dims"
+        assert set(self.sizes) <= set(axes), f"sizes of unknown axes {sorted(set(self.sizes) - set(axes))}"
+        for d, dim in enumerate(self.dims):
+            assert dim[0] not in self.sizes, f"{dim[0]!r} is the outer axis of dim {d} and is inferred; give inner sizes"
+            assert set(dim[1:]) <= set(self.sizes), f"give the sizes of {[a for a in dim[1:] if a not in self.sizes]}"
+
+    def __str__(self) -> str:
+        return " ".join(f"({' '.join(dim)})" if len(dim) > 1 else dim[0] for dim in self.dims)
+
+    def fans(self, shape: Tuple[int, int]) -> Tuple[int, int]:
+        """fan_out x fan_in of the whole weight, Block axes included."""
+        d = 0 if self.fan_out[0] in self.dims[0] else 1
+        return shape[d], shape[1 - d]
+
+    def global_shape(self, shape: Tuple[int, int], tp: int) -> Tuple[int, int]:
+        """The shape of the whole weight, from one tensor-parallel rank's shape."""
+        return tuple(n * tp if d == self.tp_dim else n for d, n in enumerate(shape))
+
+    def blocks(self, shape: Tuple[int, int]) -> List[Block]:
+        """The Blocks of a weight of this shape, row-major over the Block axes."""
+        size = dict(self.sizes)
+        for d, dim in enumerate(self.dims):
+            inner = math.prod(self.sizes[a] for a in dim[1:])
+            assert shape[d] % inner == 0, f"dim {d} ({shape[d]}) is not a multiple of {[self.sizes[a] for a in dim[1:]]}"
+            size[dim[0]] = shape[d] // inner
+        fans = self.fan_out + self.fan_in
+        ranges = []
+        for dim in self.dims:
+            span = math.prod(size[a] for a in dim if a in fans)
+            starts = [0]
+            for a in (a for a in dim if a not in fans):
+                starts = [s * size[a] + i for s in starts for i in range(size[a])]
+            ranges.append([(s * span, (s + 1) * span) for s in starts])
+        fan_out, fan_in = math.prod(size[a] for a in self.fan_out), math.prod(size[a] for a in self.fan_in)
+        return [Block(r0, r1, c0, c1, fan_out, fan_in) for r0, r1 in ranges[0] for c0, c1 in ranges[1]]
+
+
+def _parse_layout(layout: str) -> Tuple[Tuple[str, ...], ...]:
+    """"(h d) m" -> (("h", "d"), ("m",))"""
+    groups = re.findall(r"\(([^()]*)\)|([^\s()]+)", layout)
+    assert layout.count("(") == layout.count(")") == sum(bool(g) for g, _ in groups), "unbalanced parentheses"
+    return tuple(tuple((group or axis).split()) for group, axis in groups)
+
+
+def muon_spec(layout: str = "o i", *, fan_out: str = "o", fan_in: str = "i", tp_dim: Optional[int] = None,
+              **sizes: int) -> MuonSpec:
+    """A MuonSpec from a layout (see register_muon), e.g. muon_spec("(h d) m", fan_out="d", fan_in="m", d=64)."""
+    return MuonSpec(_parse_layout(layout), tuple(fan_out.split()), tuple(fan_in.split()), sizes, tp_dim)
+
+
+def register_muon(module: nn.Module, name: str = "weight", layout: str = "o i", *,
+                  fan_out: str = "o", fan_in: str = "i", **sizes: int):
+    """Mark module.<name> as a Muon weight; call it in the module's __init__.
+
+    layout: the axes of the weight's two dims, named as the forward rearranges them (parentheses
+        flatten several axes into one dim, outer first). Default: an [out, in] weight, one matrix.
+    fan_out / fan_in: the axes of the Newton-Schulz matrix rows / columns, innermost in their dim;
+        every other axis indexes separate Blocks.
+    sizes: the sizes of the inner axes; each dim's outermost axis is inferred from the shape.
+
+    The module declares the dim tensor parallelism splits: module.tp_dims[name] (None: not split).
+    """
+    param = getattr(module, name)
+    where = f"{type(module).__name__}.{name} {list(param.shape)} {layout!r}"
+    assert param.dim() == 2, f"{where}: Muon needs a 2-D parameter"
+    assert name in getattr(module, "tp_dims", {}), f"{where}: the module must declare tp_dims[{name!r}] (None if not split)"
+    try:
+        spec = muon_spec(layout, fan_out=fan_out, fan_in=fan_in, tp_dim=module.tp_dims[name], **sizes)
+        spec.blocks(tuple(param.shape))
+    except AssertionError as e:
+        raise AssertionError(f"{where}: {e}") from None
+    vars(module).setdefault("muon_specs", {})[name] = spec
 
 
 def split_muon_params(model: nn.Module):
-    """Weights of layers marked with a `muon` attribute go to Muon; everything else goes to AdamW.
-
-    Returns the Muon params, the number of row blocks of each (its mark), and the AdamW params.
-    """
-    marks = {id(m.weight): m.muon for m in model.modules() if hasattr(m, "muon")}
-    muon_params, n_blocks, adamw_params = [], [], []
-    for p in model.parameters():
-        mark = marks.get(id(p))
-        if mark is None:
-            adamw_params.append(p)
-            continue
-        muon_params.append(p)
-        n_blocks.append(mark)
-    return muon_params, n_blocks, adamw_params
+    """Registered weights go to Muon, everything else to AdamW. Call it after wrapping: the weights
+    are looked up by name. Returns the Muon params, their specs and names, and the AdamW params."""
+    registered = {id(getattr(m, name)): (spec, _pattern(f"{fqn}.{name}".lstrip(".")))
+                  for fqn, m in model.named_modules() for name, spec in vars(m).get("muon_specs", {}).items()}
+    muon_params = [p for p in model.parameters() if id(p) in registered]
+    adamw_params = [p for p in model.parameters() if id(p) not in registered]
+    specs = [registered[id(p)][0] for p in muon_params]
+    names = [registered[id(p)][1] for p in muon_params]
+    return muon_params, specs, names, adamw_params
 
 
 def _local(t: Tensor) -> Tensor:
@@ -159,13 +239,12 @@ class Muon(Optimizer):
     def __init__(
         self,
         muon_params: List[nn.Parameter],
-        blocks: List[List[Box]],
+        specs: List[MuonSpec],
         adamw_params: List[nn.Parameter],
         mesh: DeviceMesh,
         cfg: OptimConf,
     ):
-        """blocks[i]: the boxes of muon_params[i] (global coordinates) that tile it, each
-        orthogonalized on its own; row_blocks(shape, n) for a mark n."""
+        """specs[i]: how muon_params[i] maps to Newton-Schulz matrices (register_muon / muon_spec)."""
         defaults = dict(weight_decay=cfg.weight_decay, eps=cfg.epsilon)
         super().__init__(
             [
@@ -183,7 +262,7 @@ class Muon(Optimizer):
         self.process_group = mesh.get_group()
         self.world = mesh.size()
         self.rank = mesh.get_local_rank()
-        self._plan([tuple(p.shape) for p in muon_params], blocks)
+        self._plan([tuple(p.shape) for p in muon_params], specs)
 
     def load_state_dict(self, state_dict):
         """Reload momentum and AdamW moments, but keep the configured hyperparameters: the groups'
@@ -201,15 +280,13 @@ class Muon(Optimizer):
 
     # ---- plan: built once from the global shapes, identical on every rank ----
 
-    def _plan(self, shapes: List[Tuple[int, int]], boxes: List[List[Box]]):
-        self.shapes = shapes
-        for i, ((rows, cols), matrix_boxes) in enumerate(zip(shapes, boxes)):
-            for r0, r1, c0, c1 in matrix_boxes:
-                assert 0 <= r0 < r1 <= rows and 0 <= c0 < c1 <= cols, (i, shapes[i], (r0, r1, c0, c1))
-            assert sum((r1 - r0) * (c1 - c0) for r0, r1, c0, c1 in matrix_boxes) == rows * cols and not any(
-                _overlap(a, b) for a, b in itertools.combinations(matrix_boxes, 2)
-            ), f"the blocks of Muon matrix {i} {shapes[i]} must tile it exactly once"
-        self.blocks: List[Block] = [Block(i, *box) for i, matrix_boxes in enumerate(boxes) for box in matrix_boxes]
+    def _plan(self, shapes: List[Tuple[int, int]], specs: List[MuonSpec]):
+        self.fans = [spec.fans(shape) for spec, shape in zip(specs, shapes)]
+        self.blocks: List[Block] = []
+        for i, (spec, shape) in enumerate(zip(specs, shapes)):
+            for b in spec.blocks(shape):
+                b.param = i
+                self.blocks.append(b)
 
         # regions[i][r]: the box of matrix i that rank r stores
         regions = [self._regions(shape) for shape in shapes]
@@ -258,8 +335,8 @@ class Muon(Optimizer):
         return m * n * min(m, n)
 
     def _scale(self, b: Block) -> float:
-        """Update scale of block b, from its own shape or from its whole matrix's shape."""
-        fan_out, fan_in = b.shape if self.block_scale == "block" else self.shapes[b.param]
+        """Update scale of block b, from its own fans or from its whole weight's."""
+        fan_out, fan_in = (b.fan_out, b.fan_in) if self.block_scale == "block" else self.fans[b.param]
         if self.adjust_lr == "spectral_norm":
             return math.sqrt(fan_out / fan_in)
         if self.adjust_lr == "rms_norm":
@@ -347,12 +424,36 @@ class Muon(Optimizer):
                 self._adamw_step(group)
 
 
+def _pattern(fqn: str) -> str:
+    """layers.3.attention.wq.weight -> layers.*.attention.wq.weight"""
+    return re.sub(r"(?<![^.])\d+(?=\.|$)", "*", fqn)
+
+
+def _warn_unregistered(model: nn.Module, muon_ids: set):
+    """2-D weights of tensor-parallel layers in the blocks that are not registered use AdamW: say which."""
+    missed = defaultdict(int)
+    for fqn, m in model.named_modules():
+        for name in getattr(m, "tp_dims", None) or {}:
+            p = getattr(m, name, None)
+            if "layers." in fqn and isinstance(p, nn.Parameter) and p.dim() == 2 and id(p) not in muon_ids:
+                missed[_pattern(f"{fqn}.{name}")] += 1
+    if missed:
+        logger.warning(f"Muon: unregistered weights use AdamW: {dict(missed)}")
+
+
 def build_muon(model: nn.Module, mesh: DeviceMesh, cfg: OptimConf) -> Optimizer:
     """`mesh` is the FSDP mesh; Muon works over its shard dimension."""
-    muon_params, n_blocks, adamw_params = split_muon_params(model)
-    blocks = [row_blocks(tuple(p.shape), n) for p, n in zip(muon_params, n_blocks)]
+    muon_params, specs, names, adamw_params = split_muon_params(model)
+    lines = []
+    for name, spec, p in zip(names, specs, muon_params):
+        b = spec.blocks(tuple(p.shape))
+        lines.append(f"Muon {name} {list(p.shape)} {str(spec)!r}: {len(b)} blocks of fan_out {b[0].fan_out} x "
+                     f"fan_in {b[0].fan_in}, tp_dim {spec.tp_dim}")
+    for line in dict.fromkeys(lines):  # one line per kind of weight, e.g. layers.*.attention.wq.weight
+        logger.info(line)
+    _warn_unregistered(model, {id(p) for p in muon_params})
     shard_mesh = mesh if mesh.ndim == 1 else mesh["dp"]
-    optimizer = Muon(muon_params, blocks, adamw_params, shard_mesh, cfg)
+    optimizer = Muon(muon_params, specs, adamw_params, shard_mesh, cfg)
     logger.info(f"Muon: {len(muon_params)} matrices / {len(optimizer.blocks)} blocks (scale={cfg.muon_block_scale}) / "
                 f"{sum(p.numel() for p in muon_params)} params; AdamW: {len(adamw_params)} tensors / "
                 f"{sum(p.numel() for p in adamw_params)} params")
