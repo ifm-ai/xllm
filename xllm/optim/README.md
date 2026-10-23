@@ -4,7 +4,7 @@
 
 ## Muon on FSDP2
 
-`xllm/optim/muon.py`. Requires `--model.ddp_backend fsdp2`, CP = 1, no MoE (experts are registered, not yet run) and
+`xllm/optim/muon.py`. Requires `--model.ddp_backend fsdp2`, no MoE (experts are registered, not yet run) and
 `--dcp_for_optimizer true` (the optimizer state is sharded like the parameters).
 
 - **Parameters.** A module registers the weights Muon updates in its `__init__` with
@@ -14,7 +14,7 @@
   `--optim.muon_weight_decay` (default: the same value). Attention, the FFN, MoE experts and
   shared experts register their projections; linear layers in the blocks that are not
   registered are listed in a warning when the optimizer is built.
-- **Registration API.** Import `register_muon` from `xllm.optim.muon_spec`; model construction does not import the optimizer runtime. Expert layouts and arbitrary block grids describe internal geometry; this release supports dense training with CP=1 and any TP.
+- **Registration API.** Import `register_muon` from `xllm.optim.muon_spec`; model construction does not import the optimizer runtime. Expert layouts and arbitrary block grids describe internal geometry; this release supports dense training with any TP and CP.
 - **Blocks.** A registration names the axes of the weight's two dims as the forward
   rearranges them, which axes form the Newton-Schulz matrix, and the sizes of the inner axes:
 
@@ -43,6 +43,10 @@
   The same two all-to-alls run over the plane of the dp mesh x TP group, every block is
   orthogonalized once by its owner, and update scales use the whole weight's shape. Optimizer state
   is per TP rank, like the parameters.
+- **Context parallelism and replicas.** Weights are replicated over context-parallel ranks (they sit on the
+  replicate dim of the FSDP mesh, with any pure data-parallel replicas), and FSDP2 all-reduces the gradients
+  over that dim. Each replica group therefore runs the same Muon step on the same gradients over its own
+  shard group (`mesh["dp"]`); the optimizer needs nothing else for CP.
 - **Mesh.** The optimizer takes the mesh from the FSDP2 parameters themselves
   (`param.device_mesh`) and works over its shard dimension.
 - **Step.**

@@ -15,7 +15,7 @@ import torch
 import torch.distributed as dist
 from torch import nn
 from torch.distributed.device_mesh import init_device_mesh
-from torch.distributed.tensor import Shard, distribute_tensor
+from torch.distributed.tensor import Replicate, Shard, distribute_tensor
 
 from xllm.config import OptimConf
 from xllm.distributed import initialize_model_parallel
@@ -205,14 +205,27 @@ def check_resume_config_wins(mesh):
         print("resume: momentum and moments reloaded, configured weight decay and eps kept")
 
 
-def check_tensor_parallel():
-    """TP=2 x FSDP: each TP rank holds its TP-local shard of every weight, sharded on dim 0 over its dp group.
-    Blocks may sit inside a TP rank (heads), be cut by TP (wo, FFN) or straddle the TP boundary; TP and FSDP
-    are independent. The result must match the dense reference on the whole (TP=1) weights."""
-    tp = 2
+def check_tensor_parallel(rep=1, tp=2):
+    """TP x FSDP (x replicas, as with context parallel): each TP rank holds its TP-local shard of every weight,
+    sharded on dim 0 over its dp group and replicated over `rep` groups (the FSDP mesh's replicate dim, where
+    context-parallel ranks sit). Blocks may sit inside a TP rank (heads), be cut by TP (wo, FFN) or straddle
+    the TP boundary; TP, FSDP and the replicas are independent. The result must match the dense reference on
+    the whole (TP=1) weights, on every replica."""
     torch._dynamo.config.cache_size_limit = 64  # this test compiles Newton-Schulz for many more shapes
-    mesh2 = init_device_mesh("cuda", (dist.get_world_size() // tp, tp), mesh_dim_names=("dp", "tp"))
-    dp_mesh, tp_group, tp_rank = mesh2["dp"], mesh2["tp"].get_group(), mesh2["tp"].get_local_rank()
+    dp = dist.get_world_size() // (rep * tp)
+    if rep == 1:
+        mesh3 = init_device_mesh("cuda", (dp, tp), mesh_dim_names=("dp", "tp"))
+        fsdp_mesh, places = mesh3["dp"], [Shard(0)]
+        dp_mesh = fsdp_mesh
+    else:  # like models/build.py: the (cp, dp) plane of a (cp, dp, tp) mesh, or (cp, dp) without TP
+        if tp > 1:
+            mesh3 = init_device_mesh("cuda", (rep, dp, tp), mesh_dim_names=("cp", "dp", "tp"))
+            fsdp_mesh = mesh3["cp", "dp"]
+        else:
+            mesh3, fsdp_mesh = None, init_device_mesh("cuda", (rep, dp), mesh_dim_names=("cp", "dp"))
+        places, dp_mesh = [Replicate(), Shard(0)], fsdp_mesh["dp"]
+    tp_group = mesh3["tp"].get_group() if tp > 1 else None
+    tp_rank = mesh3["tp"].get_local_rank() if tp > 1 else 0
     # (shape, TP-split dim, layout kwargs): a spec with and without the TP declaration
     cases = [
         ((2048, 1536), 0, dict(layout="(h d) m", fan_out="d", fan_in="m", d=256)),      # wq: whole heads per TP rank
@@ -230,20 +243,23 @@ def check_tensor_parallel():
         full = [torch.randn(s, device="cuda") for s, _, _ in cases]
         grads = [[torch.randn_like(t) for t in full] for _ in range(STEPS)]
         shard = lambda t, d: t.chunk(tp, dim=d)[tp_rank].contiguous()
-        params = [nn.Parameter(distribute_tensor(shard(t, d), dp_mesh, [Shard(0)])) for t, (_, d, _) in zip(full, cases)]
+        params = [nn.Parameter(distribute_tensor(shard(t, d), fsdp_mesh, places)) for t, (_, d, _) in zip(full, cases)]
         opt = Muon(params, local_specs, [], dp_mesh, cfg, tp_group=tp_group)
         for step_grads in grads:
             for p, g, (_, d, _) in zip(params, step_grads, cases):
-                p.grad = distribute_tensor(shard(g, d), dp_mesh, [Shard(0)])
+                p.grad = distribute_tensor(shard(g, d), fsdp_mesh, places)
             opt.step()
         got = []
         for p, (_, d, _) in zip(params, cases):
+            if tp == 1:
+                got.append(p.full_tensor())
+                continue
             parts = [torch.empty_like(p.full_tensor()) for _ in range(tp)]
             dist.all_gather(parts, p.full_tensor().contiguous(), group=tp_group)
             got.append(torch.cat(parts, dim=d))
         want = dense_muon([x.clone() for x in full], global_specs, grads, cfg)
-        check(f"muon TP={tp} scale={cfg.muon_block_scale} vs dense reference", got, want, full, 3e-2)
-        if cfg is CFG:  # negative control: orthogonalizing each rank's half on its own is a different update
+        check(f"muon TP={tp} replicas={rep} dp={dp} scale={cfg.muon_block_scale} vs dense reference", got, want, full, 3e-2)
+        if cfg is CFG and tp > 1:  # negative control: orthogonalizing each rank's half on its own is a different update
             cut = [2, 3, 4, 5]  # the weights whose matrix TP cuts
             ref_whole_halves = []
             for i in cut:
@@ -256,7 +272,7 @@ def check_tensor_parallel():
                 print(f"negative control: TP halves orthogonalized separately differ by {err:.2e}")
             assert err > 0.3, "TP assembly is indistinguishable from per-half Newton-Schulz"
     if dist.get_rank() == 0:
-        print("tensor parallel: per-head and TP-assembled weights match the dense reference")
+        print(f"TP={tp} replicas={rep}: per-head and TP-assembled weights match the dense reference")
 
 
 def main():
@@ -326,6 +342,8 @@ def main():
     check_model_blocks()
     check_resume_config_wins(mesh)
     check_tensor_parallel()
+    check_tensor_parallel(rep=2, tp=2)  # replicas (context parallel) x TP x FSDP
+    check_tensor_parallel(rep=2, tp=1)  # replicas x FSDP
 
     if dist.get_rank() == 0:
         print("MUON_TEST_OK")
