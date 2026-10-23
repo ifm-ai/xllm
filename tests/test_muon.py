@@ -209,8 +209,8 @@ def check_resume_config_wins(mesh):
 
 def check_tensor_parallel():
     """TP=2 x FSDP: each TP rank holds its TP-local shard of every weight, sharded on dim 0 over its dp group.
-    Weights TP cuts through the matrix (wo, FFN) are assembled over the TP group; per-head weights stay local.
-    The result must match the dense reference on the whole (TP=1) weights."""
+    Blocks may sit inside a TP rank (heads), be cut by TP (wo, FFN) or straddle the TP boundary; TP and FSDP
+    are independent. The result must match the dense reference on the whole (TP=1) weights."""
     tp = 2
     torch._dynamo.config.cache_size_limit = 64  # this test compiles Newton-Schulz for many more shapes
     mesh2 = init_device_mesh("cuda", (dist.get_world_size() // tp, tp), mesh_dim_names=("dp", "tp"))
@@ -223,10 +223,10 @@ def check_tensor_parallel():
         ((4096, 1536), 0, dict()),                                                       # fc1: TP cuts the matrix
         ((1536, 4096), 1, dict()),                                                       # fc2: TP cuts the matrix
         ((2048, 1536), 0, dict(layout="(h d) m", fan_out="h d", fan_in="m", d=256)),    # all heads one matrix, TP cuts it
+        ((768, 1536), 0, dict(layout="(h d) m", fan_out="d", fan_in="m", d=256)),       # a block straddles the TP boundary
     ]
     local_specs = [muon_spec(tp_dim=d, **kw) for _, d, kw in cases]
     global_specs = [muon_spec(**kw) for _, _, kw in cases]
-    assert [s.tp_cuts_matrix for s in local_specs] == [False, False, True, True, True, True]
     for cfg in (CFG, CFG_MATRIX_SCALE):
         torch.manual_seed(3)
         full = [torch.randn(s, device="cuda") for s, _, _ in cases]
@@ -246,7 +246,7 @@ def check_tensor_parallel():
         want = dense_muon([x.clone() for x in full], global_specs, grads, cfg)
         check(f"muon TP={tp} scale={cfg.muon_block_scale} vs dense reference", got, want, full, 3e-2)
         if cfg is CFG:  # negative control: orthogonalizing each rank's half on its own is a different update
-            cut = [i for i, s in enumerate(local_specs) if s.tp_cuts_matrix]
+            cut = [2, 3, 4, 5]  # the weights whose matrix TP cuts
             ref_whole_halves = []
             for i in cut:
                 d = cases[i][1]

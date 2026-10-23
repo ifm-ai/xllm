@@ -35,14 +35,14 @@
   linear layers and the experts do); registering a weight without it is an error. The spec
   is kept on the module (FSDP2 replaces the parameter tensors);
   the optimizer resolves it once into boxes and logs one line per weight.
-- **Tensor parallelism.** Each TP rank holds its TP-local weights (FSDP2 shards them over its own
-  data-parallel group), and a weight's `tp_dim` says which dim TP splits. If that dim's outermost
-  axis is a Block axis (whole heads per rank: `wq`/`wk`/`wv`, per-head `wo`), every Block is local
-  and nothing extra happens. If it is a fan axis (the whole-matrix `wo`, FFN `fc1`/`fc2`/`fc3`), TP
-  cuts the Newton-Schulz matrix: the TP peers own the same Blocks, all-gather them along `tp_dim`
-  (one all-gather per step for all such Blocks), each runs Newton-Schulz on the whole Block (the TP
-  peers repeat it) and keeps its part. Update scales use the whole (global) weight's shape. Optimizer
-  state is per TP rank, like the parameters.
+- **Tensor parallelism.** TP is one more way the weight is sharded, independent of the block
+  layout. Each TP rank holds its TP-local weights (FSDP2 shards them over its own data-parallel
+  group); a weight's `tp_dim` (declared by the parallel layer) says which dim TP splits. Blocks
+  are defined on the whole weight and each rank's region is a box of it, so a block may sit inside
+  one TP rank (whole heads), be cut by TP (the whole-matrix `wo`, FFN) or straddle a TP boundary.
+  The same two all-to-alls run over the plane of the dp mesh x TP group, every block is
+  orthogonalized once by its owner, and update scales use the whole weight's shape. Optimizer state
+  is per TP rank, like the parameters.
 - **Mesh.** `train.py` builds the FSDP mesh once (`build_fsdp_mesh`) and passes the same
   mesh to `fully_shard` and to the optimizer. Muon works over the shard dimension.
 - **Step.**
