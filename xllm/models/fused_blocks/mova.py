@@ -9,6 +9,7 @@ from xllm.distributed import (
     get_context_parallel_world_size,
 )
 from xllm.distributed.utils import reshape_gathered_tensor_along_specific_dim
+from xllm.health_metrics import get_active_health_collector
 from xllm.modules.fused_ops import (
     memory_efficient_dropout_fwd,
     multi_group_matmul_fwd,
@@ -42,7 +43,7 @@ def mova_fwd(
     router_w, router_bias, routing_score_func, routing_scaling_factor, router_load_balancing_type,
     n_values, topk, value_backend, moe_permutation_backend, attn_gate_func,
     dropout, attention_dropout, hidden_dropout,
-    causal_attn_backend, stability_control, recompute_attn
+    causal_attn_backend, stability_control, recompute_attn, layer_id=None,
 ):
     bsz, seq_len, _ = mx.shape
     attn_gate_fn = {"silu": F.silu, "softplus": partial(F.softplus, beta=math.log(2))}[attn_gate_func]
@@ -126,6 +127,7 @@ def mova_fwd(
         xk, xk_rstd = rmsnorm_fwd(xk, None, local_kv_heads, eps)
     xk_ = rearrange(xk, 'b l (k s) -> b l k s', k=local_kv_heads)
     xk_ = apply_rope(xk_, freqs_cis, head_dim, rope_head_dim, False)
+    local_xk = xk_  # the all-gather below replaces xk_ with every context rank's keys
     xk_, handle_xk = all_gather(xk_, parallel_region='context', async_op=True)
 
     # compute r
@@ -151,6 +153,10 @@ def mova_fwd(
         xq_ = xq
     xq_ = rearrange(xq_, 'b l (h s) -> b l h s', h=local_heads)
     xq_ = apply_rope(xq_, freqs_cis, head_dim, rope_head_dim, False)
+    health_collector = get_active_health_collector()
+    if health_collector is not None and layer_id is not None:
+        # Local post-qk-norm, post-RoPE heads, before K is gathered across context ranks.
+        health_collector.record_query_key_stats(layer_id, xq_, local_xk)
 
     if handle_xk is not None:
         handle_xk.wait()

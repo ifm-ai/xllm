@@ -221,7 +221,12 @@ def causal_conv1d_fwd(
     backend: str,
     deterministic: bool
 ) -> Tuple[Tensor, Optional[Tensor], Any]:
-    w = F.softmax(weight, dim=-1, dtype=torch.float32).to(x) if apply_weight_normalization else weight
+    w = weight
+    if apply_weight_normalization:
+        w = F.softmax(weight, dim=-1, dtype=torch.float32)  # fp32
+        if backend == 'fla':
+            w = w.to(x)
+
     return conv1d_fwd(
         x, w, bias, initial_state, bos_mask, output_final_state, activation, backend, deterministic
     )
@@ -241,17 +246,18 @@ def causal_conv1d_bwd(
     deterministic: bool
 ) -> Tuple[Tensor, Optional[Tensor], Tensor, Optional[Tensor]]:
     if apply_weight_normalization:
-        w_fp32 = F.softmax(weight, dim=-1, dtype=torch.float32)
-        w = w_fp32.to(x)
+        w_fp32 = F.softmax(weight, dim=-1, dtype=torch.float32)  # fp32
+        w = w_fp32.to(x) if backend == 'fla' else w_fp32
     else:
         w = weight
         w_fp32 = None
+
     x_grad, initial_state_grad, w_grad, b_grad = conv1d_bwd(
         out_grad, final_state_grad, x, w, bias, initial_state, bos_mask,
         activation, backend, deterministic
     )
     if apply_weight_normalization:
-        w_grad = torch.ops.aten._softmax_backward_data(w_grad.float(), w_fp32, -1, torch.float32).to(w)
+        w_grad = torch.ops.aten._softmax_backward_data(w_grad.float(), w_fp32, -1, torch.float32).to(weight)
 
     return x_grad, initial_state_grad, w_grad, b_grad
 
@@ -850,7 +856,8 @@ def apply_rope(x: Tensor, freqs_cis: Tensor, head_dim: int, rope_head_dim: int, 
         x = apply_rotary_embedding(x, freqs_cis=freqs_cis, backward=backward)
     elif rope_head_dim > 0:
         x_rope = apply_rotary_embedding(x[:, :, :, :rope_head_dim], freqs_cis=freqs_cis, backward=backward)
-        x[:, :, :, :rope_head_dim] = x_rope
+        # The input may still be needed by normalization backward.
+        x = torch.cat((x_rope, x[:, :, :, rope_head_dim:]), dim=-1)
     return x
 
 
@@ -859,6 +866,6 @@ def apply_ropes(xq: Tensor, xk: Tensor, freqs_cis: Tensor, head_dim: int, rope_h
         xq, xk = apply_rotary_embeddings(xq, xk, freqs_cis=freqs_cis, backward=backward)
     elif rope_head_dim > 0:
         xq_rope, xk_rope = apply_rotary_embeddings(xq[:, :, :, :rope_head_dim], xk[:, :, :, :rope_head_dim], freqs_cis=freqs_cis, backward=backward)
-        xq[:, :, :, :rope_head_dim] = xq_rope
-        xk[:, :, :, :rope_head_dim] = xk_rope
+        xq = torch.cat((xq_rope, xq[:, :, :, rope_head_dim:]), dim=-1)
+        xk = torch.cat((xk_rope, xk[:, :, :, rope_head_dim:]), dim=-1)
     return xq, xk

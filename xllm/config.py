@@ -116,7 +116,7 @@ class OptimConf(Config):
 @dataclass
 class ModelConf(Config):
     arch: str = "transformer"  # Architecture: transformer or gekko
-    ddp_backend: str = 'fsdp1'  # Distributed parameter sharding implementation: fsdp1 or fsdp2
+    ddp_backend: str = 'fsdp2'  # Distributed parameter sharding implementation: fsdp1 or fsdp2
     num_layers: int = 8
     model_dim: int = 1024  # Dimensions of token hidden state and residual stream
     # Attention
@@ -341,6 +341,13 @@ class TrainerConf(Config):
     # Logging
     disable_workers_print: bool = False  # Whether to disable logging from non-main training processes (workers).
     disable_logging: bool = False  # Whether to disable metric logging via MetricLogger, including JSONL, TensorBoard, and W&B.
+    health_metrics: bool = False
+    health_log_freq: int = 100
+    health_query_key_stats: bool = False
+    health_weight_norms: bool = False
+    health_gradient_norms: bool = False
+    health_logits_stats: bool = False
+    health_gekko_stats: bool = False
 
     # Training hyperparameters
     batch_size: Optional[int] = None  # Num of sequences per DP rank per step. Set either this or global_batch_size.
@@ -380,6 +387,7 @@ class TrainerConf(Config):
     log_wandb: bool = False
     wandb_project: Optional[str] = None
     wandb_entity: Optional[str] = None
+    wandb_name: Optional[str] = None
 
     # Random seed
     seed: int = 1
@@ -438,6 +446,26 @@ class TrainerConf(Config):
         # freq checks
         assert self.dump_freq % self.log_freq == 0
         assert self.eval_freq < 0 or (self.eval_freq % self.log_freq == 0)
+        if self.health_metrics:
+            assert self.health_log_freq > 0
+            assert self.model.arch in ("transformer", "gekko"), "Health metrics require Transformer or Gekko"
+            if self.model.arch == "gekko":
+                assert self.model.attn_act_func == "softmax", "Gekko health metrics currently require softmax attention"
+                assert self.model.num_experts == 0 and self.model.num_values == 0, "Gekko health metrics currently require dense layers"
+        if self.health_gekko_stats:
+            assert self.health_metrics, "Gekko statistics require health_metrics=true"
+            assert self.model.arch == "gekko", "Gekko statistics require model.arch=gekko"
+        if self.health_query_key_stats:
+            assert self.health_metrics, "Query/key statistics require health_metrics=true"
+        if self.health_logits_stats:
+            assert self.health_metrics, "Logit statistics require health_metrics=true"
+        if self.health_weight_norms or self.health_gradient_norms:
+            assert self.health_metrics, "Matrix norms require health_metrics=true"
+            # Dense Gekko is enforced by the health_metrics gate above.
+            assert self.model.num_experts == 0 and self.model.arch in ("transformer", "gekko"), (
+                "Matrix norms currently require a dense Transformer or Gekko"
+            )
+            assert self.model.swiglu, "Matrix norms require SwiGLU"
 
         # async eval
         if self.async_eval_ngpus > 0:
