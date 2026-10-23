@@ -36,12 +36,13 @@ while [ ! -e "$MBOX/stop" ]; do
         if out=$(sbatch --parsable "${excl[@]}" "$SPARE_SCRIPT" 2>&1); then
           jobid=${out%%;*}
           SUBMITTED+=("$jobid")
+          : > "$MBOX/submitted.$jobid"  # also for the watchdog, should this helper die with its node
           reply="ok $jobid"
         else
           reply="error $out"
         fi ;;
       release_node)
-        if scancel "$arg" 2>&1; then reply="ok $arg"; else reply="error scancel $arg failed"; fi ;;
+        if scancel "$arg" 2>&1; then reply="ok $arg"; rm -f "$MBOX/submitted.$arg"; else reply="error scancel $arg failed"; fi ;;
       *)
         reply="error unknown request '$action'" ;;
     esac

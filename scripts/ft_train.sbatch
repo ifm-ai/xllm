@@ -38,6 +38,7 @@ export FT_MAIN_RESTART=$RESTART                             # a refill job submi
 MARKER=$DUMP_DIR/ft_finished.$SLURM_JOB_ID.$RESTART
 MAILBOX=$DUMP_DIR/ft_slurm/$SLURM_JOB_ID
 mkdir -p "$DUMP_DIR/restarts" "$MAILBOX"
+rm -f "$MAILBOX/stop"                                       # a requeue keeps the job id: the last run's stop is stale
 
 cleanup() {
   touch "$MAILBOX/stop"                                     # the helper cancels the refill jobs it submitted
@@ -58,6 +59,23 @@ trap requeue_or_fail USR1                                   # the handler exits,
 
 export XLLM_DIR
 bash scripts/ft_slurm_helper.sh "$MAILBOX" "${FT_SPARE_SCRIPT:-scripts/ft_spare.sbatch}" &
+# the batch-host watchdog, over ssh on up to two other nodes: not in a job step, so it outlives this host
+if [ "${FT_WATCHDOG:-1}" = 1 ]; then
+  launches=()
+  for host in $(scontrol show hostnames "$SLURM_JOB_NODELIST" | sed -n 2,3p); do
+    # `cd ...;` not `cd ... &&`: a backgrounded list would keep ssh's output open, and ssh would wait for it
+    # an ssh session has no SLURM environment (no scontrol on its PATH, no SLURM_CONF on m4): the batch shell's is
+    # passed on
+    timeout 60 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no -o ConnectTimeout=20 "$host" "cd $XLLM_DIR || exit 1; \
+      PATH=$(printf %q "$PATH") ${SLURM_CONF:+SLURM_CONF=$(printf %q "$SLURM_CONF")} \
+      SLURM_JOB_ID=$SLURM_JOB_ID SLURM_RESTART_COUNT=$RESTART FT_MAX_REQUEUES=$FT_MAX_REQUEUES setsid nohup \
+      bash scripts/ft_watchdog.sh $MAILBOX $MARKER > $MAILBOX/watchdog.$host.$RESTART.log 2>&1 < /dev/null &" \
+      || echo "ft: could not start the batch-host watchdog on $host (ssh); a dead batch host is not requeued" >&2 &
+    launches+=($!)
+  done
+  # the launches run side by side; never a bare wait, which would wait for the helper (it runs to the end)
+  [ ${#launches[@]} -eq 0 ] || wait "${launches[@]}"
+fi
 
 # cd: containers start elsewhere. In the background, so a USR1 can interrupt the wait below.
 srun --no-kill --kill-on-bad-exit=0 --wait=0 --ntasks-per-node=1 $LAUNCH --export=ALL \

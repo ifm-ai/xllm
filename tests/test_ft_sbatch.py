@@ -18,6 +18,15 @@ def test_train_script_invariants():
     text = TRAIN.read_text()
     assert "#SBATCH --no-kill" in text and "#SBATCH --requeue" in text
     assert "#SBATCH --signal=B:USR1" in text  # the batch shell only: trainers and agents ignore SIGUSR1
+    # a requeue keeps the job id: the previous run's stop file is removed before the helper and watchdogs start
+    assert text.index('rm -f "$MAILBOX/stop"') < text.index("ft_slurm_helper.sh") < text.index("ft_watchdog.sh")
+    launch = text[text.index("for host in"):text.index("ft_watchdog.sh")]
+    assert "srun" not in launch  # not a job step: over ssh
+    # bounded, and `cd ...;` so that the backgrounded watchdog does not keep ssh (and the batch script) waiting
+    assert "timeout 60 ssh -n" in launch and "|| exit 1;" in launch and "&& SLURM_JOB_ID" not in launch
+    assert "PATH=" in launch and "SLURM_CONF=" in launch  # an ssh session has no SLURM environment
+    block = text[text.index("for host in"):text.index("\nfi\n", text.index("for host in"))]
+    assert '|| wait "${launches[@]}"' in block and "\n  wait\n" not in block  # never wait on the helper
     agents = next(line for line in text.splitlines() if line.startswith("srun --no-kill"))
     assert "$LAUNCH" in agents
     step = text[text.index(agents):]
