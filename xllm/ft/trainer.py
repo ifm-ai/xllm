@@ -15,7 +15,7 @@ from typing import Any, Dict
 from xllm.ft.node import gpus_per_node
 from xllm.ft.progress import Progress
 from xllm.ft.replica import DUMP_LOAD_EXIT, NO_COMMON_STEP_EXIT, Replica, restore, restore_from_dump
-from xllm.ft.sizing import startup_gate
+from xllm.ft.sizing import SIZING_EXIT, SizingRefused, startup_gate
 
 logger = logging.getLogger()
 
@@ -62,7 +62,11 @@ class FtTrainer:
     def __init__(self, cfg, model, optimizer):
         ignore_requeue_signal()  # already done at startup by train.py; also for a trainer built another way
         # sizing gate: host memory now, GPU memory after the first steps
-        self.gpu_peak = startup_gate(model, cfg.ft.slot_dir, cfg.dcp_for_optimizer)
+        try:
+            self.gpu_peak = startup_gate(model, cfg.ft.slot_dir, cfg.dcp_for_optimizer)
+        except SizingRefused as e:  # every rank takes this decision: the agents end the job, no retry
+            logger.error(str(e))
+            sys.exit(SIZING_EXIT)
         self.replica = Replica(model, optimizer, cfg.ft.slot_dir, cfg.ft.k, cfg.ft.mtbf_sys, gpus_per_node(),
                                self.gpu_peak)
         self.progress = Progress.for_trainer()  # None when ft runs without the agent

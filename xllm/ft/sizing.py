@@ -105,6 +105,13 @@ class GpuPeakRecorder:
             log(f"{self.verdict}{note}")
 
 
+SIZING_EXIT = 78  # the gate refused ft at startup: a configuration error, never retried or requeued
+
+
+class SizingRefused(RuntimeError):
+    pass
+
+
 def startup_gate(model: torch.nn.Module, slot_dir: str, dcp_for_optimizer: bool) -> GpuPeakRecorder:
     """Stage 1: refuse ft before training if the copies cannot fit on this node. Collective."""
     q = torch.tensor([local_param_count(model)], dtype=torch.int64, device="cuda")
@@ -117,5 +124,5 @@ def startup_gate(model: torch.nn.Module, slot_dir: str, dcp_for_optimizer: bool)
     any_short = torch.tensor([int(bool(short))], device="cuda")
     torch.distributed.all_reduce(any_short, op=torch.distributed.ReduceOp.MAX)
     if any_short.item():
-        raise RuntimeError("ft sizing gate refused ft: " + ("; ".join(short) if short else "another node is short"))
+        raise SizingRefused("ft sizing gate refused ft: " + ("; ".join(short) if short else "another node is short"))
     return GpuPeakRecorder(int(q.item()))

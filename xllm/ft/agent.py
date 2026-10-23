@@ -49,6 +49,7 @@ from xllm.ft.inject import InjectionReader
 from xllm.ft.progress import PROGRESS_ENV, Progress, progress_path
 from xllm.ft.replica import DUMP_LOAD_EXIT, NO_COMMON_STEP_EXIT, dump_files, meta_path, slot_path, valid_steps
 from xllm.ft.scheduler import SlurmMailbox, mailbox_dir
+from xllm.ft.sizing import SIZING_EXIT
 from xllm.ft.spare_check import run_spare_check
 
 logger = logging.getLogger()
@@ -620,6 +621,8 @@ class Agent:
             self.check_gpu_faults(gen)
             failed = [(i, c) for i, c in enumerate(codes) if c not in (None, 0)]
             if failed:
+                if all(c == SIZING_EXIT for _, c in failed):
+                    return "refused"
                 if any(c == NO_COMMON_STEP_EXIT for _, c in failed):
                     self.store.set(f"nocommon/{gen}", "1")  # memory cannot restore: next generation from disk
                 if any(c == DUMP_LOAD_EXIT for _, c in failed):
@@ -782,6 +785,7 @@ class Agent:
                 time.sleep(self.conf.hb_interval)
             self.store.set("finished", "1")
             t0 = time.monotonic()
+            self.write_finished_marker()
             # every registered agent that can still ack: not barred or lost, and not silent past the node deadline
             others = len([p for p in range(int(self.store.add("next_phys", 0))) if p != self.phys
                           and self.store.check([f"host/{p}"]) and self.get_or(f"spare/{p}", "") not in ("barred", "lost")
@@ -792,6 +796,15 @@ class Agent:
             self.wait_finished()
         logger.info(f"ft agent {self.phys}: run finished")
         return EXIT_FINISHED
+
+    def write_finished_marker(self):
+        """The sbatch script requeues the job unless this file exists (scripts/ft_train.sbatch)."""
+        job, restart = os.environ["FT_EPOCH"].split(":")
+        marker = Path(self.conf.dump_dir) / f"ft_finished.{job}.{restart}"
+        try:
+            marker.write_text(f"finished at generation {self.gen()}\n")
+        except OSError as e:  # the run did finish; without the marker the script requeues once more, from disk
+            logger.error(f"ft leader: could not write {marker} ({e})")
 
     def wait_finished(self):
         while not self.store.check(["finished"]):  # raises if the leader is gone before it finished
@@ -871,6 +884,10 @@ class Agent:
                 outcome = self.monitor(gen)
                 if outcome == "finished":
                     return self.finish()
+                if outcome == "refused":  # a configuration error: the job ends and is not requeued
+                    self.kill()
+                    self.store.set("end", "the ft sizing gate refused ft (see the trainers' log)")
+                    return SIZING_EXIT
                 self.state("exiting", gen)
                 if not self.kill():
                     self.store.set("end", f"physical node {self.phys}: a trainer survived SIGKILL")
