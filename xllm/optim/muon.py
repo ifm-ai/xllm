@@ -135,6 +135,11 @@ class Muon(Optimizer):
     2. gather: one all-to-all sends every slice to its block's owner;
     3. each owner runs Newton-Schulz on its blocks;
     4. scatter: one all-to-all sends the slices back; each rank applies its update.
+
+    With tensor parallelism each rank holds its TP-local weights. A weight whose TP split falls on a
+    Block axis (whole heads / experts per rank) needs nothing extra. A weight whose matrix TP cuts (wo,
+    FFN) has its Blocks assembled across the TP group between 2 and 3: the TP peers own the same Blocks,
+    all-gather them, each runs Newton-Schulz on the whole Block and keeps its part.
     """
 
     def __init__(
@@ -144,8 +149,10 @@ class Muon(Optimizer):
         adamw_params: List[nn.Parameter],
         mesh: DeviceMesh,
         cfg: OptimConf,
+        tp_group: Optional[dist.ProcessGroup] = None,
     ):
-        """specs[i]: how muon_params[i] maps to Newton-Schulz matrices (register_muon / muon_spec)."""
+        """specs[i]: how muon_params[i] maps to Newton-Schulz matrices (register_muon / muon_spec).
+        tp_group: the tensor-parallel group; the params are then each rank's TP-local shard."""
         defaults = dict(weight_decay=cfg.weight_decay, eps=cfg.epsilon)
         super().__init__(
             [
@@ -157,6 +164,9 @@ class Muon(Optimizer):
         self.process_group = mesh.get_group()
         self.world = mesh.size()
         self.rank = mesh.get_local_rank()
+        self.tp_group = tp_group
+        self.tp = 1 if tp_group is None else dist.get_world_size(tp_group)
+        self.tp_rank = 0 if tp_group is None else dist.get_rank(tp_group)
         self._plan([tuple(p.shape) for p in muon_params], specs)
 
     # ---- plan: built once from the global shapes, identical on every rank ----
@@ -164,15 +174,20 @@ class Muon(Optimizer):
     def _plan(self, shapes: List[Tuple[int, int]], specs: List[MuonSpec]):
         # Geometry is fixed; scale policy comes from the current param group,
         # including after a checkpoint restore or an explicit config override.
+        # Scales use the whole (global) weight: shapes are this rank's TP-local ones.
         self._fans = {
-            mode: [spec.fans(shape, per_block=mode == "block") for spec, shape in zip(specs, shapes)]
+            mode: [spec.fans(spec.global_shape(shape, self.tp), per_block=mode == "block")
+                   for spec, shape in zip(specs, shapes)]
             for mode in ("block", "matrix")
         }
         self.blocks: List[Block] = []
+        # tp_dim[k]: the dim along which the TP ranks' copies of Block k are concatenated (None: whole here)
+        self.tp_dim: List[Optional[int]] = []
         for i, (spec, shape) in enumerate(zip(specs, shapes)):
             for b in spec.blocks(shape):
                 b.param = i
                 self.blocks.append(b)
+                self.tp_dim.append(spec.tp_dim if self.tp > 1 and spec.tp_cuts_matrix else None)
 
         # regions[i][r]: the box of matrix i that rank r stores
         regions = [self._regions(shape) for shape in shapes]
@@ -186,19 +201,21 @@ class Muon(Optimizer):
         # owner: the rank that stores most of the block (no transfer for that part), then the least
         # loaded; blocks are placed by decreasing Newton-Schulz cost m * n * min(m, n)
         load = [0] * self.world
-        for k in sorted(range(len(self.blocks)), key=lambda k: -self._ns_cost(self.blocks[k])):
+        for k in sorted(range(len(self.blocks)), key=lambda k: -self._ns_cost(k)):
             stored = dict.fromkeys(range(self.world), 0)
             for r, (r0, r1, c0, c1) in slices[k]:
                 stored[r] = (r1 - r0) * (c1 - c0)
             b = self.blocks[k]
             b.owner = min(range(self.world), key=lambda r: (-stored[r], load[r]))
-            load[b.owner] += self._ns_cost(b)
+            load[b.owner] += self._ns_cost(k)
 
         # my_slices[r]: my slices of the blocks rank r owns, as (matrix, box of my region)
         # owned_slices[r]: rank r's slices of the blocks I own, as (index in self.owned, box of the block)
         # Both lists follow the block order, so a sender's list matches its receiver's.
         self.owned = [k for k, b in enumerate(self.blocks) if b.owner == self.rank]
         index = {k: j for j, k in enumerate(self.owned)}
+        # owned Blocks that TP cuts: (index in self.owned, concatenation dim); the TP peers own the same ones
+        self.tp_owned = [(j, self.tp_dim[k]) for j, k in enumerate(self.owned) if self.tp_dim[k] is not None]
         self.my_slices = [[] for _ in range(self.world)]
         self.owned_slices = [[] for _ in range(self.world)]
         for k, b in enumerate(self.blocks):
@@ -215,9 +232,10 @@ class Muon(Optimizer):
         step = math.ceil(rows / self.world)
         return [(min(r * step, rows), min((r + 1) * step, rows), 0, cols) for r in range(self.world)]
 
-    @staticmethod
-    def _ns_cost(b: Block) -> int:
-        m, n = b.shape
+    def _ns_cost(self, k: int) -> int:
+        m, n = self.blocks[k].shape
+        if self.tp_dim[k] is not None:  # Newton-Schulz runs on the TP-assembled Block
+            m, n = (m * self.tp, n) if self.tp_dim[k] == 0 else (m, n * self.tp)
         return m * n * min(m, n)
 
     @staticmethod
@@ -277,12 +295,35 @@ class Muon(Optimizer):
             for (i, box), t in zip(self.my_slices[r], recv[r]):
                 updates[i][box] = t
 
+    def _tp_gather(self, blocks: List[Tensor]) -> List[Tensor]:
+        """Assemble the owned Blocks that TP cuts from the TP peers' copies (one all-gather for all of them)."""
+        if not self.tp_owned:
+            return blocks
+        flat = torch.cat([blocks[j].reshape(-1) for j, _ in self.tp_owned])
+        out = torch.empty(self.tp * flat.numel(), dtype=flat.dtype, device=flat.device)
+        dist.all_gather_into_tensor(out, flat, group=self.tp_group)
+        parts, full, offset = out.view(self.tp, -1), list(blocks), 0
+        for j, d in self.tp_owned:
+            n = blocks[j].numel()
+            full[j] = torch.cat([parts[t, offset:offset + n].view(blocks[j].shape) for t in range(self.tp)], dim=d)
+            offset += n
+        return full
+
+    def _tp_local(self, results: List[Tensor]) -> List[Tensor]:
+        """Keep this TP rank's part of the orthogonalized assembled Blocks."""
+        local = list(results)
+        for j, d in self.tp_owned:
+            size = results[j].shape[d] // self.tp
+            local[j] = results[j].narrow(d, self.tp_rank * size, size)
+        return local
+
     @torch.no_grad()
     def _muon_step(self, group: Dict):
         params, lr, wd = group["params"], group["lr"], group["weight_decay"]
         updates = [self._momentum(p, group) for p in params]                      # 1. local shards
-        gathered = self._gather(updates)                                   # 2. whole owned blocks
-        self._scatter(orthogonalize(gathered, group["eps"]), updates)      # 3. Newton-Schulz, 4. back
+        gathered = self._tp_gather(self._gather(updates))                  # 2. whole owned blocks
+        # 3. Newton-Schulz (TP peers repeat it on the Blocks they share), 4. back
+        self._scatter(self._tp_local(orthogonalize(gathered, group["eps"])), updates)
         scales = [self._scale(*fans, group["adjust_lr"]) for fans in self._fans[group["block_scale"]]]
         for p, u, scale in zip(params, updates, scales):              # 5. scaled update in fp32
             if p.grad is None:
@@ -338,17 +379,21 @@ def _warn_unregistered(model: nn.Module, muon_ids: set):
 
 def build_muon(model: nn.Module, mesh: DeviceMesh, cfg: OptimConf) -> Optimizer:
     """`mesh` is the FSDP mesh; Muon works over its shard dimension."""
+    from xllm.distributed import get_model_parallel_group, get_model_parallel_world_size
+    tp = get_model_parallel_world_size()
     muon_params, specs, names, adamw_params = split_muon_params(model)
     lines = []
     for name, spec, p in zip(names, specs, muon_params):
-        fan_out, fan_in = spec.fans(tuple(p.shape), per_block=True)
+        fan_out, fan_in = spec.fans(spec.global_shape(tuple(p.shape), tp), per_block=True)
         lines.append(f"Muon {name} {list(p.shape)} {str(spec)!r}: {len(spec.blocks(tuple(p.shape)))} blocks of "
-                     f"fan_out {fan_out} x fan_in {fan_in}, tp_dim {spec.tp_dim}")
+                     f"fan_out {fan_out} x fan_in {fan_in}, tp_dim {spec.tp_dim}"
+                     + (" (TP cuts the matrix: assembled over the TP group)" if spec.tp_cuts_matrix else ""))
     for line in dict.fromkeys(lines):  # one line per kind of weight, e.g. layers.*.attention.wq.weight
         logger.info(line)
     _warn_unregistered(model, {id(p) for p in muon_params})
     shard_mesh = mesh if mesh.ndim == 1 else mesh["dp"]
-    optimizer = Muon(muon_params, specs, adamw_params, shard_mesh, cfg)
+    tp_group = get_model_parallel_group() if tp > 1 else None
+    optimizer = Muon(muon_params, specs, adamw_params, shard_mesh, cfg, tp_group=tp_group)
     logger.info(f"Muon: {len(muon_params)} matrices / {len(optimizer.blocks)} blocks (scale={cfg.muon_block_scale}) / "
                 f"{sum(p.numel() for p in muon_params)} params; AdamW: {len(adamw_params)} tensors / "
                 f"{sum(p.numel() for p in adamw_params)} params")
