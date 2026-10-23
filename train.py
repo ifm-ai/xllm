@@ -62,6 +62,7 @@ from xllm.monitor import GPUMonitor, Timings
 from xllm.metrics import MetricLogger, build_mlogger
 from xllm.ft.trainer import FtTrainer, prepare_log_dir as ft_prepare_log_dir
 from xllm.ft.trainer import ignore_requeue_signal as ft_ignore_requeue_signal
+from xllm.ft.trainer import ignore_requeue_signal as ft_ignore_requeue_signal
 from xllm.ft.trainer import memory_restart as ft_memory_restart
 from xllm.health_metrics import HealthMetricCollector
 from xllm.configuration import cfg_from_cli

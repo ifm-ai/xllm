@@ -14,7 +14,7 @@ PROGRESS_ENV = "FT_PROGRESS_FILE"
 
 
 def progress_path(slot_dir: str, rank: int) -> Path:
-    job = os.environ.get("SLURM_JOB_ID", "local")
+    job = os.environ["FT_EPOCH"].split(":")[0] if os.environ.get("FT_EPOCH") else os.environ.get("SLURM_JOB_ID", "local")
     return Path(slot_dir) / f"ft_{job}_progress_r{rank:06d}"
 
 

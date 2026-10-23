@@ -29,7 +29,13 @@ logger = logging.getLogger()
 
 
 def run_epoch() -> Tuple[str, str]:
-    """Identifies one run of the job: slots of another epoch (an earlier run before a requeue) are never used."""
+    """
+    Identifies one run of the job: slots of another epoch (an earlier run before a requeue) are never used.
+    Under the agent FT_EPOCH carries the main job's id and restart count, also into refill-spare jobs.
+    """
+    if os.environ.get("FT_EPOCH"):
+        job, restart = os.environ["FT_EPOCH"].split(":")
+        return job, restart
     return os.environ.get("SLURM_JOB_ID", "local"), os.environ.get("SLURM_RESTART_COUNT", "0")
 
 
