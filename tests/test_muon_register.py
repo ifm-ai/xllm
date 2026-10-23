@@ -21,11 +21,15 @@ def boxes(blocks):
 
 
 class Holder(nn.Module):
-    def __init__(self, shape, tp_dim=None, declare=True):
+    def __init__(self, shape):
         super().__init__()
         self.weight = nn.Parameter(torch.zeros(shape))
-        if declare:
-            self.tp_dims = {"weight": tp_dim}
+
+
+@pytest.fixture
+def tp2(monkeypatch):
+    import xllm.distributed as xd
+    monkeypatch.setattr(xd, "get_model_parallel_world_size", lambda: 2)
 
 
 # layout, fan_out, fan_in, sizes given to register_muon, all axis sizes (for einops)
@@ -76,21 +80,20 @@ def test_whole_weight_fans(layout, fan_out, fan_in, sizes, shape, fans):
 
 def test_linear_default_is_one_matrix():
     lin = nn.Linear(6, 4, bias=False)
-    lin.tp_dims = {"weight": None}
     register_muon(lin)
     spec = lin.muon_specs["weight"]
     assert str(spec) == "o i" and spec.tp_dim is None
     assert boxes(spec.blocks((4, 6))) == [(0, 4, 0, 6)] and spec.fans((4, 6), per_block=True) == (4, 6)
 
 
-def test_tensor_parallel_global_shape():
+def test_tensor_parallel_global_shape(tp2):
     """Registered on a TP-local shard, resolved to the global weight: the outer axis is counted globally."""
-    m = Holder((2 * 4, 6), tp_dim=0)                            # 2 local heads of 4 rows
-    register_muon(m, "weight", "(h d) m", fan_out="d", fan_in="m", d=4)
+    m = Holder((2 * 4, 6))                                      # 2 local heads of 4 rows
+    register_muon(m, "weight", "(h d) m", fan_out="d", fan_in="m", d=4, tp_dim=0)
     spec = m.muon_specs["weight"]
     assert spec.global_shape((8, 6), 2) == (16, 6) and boxes(spec.blocks((16, 6))) == [(4 * j, 4 * j + 4, 0, 6) for j in range(4)]
-    m = Holder((6, 2 * 4), tp_dim=1)                            # per-head columns, TP cuts the columns
-    register_muon(m, "weight", "o (h i)", fan_out="o", fan_in="i", i=4)
+    m = Holder((6, 2 * 4))                                      # per-head columns, TP cuts the columns
+    register_muon(m, "weight", "o (h i)", fan_out="o", fan_in="i", i=4, tp_dim=1)
     spec = m.muon_specs["weight"]
     assert spec.global_shape((6, 8), 2) == (6, 16) and boxes(spec.blocks((6, 16))) == [(0, 6, 4 * j, 4 * j + 4) for j in range(4)]
 
@@ -103,8 +106,6 @@ def test_tensor_parallel_global_shape():
     (lambda m: register_muon(m, "weight", "(h d) m", fan_out="d", fan_in="m", d=4, x=3), "unknown axes"),
     (lambda m: register_muon(m, "weight", "(h d) d", fan_out="d", fan_in="d"), "repeated"),
     (lambda m: register_muon(m, "weight", "(h d) m", fan_out="d", fan_in="m", d=3), "not a multiple"),
-    (lambda m: register_muon(Holder((8, 6), declare=False), "weight", "(h d) m", fan_out="d", fan_in="m", d=4),
-     "must declare tp_dims"),
     (lambda m: register_muon(m, "weight", "(h d) m", d=4), "innermost"),           # fan_out / fan_in left at "o" / "i"
     (lambda m: register_muon(m, "weight", "(h d m", fan_out="d", fan_in="m", d=4), "unbalanced"),
     (lambda m: register_muon(m, "weight", "(h d) m", fan_out="h", fan_in="m", d=4), "innermost"),  # h is not innermost
@@ -117,3 +118,15 @@ def test_bad_registrations_are_rejected(make, match):
 def test_only_2d_parameters():
     with pytest.raises(AssertionError, match="2-D"):
         register_muon(Holder((2, 4, 6)), "weight", "e o i", fan_out="o", fan_in="i")
+
+
+def test_tensor_parallel_needs_tp_dim(tp2):
+    with pytest.raises(AssertionError, match="say which dim"):
+        register_muon(Holder((8, 6)), "weight", "(h d) m", fan_out="d", fan_in="m", d=4)
+    with pytest.raises(AssertionError, match="tp_dim must be"):
+        register_muon(Holder((8, 6)), "weight", "(h d) m", fan_out="d", fan_in="m", d=4, tp_dim=2)
+    m = Holder((8, 6))
+    register_muon(m, "weight", "(h d) m", fan_out="d", fan_in="m", d=4, tp_dim=None)  # replicated over TP
+    assert m.muon_specs["weight"].tp_dim is None
+    with pytest.raises(AssertionError, match="not a multiple"):  # layout is checked on the whole weight
+        register_muon(Holder((6, 6)), "weight", "(h d) m", fan_out="d", fan_in="m", d=8, tp_dim=0)

@@ -117,8 +117,6 @@ def check_registration(mesh):
             self.wq = nn.Linear(64, 128, bias=False)
             self.wo = nn.Linear(128, 64, bias=False)
             self.fc = nn.Linear(64, 64)
-            for lin in (self.wq, self.wo, self.fc):
-                lin.tp_dims = {"weight": None}  # plain nn.Linear: not split over tensor parallelism
             register_muon(self.wq, layout="(h d) m", fan_out="d", fan_in="m", d=32)
             register_muon(self.wo)
             register_muon(self.fc)
