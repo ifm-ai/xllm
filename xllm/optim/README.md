@@ -43,8 +43,8 @@
   The same two all-to-alls run over the plane of the dp mesh x TP group, every block is
   orthogonalized once by its owner, and update scales use the whole weight's shape. Optimizer state
   is per TP rank, like the parameters.
-- **Mesh.** `train.py` builds the FSDP mesh once (`build_fsdp_mesh`) and passes the same
-  mesh to `fully_shard` and to the optimizer. Muon works over the shard dimension.
+- **Mesh.** The optimizer takes the mesh from the FSDP2 parameters themselves
+  (`param.device_mesh`) and works over its shard dimension.
 - **Step.**
   1. Each rank updates the momentum of its own shard (`m = mu * m + g`; Nesterov by default, `--optim.muon_nesterov`)
      and casts the update direction to bf16.

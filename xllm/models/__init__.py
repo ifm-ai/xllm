@@ -4,6 +4,5 @@ from .gekko import Gekko
 from .hybrid import HybridGekko
 from .build import (
     build_model,
-    build_fsdp_mesh,
     init_cache,
 )

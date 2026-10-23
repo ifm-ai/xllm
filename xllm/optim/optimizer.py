@@ -1,9 +1,7 @@
 from logging import getLogger
-from typing import Optional
 
 import torch
 from torch import nn
-from torch.distributed.device_mesh import DeviceMesh
 from torch.optim import AdamW
 
 from xllm.config import OptimConf
@@ -23,14 +21,11 @@ def rescale_grads(model: nn.Module, scale: float):
         p.grad /= scale
 
 
-def build_optimizer(model: nn.Module, cfg: OptimConf, total_steps: int, param_dtype: str,
-                    mesh: Optional[DeviceMesh] = None):
+def build_optimizer(model: nn.Module, cfg: OptimConf, total_steps: int, param_dtype: str):
     logger.info("Starting build of optimizer...")
     if cfg.optimizer == "muon":
-        if mesh is None:
-            raise ValueError("Muon requires the FSDP2 device mesh used to build the model.")
         from .muon import build_muon
-        optimizer = build_muon(model, mesh, cfg)
+        optimizer = build_muon(model, cfg)
     else:
         optimizer = AdamW(
             model.parameters(),
