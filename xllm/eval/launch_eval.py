@@ -129,6 +129,7 @@ def launch_async_eval(
     eval_cfg = EvalConf(
         valid=cfg.valid,
         multi_segments=cfg.multi_segments,
+        attn_stability_control=cfg.attn_stability_control,
         checkpoint_dir=str(checkpoint_dir),
         full_state=False,
         dump_dir=str(eval_folder),

@@ -44,6 +44,7 @@ def eval_ppl(
     jsonl_path: str,
     cfg: ValidConf,
     multi_segments: bool,
+    stability_control: int,
     world_rank,
     world_size,
 ) -> Tuple[float, int]:
@@ -91,7 +92,7 @@ def eval_ppl(
         if i % check_sync_freq == 0:
             check_batch_for_sync({"x": x, "y": y, "mask": mask})
 
-        tok_loss = inference(model, x, y, multi_segments)
+        tok_loss = inference(model, x, y, multi_segments, stability_control)
         if mask is not None:
             tok_loss = tok_loss * mask
             loss = tok_loss.sum()
@@ -109,20 +110,25 @@ def eval_ppl(
     return math.exp(tot_loss / tot_toks), tot_toks
 
 
-def eval_choice(model: nn.Module, batch: Dict, task: ChoiceTask):
+def eval_choice(
+    model: nn.Module,
+    batch: Dict,
+    task: ChoiceTask,
+    attn_stability_control: int
+):
     assert isinstance(task, ChoiceTask)
     batch_metrics: List[Dict[str, float]] = []
     pad_tensor = torch.zeros((1, 1), dtype=torch.long)
 
     text_x = batch.get("text_x", pad_tensor).cuda()
     text_y = batch.get("text_y", pad_tensor).cuda()
-    text_nll = inference(model, text_x, text_y, False)
+    text_nll = inference(model, text_x, text_y, False, attn_stability_control)
     text_nll = text_nll.view(text_x.size()).sum(dim=-1)
     text_ntokens = (text_y != -100).sum(dim=-1)
 
     completion_x = batch.get("completion_x", pad_tensor).cuda()
     completion_y = batch.get("completion_y", pad_tensor).cuda()
-    completion_nll = inference(model, completion_x, completion_y, False)
+    completion_nll = inference(model, completion_x, completion_y, False, attn_stability_control)
     completion_nll = completion_nll.view(completion_x.size()).sum(dim=-1)
 
     if "text_x" not in batch:  # padding example
@@ -149,6 +155,7 @@ def eval_generation(
     batch: Dict,
     task: GenerationTask,
     tokenizer: Tokenizer,
+    attn_stability_control: int
 ):
     assert isinstance(task, GenerationTask)
     batch_metrics: List[Dict[str, float]] = []
@@ -171,6 +178,7 @@ def eval_generation(
         temp=cfg.temperature,
         top_k=cfg.top_k,
         top_p=cfg.top_p,
+        attn_stability_control=attn_stability_control
     )
 
     if "prompt" not in batch:
@@ -194,6 +202,7 @@ def task_evaluation(
     tokenizer: Tokenizer,
     task_name: str,
     cfg: ValidConf,
+    attn_stability_control: int,
     dump_dir: str,
     world_rank: int,
     world_size: int,
@@ -238,10 +247,11 @@ def task_evaluation(
 
         logger.debug(f"task {task_name} - batch #{i+1} / {len(batches)}")
         if isinstance(task, ChoiceTask):
-            batch_metrics = eval_choice(model, batch, task)
+            batch_metrics = eval_choice(model, batch, task, attn_stability_control)
         elif isinstance(task, GenerationTask):
             batch_metrics = eval_generation(
                 cfg=cfg, model=model, batch=batch, task=task, tokenizer=tokenizer,
+                attn_stability_control=attn_stability_control
             )
         else:
             raise RuntimeError(f"Unknown task type: {task}")
@@ -286,6 +296,7 @@ def execute_evals(
     tokenizer: Tokenizer,
     cfg: ValidConf,
     multi_segments: bool,
+    attn_stability_control,
     dump_dir: str,
     world_rank: int,
     world_size: int,
@@ -306,7 +317,9 @@ def execute_evals(
     logger.info("Running PPL evaluations ...")
     for path in cfg.ppl_files:
         logger.info(f"Evaluating PPL on {path} ...")
-        ppl, n_tokens = eval_ppl(model, tokenizer, path, cfg, multi_segments, world_rank, world_size)
+        ppl, n_tokens = eval_ppl(
+            model, tokenizer, path, cfg, multi_segments, attn_stability_control, world_rank, world_size
+        )
         logger.info(f"PPL on {path}: {ppl}, w. {n_tokens} tokens.")
         scores[f"ppl/{path}"] = ppl
         torch.cuda.empty_cache()
@@ -331,6 +344,7 @@ def execute_evals(
                 tokenizer=tokenizer,
                 task_name=task,
                 cfg=cfg,
+                attn_stability_control=attn_stability_control,
                 dump_dir=dump_dir,
                 world_rank=world_rank,
                 world_size=world_size,

@@ -29,6 +29,7 @@ def generate(
     top_k: int = 0,
     top_p: float = 0.0,
     remove_prompts: bool = True,
+    attn_stability_control: int = 0
 ) -> List[List[int]]:
     model.eval()
 
@@ -77,7 +78,11 @@ def generate(
 
     logger.debug(f"prev_pos={prev_pos}, start_pos={start_pos}, end_pos={end_pos}")
     for curr_pos in range(start_pos, end_pos):
-        logits, _, cache = model(tokens[:, prev_pos:curr_pos], False, cache=cache)
+        logits, _, cache = model(
+            tokens[:, prev_pos:curr_pos], False,
+            attn_stability_control=attn_stability_control,
+            cache=cache
+        )
         # bsz x vocab
         logits = gather_from_model_parallel_region(logits[:, -1].contiguous())
 

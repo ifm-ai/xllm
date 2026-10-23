@@ -36,6 +36,7 @@ class EvalConf(Config):
     dtype: str = get_default_inference_half()
     model_parallel_size: Optional[int] = None  # if None using the one in the checkpoint
     multi_segments: bool = True
+    attn_stability_control: int = 0  # The high precision level for attention (only supported in xattn backend)
     metrics_logger_dir: Optional[str] = None  # dir to log metrics, for async_eval
     seed: int = 42
     disable_workers_print: bool = True
@@ -86,6 +87,7 @@ def main(eval_cfg: EvalConf):
         tokenizer=tokenizer,
         cfg=eval_cfg.valid,
         multi_segments=eval_cfg.multi_segments,
+        attn_stability_control=cfg.attn_stability_control,
         dump_dir=eval_cfg.dump_dir,
         world_rank=get_data_parallel_rank(),
         world_size=get_data_parallel_world_size(),

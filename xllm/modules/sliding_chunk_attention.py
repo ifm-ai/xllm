@@ -8,6 +8,7 @@ from .rotary_positional_embedding import apply_rotary_embeddings
 from .fused_ops import (
     sliding_chunk_attention,
     swift_efficient_attention,
+    xattn_causal_flash_attn
 )
 from .causal_attention import repeat_kv
 
@@ -80,21 +81,20 @@ class SlidingChunkAttention(nn.Module):
             xk = torch.cat([prev_k, xk], dim=1) if prev_k is not None else xk
             xv = torch.cat([prev_v, xv], dim=1) if prev_v is not None else xv
             assert xk.shape[1] <= self.chunk_size * 2
-            n_rep = self.n_heads // self.n_kv_heads
-            xk_ = repeat_kv(xk, n_rep) if n_rep > 1 else xk
-            xv_ = repeat_kv(xv, n_rep) if n_rep > 1 else xv
-
-            if segment_idx is not None:
-                q_segment_idx = segment_idx if prev_k is None else segment_idx[:, self.chunk_size:]
-                k_segment_idx = segment_idx
+            if self.backend == 'xattn':
+                output = xattn_causal_flash_attn(
+                    xq, xk, xv, self.scale, bos_mask, segment_idx, stability_control, deterministic
+                )
             else:
-                q_segment_idx = None
-                k_segment_idx = None
+                n_rep = self.n_heads // self.n_kv_heads
+                xk_ = repeat_kv(xk, n_rep) if n_rep > 1 else xk
+                xv_ = repeat_kv(xv, n_rep) if n_rep > 1 else xv
+                q_segment_idx = segment_idx if segment_idx is None or prev_k is None else segment_idx[:,self.chunk_size:]
+                output = swift_efficient_attention(
+                    xq, xk_, xv_, q_segment_idx, segment_idx,
+                    self.scale, self.dropout, slen > 1, self.training
+                )
 
-            use_causal_mask = slen > 1
-            output = swift_efficient_attention(
-                xq, xk_, xv_, q_segment_idx, k_segment_idx, self.scale, self.dropout, use_causal_mask, self.training
-            )
             prev_k = xk
             prev_v = xv
 
