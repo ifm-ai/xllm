@@ -62,6 +62,7 @@ from xllm.monitor import GPUMonitor, Timings
 from xllm.metrics import MetricLogger, build_mlogger
 from xllm.ft.trainer import FtTrainer, prepare_log_dir as ft_prepare_log_dir
 from xllm.ft.trainer import ignore_requeue_signal as ft_ignore_requeue_signal
+from xllm.ft.trainer import memory_restart as ft_memory_restart
 from xllm.health_metrics import HealthMetricCollector
 from xllm.configuration import cfg_from_cli
 try:
@@ -93,18 +94,20 @@ def initialize_run(cfg: TrainerConf):
     # init dump dir / dump parameters / logger file handler
     assert cfg.dump_dir != "", "Please specify dump dir."
     dump_dir = Path(cfg.dump_dir)
-    mkdir([dump_dir], global_rank == 0, exist_ok=True)
+    if not ft_memory_restart(cfg):  # a memory restart reuses the dump dir of the first start
+        mkdir([dump_dir], global_rank == 0, exist_ok=True)
 
     if cfg.ft.enabled:  # logs and metrics go to a per-host local dir (cfg.log_dir)
         ft_prepare_log_dir(cfg)
 
-    # log restart infos before doing anything
-    restart_infos = log_restart_infos(
-        dump_dir=cfg.log_dir,
-        global_rank=global_rank,
-        step=get_last_restart_step(cfg.dump_dir, global_rank),
-    )
-    logger.warning(f"restart infos: {restart_infos}")
+    # log restart infos before doing anything (a memory restart skips the checkpoint scan: logging only)
+    if not ft_memory_restart(cfg):
+        restart_infos = log_restart_infos(
+            dump_dir=cfg.log_dir,
+            global_rank=global_rank,
+            step=get_last_restart_step(cfg.dump_dir, global_rank),
+        )
+        logger.warning(f"restart infos: {restart_infos}")
 
     # initialize signal handler (under ft from the start: the sbatch script owns the requeue)
     if cfg.ft.enabled:
@@ -132,8 +135,9 @@ def initialize_run(cfg: TrainerConf):
     )
 
     if cfg.slurm.is_master:
-        with open(Path(cfg.dump_dir) / "config.json", "w") as f:
-            json.dump(cfg.to_dict(), f, sort_keys=True, indent=4)
+        if not ft_memory_restart(cfg):  # written by the first start
+            with open(Path(cfg.dump_dir) / "config.json", "w") as f:
+                json.dump(cfg.to_dict(), f, sort_keys=True, indent=4)
         add_logger_file_handler(os.path.join(cfg.log_dir, "train.log"))
 
     # print env info
@@ -366,10 +370,11 @@ def main(cfg: TrainerConf):
             set_sharded_optimizer_state(model, optimizer, reloaded_optim_state_dict, cfg.dcp_for_optimizer)
             del reloaded_optim_state_dict
 
-    # check gpu nodes
-    check_cluster(
-        dump_dir=Path(cfg.log_dir), global_rank=cfg.slurm.global_rank, check_level=cfg.cluster_check_level, step=0
-    )
+    # check gpu nodes (a memory restart skips it: the nodes passed it at the first start or the spare check)
+    if not ft_memory_restart(cfg):
+        check_cluster(
+            dump_dir=Path(cfg.log_dir), global_rank=cfg.slurm.global_rank, check_level=cfg.cluster_check_level, step=0
+        )
 
     # build batch iterator
     logger.info("Building batch iterator ...")

@@ -19,6 +19,11 @@ from xllm.ft.sizing import startup_gate
 logger = logging.getLogger()
 
 
+def memory_restart(cfg) -> bool:
+    """An ft restart that restores from the in-memory copies: it must not wait on the shared filesystem."""
+    return cfg.ft.enabled and os.environ.get("FT_RESTORE") == "memory"
+
+
 def prepare_log_dir(cfg):
     """
     With ft on, logs and metrics go to a per-host local dir, so a shared-FS outage cannot block a restart;
