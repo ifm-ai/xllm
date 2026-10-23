@@ -4,19 +4,36 @@
 
 ## Muon on FSDP2
 
-`xllm/optim/muon.py`. Requires `--model.ddp_backend fsdp2`, TP = CP = 1, no MoE and
+`xllm/optim/muon.py`. Requires `--model.ddp_backend fsdp2`, TP = CP = 1, no MoE (experts are registered, not yet run) and
 `--dcp_for_optimizer true` (the optimizer state is sharded like the parameters).
 
-- **Parameters.** A model marks the linear layers whose weights Muon updates with a
-  `muon` attribute (`layer.muon = n`); they use `--optim.muon_lr`. Everything else
-  (embedding, output layer, norms, biases, convolutions) uses AdamW with `--optim.lr`.
-  Both groups follow the same LR schedule. AdamW uses `--optim.weight_decay`; the Muon
-  matrices use `--optim.muon_weight_decay` (default: the same value). The attention
-  layers and the FFN mark their projections.
-- **Blocks.** `n` is the number of equal row blocks the matrix is cut into, each
-  orthogonalized on its own: 1 = whole matrix, the number of heads = one block per head,
-  in between = blocks of adjacent heads. Attention marks `wq` / `wr` with its heads and
-  `wk` / `wv` with its KV heads; `wo` and the FFN are 1.
+- **Parameters.** A module registers the weights Muon updates in its `__init__` with
+  `register_muon`; they use `--optim.muon_lr`. Everything else (embedding, output layer,
+  norms, biases, convolutions, the MoE router) uses AdamW with `--optim.lr`. Both groups
+  follow the same LR schedule. AdamW uses `--optim.weight_decay`; the Muon matrices use
+  `--optim.muon_weight_decay` (default: the same value). Attention, the FFN, MoE experts and
+  shared experts register their projections; linear layers in the blocks that are not
+  registered are listed in a warning when the optimizer is built.
+- **Blocks.** A registration names the axes of the weight's two dims as the forward
+  rearranges them, which axes form the Newton-Schulz matrix, and the sizes of the inner axes:
+
+  ```python
+  register_muon(self.wo)                                     # a linear layer: one matrix
+  register_muon(self.wq, layout="(h k d) m", fan_out="k d", fan_in="m", k=nq, d=self.head_dim)
+  register_muon(self, "weight2", "(n s) d", fan_out="s", fan_in="d", s=self.model_dim)
+  ```
+
+  Parentheses flatten several axes into one dim, outer first. The `fan_out` / `fan_in` axes
+  (innermost in their dim) are the matrix rows / columns; every other axis indexes separate
+  blocks, each orthogonalized and scaled on its own: here one block per head (both softdelta
+  queries of a head together) and one per expert. Each dim's outermost axis is inferred from
+  the global shape and cannot be given, so a tensor-parallel local count cannot slip in.
+  Putting an axis in `fan_out` / `fan_in` makes it part of the matrix (`fan_out="h d"` on `wq`:
+  all heads as one matrix). A module that splits a weight over the tensor-parallel group
+  declares the split dim (`self.tp_dims = {"weight": 0}`, None if not split; the parallel
+  linear layers and the experts do); registering a weight without it is an error. The spec
+  is kept on the module (FSDP2 replaces the parameter tensors);
+  the optimizer resolves it once into boxes and logs one line per weight.
 - **Mesh.** `train.py` builds the FSDP mesh once (`build_fsdp_mesh`) and passes the same
   mesh to `fully_shard` and to the optimizer. Muon works over the shard dimension.
 - **Step.**
