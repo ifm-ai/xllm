@@ -60,6 +60,7 @@ from xllm.models import build_model
 from xllm.optim import build_optimizer, rescale_grads
 from xllm.monitor import GPUMonitor, Timings
 from xllm.metrics import MetricLogger, build_mlogger
+from xllm.ft.trainer import FtTrainer
 from xllm.health_metrics import HealthMetricCollector
 from xllm.configuration import cfg_from_cli
 try:
@@ -263,6 +264,8 @@ def main(cfg: TrainerConf):
     # build optimizer / scheduler
     optimizer, scheduler = build_optimizer(model, cfg.optim, cfg.steps, cfg.dtype)
 
+    ft = FtTrainer(cfg, model, optimizer) if cfg.ft.enabled else None  # sizing gate
+
     # setup loggers
     enable_loggers = cfg.slurm.is_master and not cfg.disable_logging
     enable_wandb = cfg.slurm.is_master and cfg.log_wandb and has_wandb
@@ -388,6 +391,8 @@ def main(cfg: TrainerConf):
     torch.cuda.empty_cache()
 
     while state.step < cfg.steps:
+        if ft is not None:
+            ft.step_start(state.step)
         torch.cuda.reset_peak_memory_stats()
         # data loading
         t1 = timer()
