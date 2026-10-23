@@ -13,6 +13,7 @@ from xllm.modules.layer_norm import GroupLayerNorm
 from xllm.modules.rms_norm import GroupRMSNorm
 from xllm.modules.residual import build_residual
 from xllm.utils import get_init_fn
+from xllm.optim.muon import register_muon
 
 
 class NormalizedFeedForwardNetwork(nn.Module):
@@ -91,7 +92,7 @@ class NormalizedFeedForwardNetwork(nn.Module):
 
         for fc in (self.fc1, self.fc2, self.fc3):
             if fc is not None:
-                fc.muon = 1  # Muon, one block (xllm/optim/muon.py)
+                register_muon(fc)  # Muon, one matrix (xllm/optim/muon.py)
 
     def forward(
         self,
