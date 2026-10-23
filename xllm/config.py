@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from logging import getLogger
 from typing import Optional
 from pathlib import Path
@@ -7,6 +7,7 @@ import os
 import json
 
 from xllm.configuration import Config
+from xllm.ft.config import FtConf
 from xllm.distributed import (
     model_parallel_is_initialized,
     get_data_parallel_world_size,
@@ -383,6 +384,8 @@ class TrainerConf(Config):
     nccl_timeout: int = 3600  # NCCL timeout in seconds.
 
     cluster_check_level: int = 1  # Cluster check level at start. 0 will only log env. >=1 will run communication benchmarks in addition.
+
+    ft: FtConf = field(default_factory=FtConf)  # In-band fault tolerance (hot swap), off by default: xllm/ft/config.py
 
     @property
     def data_parallel_size(self) -> int:
