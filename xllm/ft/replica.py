@@ -18,7 +18,7 @@ import pickle
 import threading
 from pathlib import Path
 from timeit import default_timer as timer
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 import torch
 import torch.distributed as dist
@@ -87,11 +87,14 @@ class Replica:
         if sizes[0].item() != -sizes[1].item():
             raise RuntimeError(f"ft: ranks disagree on the GPUs per node ({-sizes[1].item()}..{sizes[0].item()})")
         multi_node = self.world > gpus_per_node
+        self.gpus_per_node = gpus_per_node
         self.peer_of = (self.rank + gpus_per_node) % self.world if multi_node else None
         self.peer_src = (self.rank - gpus_per_node) % self.world if multi_node else None
         self.group = dist.new_group(list(range(self.world)))  # never queued behind training collectives
         self.stream = torch.cuda.Stream()
         self.busy = False
+        self.force_copy = False  # set by a memory restore: copy at the first allowed step
+        self.restored_slot: Optional[int] = None  # the forced copy goes to the other slot
         self.thread: Optional[threading.Thread] = None
         self.gpu_mine = self.gpu_recv = self.host_mine = self.host_recv = None
         self.recv_nbytes = 0
@@ -102,16 +105,19 @@ class Replica:
         """Call after the optimizer and scheduler steps. Collective over all ranks."""
         if not self.gpu_peak.copies_allowed:
             return
-        if self.k == 0 and not self._set_auto_k(step):
+        forced = self.force_copy
+        if forced:
+            self.force_copy = False
+        elif self.k == 0 and not self._set_auto_k(step):
             return
-        if self.k > 0 and step % self.k != 0:
+        elif self.k > 0 and step % self.k != 0:
             return
         busy = torch.tensor([int(self.busy)], device="cuda")
         dist.all_reduce(busy, op=dist.ReduceOp.MAX, group=self.group)
         if busy.item():
             logger.warning(f"ft: copy at step {step} skipped, the previous copy is still being written")
             return
-        self._start_copy(step, training_state())
+        self._start_copy(step, training_state(), forced)
 
     def _set_auto_k(self, step: int) -> bool:
         """Auto k: copy once at the first allowed step, then k* = sqrt(2 C MTBF) / t from its measured cost."""
@@ -133,7 +139,8 @@ class Replica:
         logger.info(f"ft: copy cost {c:.2f} s, step {t:.3f} s, MTBF {self.mtbf_sys:.0f} s -> copy every {self.k} steps")
         return False
 
-    def _buffers(self, nbytes: int):
+    def prepare(self, nbytes: int):
+        """Allocates the copy buffers and learns the size of the state this rank holds. Collective (pairs)."""
         if self.gpu_mine is None:
             self.gpu_mine = torch.empty(nbytes, dtype=torch.uint8, device="cuda")
             self.host_mine = torch.empty(nbytes, dtype=torch.uint8, pin_memory=True)
@@ -151,11 +158,14 @@ class Replica:
                 self.gpu_recv = torch.empty(self.recv_nbytes, dtype=torch.uint8, device="cuda")
                 self.host_recv = torch.empty(self.recv_nbytes, dtype=torch.uint8, pin_memory=True)
 
-    def _start_copy(self, step: int, training_state: Dict[str, Any]):
-        slot = (step // self.k) % 2 if self.k > 0 else 0
+    def _start_copy(self, step: int, training_state: Dict[str, Any], forced: bool = False):
+        if forced and self.restored_slot is not None:
+            slot = 1 - self.restored_slot  # keep the restored copy until the new one is complete
+        else:
+            slot = (step // self.k) % 2 if self.k > 0 else 0
         tensors = state_tensors(self.model, self.optimizer)
         nbytes = sum(t.numel() * t.element_size() for t in tensors)
-        self._buffers(nbytes)
+        self.prepare(nbytes)
         assert nbytes == self.gpu_mine.numel(), "the training state changed size"
         meta = pickle.dumps({"step": step, "epoch": run_epoch(), "rank": self.rank, "nbytes": nbytes,
                              "training_state": training_state})
@@ -246,3 +256,123 @@ def read_meta(path: Path) -> Optional[Dict[str, Any]]:
     if not mp.exists():
         return None
     return pickle.loads(mp.read_bytes())
+
+
+NO_COMMON_STEP_EXIT = 76  # a memory restore found no step that every rank holds: the agent restarts from disk
+
+
+def replaced_nodes() -> List[int]:
+    """Logical nodes whose state was lost this generation (set by the agent; their ranks restore from the holder)."""
+    return [int(n) for n in os.environ.get("FT_REPLACED", "").split(",") if n]
+
+
+def valid_steps(path_of_slot: Callable[[int], Path], rank: int) -> Dict[int, int]:
+    """step -> slot index, for the slots whose metadata is complete and belongs to this run and this rank."""
+    out = {}
+    for slot in (0, 1):
+        meta = read_meta(path_of_slot(slot))
+        if meta is not None and meta["epoch"] == run_epoch() and meta["rank"] == rank:
+            out[meta["step"]] = slot
+    return out
+
+
+@torch.no_grad()
+def init_optimizer_state(model: torch.nn.Module, optimizer: torch.optim.Optimizer):
+    """Creates the optimizer state with its real shapes, sharding and devices (it is overwritten right after).
+    Only trainable parameters get a gradient, so the state set matches the one copied."""
+    for p in model.parameters():
+        if p.requires_grad:
+            p.grad = torch.zeros_like(p)
+    optimizer.step()
+    optimizer.zero_grad()
+
+
+@torch.no_grad()
+def unpack(tensors: List[torch.Tensor], buf: torch.Tensor):
+    off = 0
+    for t in tensors:
+        n = t.numel() * t.element_size()
+        src = buf[off:off + n].to(t.device)
+        if t.is_contiguous():
+            t.view(-1).view(torch.uint8).copy_(src)
+        else:  # through a contiguous buffer, in the order pack() wrote it
+            t.copy_(src.view(t.dtype).view(t.shape))
+        off += n
+    assert off == buf.numel(), "the copy does not match the training state"
+
+
+ANY_STEP = 2**62  # offered by a rank whose state comes from its holder: it takes whatever step the others agree on
+
+
+def agree_step(candidates: Optional[Set[int]], reduce_min: Callable[[int], int]) -> int:
+    """
+    The newest step every rank holds, or -1. candidates: this rank's steps (None: any step). reduce_min: an
+    all-reduce MIN over all ranks. A failed copy write can leave ranks with different steps, so a step counts only
+    once every rank confirmed it holds it; else the ranks agree again below it. Collective.
+    """
+    bound = ANY_STEP + 1
+    while True:
+        mine = None if candidates is None else [s for s in candidates if s < bound]
+        step = reduce_min(ANY_STEP if mine is None else max(mine, default=-1))
+        if step < 0 or step == ANY_STEP:
+            return -1
+        if reduce_min(int(candidates is None or step in candidates)) == 1:
+            return step
+        bound = step
+
+
+def restore(replica: Replica) -> Optional[Dict[str, Any]]:
+    """
+    After the process groups are rebuilt: agree on the newest step every rank holds, then load it into the
+    model, optimizer and buffers. Returns this rank's non-tensor training state, or None when no common
+    step exists (the caller exits with NO_COMMON_STEP_EXIT). Collective over all ranks.
+    """
+    rank, gpus = replica.rank, replica.gpus_per_node
+    node_replaced = (rank // gpus) in replaced_nodes()
+    own = valid_steps(lambda s: slot_path(replica.slot_dir, "own", rank, s), rank)
+    candidates = set(own) if not node_replaced else None  # None: this rank's state comes from its holder
+    holder_of = replica.peer_src is not None and (replica.peer_src // gpus) in replaced_nodes()
+    if holder_of:  # this rank holds the copy of a rank whose node was replaced
+        held = valid_steps(lambda s: slot_path(replica.slot_dir, "peer", replica.peer_src, s), replica.peer_src)
+        candidates = set(held) if candidates is None else candidates & set(held)
+
+    def reduce_min(value: int) -> int:
+        t = torch.tensor([value], device="cuda", dtype=torch.int64)
+        dist.all_reduce(t, op=dist.ReduceOp.MIN)
+        return int(t.item())
+
+    step = agree_step(candidates, reduce_min)
+    if step < 0:
+        logger.error(f"ft: no in-memory step held by every rank (this rank holds {sorted(candidates or [])})")
+        return None
+
+    init_optimizer_state(replica.model, replica.optimizer)
+    tensors = state_tensors(replica.model, replica.optimizer)
+    nbytes = sum(t.numel() * t.element_size() for t in tensors)
+    replica.prepare(nbytes)
+    if holder_of:  # send the held copy and its metadata to the rank that now owns that state
+        path = slot_path(replica.slot_dir, "peer", replica.peer_src, held[step])
+        payload = torch.from_file(str(path), shared=False, size=path.stat().st_size, dtype=torch.uint8).cuda()
+        meta = torch.frombuffer(bytearray(meta_path(path).read_bytes()), dtype=torch.uint8).cuda()
+        sizes = torch.tensor([payload.numel(), meta.numel()], device="cuda")
+        dist.send(sizes, replica.peer_src, group=replica.group)
+        dist.send(payload, replica.peer_src, group=replica.group)
+        dist.send(meta, replica.peer_src, group=replica.group)
+    if node_replaced:
+        sizes = torch.empty(2, dtype=torch.int64, device="cuda")
+        dist.recv(sizes, replica.peer_of, group=replica.group)
+        payload = torch.empty(int(sizes[0].item()), dtype=torch.uint8, device="cuda")
+        meta_t = torch.empty(int(sizes[1].item()), dtype=torch.uint8, device="cuda")
+        dist.recv(payload, replica.peer_of, group=replica.group)
+        dist.recv(meta_t, replica.peer_of, group=replica.group)
+        meta = pickle.loads(bytes(meta_t.cpu().numpy()))
+    else:
+        path = slot_path(replica.slot_dir, "own", rank, own[step])
+        payload = torch.from_file(str(path), shared=False, size=path.stat().st_size, dtype=torch.uint8).cuda()
+        meta = read_meta(path)
+    assert meta["step"] == step and meta["rank"] == rank and meta["nbytes"] == nbytes == payload.numel()
+    unpack(tensors, payload)
+    replica.restored_slot = None if node_replaced else own[step]
+    replica.force_copy = True  # after the first good step, copy at once: fresh copies everywhere
+    logger.info(f"ft: restored step {step} from memory{' (state received from its holder)' if node_replaced else ''}")
+    return meta["training_state"]

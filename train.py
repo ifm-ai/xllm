@@ -245,10 +245,13 @@ def main(cfg: TrainerConf):
         logger.info(f"No print for worker {cfg.slurm.global_rank}")
         logger.disabled = True
 
-    # model / optimizer paths
-    model_path, optim_path, training_state_path = get_latest_checkpoint_paths_for_sharded_states(
-        cfg.dump_dir, cfg.slurm.global_rank, cfg.fully_sharded_size, cfg.dcp_for_optimizer
-    )
+    # model / optimizer paths (a memory restart does not look at the disk checkpoints)
+    if ft_memory_restart(cfg):
+        model_path = optim_path = training_state_path = None
+    else:
+        model_path, optim_path, training_state_path = get_latest_checkpoint_paths_for_sharded_states(
+            cfg.dump_dir, cfg.slurm.global_rank, cfg.fully_sharded_size, cfg.dcp_for_optimizer
+        )
     assert (model_path is None) == (optim_path is None)
 
     logger.info("Start building of model...")
@@ -319,8 +322,13 @@ def main(cfg: TrainerConf):
         async_checkpointing=cfg.async_checkpointing,
     )
 
-    # reload model if available
-    if model_path is not None:
+    # reload: from the in-memory copies on an ft memory restart, else from disk if available
+    if ft_memory_restart(cfg):
+        restored = ft.restore(cfg)
+        for group, saved in zip(optimizer.param_groups, restored["param_groups"]):
+            group.update(saved)
+        set_optim_state(scheduler, restored, state, data_iterator, timings, cfg.optim)
+    elif model_path is not None:
         logger.info(f"Reloading model checkpoint from {model_path} ...")
         hsdp_group = get_hybrid_shard_data_parallel_group()
         # reload sharded model state

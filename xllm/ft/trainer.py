@@ -8,12 +8,13 @@ import os
 import shutil
 import signal
 import socket
+import sys
 from pathlib import Path
 from typing import Any, Dict
 
 from xllm.ft.node import gpus_per_node
 from xllm.ft.progress import Progress
-from xllm.ft.replica import Replica
+from xllm.ft.replica import NO_COMMON_STEP_EXIT, Replica, restore
 from xllm.ft.sizing import startup_gate
 
 logger = logging.getLogger()
@@ -60,6 +61,13 @@ class FtTrainer:
         self.replica = Replica(model, optimizer, cfg.ft.slot_dir, cfg.ft.k, cfg.ft.mtbf_sys, gpus_per_node(),
                                self.gpu_peak)
         self.progress = Progress.for_trainer()  # None when ft runs without the agent
+
+    def restore(self, cfg) -> Dict[str, Any]:
+        """The training state of a memory or agent-dump restart; exits with the code the agent acts on if none."""
+        restored = restore(self.replica)
+        if restored is None:
+            sys.exit(NO_COMMON_STEP_EXIT)  # the agent restarts this generation from disk
+        return restored
 
     def step_start(self, step: int):
         self.gpu_peak.record(step)

@@ -35,6 +35,7 @@ from torch.distributed import TCPStore
 
 from xllm.ft.inject import InjectionReader
 from xllm.ft.progress import PROGRESS_ENV, Progress, progress_path
+from xllm.ft.replica import NO_COMMON_STEP_EXIT
 
 logger = logging.getLogger()
 
@@ -185,11 +186,16 @@ class Agent:
                 RANK=str(rank), SLURM_PROCID=str(rank), WORLD_SIZE=str(self.nnodes * self.gpus),
                 LOCAL_RANK=str(local), LOCAL_WORLD_SIZE=str(self.gpus), MASTER_ADDR=self.leader_addr,
                 MASTER_PORT=str(self.store_port + 1 + gen), FT_AGENT_PID=str(os.getpid()), FT_GEN=str(gen),
-                FT_RESTORE="disk", **{PROGRESS_ENV: str(path)},
+                FT_RESTORE=self.restore_mode(gen), **{PROGRESS_ENV: str(path)},
             )
             self.procs.append(subprocess.Popen([sys.executable, "-m", "xllm.ft.child"] + self.train_args, env=env))
         self.state("running", gen)
         logger.info(f"ft agent {self.node}: generation {gen}, {self.gpus} trainers started")
+
+    def restore_mode(self, gen: int) -> str:
+        """memory or disk, decided by the leader for each generation; the first start reads the disk checkpoint."""
+        key = f"mode/{gen}"
+        return self.store.get(key).decode() if gen > 0 and self.store.check([key]) else "disk"
 
     def kill(self, timeout: float = KILL_TIMEOUT) -> bool:
         """SIGKILL every trainer and wait for them; False when one is still alive after the timeout."""
@@ -295,6 +301,8 @@ class Agent:
                 return "finished"
             failed = [(i, c) for i, c in enumerate(codes) if c not in (None, 0)]
             if failed:
+                if any(c == NO_COMMON_STEP_EXIT for _, c in failed):
+                    self.store.set(f"nocommon/{gen}", "1")  # memory cannot restore: next generation from disk
                 self.request(gen, f"trainer exit codes {failed}")
             deadline = self.hang_deadline(gaps)
             now = time.monotonic()
@@ -380,7 +388,11 @@ class Agent:
                 logger.error(f"ft leader: {self.retries_used} generations in a row failed without progress ({reason})")
                 self.store.set("end", reason)
                 return "end"
-            logger.warning(f"ft leader: restarting all trainers, generation {gen} -> {gen + 1} ({reason})")
+            # memory first; disk when memory has no common step or R memory restarts in a row failed
+            no_common = self.store.check([f"nocommon/{gen}"])
+            mode = "disk" if no_common or self.retries_used >= self.conf.retries else "memory"
+            logger.warning(f"ft leader: restarting all trainers from {mode}, generation {gen} -> {gen + 1} ({reason})")
+            self.store.set(f"mode/{gen + 1}", mode)
             self.store.set("gen", str(gen + 1))
             return "restart"
         return None
