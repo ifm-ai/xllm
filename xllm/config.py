@@ -81,7 +81,14 @@ class SlurmConf(Config):
 
 @dataclass
 class OptimConf(Config):
+    optimizer: str = "adamw"  # adamw, or muon (Muon for linear weights in the blocks, AdamW for the rest)
     lr: float = 1e-3  # AdamW learning rate after warmup
+    muon_lr: float = 0.01  # Muon learning rate after warmup (optimizer=muon)
+    muon_momentum: float = 0.95
+    muon_nesterov: bool = True  # Nesterov momentum (Keller Jordan Muon, Moonlight)
+    muon_adjust_lr: Optional[str] = "spectral_norm"  # Muon update scaling: spectral_norm, rms_norm or None
+    muon_block_scale: str = "block"  # Update scale of a row block (from the layers' `muon` marks): block (its own shape) or matrix (its whole matrix's shape)
+    muon_weight_decay: Optional[float] = None  # Decoupled weight decay of the Muon matrices; None = weight_decay
     warmup: int = 2000  # Num of steps for LR warmup. 0 means no warmup
     weight_decay: float = 0.1  # Decoupled weight decay
     epsilon: float = 1e-8
@@ -96,6 +103,10 @@ class OptimConf(Config):
     wsd_decay_style: str = 'cosine'  # The curve type of decay phase in WSD scheduler: cosine or linear
 
     def __post_init__(self):
+        assert self.optimizer in ['adamw', 'muon']
+        assert self.muon_adjust_lr in [None, "spectral_norm", "rms_norm"]
+        assert self.muon_block_scale in ['block', 'matrix']
+        assert self.muon_weight_decay is None or self.muon_weight_decay >= 0
         assert self.scheduler in ['linear', 'cosine', 'constant', 'wsd']
         assert self.warmup >= 0
         if self.scheduler == 'wsd':
@@ -421,6 +432,11 @@ class TrainerConf(Config):
         assert self.dtype in ["bf16", "fp16", "fp32"]
         if self.dtype == "fp16":
             assert self.loss_rescaling, "loss rescaling needed for fp16!"
+
+        if self.optim.optimizer == "muon":
+            assert self.model.ddp_backend == "fsdp2", "Muon requires FSDP2."
+            assert self.model.num_experts == 0, "Muon does not support MoE."
+            assert self.dcp_for_optimizer, "Muon requires dcp_for_optimizer (sharded momentum)."
 
         # MoE
         if self.model.num_experts > 0:
