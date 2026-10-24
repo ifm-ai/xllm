@@ -127,6 +127,8 @@ def takeover_wait(leader: Dict, state: Dict, phys: int, lease_ttl: float) -> flo
     line = [p for i, p in enumerate(line) if p not in line[:i] and p not in (-1, None, leader.get("phys"))]
     if phys not in line or leader.get("ended"):  # a leader that ended the step: nothing to take over
         return float("inf")
+    if leader.get("stepdown") and phys == line[0]:  # the leader handed over on purpose: no need to wait
+        return 0.0
     return lease_ttl * (1.5 + line.index(phys))
 
 
@@ -191,7 +193,7 @@ class Agent:
         self.injections = InjectionReader(node=-1, ranks=[])
         self.faults: List = []  # (gpu, xid) reported by the GPU-fault lane's thread
         self.faults_lock = threading.Lock()
-        self.lease_lock = threading.Lock()  # the lease thread's publish vs an end's (mark_ended)
+        self.lease_lock = threading.Lock()  # the lease thread's publish vs a step-down's
         self.bad_reason = ""  # why this node must be replaced: told again to a new leader (the old store is gone)
         self.xids_to_replace = {int(x) for x in self.conf.xid_replace.split(",") if x}
         self.gpu_faults = GpuFaultLane(self._on_gpu_fault)
@@ -459,8 +461,9 @@ class Agent:
 
     def replace(self, gen: int, logical: int, phys: int, reason: str, mode: str) -> str:
         """Leader: put a spare in place of a failed training node and start the next generation."""
-        if phys == self.phys:  # the leader hosts the control store: its node cannot be handed over
-            self.store.set("end", f"the leader's node must be replaced ({reason})")
+        if phys == self.phys:  # the leader's own node: the standby takes over and replaces it
+            self.step_down(reason)
+            self.store.set("end", f"the leader's node must be replaced and there is no standby ({reason})")
             return "end"
         if not self.take_spare(gen + 1, logical, phys, reason):
             return "end"
@@ -882,7 +885,7 @@ class Agent:
                 barred, hosts = set(state["barred"]), state.pop("hosts")
                 choice = min((p for p in state["map"].values() if p != self.phys and p not in self.known_lost
                               and hosts.get(p, "") not in barred), default=-1)
-                with self.lease_lock:  # never over an end's publish
+                with self.lease_lock:  # never over a step-down's or an end's publish
                     if self.stopping.is_set():
                         return
                     now = self.lease.leader()
@@ -890,6 +893,8 @@ class Agent:
                         logger.error(f"ft leader {self.phys}: term {now['term']} was taken over; stepping down")
                         self.newer_term = now["term"]
                         store.set("moved", str(now["term"]))
+                        return
+                    if now is not None and now.get("stepdown") and now.get("term") == term:  # handed over: stop
                         return
                     if choice != standby or counter == 1:
                         standby = choice
@@ -919,6 +924,29 @@ class Agent:
             leader = self.lease.leader() or {}
             if int(leader.get("term", -1)) == self.term:
                 self.lease.publish(dict(leader, ended=True))
+
+    def step_down(self, reason: str):
+        """
+        Leader whose own node must go (a GPU that needs a reset, a node barred in an earlier run): save the state,
+        let the standby take over at once, and carry on as an ordinary agent; the new leader replaces this node.
+        Returns only when there is no standby (a single training node): the step then ends as before.
+        """
+        def handable(leader):
+            return int(leader.get("standby", -1)) >= 0 and int(leader.get("term", -1)) == self.term
+
+        if not handable(self.lease.leader() or {}):
+            return
+        state = self.lease_state(self.store, self.term)  # store reads: outside the lock
+        state.pop("hosts")
+        with self.lease_lock:  # the lease thread must not publish over it
+            leader = self.lease.leader() or {}
+            if not handable(leader):
+                return
+            self.lease.save_state(state)
+            self.lease.publish(dict(leader, stepdown=True))
+        logger.warning(f"ft leader {self.phys}: stepping down ({reason}); the standby {leader['standby']} takes over")
+        self.store.set("moved", "stepdown")
+        raise LeaderLost(f"stepped down: {reason}")
 
     def _watch_leader(self):
         """
@@ -971,7 +999,8 @@ class Agent:
         self.new_failures = state.get("new_failures", 0)
         logger.warning(f"ft agent {self.phys}: the leader (physical node {old.get('phys')}, term {term - 1}) is "
                        f"silent; taking over as the leader of term {term}")
-        self.takeover = {"term": term, "store": store, "port": port, "old": int(old.get("phys", -1)), "state": state}
+        self.takeover = {"term": term, "store": store, "port": port, "old": int(old.get("phys", -1)), "state": state,
+                         "stepdown": bool(old.get("stepdown"))}
 
     def rejoin(self) -> bool:
         """
@@ -980,7 +1009,7 @@ class Agent:
         """
         logger.warning(f"ft agent {self.phys}: lost the leader of term {self.term}; waiting for the next one")
         self.kill()
-        if self.is_leader:  # a leader that lost its term (cut off and taken over): an ordinary agent from now on
+        if self.is_leader:  # stepped down, or cut off and taken over: an ordinary agent from now on
             self.is_leader = False
             threading.Thread(target=self._watch_leader, daemon=True).start()
         # the standby takes over after 1.5 lease_ttl of silence, the next ones a lease_ttl apart
@@ -993,7 +1022,7 @@ class Agent:
             if leader is not None and leader.get("ended") and int(leader.get("term", 0)) == self.term:
                 logger.warning(f"ft agent {self.phys}: the leader ended the step")
                 return False
-            same = leader is not None and int(leader.get("term", 0)) == self.term
+            same = leader is not None and int(leader.get("term", 0)) == self.term and not leader.get("stepdown")
             if same and alive.silent_for(self.lease.counter(self.term)) < 3 * self.conf.lease_renew and \
                     time.monotonic() - alive.since < self.conf.lease_ttl:
                 try:  # the leader is alive (a network glitch): back to the same store
@@ -1063,7 +1092,7 @@ class Agent:
             self.set_mode(gen + 1, "memory")
             self.store.set("gen", str(gen + 1))
             return True
-        self.store.set(f"spare/{old}", "lost")
+        self.store.set(f"spare/{old}", "barred" if t.get("stepdown") else "lost")  # stepped down: already barred
         return self.replace(gen, logical, old, reason, "memory") == "restart"
 
     def report_free(self, gen: int, logical: int):
@@ -1180,9 +1209,10 @@ class Agent:
                         continue
                     if gen == 0 and socket.gethostname() in self.barred():
                         # barred in an earlier run of this job and given back by SLURM: replace it right away
-                        if self.is_leader:  # the leader's node cannot be handed over: end before any trainer starts
-                            host = socket.gethostname()
-                            self.store.set("end", f"the leader's node {host} was barred in an earlier run")
+                        if self.is_leader:  # hand over to the standby before any trainer starts, or end
+                            reason = f"the leader's node {socket.gethostname()} was barred in an earlier run"
+                            self.step_down(reason)
+                            self.store.set("end", reason)
                             return EXIT_REQUEUE
                         self.bad_reason = "barred in an earlier run of this job"
                         self.store.set(f"bad/{self.phys}", self.bad_reason)

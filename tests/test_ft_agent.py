@@ -231,6 +231,8 @@ def test_takeover_order_standby_first_then_the_others():
     assert takeover_wait(leader, state, 1, 60.0) == 150.0  # next in line, a lease_ttl later
     assert takeover_wait(leader, state, 0, 60.0) == float("inf")  # the old leader itself
     assert takeover_wait(leader, state, 5, 60.0) == float("inf")  # a spare (not a training node)
+    stepdown = dict(leader, stepdown=True)  # the leader handed over on purpose: the standby goes at once
+    assert takeover_wait(stepdown, state, 2, 60.0) == 0.0 and takeover_wait(stepdown, state, 1, 60.0) == 150.0
 
 
 def leader_agent(tmp_path, monkeypatch, phys=1):
@@ -346,6 +348,33 @@ def test_a_node_that_registers_late_is_not_lost_for_ever(tmp_path, monkeypatch):
     assert agent.lost_node([2]) == 2
     agent.store.set("reg/1/2", "1")  # it was in a long GPU release when the barrier ended
     assert agent.lost_node([2]) is None
+
+
+def test_a_leader_whose_node_must_go_hands_over_to_the_standby(tmp_path, monkeypatch):
+    import pytest
+
+    from xllm.ft.agent import LeaderLost
+
+    agent = leader_agent(tmp_path, monkeypatch, phys=0)
+    agent.is_leader, agent.retries_used, agent.failed_at = True, 0, 0
+    for k, v in {"map/0": "0", "map/1": "1", "gen": "2", "host/0": "n0", "host/1": "n1", "barred": "n0"}.items():
+        agent.store.set(k, v)
+    agent.store.add("next_phys", 2)
+    agent.lease.publish({"term": 0, "host": "n0", "port": 20000, "phys": 0, "standby": 1})
+    with pytest.raises(LeaderLost):
+        agent.replace(2, 0, 0, "Xid 79 on GPU 3", "memory")
+    assert agent.lease.leader()["stepdown"] and agent.store.get("moved") == b"stepdown"
+    assert agent.lease.state()["barred"] == ["n0"] and agent.lease.state()["gen"] == 2
+    assert not agent.store.check(["end"])
+
+
+def test_a_leader_without_a_standby_ends_the_step(tmp_path, monkeypatch):
+    agent = leader_agent(tmp_path, monkeypatch, phys=0)
+    agent.is_leader = True
+    agent.lease.publish({"term": 0, "host": "n0", "port": 20000, "phys": 0, "standby": -1})
+    assert agent.replace(2, 0, 0, "Xid 79 on GPU 3", "memory") == "end" and agent.store.check(["end"])
+
+
 def test_a_node_that_must_be_replaced_tells_the_new_leader_again(tmp_path, monkeypatch):
     agent = leader_agent(tmp_path, monkeypatch)
     agent.term, agent.bad_reason, agent.spare_ready = 1, "Xid 79 on GPU 3", False
@@ -465,6 +494,32 @@ def test_a_term_claimed_but_never_led_is_skipped(tmp_path, monkeypatch):
         time.sleep(0.05)
     agent.stopping.set()
     assert agent.takeover == {"term": 2} and agent.lease.leader()["term"] == 1
+
+
+def test_the_lease_thread_stops_at_a_step_down_and_never_publishes_over_it(tmp_path, monkeypatch):
+    import threading
+    import time
+
+    import pytest
+
+    from xllm.ft.agent import LeaderLost
+
+    agent = leader_agent(tmp_path, monkeypatch, phys=0)
+    agent.is_leader, agent.retries_used, agent.failed_at, agent.leader_addr, agent.port = True, 0, 0, "n0", 20000
+    agent.conf.lease_renew = 0.01
+    for k, v in {"map/0": "0", "map/1": "1", "gen": "2", "host/0": "n0", "host/1": "n1"}.items():
+        agent.store.set(k, v)
+    agent.store.add("next_phys", 2)
+    agent._connect = lambda host: agent.store
+    lease_thread = threading.Thread(target=agent._lead_lease, args=(0,), daemon=True)
+    lease_thread.start()
+    deadline = time.monotonic() + 10
+    while (agent.lease.leader() or {}).get("standby") != 1 and time.monotonic() < deadline:
+        time.sleep(0.01)
+    with pytest.raises(LeaderLost):
+        agent.step_down("Xid 79 on GPU 3")
+    lease_thread.join(5)
+    assert not lease_thread.is_alive() and agent.lease.leader()["stepdown"]
 
 
 def test_a_spare_mapped_into_the_generation_being_started_starts_at_once(tmp_path, monkeypatch):
