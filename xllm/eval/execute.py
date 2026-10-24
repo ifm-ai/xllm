@@ -163,7 +163,7 @@ def eval_generation(
         pad_tensor = torch.zeros((1, 1), dtype=torch.long)
         text_x = batch.get("text_x", pad_tensor).cuda()
         text_y = batch.get("text_y", pad_tensor).cuda()
-        nll = inference(model, text_x, text_y, False)
+        nll = inference(model, text_x, text_y, False, attn_stability_control)
         nll = nll.view(text_x.size()).sum(dim=-1)
     else:
         nll = None
