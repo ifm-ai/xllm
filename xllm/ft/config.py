@@ -27,6 +27,8 @@ class FtConf(Config):
     spare_health: bool = True  # Whether spares pass a local GPU and NCCL health check before admission.
     spares: int = 0  # Number of the allocated nodes kept as idle spares (the last ones). 0 = none: a lost node is not replaced.
     retries: int = 2  # Failed recoveries from memory before falling back to disk.
+    lease_ttl: float = 60.0  # Seconds after which a standby takes over from a leader whose lease stopped being renewed.
+    lease_renew: float = 6.0  # Seconds between the leader's lease renewals (and state flushes) on the shared FS.
     slot_dir: str = "/dev/shm/xllm_ft"  # Directory holding the in-memory copies (must be RAM-backed).
     local_log_dir: str = "/tmp/xllm_ft_logs"  # Per-host local directory for logs and metrics when enabled (a job subfolder is used).
 
@@ -37,4 +39,5 @@ class FtConf(Config):
             assert self.retries >= 0 and self.dump_keep >= 1
             assert self.hb_deadline >= 0 and self.hb_margin >= 0 and self.hb_interval > 0
             assert self.node_deadline > 0 and self.release_timeout >= 0 and self.refill_wait_s >= 0
+            assert 0 < self.lease_renew < self.lease_ttl / 4, "ft.lease_renew must be well under ft.lease_ttl"
             assert all(x.isdigit() for x in self.xid_replace.split(",") if x), "ft.xid_replace: comma separated Xids"
