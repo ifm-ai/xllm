@@ -3,6 +3,7 @@ import math
 import torch
 
 from xllm.distributed.utils import reshape_gathered_tensor_along_specific_dim
+from xllm.health_metrics import get_active_health_collector
 from xllm.modules.fused_ops import (
     memory_efficient_dropout_fwd,
     memory_efficient_dropout_bwd,
@@ -132,6 +133,11 @@ class TransformerMoVABlockFunction(torch.autograd.Function):
         attn_for_save, attn_lse = attn_out
         flash_rng_state, attn_rng_state, attn_out_rng_state, xh_rng_state = rng_states
         v_original_scores, v_routing_indices, v_org_topk_scores, v_tokens_per_expert, v_group_sizes = routing_state
+        health_collector = get_active_health_collector()
+        if health_collector is not None:
+            health_collector.record_router_stats(
+                "mova", layer_id, v_tokens_per_expert, v_org_topk_scores, mova_router_bias, aux_loss_mova,
+            )
 
         if segments is not None:
             if causal_attn_backend == 'flash':
@@ -170,6 +176,11 @@ class TransformerMoVABlockFunction(torch.autograd.Function):
             hidden_dropout, recompute_fc1_out, recompute_fc3_out
         )
         original_scores, routing_indices, org_topk_scores, tokens_per_expert = routing_out
+        health_collector = get_active_health_collector()
+        if health_collector is not None:
+            health_collector.record_router_stats(
+                "moe", layer_id, tokens_per_expert, org_topk_scores, moe_router_bias, aux_loss_moe,
+            )
         h1, h3 = shared_hiddens
         group_sizes, input_splits, output_splits, curr_bsz = routing_state
         expert_hidden_rng_state, shared_hidden_rng_state = rng_states

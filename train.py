@@ -61,6 +61,8 @@ from xllm.optim import build_optimizer, rescale_grads
 from xllm.monitor import GPUMonitor, Timings
 from xllm.metrics import MetricLogger, build_mlogger
 from xllm.health_metrics import HealthMetricCollector
+from xllm.modules.moe.moe import moe_layer_ids
+from xllm.modules.moe.mova import mova_layer_ids
 from xllm.configuration import cfg_from_cli
 try:
     import wandb
@@ -278,6 +280,11 @@ def main(cfg: TrainerConf):
             cfg.dump_dir, k, enable_loggers, enable_wandb, enable_prefix_keys=k != "health"
         ) for k in to_log
     }
+    router_stats_layers = {}
+    if cfg.health_moe_stats:
+        router_stats_layers["moe"] = moe_layer_ids(model)
+    if cfg.health_mova_stats:
+        router_stats_layers["mova"] = mova_layer_ids(model)
     health_collector = HealthMetricCollector(
         enabled=enable_health,
         freq=cfg.health_log_freq,
@@ -287,6 +294,7 @@ def main(cfg: TrainerConf):
         enable_gradient_norms=cfg.health_gradient_norms,
         enable_logits_stats=cfg.health_logits_stats,
         enable_gekko_stats=cfg.health_gekko_stats,
+        router_stats_layers=router_stats_layers,
     )
 
     model.train()

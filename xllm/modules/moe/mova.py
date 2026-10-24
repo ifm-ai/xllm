@@ -4,6 +4,7 @@ import torch
 from torch import nn, Tensor
 import torch.nn.functional as F
 
+from xllm.health_metrics import get_active_health_collector
 from xllm.utils import get_init_fn
 from xllm.distributed.utils import divide_and_check_no_remainder
 from xllm.distributed import (
@@ -238,6 +239,11 @@ class MOVAttention(nn.Module):
         sx = scatter_to_model_parallel_region(x) if self.norm.gather_input else x
         # B x L x K
         routing_scores, routing_indices, tokens_per_expert, aux_loss = self.router(sx, load_balancing_type)
+        health_collector = get_active_health_collector()
+        if health_collector is not None:
+            health_collector.record_router_stats(
+                "mova", self.layer_id, tokens_per_expert, routing_scores, self.router.bias, aux_loss,
+            )
         # B*L*K
         sorted_indices = torch.argsort(routing_indices.flatten(), stable=True)
         permute_indices = sorted_indices // self.topk
@@ -290,3 +296,8 @@ class MOVAttention(nn.Module):
             self.permutation_backend, self.attn_gate_fn if self.apply_attn_gate else None,
             self.init_mode, self.init_std
         )
+
+
+def mova_layer_ids(model: nn.Module) -> list[int]:
+    """Decoder layers that hold MoVA attention, read from the built (possibly FSDP-wrapped) model."""
+    return sorted(module.layer_id for module in model.modules() if isinstance(module, MOVAttention))
