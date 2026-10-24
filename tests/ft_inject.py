@@ -32,6 +32,7 @@ def parse_args(argv: Optional[List[str]] = None):
     group.add_argument("--gpu-lost", type=int, metavar="N")
     group.add_argument("--fail-spare-health", type=int, metavar="N")
     group.add_argument("--dump-kill", type=int, metavar="N")
+    group.add_argument("--lease-cut", type=int, metavar="N")
     return parser.parse_args(argv)
 
 

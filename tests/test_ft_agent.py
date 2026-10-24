@@ -67,6 +67,12 @@ class DictStore:
         return v.encode() if isinstance(v, str) else v
 
 
+class FakeStore(DictStore):
+    def add(self, k, v):
+        self.data[k] = int(self.data.get(k, 0)) + v
+        return self.data[k]
+
+
 def test_gpu_faults_restart_or_replace():
     import threading
 
@@ -135,7 +141,7 @@ def test_a_node_that_never_sent_a_heartbeat_gets_the_startup_deadline():
             return self.data[k]
 
     agent = Agent.__new__(Agent)
-    agent.store, agent.hb_seen, agent.startup_s = Counters(), {}, None
+    agent.store, agent.hb_seen, agent.startup_s, agent.known_lost = Counters(), {}, None, set()
     agent.conf = types.SimpleNamespace(node_deadline=10.0, hb_margin=0.5, nccl_timeout=3600)
     assert agent.lost_node([1]) is None
     agent.hb_seen[1] = (0, agent.hb_seen[1][1] - 11.0)  # 11 s silent, but it never started: still starting
@@ -197,12 +203,13 @@ def test_hang_deadline_must_fire_before_nccl_timeout():
         agent_conf(["train.py", "--ft.hb_deadline", "4000", "--nccl_timeout", "3600"])
 
 
-def test_a_follower_keeps_trying_to_join_a_late_leader(monkeypatch):
+def test_a_follower_keeps_trying_to_join_a_late_leader(tmp_path, monkeypatch):
     import types
 
     agent = Agent.__new__(Agent)
-    agent.conf = types.SimpleNamespace(nccl_timeout=3600, node_deadline=10.0)
-    agent.leader_addr, agent.store_port = "node0", 20000
+    agent.conf = types.SimpleNamespace(nccl_timeout=3600, node_deadline=10.0, dump_dir=str(tmp_path))
+    agent.leader_addr, agent.store_port, agent.port = "node0", 20000, 20000
+    agent.main_job, agent.term, agent.newer_term = 9, 0, 0
     attempts = []
 
     def connect(host):
@@ -212,4 +219,285 @@ def test_a_follower_keeps_trying_to_join_a_late_leader(monkeypatch):
         return "store"
 
     agent._connect = connect
+    monkeypatch.setattr("xllm.ft.agent.time.sleep", lambda s: None)
     assert agent._join() == "store" and attempts == [False, False, False]
+
+
+def test_takeover_order_standby_first_then_the_others():
+    from xllm.ft.agent import takeover_wait
+
+    leader, state = {"term": 0, "phys": 0, "standby": 2}, {"map": {"0": 0, "1": 1, "2": 2}}
+    assert takeover_wait(leader, state, 2, 60.0) == 90.0  # the designated standby
+    assert takeover_wait(leader, state, 1, 60.0) == 150.0  # next in line, a lease_ttl later
+    assert takeover_wait(leader, state, 0, 60.0) == float("inf")  # the old leader itself
+    assert takeover_wait(leader, state, 5, 60.0) == float("inf")  # a spare (not a training node)
+
+
+def leader_agent(tmp_path, monkeypatch, phys=1):
+    """A follower (physical node phys) of a 2-node run whose leader (node 0) published term 0."""
+    import threading
+    import types
+
+    from xllm.ft.leader import Lease
+
+    monkeypatch.setenv("FT_EPOCH", "9:0")
+    agent = Agent.__new__(Agent)
+    agent.conf = types.SimpleNamespace(lease_ttl=60.0, lease_renew=6.0, hb_interval=0.01, node_deadline=10.0,
+                                       hb_margin=0.5, nccl_timeout=3600, refill_wait=0.0, dump_dir=str(tmp_path),
+                                       slot_dir=str(tmp_path))
+    agent.phys, agent.ntrain, agent.gpus, agent.is_leader, agent.term, agent.newer_term = phys, 2, 8, False, 0, 0
+    agent.store, agent.store_epoch, agent.known_lost, agent.takeover = FakeStore(), 0, set(), None
+    agent.teardown_s = None
+    agent.procs, agent.spare_ready, agent.hb_seen, agent.store_port = [], False, {}, 20000
+    agent.renewed_at = __import__("time").monotonic()
+    agent.lease, agent.stopping, agent.finished_locally = Lease(tmp_path / "lease"), threading.Event(), False
+    agent.request_refill = lambda: None
+    agent.bad_reason, agent.lease_lock = "", threading.Lock()
+    agent.new_failures, agent.warm_gen = 0, -1
+    return agent
+
+
+def test_gen_is_fenced_by_a_newer_term_or_a_moved_store(tmp_path, monkeypatch):
+    import pytest
+
+    from xllm.ft.agent import LeaderLost
+
+    agent = leader_agent(tmp_path, monkeypatch)
+    agent.store.set("gen", "3")
+    assert agent.gen() == 3
+    agent.newer_term = 1  # the standby thread read term 1 on the shared FS
+    with pytest.raises(LeaderLost):
+        agent.gen()
+    agent.newer_term = 0
+    agent.store.set("moved", "1")  # the old leader stepped down and says so in its own store
+    with pytest.raises(LeaderLost):
+        agent.gen()
+    agent.store.data.pop("moved")
+    agent.takeover = {"term": 1}  # this agent won term 1 while its leader is alive but cut off
+    with pytest.raises(LeaderLost):
+        agent.gen()
+
+
+def test_a_follower_rejoins_the_leader_of_the_next_term(tmp_path, monkeypatch):
+    agent = leader_agent(tmp_path, monkeypatch)
+    new_store = FakeStore()
+    agent._connect = lambda host: new_store
+    agent.mapped = lambda: {0: 2, 1: 1}
+    agent.lease.publish({"term": 1, "host": "node1", "port": 22001, "phys": 1, "standby": 2})
+    assert agent.rejoin() is True
+    assert agent.store is new_store and agent.term == 1 and (agent.leader_addr, agent.port) == ("node1", 22001)
+    assert new_store.data["reg/1/1"] == "1" and agent.store_epoch == 1  # registered; the side threads reconnect
+
+
+def test_the_new_leader_replaces_the_old_leaders_node(tmp_path, monkeypatch):
+    import xllm.ft.agent as agent_mod
+
+    monkeypatch.setattr(agent_mod, "REFILL_WAIT_FLOOR_S", 0.0)
+    agent = leader_agent(tmp_path, monkeypatch)
+    agent._start_lease = lambda term: None
+    store = FakeStore()
+    for k, v in {"map/0": "0", "map/1": "1", "gen": "5", "next_phys": 3, "spare/2": "ready", "host/2": "dgx-c",
+                 "reg/1/2": "1"}.items():
+        store.set(k, v)
+    agent.takeover = {"term": 1, "store": store, "port": 22001, "old": 0, "state": {"map": {"0": 0, "1": 1}}}
+    assert agent._take_over() is True
+    data = store.data
+    assert agent.is_leader and agent.term == 1 and 0 in agent.known_lost
+    assert data["map/0"] == "2" and data["spare/2"] == "used" and data["gen"] == "6" and data["mode/6"] == "memory"
+    assert data["spare/0"] == "lost" and data["reg/1/1"] == "1"
+
+
+def test_a_leader_lost_during_the_finish_ends_the_run_without_training(tmp_path, monkeypatch):
+    agent = leader_agent(tmp_path, monkeypatch)
+    agent.finished_locally = True
+    (tmp_path / "ft_finished.9.0").write_text("finished\n")  # the old leader wrote it before it died
+    agent.wait_finished()  # returns at once, though the store never says "finished"
+    agent._start_lease = lambda term: None
+    store = FakeStore()
+    for k, v in {"map/0": "0", "map/1": "1", "gen": "5", "reg/1/1": "1"}.items():
+        store.set(k, v)
+    agent.takeover = {"term": 1, "store": store, "port": 22001, "old": 0, "state": {"map": {"0": 0, "1": 1}}}
+    assert agent._take_over() is True and store.data["gen"] == "5"  # no restart, no spare taken
+
+
+def test_a_finished_agent_tells_the_new_leader_the_run_is_over(tmp_path, monkeypatch):
+    agent = leader_agent(tmp_path, monkeypatch, phys=2)  # this one was a poll behind: not finished itself
+    agent.ntrain = 3
+    agent._start_lease = lambda term: None
+    store = FakeStore()
+    for k, v in {"map/0": "0", "map/1": "1", "map/2": "2", "gen": "5", "reg/1/1": "1", "fin/1/1": "1"}.items():
+        store.set(k, v)
+    state = {"map": {"0": 0, "1": 1, "2": 2}}
+    agent.takeover = {"term": 1, "store": store, "port": 22001, "old": 0, "state": state}
+    assert agent._take_over() is True and agent.finished_locally and store.data["gen"] == "5"
+
+
+def test_the_marker_is_written_past_the_fence(tmp_path, monkeypatch):
+    agent = leader_agent(tmp_path, monkeypatch)
+    agent.store.set("gen", "7")
+    agent.newer_term = 2  # a third leader appeared during the finish: gen() would raise
+    agent.write_finished_marker()
+    assert (tmp_path / "ft_finished.9.0").read_text() == "finished at generation 7\n"
+
+
+def test_a_node_that_registers_late_is_not_lost_for_ever(tmp_path, monkeypatch):
+    agent = leader_agent(tmp_path, monkeypatch)
+    agent.term, agent.known_lost = 1, {2}
+    assert agent.lost_node([2]) == 2
+    agent.store.set("reg/1/2", "1")  # it was in a long GPU release when the barrier ended
+    assert agent.lost_node([2]) is None
+def test_a_node_that_must_be_replaced_tells_the_new_leader_again(tmp_path, monkeypatch):
+    agent = leader_agent(tmp_path, monkeypatch)
+    agent.term, agent.bad_reason, agent.spare_ready = 1, "Xid 79 on GPU 3", False
+    agent.store.set("map/0", "0")
+    agent.store.set("map/1", "1")
+    agent.reannounce()  # in the new leader's store
+    assert agent.store.get("bad/1") == b"Xid 79 on GPU 3" and agent.store.check(["reg/1/1"])
+
+
+def test_an_agent_that_starts_late_joins_the_leader_of_the_newest_term(tmp_path, monkeypatch):
+    from xllm.ft.leader import Lease, lease_dir
+
+    agent = leader_agent(tmp_path, monkeypatch)
+    agent.leader_addr, agent.port, agent.main_job = "n0", 20000, 9
+    monkeypatch.setenv("SLURM_RESTART_COUNT", "0")
+    Lease(lease_dir(str(tmp_path), "9", "0")).publish({"term": 1, "host": "n1", "port": 22001, "phys": 1, "standby": 2})
+    tried = []
+
+    def connect(host):
+        tried.append((agent.leader_addr, agent.port))
+        if agent.port == 20000:  # the first leader stepped down and its store is closed
+            raise ConnectionRefusedError("closed")
+        return "store of term 1"
+
+    agent._connect = connect
+    monkeypatch.setattr("xllm.ft.agent.time.sleep", lambda s: None)
+    assert agent._join() == "store of term 1" and agent.term == 1 and tried == [("n0", 20000), ("n1", 22001)]
+
+
+def test_a_leader_cut_off_from_the_lease_freezes_and_leaves_once_its_agents_left(tmp_path, monkeypatch):
+    import time
+
+    import pytest
+
+    from xllm.ft.agent import LeaderLost
+
+    agent = leader_agent(tmp_path, monkeypatch, phys=0)
+    agent.is_leader, agent.conf.node_deadline = True, 0.05
+    agent.store.set("map/0", "0")
+    agent.store.set("map/1", "1")
+    agent.renewed_at = time.monotonic() - agent.conf.lease_ttl  # no renewal for a whole lease (or one blocking)
+    assert agent.frozen and agent.lead(3) is None  # frozen: no decision
+    for _ in range(3):  # node 1 still heartbeats here (a shared-FS outage for everyone): stay, frozen
+        agent.store.add("hb/1", 1)
+        time.sleep(0.03)
+        assert agent.lead(3) is None
+    time.sleep(0.1)  # node 1 went quiet: it follows a newer leader
+    with pytest.raises(LeaderLost):
+        agent.lead(3)
+    assert agent.store.get("moved") == b"abandoned"
+
+
+def test_a_leader_that_ends_the_step_is_never_taken_over(tmp_path, monkeypatch):
+    from xllm.ft.agent import EXIT_REQUEUE, takeover_wait
+
+    leader = leader_agent(tmp_path, monkeypatch, phys=0)
+    leader.is_leader = True
+    leader.lease.publish({"term": 0, "host": "n0", "port": 20000, "phys": 0, "standby": 1})
+    leader.mark_ended(EXIT_REQUEUE)  # retries used up, no spare, ...: the job requeues from disk
+    ended = leader.lease.leader()
+    assert ended["ended"] and takeover_wait(ended, {"map": {"0": 0, "1": 1}}, 1, 60.0) == float("inf")
+    follower = leader_agent(tmp_path, monkeypatch, phys=1)
+    follower.lease, follower.kill = leader.lease, lambda: True
+    monkeypatch.setattr("xllm.ft.agent.time.sleep", lambda s: None)
+    assert follower.rejoin() is False  # it stops too, instead of waiting for a takeover
+
+
+def test_a_refill_numbered_after_the_last_journal_save_keeps_its_number_unique(tmp_path, monkeypatch):
+    agent = leader_agent(tmp_path, monkeypatch, phys=5)
+    agent.store.add("next_phys", 4)  # the new leader's store, seeded from a journal that predates node 5
+    agent.reannounce()
+    assert int(agent.store.add("next_phys", 0)) == 6
+
+
+def test_a_spare_checked_before_a_takeover_is_not_checked_again(tmp_path, monkeypatch):
+    import pytest
+
+    agent = leader_agent(tmp_path, monkeypatch, phys=2)
+    agent.conf.spare_health, agent.spare_ready, agent.state = True, True, lambda *a: None
+    agent.store.set("gen", "1")
+    agent.store.set("finished", "1")  # ends park() at once
+    agent.wait_finished = lambda: None
+    monkeypatch.setattr("xllm.ft.agent.run_spare_check", lambda *a: pytest.fail("checked again"))
+    agent.barred = lambda: []
+    assert agent.park() is None and agent.store.get("spare/2") == b"ready"
+
+
+def test_a_closed_store_port_fails_fast_instead_of_waiting_the_store_timeout(tmp_path, monkeypatch):
+    import socket
+    import time
+
+    agent = leader_agent(tmp_path, monkeypatch)
+    with socket.socket() as s:  # a port nobody listens on
+        s.bind(("127.0.0.1", 0))
+        agent.leader_addr, agent.port = "127.0.0.1", s.getsockname()[1]
+    start = time.monotonic()
+    try:
+        agent._connect(False)
+        raise AssertionError("connected to a closed port")
+    except OSError:
+        assert time.monotonic() - start < 5
+
+
+def test_a_term_claimed_but_never_led_is_skipped(tmp_path, monkeypatch):
+    import threading
+    import time
+
+    agent = leader_agent(tmp_path, monkeypatch, phys=1)
+    agent.conf.lease_ttl, agent.conf.lease_renew = 0.2, 0.05
+    agent.lease.publish({"term": 0, "host": "n0", "port": 20000, "phys": 0, "standby": 1})
+    assert agent.lease.claim(1)  # its winner died before it opened a store or renewed once
+    agent._become_leader = lambda term, old, state: setattr(agent, "takeover", {"term": term})
+    watcher = threading.Thread(target=agent._watch_leader, daemon=True)
+    watcher.start()
+    deadline = time.monotonic() + 20
+    while agent.takeover is None and time.monotonic() < deadline:
+        time.sleep(0.05)
+    agent.stopping.set()
+    assert agent.takeover == {"term": 2} and agent.lease.leader()["term"] == 1
+
+
+def test_a_spare_mapped_into_the_generation_being_started_starts_at_once(tmp_path, monkeypatch):
+    import threading
+
+    agent = leader_agent(tmp_path, monkeypatch, phys=4)
+    agent.conf.spare_health, agent.state = False, lambda *a: None
+    agent.ntrain, agent.barred = 3, lambda: []
+    for k, v in {"gen": "1", "map/0": "0", "map/1": "3", "map/2": "2"}.items():
+        agent.store.set(k, v)
+    result = []
+    parked = threading.Thread(target=lambda: result.append(agent.park()), daemon=True)
+    parked.start()
+    __import__("time").sleep(0.2)
+    agent.store.set("map/2", "4")  # a second node lost while generation 1 is being started: no gen change
+    parked.join(5)
+    assert result == [1]
+
+
+def test_new_nodes_failing_their_first_step_in_a_row_stop_being_barred(tmp_path, monkeypatch):
+    from xllm.ft.agent import NEW_NODE_FAILURES
+
+    agent = leader_agent(tmp_path, monkeypatch, phys=0)
+    agent.is_leader, agent.retries_used, agent.failed_at, agent.new_failures = True, 0, 0, 0
+    calls = []
+    agent.lost_node = lambda nodes: None
+    agent.spares = lambda: []
+    agent.bar = lambda phys, reason: calls.append("bar")
+    agent.replace = lambda gen, lg, phys, reason, mode: calls.append("replace") or "restart"
+    agent.account = lambda gen, reason: calls.append("account") or None
+    for k, v in {"map/0": "0", "map/1": "5", "req/3": "logical node 1: exit 1", "reqnode/3": "1", "new/3/1": "1"}.items():
+        agent.store.set(k, v)
+    for _ in range(NEW_NODE_FAILURES):
+        assert agent.lead(3) == "restart"
+    assert agent.lead(3) == "end"  # one more: a cause other than the nodes, so the retries (here used up) decide
+    assert calls == ["bar", "replace"] * NEW_NODE_FAILURES + ["account"]

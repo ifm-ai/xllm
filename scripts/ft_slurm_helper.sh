@@ -24,11 +24,26 @@ cleanup() {
 }
 trap cleanup TERM INT EXIT
 
-while [ ! -e "$MBOX/stop" ]; do
+RUN=${FT_MAIN_RESTART:-}
+ticker() {  # its own loop: a slow sbatch must not look like a dead helper to the watchdogs
+  local n=0
+  while kill -0 $$ 2>/dev/null; do
+    n=$((n + 1))
+    echo "$(hostname) $$ $n" > "$MBOX/.helper.tick.$$" && mv -f "$MBOX/.helper.tick.$$" "$MBOX/helper.tick"
+    sleep 1
+  done
+}
+ticker &
+# until the job ends, or a later run of the job (a requeue) owns the mailbox; a watchdog judges this helper alive by
+# helper.tick (scripts/ft_watchdog.sh), so exactly one helper answers requests
+while [ ! -e "$MBOX/stop" ] && { [ -z "$RUN" ] || [ "$(cat "$MBOX/run" 2>/dev/null || echo "$RUN")" = "$RUN" ]; }; do
   for req in "$MBOX"/req.*; do
-    [ -e "$req" ] || continue
+    case $req in *.taken.*) continue ;; esac               # another helper's (during a takeover)
     id=${req##*/req.}
-    read -r action arg < "$req" || continue                # withdrawn by the client after its timeout
+    mine=$req.taken.$(hostname).$$
+    mv "$req" "$mine" 2>/dev/null || continue              # gone: withdrawn, or another helper took it
+    req=$mine
+    read -r action arg < "$req" || { rm -f "$req"; continue; }
     case $action in
       request_node)
         excl=()

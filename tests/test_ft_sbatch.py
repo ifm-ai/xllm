@@ -24,7 +24,9 @@ def test_train_script_invariants():
     assert "srun" not in launch  # not a job step: over ssh
     # bounded, and `cd ...;` so that the backgrounded watchdog does not keep ssh (and the batch script) waiting
     assert "timeout 60 ssh -n" in launch and "|| exit 1;" in launch and "&& SLURM_JOB_ID" not in launch
-    assert "PATH=" in launch and "SLURM_CONF=" in launch  # an ssh session has no SLURM environment
+    for knob in ("PATH", "SLURM_CONF", "FT_LEASE_TTL", "FT_WATCHDOG_MARGIN", "FT_WATCHDOG_POLL", "FT_SLOT_DIR",
+                 "LAUNCH"):  # read remotely: an ssh session has no SLURM environment
+        assert f"{knob}=" in launch
     block = text[text.index("for host in"):text.index("\nfi\n", text.index("for host in"))]
     assert '|| wait "${launches[@]}"' in block and "\n  wait\n" not in block  # never wait on the helper
     agents = next(line for line in text.splitlines() if line.startswith("srun --no-kill"))

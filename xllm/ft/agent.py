@@ -41,11 +41,12 @@ import time
 from pathlib import Path
 from typing import Dict, List, Optional
 
-from torch.distributed import TCPStore
+from torch.distributed import DistError, TCPStore
 
 from xllm.ft import dumper
 from xllm.ft.gpu_faults import GpuFaultLane
 from xllm.ft.inject import InjectionReader
+from xllm.ft.leader import Lease, Liveness, lease_dir
 from xllm.ft.progress import PROGRESS_ENV, Progress, progress_path
 from xllm.ft.replica import DUMP_LOAD_EXIT, NO_COMMON_STEP_EXIT, dump_files, meta_path, slot_path, valid_steps
 from xllm.ft.scheduler import SlurmMailbox, mailbox_dir
@@ -58,6 +59,7 @@ EXIT_FINISHED = 0
 EXIT_REQUEUE = 75
 WARMUP_STEPS = 10  # steps whose gaps are measured before the auto hang deadline is armed
 FINISH_ACK_TIMEOUT = 60.0
+TERM_PORT_OFFSET = 2000  # the store of term t > 0 listens on store_port + 2000 + t (rendezvous: store_port + 1 + gen)
 KILL_TIMEOUT = 60.0  # a trainer still alive this long after SIGKILL is stuck in the kernel: the node is unusable
 HANG_FLOOR_S = 30.0  # the auto step deadline never goes below this: step-time jitter is not a hang
 REFILL_WAIT_FLOOR_S = 300.0  # waiting for a spare never gives up earlier than this
@@ -84,6 +86,8 @@ class AgentConf:
     dump_enabled: bool
     dump_keep: int
     ft_dump_dir: Optional[str]
+    lease_ttl: float = 60.0
+    lease_renew: float = 6.0
 
 
 def agent_conf(train_args: List[str]) -> AgentConf:
@@ -99,7 +103,7 @@ def agent_conf(train_args: List[str]) -> AgentConf:
         "release_timeout": "ft.release_timeout", "nccl_timeout": "nccl_timeout", "xid_replace": "ft.xid_replace",
         "spares": "ft.spares", "spare_health": "ft.spare_health", "refill_wait": "ft.refill_wait_s",
         "dump_dir": "dump_dir", "dump_enabled": "ft.dump_enabled", "dump_keep": "ft.dump_keep",
-        "ft_dump_dir": "ft.dump_dir",
+        "ft_dump_dir": "ft.dump_dir", "lease_ttl": "ft.lease_ttl", "lease_renew": "ft.lease_renew",
     }
     parser = argparse.ArgumentParser(allow_abbrev=False)
     for field in dataclasses.fields(AgentConf):
@@ -111,6 +115,23 @@ def agent_conf(train_args: List[str]) -> AgentConf:
     conf = AgentConf(**{f.name: getattr(known, names[f.name]) for f in dataclasses.fields(AgentConf)})
     assert conf.hb_deadline < conf.nccl_timeout, "ft.hb_deadline: the hang deadline must fire before the NCCL timeout"
     return conf
+
+
+def takeover_wait(leader: Dict, state: Dict, phys: int, lease_ttl: float) -> float:
+    """
+    Seconds of leader silence after which this agent claims the next term: the designated standby after
+    1.5 lease_ttl, every other training node one lease_ttl later per place in line (a dead standby is covered);
+    never for a spare or the old leader itself.
+    """
+    line = [leader.get("standby")] + sorted(int(p) for p in state.get("map", {}).values())
+    line = [p for i, p in enumerate(line) if p not in line[:i] and p not in (-1, None, leader.get("phys"))]
+    if phys not in line or leader.get("ended"):  # a leader that ended the step: nothing to take over
+        return float("inf")
+    return lease_ttl * (1.5 + line.index(phys))
+
+
+class LeaderLost(Exception):
+    """The control store of this agent's leader is gone, or a newer leader (higher term) took over."""
 
 
 class GpuMemory:
@@ -149,6 +170,15 @@ class Agent:
         job = int(os.environ.get("FT_MAIN_JOB_ID", os.environ.get("SLURM_JOB_ID", "0")))
         self.main_job = job
         self.store_port = int(os.environ.get("FT_STORE_PORT", 20000 + job % 20000))
+        self.port = self.store_port  # the current leader's store: term 0 on store_port, term t on +2000+t
+        self.term = 0  # the leader's term this agent follows
+        self.newer_term = 0  # the highest term read from the shared FS (the standby thread keeps it current)
+        self.store_epoch = 0  # bumped at every switch to a new leader's store: the side threads reconnect
+        self.known_lost: set = set()  # nodes the leader knows are gone (a lost leader, a node that did not rejoin)
+        self.takeover: Optional[Dict] = None  # set by the standby thread when this agent won the next term
+        self.renewed_at = time.monotonic()  # the leader's last lease renewal (see frozen)
+        self.spare_ready = False
+        self.finished_locally = False  # this node's trainers all exited 0: the run reached its last step
         self.procs: List[subprocess.Popen] = []
         self.baseline = self.gpu.used()
         self.teardown_s: Optional[float] = None
@@ -161,6 +191,8 @@ class Agent:
         self.injections = InjectionReader(node=-1, ranks=[])
         self.faults: List = []  # (gpu, xid) reported by the GPU-fault lane's thread
         self.faults_lock = threading.Lock()
+        self.lease_lock = threading.Lock()  # the lease thread's publish vs an end's (mark_ended)
+        self.bad_reason = ""  # why this node must be replaced: told again to a new leader (the old store is gone)
         self.xids_to_replace = {int(x) for x in self.conf.xid_replace.split(",") if x}
         self.gpu_faults = GpuFaultLane(self._on_gpu_fault)
         self.store = self._connect(self.is_leader) if self.is_leader else self._join()
@@ -181,6 +213,7 @@ class Agent:
             self.store.set("gen", "0")
         self.ntrain = int(self.store.get("ntrain"))
         os.environ["FT_EPOCH"] = self.store.get("epoch").decode()  # slot names and run identity of the main job
+        self.lease = Lease(lease_dir(self.conf.dump_dir, *os.environ["FT_EPOCH"].split(":")))
         self.phys = int(os.environ.get("SLURM_NODEID", "0")) if not self.refill else self.store.add("next_phys", 1) - 1
         self.store.set(f"host/{self.phys}", socket.gethostname())
         self.dump_root = Path(self.conf.ft_dump_dir or os.path.join(self.conf.dump_dir, "ft_checkpoints"))
@@ -193,6 +226,11 @@ class Agent:
         self.hb_thread.start()
         if self.conf.dump_enabled:
             threading.Thread(target=self._dumps, daemon=True).start()
+        if self.is_leader:
+            self.store.set("term", "0")
+            self._start_lease(0)
+        else:
+            threading.Thread(target=self._watch_leader, daemon=True).start()
         signal.signal(signal.SIGTERM, self._on_sigterm)
         signal.signal(signal.SIGUSR1, signal.SIG_IGN)  # the sbatch script owns the requeue
 
@@ -208,24 +246,36 @@ class Agent:
             except Exception as e:  # DistNetworkError / DistStoreError: the store is not up yet
                 if time.monotonic() > deadline:
                     raise
-                logger.warning(f"ft agent: control store at {self.leader_addr}:{self.store_port} not reachable yet "
+                logger.warning(f"ft agent: control store at {self.leader_addr}:{self.port} not reachable yet "
                                f"({type(e).__name__}); retrying")
+                time.sleep(5.0)
+                # a late start: the first leader may already be gone and a standby lead a newer term
+                restart = os.environ.get("FT_MAIN_RESTART", os.environ.get("SLURM_RESTART_COUNT", "0"))
+                leader = Lease(lease_dir(self.conf.dump_dir, str(self.main_job), restart)).leader() or {}
+                if int(leader.get("term", 0)) > self.term and leader.get("host"):
+                    self.leader_addr, self.port = leader["host"], int(leader["port"])
+                    self.term = self.newer_term = int(leader["term"])
 
     def _connect(self, host: bool) -> TCPStore:
+        if not host:  # a quick probe first: a store client waits its whole timeout on a closed port
+            socket.create_connection((self.leader_addr, self.port), timeout=self.conf.lease_renew).close()
         return TCPStore(
-            self.leader_addr, self.store_port, world_size=None, is_master=host,
+            self.leader_addr, self.port, world_size=None, is_master=host,
             timeout=datetime.timedelta(seconds=max(60.0, 6 * self.conf.node_deadline)), wait_for_workers=False,
         )
 
     def _heartbeat(self):
         """Counter heartbeat for the agent's whole life, on its own connection, also while waiting or releasing GPUs."""
-        store = None
+        store, epoch = None, self.store_epoch
         while not self.stopping.is_set():
             try:
+                if epoch != self.store_epoch:  # a new leader: its store from now on
+                    store, epoch = None, self.store_epoch
                 store = store or self._connect(False)
                 store.add(f"hb/{self.phys}", 1)
             except Exception as e:  # reconnect next time; a lasting failure shows up as a lost node
-                logger.warning(f"ft agent {self.phys}: heartbeat failed ({e})")
+                if store is not None:
+                    logger.warning(f"ft agent {self.phys}: heartbeat failed ({e})")
                 store = None
             time.sleep(self.conf.hb_interval)
 
@@ -233,6 +283,8 @@ class Agent:
         """Leader: a physical node whose heartbeat stopped for longer than the node deadline and that did not finish."""
         now = time.monotonic()
         for n in nodes:
+            if n in self.known_lost and not self.store.check([f"reg/{self.term}/{n}"]):  # unless it came back late
+                return n
             count = int(self.store.add(f"hb/{n}", 0))
             if count != self.hb_seen.get(n, (None,))[0]:
                 self.hb_seen[n] = (count, now)
@@ -272,10 +324,12 @@ class Agent:
 
     def _dumps(self):
         """Background agent dumps from the RAM slots, on their own store connection (see xllm/ft/dumper.py)."""
-        store, done = None, set()
+        store, done, epoch = None, set(), self.store_epoch
         while not self.stopping.is_set():
             time.sleep(1.0)
             try:
+                if epoch != self.store_epoch:
+                    store, epoch = None, self.store_epoch
                 store = store or self._connect(False)
                 logical = self.logical
                 if logical is None or self.procs == [] or any(p.poll() is not None for p in self.procs):
@@ -303,6 +357,8 @@ class Agent:
                 store = None
 
     def _lead_dumps(self, store, current: str):
+        if self.frozen:
+            return
         if current:
             step, gen, _ = (int(x) for x in current.split(":"))
             staging = dumper.staging_dir(self.dump_root, gen, step)
@@ -538,7 +594,8 @@ class Agent:
             what = "GPU lost" if xid is None else f"Xid {xid}"
             if xid is None or xid in self.xids_to_replace:
                 logger.error(f"ft agent {self.phys}: {what} on GPU {gpu}: this node must be replaced")
-                self.store.set(f"bad/{self.phys}", f"{what} on GPU {gpu}")
+                self.bad_reason = f"{what} on GPU {gpu}"
+                self.store.set(f"bad/{self.phys}", self.bad_reason)
             self.request(gen, f"{what} on GPU {gpu}")
 
     # ------------------------------------------------------------------ control store
@@ -546,21 +603,33 @@ class Agent:
         self.store.set(f"state/{self.phys}", f"{name}:{gen}")
 
     def gen(self) -> int:
+        """
+        The current generation; raises LeaderLost when a newer leader took over (the term on the shared FS), or when
+        this agent won the next term (its leader may be alive but cut off: nothing else would stop this generation).
+        """
+        if self.newer_term > self.term or self.takeover is not None or self.store.check(["moved"]):
+            raise LeaderLost("this agent won the next term" if self.takeover is not None
+                             else f"a newer leader (term {self.newer_term})")
         return int(self.store.get("gen"))
 
     def request(self, gen: int, reason: str):
         if not self.store.check([f"req/{gen}"]):
             logger.warning(f"ft agent {self.phys}: generation {gen} failed: {reason}")
             self.store.set(f"req/{gen}", f"logical node {self.logical}: {reason}")
-            self.store.set(f"reqnode/{gen}", str(self.logical))
+            self.store.set(f"reqnode/{gen}", str(-1 if self.logical is None else self.logical))
 
     def wait_go(self, gen: int) -> bool:
         """Generation gen starts once the training nodes of the last one released their GPUs (the leader decides)."""
         deadline = time.monotonic() + self.wait_deadline()
         if self.is_leader:
             new = [lg for lg in range(self.ntrain) if self.store.check([f"new/{gen}/{lg}"])]
-            while gen > 0 and not all(self.store.check([f"free/{gen}/{lg}"]) for lg in range(self.ntrain)
-                                      if lg not in new):
+            while self.frozen or gen > 0 and not all(self.store.check([f"free/{gen}/{lg}"])
+                                                     for lg in range(self.ntrain) if lg not in new):
+                if self.frozen:  # no decision until the lease is renewed again (or a newer leader took over)
+                    self.gen()
+                    self.check_abandoned()
+                    time.sleep(self.conf.hb_interval)
+                    continue
                 mapped = self.mapped()
                 lost = self.lost_node([p for lg, p in mapped.items() if lg not in new and p != self.phys])
                 if lost is not None:  # lost before this generation started: re-map it, no new generation
@@ -588,7 +657,7 @@ class Agent:
                 self.store.set(f"dumpdir/{gen}", self.disk_candidate())
             self.store.set(f"go/{gen}", "1")
         else:
-            while not self.store.check([f"go/{gen}"]):
+            while not self.store.check([f"go/{gen}"]) and self.gen() == gen:  # moved on: the caller re-reads it
                 if self.store.check(["end"]) or time.monotonic() > deadline:
                     return False
                 time.sleep(self.conf.hb_interval)
@@ -692,6 +761,8 @@ class Agent:
                 self.bitflip(inj.rank)
             elif inj.kind == "dump_kill":
                 self.dump_abort.set()
+            elif inj.kind == "lease_cut":
+                self.lease = Lease(Path("/proc/ft_lease_cut"))  # nothing can be created or read there
 
     def torn_write(self, rank: int):
         """Injection: the trainer dies halfway through overwriting its newest own slot (metadata removed first,
@@ -732,6 +803,9 @@ class Agent:
         return min(max(measured, HANG_FLOOR_S), 0.9 * self.conf.nccl_timeout)
 
     def lead(self, gen: int) -> Optional[str]:
+        if self.frozen:
+            self.check_abandoned()
+            return None
         if self.new_failures and gen != self.warm_gen and all(
                 self.store.check([f"warm/{gen}/{lg}"]) for lg in range(self.ntrain)):
             self.new_failures, self.warm_gen = 0, gen  # every node trained: earlier bars were the nodes' fault
@@ -772,8 +846,237 @@ class Agent:
             return "restart"
         return None
 
+    # ------------------------------------------------------------------ leader lease and takeover (xllm/ft/leader.py)
+    @property
+    def frozen(self) -> bool:
+        """A leader whose lease is not renewed for lease_ttl/2 decides nothing (on NFS a renewal may also block)."""
+        return time.monotonic() - self.renewed_at > self.conf.lease_ttl / 2
+
+    def check_abandoned(self):
+        """Frozen leader: when every other training node stopped heartbeating here, they follow a newer leader."""
+        others = [p for p in self.mapped().values() if p != self.phys]
+        if others and all(self.lost_node([p]) is not None for p in others):
+            self.store.set("moved", "abandoned")
+            raise LeaderLost("cut off from the shared FS, and its agents left for a newer leader")
+
+    def _start_lease(self, term: int):
+        """Leader: publish the store's address for this term and keep the lease renewed (its own thread)."""
+        self.renewed_at = time.monotonic()
+        self.lease.claim(term)
+        threading.Thread(target=self._lead_lease, args=(term,), daemon=True).start()
+
+    def _lead_lease(self, term: int):
+        """
+        Leader: renew the lease, keep the published standby and the state (journal) current. A renewal that
+        fails for lease_ttl/2 freezes all decisions; a newer term on the FS (this leader was cut off) moves its
+        agents to the newer leader.
+        """
+        store, counter, standby = None, 0, None
+        while not self.stopping.is_set() and self.term == term:
+            try:
+                store = store or self._connect(False)
+                counter += 1
+                if self.lease.renew(term, counter):
+                    self.renewed_at = time.monotonic()
+                state = self.lease_state(store, term)
+                barred, hosts = set(state["barred"]), state.pop("hosts")
+                choice = min((p for p in state["map"].values() if p != self.phys and p not in self.known_lost
+                              and hosts.get(p, "") not in barred), default=-1)
+                with self.lease_lock:  # never over an end's publish
+                    if self.stopping.is_set():
+                        return
+                    now = self.lease.leader()
+                    if now is not None and now.get("term", -1) > term:
+                        logger.error(f"ft leader {self.phys}: term {now['term']} was taken over; stepping down")
+                        self.newer_term = now["term"]
+                        store.set("moved", str(now["term"]))
+                        return
+                    if choice != standby or counter == 1:
+                        standby = choice
+                        self.lease.publish({"term": term, "host": self.leader_addr, "port": self.port,
+                                            "phys": self.phys, "standby": standby})
+                    self.lease.save_state(state)
+            except Exception as e:  # best effort: the next round retries
+                logger.warning(f"ft leader {self.phys}: lease round failed ({type(e).__name__}: {e})")
+                store = None
+            time.sleep(self.conf.lease_renew)
+
+    def lease_state(self, store, term: int) -> Dict:
+        """The leader's state as a standby needs it (the journal), read from this store."""
+        mapped = {lg: int(store.get(f"map/{lg}")) for lg in range(self.ntrain)}
+        barred = set(store.get("barred").decode().split(",")) if store.check(["barred"]) else set()
+        hosts = {p: store.get(f"host/{p}").decode() for p in mapped.values() if store.check([f"host/{p}"])}
+        return {"term": term, "gen": int(store.get("gen")), "map": mapped, "ntrain": self.ntrain,
+                "next_phys": int(store.add("next_phys", 0)), "barred": sorted(h for h in barred if h),
+                "retries_used": self.retries_used, "failed_at": self.failed_at, "new_failures": self.new_failures,
+                "hosts": hosts}
+
+    def mark_ended(self, code: int):
+        """Leader that ends the step (anything but a finish): no agent may take over its term and train on."""
+        if not self.is_leader or code == EXIT_FINISHED:
+            return
+        with self.lease_lock:
+            leader = self.lease.leader() or {}
+            if int(leader.get("term", -1)) == self.term:
+                self.lease.publish(dict(leader, ended=True))
+
+    def _watch_leader(self):
+        """
+        Every agent but the leader: read the published leader, keep newer_term current (the fence), and take over
+        when the leader's renewal counter stops: the designated standby after 1.5 lease_ttl, any other training
+        node one lease_ttl later per place in line, so that a dead standby is covered too.
+        """
+        alive, term_seen = Liveness(), None
+        while not self.stopping.is_set():
+            time.sleep(min(2.0, self.conf.lease_renew))
+            leader = self.lease.leader()
+            if leader is None or self.takeover is not None or self.is_leader:
+                continue
+            term = int(leader.get("term", 0))
+            self.newer_term = max(self.newer_term, term)
+            if term != term_seen:
+                alive, term_seen = Liveness(), term
+            silent = alive.silent_for(self.lease.counter(term))
+            # no journal yet (the leader died before its first save): the map it started with
+            state = self.lease.state() or {"map": {str(lg): lg for lg in range(self.ntrain)}}
+            wait = takeover_wait(leader, state, self.phys, self.conf.lease_ttl)
+            if wait > silent:
+                continue
+            if self.lease.counter(term + 1) is None and silent > wait + 2 * self.conf.lease_ttl:
+                # term + 1 was claimed but never led (its winner died right after the claim): skip it
+                self.lease.publish(dict(leader, term=term + 1, host="", port=0, standby=-1))
+                continue
+            if self.lease.claim(term + 1):
+                try:
+                    self._become_leader(term + 1, leader, state)
+                except Exception as e:  # a term nobody leads: published silent, so the next in line claims the one after
+                    logger.error(f"ft agent {self.phys}: could not lead term {term + 1} ({type(e).__name__}: {e})")
+                    self.lease.publish({"term": term + 1, "host": "", "port": 0, "phys": self.phys, "standby": -1})
+
+    def _become_leader(self, term: int, old: Dict, state: Dict):
+        """This agent won the term: open its store with the last leader's state; the main thread takes over."""
+        port = self.store_port + TERM_PORT_OFFSET + term
+        store = TCPStore(socket.gethostname(), port, world_size=None, is_master=True,
+                         timeout=datetime.timedelta(seconds=max(60.0, 6 * self.conf.node_deadline)),
+                         wait_for_workers=False)
+        store.set("barred", ",".join(sorted(set(state.get("barred", [])) | set(self.barred_file_hosts()))))
+        store.set("ntrain", str(self.ntrain))
+        for lg, p in state.get("map", {}).items():
+            store.set(f"map/{lg}", str(p))
+        store.set("epoch", os.environ["FT_EPOCH"])
+        store.add("next_phys", int(state.get("next_phys", self.ntrain + self.conf.spares)))
+        store.set("gen", str(state.get("gen", 0)))
+        store.set("term", str(term))
+        self.retries_used, self.failed_at = state.get("retries_used", 0), state.get("failed_at", 0)
+        self.new_failures = state.get("new_failures", 0)
+        logger.warning(f"ft agent {self.phys}: the leader (physical node {old.get('phys')}, term {term - 1}) is "
+                       f"silent; taking over as the leader of term {term}")
+        self.takeover = {"term": term, "store": store, "port": port, "old": int(old.get("phys", -1)), "state": state}
+
+    def rejoin(self) -> bool:
+        """
+        The leader's store is gone or a newer leader took over: every leader loss starts a new generation, so
+        stop the trainers, then follow the newer leader (or become it); False when none appears in time.
+        """
+        logger.warning(f"ft agent {self.phys}: lost the leader of term {self.term}; waiting for the next one")
+        self.kill()
+        if self.is_leader:  # a leader that lost its term (cut off and taken over): an ordinary agent from now on
+            self.is_leader = False
+            threading.Thread(target=self._watch_leader, daemon=True).start()
+        # the standby takes over after 1.5 lease_ttl of silence, the next ones a lease_ttl apart
+        deadline = time.monotonic() + self.conf.lease_ttl * 4.5 + self.wait_deadline()
+        alive = Liveness()
+        while time.monotonic() < deadline:
+            if self.takeover is not None:
+                return self._take_over()
+            leader = self.lease.leader()
+            if leader is not None and leader.get("ended") and int(leader.get("term", 0)) == self.term:
+                logger.warning(f"ft agent {self.phys}: the leader ended the step")
+                return False
+            same = leader is not None and int(leader.get("term", 0)) == self.term
+            if same and alive.silent_for(self.lease.counter(self.term)) < 3 * self.conf.lease_renew and \
+                    time.monotonic() - alive.since < self.conf.lease_ttl:
+                try:  # the leader is alive (a network glitch): back to the same store
+                    self.store = self._connect(False)
+                    self.store_epoch += 1
+                    self.reannounce()
+                    return True
+                except Exception:
+                    pass
+            if leader is not None and int(leader.get("term", 0)) > self.term:
+                try:
+                    self.leader_addr, self.port = leader["host"], int(leader["port"])
+                    self.store = self._connect(False)
+                except Exception:  # its store is not up yet
+                    time.sleep(2.0)
+                    continue
+                self.term = self.newer_term = int(leader["term"])
+                self.store_epoch += 1
+                self.reannounce()
+                return True
+            time.sleep(2.0)
+        return False
+
+    def reannounce(self):
+        """This agent, in the new leader's store: its host, its state as a spare, and its registration."""
+        self.store.set(f"host/{self.phys}", socket.gethostname())
+        behind = self.phys + 1 - int(self.store.add("next_phys", 0))
+        if behind > 0:  # a refill numbered after the last journal save: never number another node the same
+            self.store.add("next_phys", behind)
+        if self.spare_ready and self.my_logical() is None:
+            self.store.set(f"spare/{self.phys}", "ready")
+        if self.bad_reason:
+            self.store.set(f"bad/{self.phys}", self.bad_reason)
+        if self.finished_locally:
+            self.store.set(f"fin/{self.term}/{self.phys}", "1")
+        self.store.set(f"reg/{self.term}/{self.phys}", "1")
+
+    def _take_over(self) -> bool:
+        """
+        The new leader, in the main thread: wait for the agents to register (no node is judged on an empty
+        heartbeat baseline), then replace the old leader's node like any lost node and start the next generation.
+        """
+        t = self.takeover
+        self.store, self.port, self.term, self.leader_addr = t["store"], t["port"], t["term"], socket.gethostname()
+        self.newer_term = self.term
+        self.renewed_at = time.monotonic()  # before is_leader: never seen as a frozen leader
+        self.is_leader = True
+        self.takeover = None  # cleared after is_leader is set: the watcher never sees both unset
+        self.store_epoch += 1
+        self._start_lease(self.term)
+        self.reannounce()
+        old = t["old"]
+        expected = {int(p) for p in t["state"].get("map", {}).values()} - {old, self.phys}
+        deadline = time.monotonic() + self.wait_deadline()
+        while time.monotonic() < deadline and not all(self.store.check([f"reg/{self.term}/{p}"]) for p in expected):
+            time.sleep(self.conf.hb_interval)
+        self.known_lost |= {old} | {p for p in expected if not self.store.check([f"reg/{self.term}/{p}"])}
+        self.hb_seen = {}
+        if any(self.store.check([f"fin/{self.term}/{p}"]) for p in expected | {self.phys}):
+            self.finished_locally = True  # the old leader died while the run was finishing: one finished, all did
+            return True
+        gen = self.gen()
+        mapped = self.mapped()
+        logical = next((lg for lg, p in mapped.items() if p == old), None)
+        reason = f"the leader of term {self.term - 1} (physical node {old}) was lost"
+        if logical is None:  # the old leader trained nothing: just start the next generation
+            self.set_mode(gen + 1, "memory")
+            self.store.set("gen", str(gen + 1))
+            return True
+        self.store.set(f"spare/{old}", "lost")
+        return self.replace(gen, logical, old, reason, "memory") == "restart"
+
+    def report_free(self, gen: int, logical: int):
+        """This node released its GPUs for generation gen; say whether it can restore from its own copies."""
+        if not self.has_own_copies(logical):
+            self.store.set(f"fresh/{gen}/{logical}", "1")
+        if not self.holds_copies(logical):
+            self.store.set(f"nocopy/{gen}/{logical}", "1")
+        self.store.set(f"free/{gen}/{logical}", "1")
+
     # ------------------------------------------------------------------ main loop
     def finish(self) -> int:
+        self.finished_locally = True  # trainers end in lockstep: every rank reached the last step
         self.state("finished", self.gen())
         self.store.add("done", 1)
         if self.is_leader:
@@ -797,17 +1100,22 @@ class Agent:
         logger.info(f"ft agent {self.phys}: run finished")
         return EXIT_FINISHED
 
+    def finished_marker(self) -> Path:
+        job, restart = os.environ["FT_EPOCH"].split(":")
+        return Path(self.conf.dump_dir) / f"ft_finished.{job}.{restart}"
+
     def write_finished_marker(self):
         """The sbatch script requeues the job unless this file exists (scripts/ft_train.sbatch)."""
-        job, restart = os.environ["FT_EPOCH"].split(":")
-        marker = Path(self.conf.dump_dir) / f"ft_finished.{job}.{restart}"
+        marker = self.finished_marker()
         try:
-            marker.write_text(f"finished at generation {self.gen()}\n")
+            marker.write_text(f"finished at generation {self.get_or('gen', '?')}\n")  # not gen(): no fence here
         except OSError as e:  # the run did finish; without the marker the script requeues once more, from disk
             logger.error(f"ft leader: could not write {marker} ({e})")
 
     def wait_finished(self):
         while not self.store.check(["finished"]):  # raises if the leader is gone before it finished
+            if self.finished_marker().exists():  # the leader wrote it and is gone: the run did finish
+                return
             if self.store.check(["end"]):
                 raise RuntimeError("the job step ends")
             time.sleep(self.conf.hb_interval)
@@ -829,14 +1137,17 @@ class Agent:
             logger.warning(f"ft agent {self.phys}: this node is barred; it leaves the run")
             return None
         if status != b"ready":
-            healthy = not self.conf.spare_health or (
+            # a check passed before a takeover counts (a fresh store knows nothing of it)
+            healthy = (status == b"" and self.spare_ready) or not self.conf.spare_health or (
                 not self.store.check([f"fail_health/{self.phys}"])
                 and run_spare_check(self.gpus, SPARE_CHECK_TIMEOUT, self.store_port + 10000 + self.phys))
             if not healthy:
                 self.store.set(f"spare/{self.phys}", "barred")
                 logger.warning(f"ft agent {self.phys}: spare health check failed; this node leaves the run")
                 return None
+            self.spare_ready = True
             self.store.set(f"spare/{self.phys}", "ready")
+        self.spare_ready = True
         self.state("spare", self.gen())
         logger.info(f"ft agent {self.phys}: spare, waiting")
         while True:
@@ -860,51 +1171,89 @@ class Agent:
                 self.store.set(f"spare/{self.phys}", "lost")  # never counted as a spare or as an agent to wait for
                 return EXIT_FINISHED
             while True:
-                logical = self.my_logical()
-                if logical is None:  # a spare (or a fenced node that was declared dead): wait in the pool
-                    gen = self.park()
-                    if gen is None:
+                try:
+                    logical = self.my_logical()
+                    if logical is None:  # a spare (or a fenced node that was declared dead): wait in the pool
+                        gen = self.park()
+                        if gen is None:
+                            return EXIT_FINISHED
+                        continue
+                    if gen == 0 and socket.gethostname() in self.barred():
+                        # barred in an earlier run of this job and given back by SLURM: replace it right away
+                        if self.is_leader:  # the leader's node cannot be handed over: end before any trainer starts
+                            host = socket.gethostname()
+                            self.store.set("end", f"the leader's node {host} was barred in an earlier run")
+                            return EXIT_REQUEUE
+                        self.bad_reason = "barred in an earlier run of this job"
+                        self.store.set(f"bad/{self.phys}", self.bad_reason)
+                        self.request(gen, f"physical node {self.phys} is barred")
+                        while self.my_logical() == logical and not self.store.check(["end"]):  # no trainers here
+                            time.sleep(self.conf.hb_interval)
+                        if self.store.check(["end"]):
+                            return EXIT_REQUEUE
+                        continue  # replaced: park() refuses the barred node
+                    if not self.wait_go(gen):
+                        return EXIT_REQUEUE
+                    if self.gen() > gen:  # moved on before it started (a takeover): free at once, then follow it
+                        gen = self.gen()
+                        if self.my_logical() == logical:
+                            self.report_free(gen, logical)
+                        continue
+                    self.spawn(gen, logical)
+                    outcome = self.monitor(gen)
+                    if outcome == "finished":
+                        return self.finish()
+                    if outcome == "refused":  # a configuration error: the job ends and is not requeued
+                        self.kill()
+                        self.store.set("end", "the ft sizing gate refused ft (see the trainers' log)")
+                        return SIZING_EXIT
+                    self.state("exiting", gen)
+                    if not self.kill():
+                        self.store.set("end", f"physical node {self.phys}: a trainer survived SIGKILL")
+                        return EXIT_REQUEUE
+                    if outcome == "end":
+                        return EXIT_REQUEUE
+                    gen = self.gen()
+                    if self.my_logical() != logical:  # replaced (declared dead or bad GPU): fenced, join the pool
+                        continue
+                    if not self.release_poll():
+                        self.store.set("end", f"physical node {self.phys}: GPU memory not released")
+                        return EXIT_REQUEUE
+                    self.report_free(gen, logical)
+                except (LeaderLost, DistError, ConnectionError) as e:  # follow (or become) the next leader
+                    logger.warning(f"ft agent {self.phys}: {type(e).__name__}: {e}")
+                    running = gen
+                    if not self.rejoin():
+                        logger.error(f"ft agent {self.phys}: no leader to follow, or the new leader ended the step")
+                        return EXIT_REQUEUE
+                    if self.finished_locally:  # the leader was lost during the finish: end the run, train nothing
+                        if self.is_leader:
+                            self.write_finished_marker()
+                            self.store.set("finished", "1")
+                        else:
+                            self.store.add("done", 1)
+                            self.wait_finished()
+                        logger.info(f"ft agent {self.phys}: run finished")
                         return EXIT_FINISHED
-                    continue
-                if gen == 0 and socket.gethostname() in self.barred():
-                    # barred in an earlier run of this job and given back by SLURM: replace it right away
-                    if self.is_leader:  # the leader's node cannot be handed over: end before any trainer starts
-                        self.store.set("end", f"the leader's node {socket.gethostname()} was barred in an earlier run")
-                        return EXIT_REQUEUE
-                    self.store.set(f"bad/{self.phys}", "barred in an earlier run of this job")
-                    self.request(gen, f"physical node {self.phys} was barred in an earlier run")
-                    while self.my_logical() == logical and not self.store.check(["end"]):  # no trainers here
-                        time.sleep(self.conf.hb_interval)
-                    if self.store.check(["end"]):
-                        return EXIT_REQUEUE
-                    continue  # replaced: park() refuses the barred node
-                if not self.wait_go(gen):
-                    return EXIT_REQUEUE
-                self.spawn(gen, logical)
-                outcome = self.monitor(gen)
-                if outcome == "finished":
-                    return self.finish()
-                if outcome == "refused":  # a configuration error: the job ends and is not requeued
-                    self.kill()
-                    self.store.set("end", "the ft sizing gate refused ft (see the trainers' log)")
-                    return SIZING_EXIT
-                self.state("exiting", gen)
-                if not self.kill():
-                    self.store.set("end", f"physical node {self.phys}: a trainer survived SIGKILL")
-                    return EXIT_REQUEUE
-                if outcome == "end":
-                    return EXIT_REQUEUE
-                gen = self.gen()
-                if self.my_logical() != logical:  # replaced (declared dead or bad GPU): fenced, join the pool
-                    continue
-                if not self.release_poll():
-                    self.store.set("end", f"physical node {self.phys}: GPU memory not released")
-                    return EXIT_REQUEUE
-                if not self.has_own_copies(logical):
-                    self.store.set(f"fresh/{gen}/{logical}", "1")
-                if not self.holds_copies(logical):
-                    self.store.set(f"nocopy/{gen}/{logical}", "1")
-                self.store.set(f"free/{gen}/{logical}", "1")
+                    if not self.is_leader and self.my_logical() is not None:
+                        # this node's trainers are gone: never back into the generation that was running
+                        # the same leader after a glitch, or a new one not yet started (a node that must go is
+                        # replaced anyway: nothing to ask)
+                        if self.gen() <= running and not self.bad_reason:
+                            self.request(running, f"physical node {self.phys} lost the control store")
+                        while self.gen() <= running:
+                            if self.store.check(["finished"]) or self.finished_marker().exists():
+                                logger.info(f"ft agent {self.phys}: run finished")
+                                return EXIT_FINISHED
+                            if self.store.check(["end"]):
+                                return EXIT_REQUEUE
+                            time.sleep(self.conf.hb_interval)
+                    gen, logical = self.gen(), self.my_logical()
+                    if logical is not None:  # still a training node: its GPUs are free for the next generation
+                        if not self.release_poll():
+                            self.store.set("end", f"physical node {self.phys}: GPU memory not released")
+                            return EXIT_REQUEUE
+                        self.report_free(gen, logical)
         except Exception as e:  # the control store went away (leader lost), barred, or anything unexpected
             logger.error(f"ft agent {self.phys}: {type(e).__name__}: {e}")
             self.kill()
@@ -919,6 +1268,7 @@ def main():
     logging.basicConfig(level=logging.INFO, format=f"%(asctime)s ft-agent {socket.gethostname()} %(message)s")
     agent = Agent(sys.argv[1:])
     code = agent.run()
+    agent.mark_ended(code)
     if agent.refill:  # a refill spare's own 1-node job just ends; only the main job's script decides requeues
         code = EXIT_FINISHED
     # exit without running C++ destructors of the store objects (the leader's store may already be gone)

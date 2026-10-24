@@ -9,8 +9,9 @@ def _claim(folder, term, out):
 
 def test_a_term_is_claimed_exactly_once_even_by_racing_processes(tmp_path):
     folder = lease_dir(str(tmp_path), "77", "0")
-    out = multiprocessing.Queue()
-    procs = [multiprocessing.Process(target=_claim, args=(folder, 1, out)) for _ in range(6)]
+    ctx = multiprocessing.get_context("spawn")  # never fork a multi-threaded test process
+    out = ctx.Queue()
+    procs = [ctx.Process(target=_claim, args=(folder, 1, out)) for _ in range(6)]
     for p in procs:
         p.start()
     for p in procs:

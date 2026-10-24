@@ -28,6 +28,7 @@ KINDS = {
     "gpu_lost": "node",  # the agent's NVML wrapper raises NVML_ERROR_GPU_IS_LOST
     "fail_spare_health": "node",  # the next spare health gate on the node fails
     "dump_kill": "node",  # the agent's dumper is killed in the middle of a write
+    "lease_cut": "node",  # every later lease read and write of the agent fails, as if cut off from the shared FS
 }
 
 

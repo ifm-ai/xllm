@@ -41,6 +41,7 @@ def test_every_flag_maps_to_one_kind():
         "gpu_lost": ["--gpu-lost", "1"],
         "fail_spare_health": ["--fail-spare-health", "1"],
         "dump_kill": ["--dump-kill", "1"],
+        "lease_cut": ["--lease-cut", "0"],
     }
     assert set(flags) == set(KINDS)
     for kind, flag in flags.items():

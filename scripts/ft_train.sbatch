@@ -28,17 +28,20 @@ XLLM_DIR=${XLLM_DIR:-$SLURM_SUBMIT_DIR}   # the xLLM checkout (sbatch runs a cop
 cd "$XLLM_DIR"
 
 export FT_MAX_REQUEUES=${FT_MAX_REQUEUES:-3}
+FT_LEASE_TTL=${FT_LEASE_TTL:-60}                            # the leader's lease (s): the standby takes over after 1.5x
 export FT_SLOT_DIR=${FT_SLOT_DIR:-/dev/shm/xllm_ft}
 export FT_LEADER_ADDR=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -1)
 export FT_STORE_PORT=${FT_STORE_PORT:-$((20000 + SLURM_JOB_ID % 20000))}
 export FT_MAIN_JOB_ID=$SLURM_JOB_ID
-export FT_TRAIN_ARGS="$TRAIN_ARGS --dump_dir $DUMP_DIR --ft.enabled true --ft.spares $FT_SPARES --ft.slot_dir $FT_SLOT_DIR"
+export FT_TRAIN_ARGS="$TRAIN_ARGS --dump_dir $DUMP_DIR --ft.enabled true --ft.spares $FT_SPARES --ft.slot_dir $FT_SLOT_DIR --ft.lease_ttl $FT_LEASE_TTL"
 RESTART=${SLURM_RESTART_COUNT:-0}
 export FT_MAIN_RESTART=$RESTART                             # a refill job submitted before a requeue must not join the next run
 MARKER=$DUMP_DIR/ft_finished.$SLURM_JOB_ID.$RESTART
 MAILBOX=$DUMP_DIR/ft_slurm/$SLURM_JOB_ID
 mkdir -p "$DUMP_DIR/restarts" "$MAILBOX"
-rm -f "$MAILBOX/stop"                                       # a requeue keeps the job id: the last run's stop is stale
+rm -f "$MAILBOX/stop"
+# the run that owns the mailbox: helpers of earlier runs exit (written whole: readers never see half of it)
+echo "$RESTART" > "$MAILBOX/.run.$$" && mv -f "$MAILBOX/.run.$$" "$MAILBOX/run"                                       # a requeue keeps the job id: the last run's stop is stale
 
 cleanup() {
   touch "$MAILBOX/stop"                                     # the helper cancels the refill jobs it submitted
@@ -58,19 +61,25 @@ requeue_or_fail() {
 trap requeue_or_fail USR1                                   # the handler exits, so it requeues once
 
 export XLLM_DIR
+# what a watchdog (below) needs to run the SLURM helper should this host die
+# (the whole exported environment, as the helper here has it; readable by the job's owner only: it may hold tokens)
+(umask 077 && export -p > "$MAILBOX/.helper.env.$$" && mv -f "$MAILBOX/.helper.env.$$" "$MAILBOX/helper.env.$RESTART")
 bash scripts/ft_slurm_helper.sh "$MAILBOX" "${FT_SPARE_SCRIPT:-scripts/ft_spare.sbatch}" &
 # the batch-host watchdog, over ssh on up to two other nodes: not in a job step, so it outlives this host
 if [ "${FT_WATCHDOG:-1}" = 1 ]; then
   launches=()
   for host in $(scontrol show hostnames "$SLURM_JOB_NODELIST" | sed -n 2,3p); do
     # `cd ...;` not `cd ... &&`: a backgrounded list would keep ssh's output open, and ssh would wait for it
-    # an ssh session has no SLURM environment (no scontrol on its PATH, no SLURM_CONF on m4): the batch shell's is
-    # passed on
-    timeout 60 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no -o ConnectTimeout=20 "$host" "cd $XLLM_DIR || exit 1; \
+    # the remote shell parses the command again: every path and value is quoted for it. An ssh session has no
+    # SLURM environment (no scontrol on its PATH, no SLURM_CONF on m4): the batch shell's is passed on
+    timeout 60 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no -o ConnectTimeout=20 "$host" "cd $(printf %q "$XLLM_DIR") || exit 1; \
       PATH=$(printf %q "$PATH") ${SLURM_CONF:+SLURM_CONF=$(printf %q "$SLURM_CONF")} \
-      SLURM_JOB_ID=$SLURM_JOB_ID SLURM_RESTART_COUNT=$RESTART FT_MAX_REQUEUES=$FT_MAX_REQUEUES setsid nohup \
-      bash scripts/ft_watchdog.sh $MAILBOX $MARKER > $MAILBOX/watchdog.$host.$RESTART.log 2>&1 < /dev/null &" \
-      || echo "ft: could not start the batch-host watchdog on $host (ssh); a dead batch host is not requeued" >&2 &
+      SLURM_JOB_ID=$SLURM_JOB_ID SLURM_RESTART_COUNT=$RESTART FT_MAX_REQUEUES=$FT_MAX_REQUEUES \
+      FT_LEASE_TTL=$FT_LEASE_TTL FT_WATCHDOG_MARGIN=${FT_WATCHDOG_MARGIN:-900} FT_WATCHDOG_POLL=${FT_WATCHDOG_POLL:-30} \
+      FT_SLOT_DIR=$(printf %q "$FT_SLOT_DIR") LAUNCH=$(printf %q "$LAUNCH") setsid nohup bash \
+      scripts/ft_watchdog.sh $(printf '%q ' "$MAILBOX" "$MARKER" "$DUMP_DIR/ft_leader/$SLURM_JOB_ID.$RESTART") \
+      > $(printf %q "$MAILBOX/watchdog.$host.$RESTART.log") 2>&1 < /dev/null &" \
+      || echo "ft: could not start the batch-host watchdog on $host (ssh); a dead batch host leaves the job to its limit" >&2 &
     launches+=($!)
   done
   # the launches run side by side; never a bare wait, which would wait for the helper (it runs to the end)
