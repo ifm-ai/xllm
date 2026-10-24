@@ -172,10 +172,11 @@ class TransformerMoVABlockFunction(torch.autograd.Function):
         out, aux_loss_moe, routing_out, shared_hiddens, routing_state, rng_states = moe_fwd(
             xf, moe_router_w,  moe_router_bias, routing_score_func, routing_scaling_factor, router_load_balancing_type,
             fc1_w, fc2_w, fc3_w, n_experts, n_local_experts, expert_start_idx, expert_end_idx, moe_topk,
+            'topk', None,  # routing_type, qb_globalnorm
             expert_w1, expert_w2, expert_w3, expert_backend, moe_permutation_backend,
             hidden_dropout, recompute_fc1_out, recompute_fc3_out
         )
-        original_scores, routing_indices, org_topk_scores, tokens_per_expert = routing_out
+        original_scores, routing_indices, org_topk_scores, _, tokens_per_expert = routing_out
         health_collector = get_active_health_collector()
         if health_collector is not None:
             health_collector.record_router_stats(
@@ -438,9 +439,11 @@ class TransformerMoVABlockFunction(torch.autograd.Function):
 
         # MoE backward
         xf_grad, ew1_grad, ew2_grad, ew3_grad, fc1_w_grad, fc2_w_grad, fc3_w_grad, moe_router_w_grad = moe_bwd(
-            out_grad, aux_loss_grad, xf, xf_flat, original_scores, routing_indices, org_topk_scores, tokens_per_expert,
+            out_grad, aux_loss_grad, xf, xf_flat, original_scores, routing_indices, org_topk_scores, None, tokens_per_expert,
             moe_router_w, moe_router_bias, router_bias_update_rate, routing_score_func, routing_scaling_factor, router_load_balancing_type,
-            h1, h3, fc1_w, fc2_w, fc3_w, n_experts, n_local_experts, moe_topk, expert_w1, expert_w2, expert_w3,
+            h1, h3, fc1_w, fc2_w, fc3_w, n_experts, n_local_experts, moe_topk,
+            'topk', None, None, None,  # routing_type, qb_update_method, qb_decay, qb_globalnorm
+            expert_w1, expert_w2, expert_w3,
             expert_backend, moe_permutation_backend, hidden_dropout, group_sizes, input_splits, output_splits, curr_bsz,
             expert_hidden_rng_state, shared_hidden_rng_state, gather_before_norm,
         )

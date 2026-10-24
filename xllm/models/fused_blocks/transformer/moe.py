@@ -66,11 +66,15 @@ class TransformerMoEBlockFunction(torch.autograd.Function):
         expert_end_idx: int,
         topk: int,
         moe_permutation_backend: str,
+        routing_type: str,
         routing_score_func: str,
         router_bias: Optional[torch.Tensor],
         router_bias_update_rate: Optional[float],
         routing_scaling_factor: Optional[float],
         router_load_balancing_type: Optional[str],
+        qb_update_method: Optional[str],
+        qb_decay: Optional[float],
+        qb_globalnorm: Optional[bool],
         expert_w1: torch.Tensor,
         expert_w2: torch.Tensor,
         expert_w3: torch.Tensor,
@@ -160,10 +164,11 @@ class TransformerMoEBlockFunction(torch.autograd.Function):
         out, aux_loss, routing_out, shared_hiddens, routing_state, rng_states = moe_fwd(
             xf, router_w,  router_bias, routing_score_func, routing_scaling_factor, router_load_balancing_type,
             fc1_w, fc2_w, fc3_w, n_experts, n_local_experts, expert_start_idx, expert_end_idx, topk,
+            routing_type, qb_globalnorm,
             expert_w1, expert_w2, expert_w3, expert_backend, moe_permutation_backend,
             hidden_dropout, recompute_fc1_out, recompute_fc3_out
         )
-        original_scores, routing_indices, org_topk_scores, tokens_per_expert = routing_out
+        original_scores, routing_indices, org_topk_scores, token_indices, tokens_per_expert = routing_out
         health_collector = get_active_health_collector()
         if health_collector is not None:
             health_collector.record_router_stats(
@@ -213,8 +218,9 @@ class TransformerMoEBlockFunction(torch.autograd.Function):
             flash_rng_state,
             xo,  # (bsz, slen, d/MP)
             original_scores if not recompute_router else None,  # (bsz, slen, n_experts)
-            routing_indices,  # (bsz, slen, topk)
-            org_topk_scores,  # (bsz, slen, topk)
+            routing_indices,  # (bsz, slen, topk), or (routes) for dynamic QB
+            org_topk_scores,  # (bsz, slen, topk), or (routes) for dynamic QB
+            token_indices,  # (routes) for dynamic QB, None for top-k
             tokens_per_expert,  # (n_experts)
             h1 if not recompute_fc1_out else None,  # (bsz, slen, v/MP)
             h3 if not recompute_fc3_out else None,  # (bsz, slen, v/MP)
@@ -231,10 +237,14 @@ class TransformerMoEBlockFunction(torch.autograd.Function):
         ctx.expert_backend = expert_backend
         ctx.topk = topk
         ctx.moe_permutation_backend = moe_permutation_backend
+        ctx.routing_type = routing_type
         ctx.routing_score_func = routing_score_func
         ctx.router_bias_update_rate = router_bias_update_rate
         ctx.routing_scaling_factor = routing_scaling_factor
         ctx.router_load_balancing_type = router_load_balancing_type
+        ctx.qb_update_method = qb_update_method
+        ctx.qb_decay = qb_decay
+        ctx.qb_globalnorm = qb_globalnorm
         ctx.group_sizes = group_sizes
         ctx.input_splits = input_splits
         ctx.output_splits = output_splits
@@ -306,8 +316,9 @@ class TransformerMoEBlockFunction(torch.autograd.Function):
             flash_rng_state,
             xo,  # (bsz, slen, d/MP)
             original_scores,  # (bsz, slen, n_experts)
-            routing_indices,  # (bsz, slen, topk)
-            org_topk_scores,  # (bsz, slen, topk)
+            routing_indices,  # (bsz, slen, topk), or (routes) for dynamic QB
+            org_topk_scores,  # (bsz, slen, topk), or (routes) for dynamic QB
+            token_indices,  # (routes) for dynamic QB, None for top-k
             tokens_per_expert,  # (n_experts)
             h1,  # (bsz, slen, v/MP)
             h3,  # (bsz, slen, v/MP)
@@ -326,10 +337,14 @@ class TransformerMoEBlockFunction(torch.autograd.Function):
         expert_end_idx = ctx.expert_end_idx
         expert_backend = ctx.expert_backend
         moe_permutation_backend = ctx.moe_permutation_backend
+        routing_type = ctx.routing_type
         routing_score_func = ctx.routing_score_func
         router_bias_update_rate = ctx.router_bias_update_rate
         routing_scaling_factor = ctx.routing_scaling_factor
         router_load_balancing_type = ctx.router_load_balancing_type
+        qb_update_method = ctx.qb_update_method
+        qb_decay = ctx.qb_decay
+        qb_globalnorm = ctx.qb_globalnorm
         group_sizes = ctx.group_sizes
         input_splits = ctx.input_splits
         output_splits = ctx.output_splits
@@ -397,9 +412,11 @@ class TransformerMoEBlockFunction(torch.autograd.Function):
 
         # MoE backward
         xf_grad, ew1_grad, ew2_grad, ew3_grad, fc1_w_grad, fc2_w_grad, fc3_w_grad, router_w_grad = moe_bwd(
-            out_grad, aux_loss_grad, xf, xf_flat, original_scores, routing_indices, org_topk_scores, tokens_per_expert,
+            out_grad, aux_loss_grad, xf, xf_flat, original_scores, routing_indices, org_topk_scores, token_indices, tokens_per_expert,
             router_w, router_bias, router_bias_update_rate, routing_score_func, routing_scaling_factor, router_load_balancing_type,
-            h1, h3, fc1_w, fc2_w, fc3_w, n_experts, n_local_experts, topk, expert_w1, expert_w2, expert_w3,
+            h1, h3, fc1_w, fc2_w, fc3_w, n_experts, n_local_experts, topk,
+            routing_type, qb_update_method, qb_decay, qb_globalnorm,
+            expert_w1, expert_w2, expert_w3,
             expert_backend, moe_permutation_backend, hidden_dropout, group_sizes, input_splits, output_splits, curr_bsz,
             expert_hidden_rng_state, shared_hidden_rng_state, gather_before_norm,
         )
@@ -523,11 +540,15 @@ class TransformerMoEBlockFunction(torch.autograd.Function):
             None,  # expert_end_idx
             None,  # topk
             None,  # moe_permutation_backend
+            None,  # routing_type
             None,  # routing_score_func
             None,  # router_bias
             None,  # router_bias_update_rate
             None,  # routing_scaling_factor
             None,  # router_load_balancing_type
+            None,  # qb_update_method
+            None,  # qb_decay
+            None,  # qb_globalnorm
             ew1_grad,
             ew2_grad,
             ew3_grad,

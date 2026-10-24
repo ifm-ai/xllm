@@ -244,6 +244,10 @@ class TransformerMoEBlock(nn.Module):
             router_bias=cfg.moe_router_bias,
             router_bias_update_rate=cfg.moe_router_bias_update_rate,
             router_scaling_factor=cfg.moe_router_scaling_factor,
+            router_type=cfg.moe_router_type,
+            router_dynamic_qb_update_method=cfg.moe_router_dynamic_qb_update_method,
+            router_dynamic_qb_decay=cfg.moe_router_dynamic_qb_decay,
+            router_dynamic_qb_globalnorm=cfg.moe_router_dynamic_qb_globalnorm,
             dropout=cfg.dropout,
             hidden_dropout=cfg.hidden_dropout,
             norm_num_groups=cfg.layernorm_num_groups,
@@ -271,6 +275,7 @@ class TransformerMoEBlock(nn.Module):
     ) -> Tuple[Tensor, Optional[Tensor], Optional[Any]]:
         if self.fused_block and self.training:
             fn = TransformerMoEBlockFunction
+            dynamic_qb = self.moe.router.routing_type == 'dynamic_qb'
             return fn.apply(
                 self.layer_id,
                 x,
@@ -306,11 +311,16 @@ class TransformerMoEBlock(nn.Module):
                 self.moe.expert_end_idx,
                 self.moe.topk,
                 self.moe.permutation_backend,
+                self.moe.router.routing_type,
                 self.moe.router.score_func,
+                # selection bias for top-k, or thresholds for dynamic QB
                 self.moe.router.bias,
-                self.moe.router.bias_update_rate,
+                self.moe.router.bias_update_rate if not dynamic_qb else None,
                 self.moe.router.scaling_factor,
                 moe_router_load_balancing_type,
+                self.moe.router.update_method if dynamic_qb else None,
+                self.moe.router.decay if dynamic_qb else None,
+                self.moe.router.globalnorm if dynamic_qb else None,
                 self.moe.experts.weight1,
                 self.moe.experts.weight2,
                 self.moe.experts.weight3,
@@ -414,6 +424,10 @@ class TransformerMoVABlock(nn.Module):
             router_bias=cfg.moe_router_bias,
             router_bias_update_rate=cfg.moe_router_bias_update_rate,
             router_scaling_factor=cfg.moe_router_scaling_factor,
+            router_type=cfg.moe_router_type,
+            router_dynamic_qb_update_method=cfg.moe_router_dynamic_qb_update_method,
+            router_dynamic_qb_decay=cfg.moe_router_dynamic_qb_decay,
+            router_dynamic_qb_globalnorm=cfg.moe_router_dynamic_qb_globalnorm,
             dropout=cfg.dropout,
             hidden_dropout=cfg.hidden_dropout,
             norm_num_groups=cfg.layernorm_num_groups,

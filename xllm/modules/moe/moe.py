@@ -22,7 +22,7 @@ from xllm.modules.rms_norm import GroupRMSNorm
 from xllm.modules.residual import build_residual
 from xllm.health_metrics import get_active_health_collector
 from xllm.utils import get_init_fn
-from .router import TopKRouter
+from .router import build_router, dynamic_qb_combine
 from .expert import Expert
 from .permute import fused_permute_y
 
@@ -42,6 +42,10 @@ class NormalizedMoE(nn.Module):
         router_bias: bool = False,
         router_bias_update_rate: Optional[float] = None,
         router_scaling_factor: Optional[float] = None,
+        router_type: str = 'topk',
+        router_dynamic_qb_update_method: str = 'average',
+        router_dynamic_qb_decay: float = 0.3,
+        router_dynamic_qb_globalnorm: bool = True,
         dropout: float = 0.0,
         hidden_dropout: float = 0.0,
         norm_num_groups: int = 1,
@@ -87,12 +91,16 @@ class NormalizedMoE(nn.Module):
         )
         init_fn = get_init_fn(init_mode, dim=model_dim, std=init_std)
         # router
-        self.router = TopKRouter(
+        self.router = build_router(
+            router_type,
             model_dim,
             self.n_experts,
             self.topk,
             bias=router_bias,
             bias_update_rate=router_bias_update_rate,
+            dynamic_qb_update_method=router_dynamic_qb_update_method,
+            dynamic_qb_decay=router_dynamic_qb_decay,
+            dynamic_qb_globalnorm=router_dynamic_qb_globalnorm,
             score_func=router_score_func,
             scaling_factor=router_scaling_factor,
             init_method=init_fn
@@ -165,7 +173,7 @@ class NormalizedMoE(nn.Module):
 
         rank = get_model_parallel_rank()
         world_size = get_model_parallel_world_size()
-        # B x L x K
+        # B x L x K for top-k, or routes for dynamic QB
         routing_scores, routing_indices, tokens_per_expert, aux_loss = self.router(x, load_balancing_type)
         health_collector = get_active_health_collector()
         if health_collector is not None:
@@ -174,11 +182,15 @@ class NormalizedMoE(nn.Module):
             )
         # B*L x D/TP
         x = x.view(bsz * slen, -1)
-        # B*L*K
-        routing_indices = routing_indices.flatten()
-        # B*L*K
-        sorted_indices = torch.argsort(routing_indices, stable=True)
-        permute_indices = sorted_indices // self.topk
+        if self.router.routing_type == 'dynamic_qb':
+            # routes are grouped by expert, and the indices are their tokens
+            permute_indices = routing_indices
+        else:
+            # B*L*K
+            routing_indices = routing_indices.flatten()
+            # B*L*K
+            sorted_indices = torch.argsort(routing_indices, stable=True)
+            permute_indices = sorted_indices // self.topk
         # N
         group_sizes = tokens_per_expert[self.expert_start_idx:self.expert_end_idx].tolist()
         input_splits = tokens_per_expert.view(-1, self.n_local_experts).sum(dim=1).tolist()
@@ -198,7 +210,10 @@ class NormalizedMoE(nn.Module):
             y2 = x
         y2 = all_to_all_expert_parallel_region(y2, output_splits, input_splits)
         # permute y2
-        y2 = fused_permute_y(sorted_indices, y2, routing_scores, bsz, slen, self.topk, self.permutation_backend)
+        if self.router.routing_type == 'dynamic_qb':
+            y2 = dynamic_qb_combine(y2, permute_indices, bsz * slen, routing_scores).view(bsz, slen, -1)
+        else:
+            y2 = fused_permute_y(sorted_indices, y2, routing_scores, bsz, slen, self.topk, self.permutation_backend)
 
         # combine shared expert
         y = y1 + y2 if y1 is not None else y2
