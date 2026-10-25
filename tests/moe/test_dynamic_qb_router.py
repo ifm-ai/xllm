@@ -407,7 +407,7 @@ def test_fused_dynamic_qb_router_recompute_matches_saved_scores(globalnorm):
 
     out, _, routing_out, shared_hiddens, routing_state, rng_states = fused_moe.moe_fwd(
         x, router_weight, initial_bias, 'sigmoid', 1.0, None,
-        None, None, None, 4, 4, 0, 4, 2,
+        None, None, None, None, None, None, False, 1e-6, 4, 4, 0, 4, 2,
         'dynamic_qb', globalnorm,
         flat_w1, flat_w2, flat_w3, 'sequential', 'torch', 0.0, False, False,
     )
@@ -450,7 +450,7 @@ def test_fused_dynamic_qb_router_recompute_matches_saved_scores(globalnorm):
             out_grad, None, x, x.flatten(end_dim=-2),
             scores, routing_indices, selected_scores, token_indices, tokens_per_expert,
             router_weight, bias, 0.0, 'sigmoid', 1.0, None,
-            h1, h3, None, None, None, 4, 4, 2,
+            h1, h3, None, None, None, None, None, None, False, 1e-6, 4, 4, 2,
             'dynamic_qb', 'average', 0.3, globalnorm,
             flat_w1, flat_w2, flat_w3, 'sequential', 'torch', 0.0,
             group_sizes, input_splits, output_splits, curr_bsz,

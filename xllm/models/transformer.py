@@ -235,9 +235,11 @@ class TransformerMoEBlock(nn.Module):
             layer_id=layer_id,
             model_dim=cfg.model_dim,
             expert_inter_dim=cfg.expert_inter_dim,
-            num_experts=cfg.num_experts,
-            num_activated_experts=cfg.num_activated_experts,
+            num_experts=cfg.effective_num_experts,
+            num_activated_experts=cfg.effective_num_activated_experts,
             num_shared_experts=cfg.num_shared_experts,
+            latent_dim=cfg.moe_latent_dim,
+            latent_post_rmsnorm=cfg.moe_latent_post_rmsnorm,
             expert_backend=cfg.moe_expert_backend,
             permutation_backend=cfg.moe_permutation_backend,
             router_score_func=cfg.moe_router_score_func,
@@ -304,6 +306,10 @@ class TransformerMoEBlock(nn.Module):
                 self.moe.fc1.weight if self.moe.fc1 is not None else None,
                 self.moe.fc2.weight if self.moe.fc2 is not None else None,
                 self.moe.fc3.weight if self.moe.fc3 is not None else None,
+                self.moe.w_down.weight if self.moe.w_down is not None else None,
+                self.moe.w_up.weight if self.moe.w_up is not None else None,
+                self.moe.latent_norm.weight if self.moe.latent_norm is not None else None,
+                self.moe.latent_norm is not None,
                 self.moe.router.weight,
                 self.moe.n_experts,
                 self.moe.n_local_experts,
@@ -829,13 +835,17 @@ class Transformer(XLLModel):
             activated_params += attn_params_per_block * (self.num_layers - self.num_dense_layers)
             total_params += attn_params_per_block * (self.num_layers - self.num_dense_layers)
         if self.num_experts > 0:
+            routed_dim = self.moe_latent_dim if self.moe_latent_dim is not None else self.model_dim
             shared_expert_params = self.model_dim * self.expert_inter_dim * self.num_shared_experts * 3
-            routed_expert_params = self.model_dim * self.expert_inter_dim * self.num_experts * 3
-            activated_expert_params = self.model_dim * self.expert_inter_dim * self.num_activated_experts * 3
-            router_params = self.model_dim * self.num_experts
+            routed_expert_params = routed_dim * self.expert_inter_dim * self.effective_num_experts * 3
+            activated_expert_params = routed_dim * self.expert_inter_dim * self.effective_num_activated_experts * 3
+            router_params = self.model_dim * self.effective_num_experts
+            latent_params = 2 * self.model_dim * routed_dim if self.moe_latent_dim is not None else 0
+            if self.moe_latent_post_rmsnorm:
+                latent_params += routed_dim
             residual_params = num_params_in_residual(self.residual_func, self.model_dim, self.residual_heads, self.model_dim)
-            activated_params += (shared_expert_params + activated_expert_params + router_params + residual_params) * (self.num_layers - self.num_dense_layers)
-            total_params += (shared_expert_params + routed_expert_params + router_params) * (self.num_layers - self.num_dense_layers)
+            activated_params += (shared_expert_params + activated_expert_params + router_params + latent_params + residual_params) * (self.num_layers - self.num_dense_layers)
+            total_params += (shared_expert_params + routed_expert_params + router_params + latent_params) * (self.num_layers - self.num_dense_layers)
         # final norm
         activated_params += self.model_dim * (1 if self.apply_rmsnorm else 2)
         total_params += self.model_dim * (1 if self.apply_rmsnorm else 2)
@@ -878,8 +888,14 @@ class Transformer(XLLModel):
             raise ValueError(f"Unknown attention activation function: {self.attn_act_func}")
 
         # MoE
-        moe_flops = self.model_dim * self.expert_inter_dim * (self.num_activated_experts + self.num_shared_experts) * 3
-        moe_flops += self.model_dim * self.num_experts
+        routed_dim = self.moe_latent_dim if self.moe_latent_dim is not None else self.model_dim
+        moe_flops = routed_dim * self.expert_inter_dim * self.effective_num_activated_experts * 3
+        moe_flops += self.model_dim * self.expert_inter_dim * self.num_shared_experts * 3
+        moe_flops += self.model_dim * self.effective_num_experts
+        if self.moe_latent_dim is not None:
+            moe_flops += 2 * self.model_dim * routed_dim
+        if self.moe_latent_post_rmsnorm:
+            moe_flops += 4 * routed_dim
 
         total_tflops = embed_flops + logits_flops + norm_flops
         total_tflops += self.num_layers * (norm_flops + res_flops)

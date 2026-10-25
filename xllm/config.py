@@ -133,6 +133,8 @@ class ModelConf(Config):
     num_shared_experts: int = 0  # Num of shared experts for each token, in addition to routed experts
     num_dense_layers: Optional[int] = None  # Number of initial dense layers. If None, defaults to 0 when MoE is enabled, otherwise to all layers.
     expert_inter_dim: int = 0  # Hidden dimension of the FFN in a single expert.
+    moe_latent_alpha: Optional[int] = None  # LatentMoE: routed experts run in a model_dim/alpha latent space, with alpha times the experts and top-k. None disables it.
+    moe_latent_post_rmsnorm: bool = False  # Whether LatentMoE normalizes the routed mixture with RMSNorm before the up-projection.
     moe_router_score_func: str = 'sigmoid'  # sigmoid or softmax
     moe_router_bias: bool = False  # Whether to include the router bias, only affects top-k selection.
     moe_router_bias_update_rate: Optional[float] = None  # Update rate for the router bias during backprop
@@ -192,6 +194,19 @@ class ModelConf(Config):
 
     recompute_logits: bool = False  # Whether to recompute logits in output layer. Independent of fused_block. True = recompute logits and compute grad_X/grad_W during backward, False = precompute grad_X/grad_W during forward.
 
+    @property
+    def effective_num_experts(self) -> int:
+        # routed experts instantiated by the model
+        return self.num_experts * (self.moe_latent_alpha or 1)
+
+    @property
+    def effective_num_activated_experts(self) -> int:
+        return self.num_activated_experts * (self.moe_latent_alpha or 1)
+
+    @property
+    def moe_latent_dim(self) -> Optional[int]:
+        return self.model_dim // self.moe_latent_alpha if self.moe_latent_alpha is not None else None
+
     def __post_init__(self):
         assert self.arch in ['transformer', 'gekko']
         assert self.ddp_backend in ['fsdp1', 'fsdp2']
@@ -217,6 +232,15 @@ class ModelConf(Config):
         if self.num_values > 0:
             assert 0 < self.num_activated_values <= self.num_values
             assert self.num_experts > 0, "MoVA requires MoE."
+
+        if self.moe_latent_alpha is not None:
+            assert self.arch == 'transformer'
+            assert self.num_experts > 0, "LatentMoE requires routed experts."
+            assert self.num_values == 0, "LatentMoE is not supported by MoVA blocks."
+            assert isinstance(self.moe_latent_alpha, int) and self.moe_latent_alpha > 1
+            assert self.model_dim % self.moe_latent_alpha == 0
+        else:
+            assert not self.moe_latent_post_rmsnorm, "moe_latent_post_rmsnorm requires moe_latent_alpha."
 
         if self.num_experts > 0:
             assert 0 < self.num_activated_experts <= self.num_experts
@@ -435,7 +459,9 @@ class TrainerConf(Config):
 
         # MoE
         if self.model.num_experts > 0:
-            assert self.model.num_experts % self.model_parallel_size == 0, f"{self.model.num_experts}/{self.model_parallel_size}"
+            assert self.model.effective_num_experts % self.model_parallel_size == 0, f"{self.model.effective_num_experts}/{self.model_parallel_size}"
+        if self.model.moe_latent_dim is not None:
+            assert self.model.moe_latent_dim % self.model_parallel_size == 0, f"{self.model.moe_latent_dim}/{self.model_parallel_size}"
         if self.moe_router_load_balancing_type is not None:
             assert self.moe_router_load_balancing_type in ['dot', 'entropy']
             assert self.model.moe_router_type == 'topk', "Dynamic QB does not use auxiliary load-balancing loss."

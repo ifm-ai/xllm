@@ -59,6 +59,10 @@ class TransformerMoEBlockFunction(torch.autograd.Function):
         fc1_w: Optional[torch.Tensor],
         fc2_w: Optional[torch.Tensor],
         fc3_w: Optional[torch.Tensor],
+        w_down: Optional[torch.Tensor],  # (latent_dim, d/MP)
+        w_up: Optional[torch.Tensor],  # (d, latent_dim/MP)
+        latent_norm_w: Optional[torch.Tensor],  # (latent_dim/MP)
+        latent_post_rmsnorm: bool,
         router_w: torch.Tensor,
         n_experts: int,
         n_local_experts: int,
@@ -163,7 +167,8 @@ class TransformerMoEBlockFunction(torch.autograd.Function):
         # MoE forward
         out, aux_loss, routing_out, shared_hiddens, routing_state, rng_states = moe_fwd(
             xf, router_w,  router_bias, routing_score_func, routing_scaling_factor, router_load_balancing_type,
-            fc1_w, fc2_w, fc3_w, n_experts, n_local_experts, expert_start_idx, expert_end_idx, topk,
+            fc1_w, fc2_w, fc3_w, w_down, w_up, latent_norm_w, latent_post_rmsnorm, rmsnorm_eps,
+            n_experts, n_local_experts, expert_start_idx, expert_end_idx, topk,
             routing_type, qb_globalnorm,
             expert_w1, expert_w2, expert_w3, expert_backend, moe_permutation_backend,
             hidden_dropout, recompute_fc1_out, recompute_fc3_out
@@ -203,6 +208,9 @@ class TransformerMoEBlockFunction(torch.autograd.Function):
             fc1_w,
             fc2_w,
             fc3_w,
+            w_down,
+            w_up,
+            latent_norm_w,
             router_w,
             router_bias,
             expert_w1,
@@ -235,6 +243,7 @@ class TransformerMoEBlockFunction(torch.autograd.Function):
         ctx.expert_start_idx = expert_start_idx
         ctx.expert_end_idx = expert_end_idx
         ctx.expert_backend = expert_backend
+        ctx.latent_post_rmsnorm = latent_post_rmsnorm
         ctx.topk = topk
         ctx.moe_permutation_backend = moe_permutation_backend
         ctx.routing_type = routing_type
@@ -301,6 +310,9 @@ class TransformerMoEBlockFunction(torch.autograd.Function):
             fc1_w,
             fc2_w,
             fc3_w,
+            w_down,
+            w_up,
+            latent_norm_w,
             router_w,
             router_bias,
             expert_w1,
@@ -336,6 +348,7 @@ class TransformerMoEBlockFunction(torch.autograd.Function):
         expert_start_idx = ctx.expert_start_idx
         expert_end_idx = ctx.expert_end_idx
         expert_backend = ctx.expert_backend
+        latent_post_rmsnorm = ctx.latent_post_rmsnorm
         moe_permutation_backend = ctx.moe_permutation_backend
         routing_type = ctx.routing_type
         routing_score_func = ctx.routing_score_func
@@ -411,10 +424,14 @@ class TransformerMoEBlockFunction(torch.autograd.Function):
             handle_mx = None
 
         # MoE backward
-        xf_grad, ew1_grad, ew2_grad, ew3_grad, fc1_w_grad, fc2_w_grad, fc3_w_grad, router_w_grad = moe_bwd(
+        (
+            xf_grad, ew1_grad, ew2_grad, ew3_grad, fc1_w_grad, fc2_w_grad, fc3_w_grad, router_w_grad,
+            w_down_grad, w_up_grad, latent_norm_w_grad
+        ) = moe_bwd(
             out_grad, aux_loss_grad, xf, xf_flat, original_scores, routing_indices, org_topk_scores, token_indices, tokens_per_expert,
             router_w, router_bias, router_bias_update_rate, routing_score_func, routing_scaling_factor, router_load_balancing_type,
-            h1, h3, fc1_w, fc2_w, fc3_w, n_experts, n_local_experts, topk,
+            h1, h3, fc1_w, fc2_w, fc3_w, w_down, w_up, latent_norm_w, latent_post_rmsnorm, rmsnorm_eps,
+            n_experts, n_local_experts, topk,
             routing_type, qb_update_method, qb_decay, qb_globalnorm,
             expert_w1, expert_w2, expert_w3,
             expert_backend, moe_permutation_backend, hidden_dropout, group_sizes, input_splits, output_splits, curr_bsz,
@@ -533,6 +550,10 @@ class TransformerMoEBlockFunction(torch.autograd.Function):
             fc1_w_grad,
             fc2_w_grad,
             fc3_w_grad,
+            w_down_grad,
+            w_up_grad,
+            latent_norm_w_grad,
+            None,  # latent_post_rmsnorm
             router_w_grad,
             None,  # n_experts
             None,  # n_local_experts
