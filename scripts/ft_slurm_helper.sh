@@ -22,6 +22,21 @@ FT_SCANCEL_TIMEOUT=${FT_SCANCEL_TIMEOUT:-30}
 mkdir -p "$MBOX"
 SUBMITTED=()
 
+# Re-adopt orphaned requests previously claimed by a helper on this host that died
+START_TIME=$(date +%s)
+HOST=$(hostname)
+for taken in "$MBOX"/req.*.taken."$HOST".*; do
+  [ -e "$taken" ] || continue
+  pid=${taken##*.}
+  if ! kill -0 "$pid" 2>/dev/null; then
+    mtime=$(stat -c %Y "$taken" 2>/dev/null || echo "$START_TIME")
+    if [ "$mtime" -le "$START_TIME" ]; then
+      orig=${taken%%.taken.*}
+      mv -n "$taken" "$orig" 2>/dev/null || rm -f "$taken"
+    fi
+  fi
+done
+
 cleanup() {
   for j in "${SUBMITTED[@]}"; do scancel "$j" 2>/dev/null; done
   exit 0

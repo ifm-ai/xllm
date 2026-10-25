@@ -77,3 +77,37 @@ def test_sbatch_timeout_reported(tmp_path):
         proc.terminate()
         proc.wait(timeout=5)
 
+
+def test_orphaned_taken_request_readopted(tmp_path):
+    import socket
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    log = tmp_path / "calls"
+    (bin_dir / "sbatch").write_text(f'#!/bin/bash\necho "sbatch $*" >> {log}\necho "5001;cluster"\n')
+    (bin_dir / "scancel").write_text(f'#!/bin/bash\necho "scancel $*" >> {log}\n')
+    for f in bin_dir.iterdir():
+        f.chmod(0o755)
+    mbox = tmp_path / "mbox"
+    mbox.mkdir()
+    host = socket.gethostname()
+    dead_pid = 999999
+    orphan = mbox / f"req.orphan1.taken.{host}.{dead_pid}"
+    orphan.write_text("request_node -\n")
+    os.utime(orphan, (time.time() - 10, time.time() - 10))
+
+    env = dict(os.environ, PATH=f"{bin_dir}:{os.environ['PATH']}", FT_HELPER_POLL="0.05")
+    proc = subprocess.Popen(["bash", str(HELPER), str(mbox), "/path/spare.sbatch"], env=env)
+    time.sleep(0.5)
+    try:
+        rep = mbox / "rep.orphan1"
+        for _ in range(30):
+            if rep.exists():
+                break
+            time.sleep(0.1)
+        assert rep.exists(), "Orphaned request was not processed"
+        assert rep.read_text().strip() == "ok 5001"
+    finally:
+        proc.terminate()
+        proc.wait(timeout=5)
+
+
