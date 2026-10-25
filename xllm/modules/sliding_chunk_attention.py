@@ -81,7 +81,7 @@ class SlidingChunkAttention(nn.Module):
             xk = torch.cat([prev_k, xk], dim=1) if prev_k is not None else xk
             xv = torch.cat([prev_v, xv], dim=1) if prev_v is not None else xv
             assert xk.shape[1] <= self.chunk_size * 2
-            if self.backend == 'xattn':
+            if self.backend in ['xattn', 'flash']:
                 output = xattn_causal_flash_attn(
                     xq, xk, xv, self.scale, bos_mask, segment_idx, stability_control, deterministic
                 )
