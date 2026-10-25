@@ -34,7 +34,8 @@ def initialize_model_parallel(
     timeout: int,
     model_parallel_backend: Optional[str] = None,
     context_parallel_backend: Optional[str] = None,
-    ddp_backend: Optional[str] = None
+    ddp_backend: Optional[str] = None,
+    local_sync: bool = False,
 ) -> None:
     """
     Initialize GPU parallel groups.
@@ -46,6 +47,8 @@ def initialize_model_parallel(
         model_parallel_backend: model parallel backend,
         context_parallel_backend: context parallel backend,
         ddp_backend: data parallel backend
+        local_sync: only the members of each group synchronize when it is created (used by ft, where
+            groups are rebuilt on every restart and a global barrier per group grows with the world size)
 
     """
     # Get world size and rank. Ensure some consistencies.
@@ -76,7 +79,9 @@ def initialize_model_parallel(
     for j in range(context_parallel_size):
         for k in range(model_parallel_size):
             ranks = groups[:, j, k].tolist()
-            group = torch.distributed.new_group(ranks, timeout=timeout, backend=ddp_backend, device_id=device)
+            group = torch.distributed.new_group(
+                ranks, timeout=timeout, backend=ddp_backend, device_id=device, use_local_synchronization=local_sync
+            )
             if j == found[1] and k == found[2]:
                 _DATA_PARALLEL_GROUP = group
 
@@ -87,7 +92,8 @@ def initialize_model_parallel(
         for j in range(context_parallel_size):
             ranks = groups[i, j, :].tolist()
             group = torch.distributed.new_group(
-                ranks, timeout=timeout, backend=model_parallel_backend, device_id=device
+                ranks, timeout=timeout, backend=model_parallel_backend, device_id=device,
+                use_local_synchronization=local_sync,
             ) if model_parallel_size > 1 else None
 
             if i == found[0] and j == found[1]:
@@ -101,7 +107,8 @@ def initialize_model_parallel(
         for k in range(model_parallel_size):
             ranks = groups[i, :, k].tolist()
             group = torch.distributed.new_group(
-                ranks, timeout=timeout, backend=context_parallel_backend, device_id=device
+                ranks, timeout=timeout, backend=context_parallel_backend, device_id=device,
+                use_local_synchronization=local_sync,
             ) if context_parallel_size > 1 else None
 
             if i == found[0] and k == found[2]:
@@ -116,7 +123,9 @@ def initialize_model_parallel(
     groups = torch.LongTensor(range(world_size)).reshape(-1, model_parallel_size)
     for k in range(model_parallel_size):
         ranks = groups[:, k].tolist()
-        group = torch.distributed.new_group(ranks, timeout=timeout, backend=ddp_backend, device_id=device)
+        group = torch.distributed.new_group(
+            ranks, timeout=timeout, backend=ddp_backend, device_id=device, use_local_synchronization=local_sync
+        )
         if k == found[2]:
             _HYBRID_SHARD_DATA_PARALLEL_GROUP = group
 

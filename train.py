@@ -60,6 +60,9 @@ from xllm.models import build_model
 from xllm.optim import build_optimizer, rescale_grads
 from xllm.monitor import GPUMonitor, Timings
 from xllm.metrics import MetricLogger, build_mlogger
+from xllm.ft.trainer import FtTrainer, prepare_log_dir as ft_prepare_log_dir
+from xllm.ft.trainer import ignore_requeue_signal as ft_ignore_requeue_signal
+from xllm.ft.trainer import dump_restart as ft_dump_restart, memory_restart as ft_memory_restart
 from xllm.health_metrics import HealthMetricCollector
 from xllm.modules.moe.moe import moe_layer_ids
 from xllm.modules.moe.mova import mova_layer_ids
@@ -93,18 +96,26 @@ def initialize_run(cfg: TrainerConf):
     # init dump dir / dump parameters / logger file handler
     assert cfg.dump_dir != "", "Please specify dump dir."
     dump_dir = Path(cfg.dump_dir)
-    mkdir([dump_dir], global_rank == 0, exist_ok=True)
+    if not ft_memory_restart(cfg):  # a memory restart reuses the dump dir of the first start
+        mkdir([dump_dir], global_rank == 0, exist_ok=True)
 
-    # log restart infos before doing anything
-    restart_infos = log_restart_infos(
-        dump_dir=cfg.dump_dir,
-        global_rank=global_rank,
-        step=get_last_restart_step(cfg.dump_dir, global_rank),
-    )
-    logger.warning(f"restart infos: {restart_infos}")
+    if cfg.ft.enabled:  # logs and metrics go to a per-host local dir (cfg.log_dir)
+        ft_prepare_log_dir(cfg)
 
-    # initialize signal handler
-    init_signal_handler()
+    # log restart infos before doing anything (a memory restart skips the checkpoint scan: logging only)
+    if not ft_memory_restart(cfg):
+        restart_infos = log_restart_infos(
+            dump_dir=cfg.log_dir,
+            global_rank=global_rank,
+            step=get_last_restart_step(cfg.dump_dir, global_rank),
+        )
+        logger.warning(f"restart infos: {restart_infos}")
+
+    # initialize signal handler (under ft from the start: the sbatch script owns the requeue)
+    if cfg.ft.enabled:
+        ft_ignore_requeue_signal()
+    else:
+        init_signal_handler()
 
     # initialize distributed mode / model parallel
     logger.info("Starting init of torch.distributed...")
@@ -113,7 +124,9 @@ def initialize_run(cfg: TrainerConf):
     logger.info("Done init of torch.distributed.")
 
     logger.info("Starting init of model parallel...")
-    initialize_model_parallel(cfg.model_parallel_size, cfg.context_parallel_size, cfg.nccl_timeout)
+    initialize_model_parallel(
+        cfg.model_parallel_size, cfg.context_parallel_size, cfg.nccl_timeout, local_sync=cfg.ft.enabled
+    )
     logger.info("Done init of model parallel.")
 
     logger.info(
@@ -124,9 +137,10 @@ def initialize_run(cfg: TrainerConf):
     )
 
     if cfg.slurm.is_master:
-        with open(Path(cfg.dump_dir) / "config.json", "w") as f:
-            json.dump(cfg.to_dict(), f, sort_keys=True, indent=4)
-        add_logger_file_handler(os.path.join(cfg.dump_dir, "train.log"))
+        if not ft_memory_restart(cfg):  # written by the first start
+            with open(Path(cfg.dump_dir) / "config.json", "w") as f:
+                json.dump(cfg.to_dict(), f, sort_keys=True, indent=4)
+        add_logger_file_handler(os.path.join(cfg.log_dir, "train.log"))
 
     # print env info
     if cfg.slurm.is_slurm_job:
@@ -233,10 +247,13 @@ def main(cfg: TrainerConf):
         logger.info(f"No print for worker {cfg.slurm.global_rank}")
         logger.disabled = True
 
-    # model / optimizer paths
-    model_path, optim_path, training_state_path = get_latest_checkpoint_paths_for_sharded_states(
-        cfg.dump_dir, cfg.slurm.global_rank, cfg.fully_sharded_size, cfg.dcp_for_optimizer
-    )
+    # model / optimizer paths (memory and agent-dump restarts do not look at xLLM's checkpoints)
+    if ft_memory_restart(cfg) or ft_dump_restart(cfg):
+        model_path = optim_path = training_state_path = None
+    else:
+        model_path, optim_path, training_state_path = get_latest_checkpoint_paths_for_sharded_states(
+            cfg.dump_dir, cfg.slurm.global_rank, cfg.fully_sharded_size, cfg.dcp_for_optimizer
+        )
     assert (model_path is None) == (optim_path is None)
 
     logger.info("Start building of model...")
@@ -265,6 +282,8 @@ def main(cfg: TrainerConf):
     # build optimizer / scheduler
     optimizer, scheduler = build_optimizer(model, cfg.optim, cfg.steps, cfg.dtype)
 
+    ft = FtTrainer(cfg, model, optimizer) if cfg.ft.enabled else None  # in-memory copies, sizing gate, progress
+
     # setup loggers
     enable_loggers = cfg.slurm.is_master and not cfg.disable_logging
     enable_wandb = cfg.slurm.is_master and cfg.log_wandb and has_wandb
@@ -277,7 +296,7 @@ def main(cfg: TrainerConf):
 
     mloggers: Dict[str, MetricLogger] = {
         k: build_mlogger(
-            cfg.dump_dir, k, enable_loggers, enable_wandb, enable_prefix_keys=k != "health"
+            cfg.log_dir, k, enable_loggers, enable_wandb, enable_prefix_keys=k != "health"
         ) for k in to_log
     }
     router_stats_layers = {}
@@ -311,8 +330,13 @@ def main(cfg: TrainerConf):
         async_checkpointing=cfg.async_checkpointing,
     )
 
-    # reload model if available
-    if model_path is not None:
+    # reload: from the in-memory copies on an ft memory restart, from an agent dump or xLLM's checkpoint on disk
+    if ft_memory_restart(cfg) or ft_dump_restart(cfg):
+        restored = ft.restore(cfg)
+        for group, saved in zip(optimizer.param_groups, restored["param_groups"]):
+            group.update(saved)
+        set_optim_state(scheduler, restored, state, data_iterator, timings, cfg.optim)
+    elif model_path is not None:
         logger.info(f"Reloading model checkpoint from {model_path} ...")
         hsdp_group = get_hybrid_shard_data_parallel_group()
         # reload sharded model state
@@ -362,10 +386,11 @@ def main(cfg: TrainerConf):
             set_sharded_optimizer_state(model, optimizer, reloaded_optim_state_dict, cfg.dcp_for_optimizer)
             del reloaded_optim_state_dict
 
-    # check gpu nodes
-    check_cluster(
-        dump_dir=Path(cfg.dump_dir), global_rank=cfg.slurm.global_rank, check_level=cfg.cluster_check_level, step=0
-    )
+    # check gpu nodes (a memory restart skips it: the nodes passed it at the first start or the spare check)
+    if not ft_memory_restart(cfg):
+        check_cluster(
+            dump_dir=Path(cfg.log_dir), global_rank=cfg.slurm.global_rank, check_level=cfg.cluster_check_level, step=0
+        )
 
     # build batch iterator
     logger.info("Building batch iterator ...")
@@ -396,6 +421,8 @@ def main(cfg: TrainerConf):
     torch.cuda.empty_cache()
 
     while state.step < cfg.steps:
+        if ft is not None:
+            ft.step_start(state.step)
         torch.cuda.reset_peak_memory_stats()
         # data loading
         t1 = timer()
@@ -496,6 +523,9 @@ def main(cfg: TrainerConf):
         optimizer.step()
         scheduler.step()
         optimizer.zero_grad()
+
+        if ft is not None:  # in-memory copy every k steps; progress for the agent's hang deadline
+            ft.step_end(optimizer, scheduler, state, data_iterator)
 
         # logging
         s_logging = timer()
@@ -643,6 +673,8 @@ def main(cfg: TrainerConf):
 
         should_checkpoint = state.step % cfg.dump_freq == 0 or state.step == cfg.steps
         should_eval = cfg.eval_freq > 0 and (state.step % cfg.eval_freq == 0 or state.step == cfg.steps)
+        if ft is not None and (should_checkpoint or should_eval):
+            ft.pause(True)
 
         if should_checkpoint:
             gc.collect()
@@ -684,11 +716,15 @@ def main(cfg: TrainerConf):
         timings.eval += timer() - s_eval
 
     # end of training
+    if ft is not None:
+        ft.pause(True)
     logger.info(f"Reached {cfg.steps} steps.")
     data_iterator.close()
     checkpointer.close()
     for mlogger in mloggers.values():
         mlogger.close()
+    if ft is not None:
+        ft.close(cfg)  # also copies rank 0's local logs back to dump_dir
     torch.distributed.destroy_process_group()
 
 
