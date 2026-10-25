@@ -11,10 +11,14 @@
 #
 # Usage (started in the background by the sbatch script, outside the container):
 #   scripts/ft_slurm_helper.sh <mailbox dir> <refill-spare sbatch script>
+#
+# Invariant: FT_SBATCH_TIMEOUT (default 90s) < SlurmMailbox.timeout (120s)
 set -u
 MBOX=$1
 SPARE_SCRIPT=$2
 POLL=${FT_HELPER_POLL:-1}
+FT_SBATCH_TIMEOUT=${FT_SBATCH_TIMEOUT:-90}
+FT_SCANCEL_TIMEOUT=${FT_SCANCEL_TIMEOUT:-30}
 mkdir -p "$MBOX"
 SUBMITTED=()
 
@@ -48,16 +52,16 @@ while [ ! -e "$MBOX/stop" ] && { [ -z "$RUN" ] || [ "$(cat "$MBOX/run" 2>/dev/nu
       request_node)
         excl=()
         [ "$arg" != "-" ] && excl=(--exclude="$arg")
-        if out=$(sbatch --parsable "${excl[@]}" "$SPARE_SCRIPT" 2>&1); then
+        if out=$(timeout "$FT_SBATCH_TIMEOUT" sbatch --parsable "${excl[@]}" "$SPARE_SCRIPT" 2>&1); then
           jobid=${out%%;*}
           SUBMITTED+=("$jobid")
           : > "$MBOX/submitted.$jobid"  # also for the watchdog, should this helper die with its node
           reply="ok $jobid"
         else
-          reply="error $out"
+          reply="error ${out:-timeout}"
         fi ;;
       release_node)
-        if scancel "$arg" 2>&1; then reply="ok $arg"; rm -f "$MBOX/submitted.$arg"; else reply="error scancel $arg failed"; fi ;;
+        if timeout "$FT_SCANCEL_TIMEOUT" scancel "$arg" 2>&1; then reply="ok $arg"; rm -f "$MBOX/submitted.$arg"; else reply="error scancel $arg failed"; fi ;;
       *)
         reply="error unknown request '$action'" ;;
     esac

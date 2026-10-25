@@ -53,3 +53,27 @@ def test_submitted_jobs_are_cancelled_when_the_job_ends(helper):
     proc.wait(timeout=10)
     calls = log.read_text().splitlines()
     assert f"scancel {a}" in calls and f"scancel {b}" in calls
+
+
+def test_sbatch_timeout_reported(tmp_path):
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    (bin_dir / "sbatch").write_text('#!/bin/bash\nsleep 2\necho "5000;cluster"\n')
+    (bin_dir / "scancel").write_text('#!/bin/bash\nexit 0\n')
+    for f in bin_dir.iterdir():
+        f.chmod(0o755)
+    mbox = tmp_path / "mbox"
+    env = dict(os.environ, PATH=f"{bin_dir}:{os.environ['PATH']}", FT_HELPER_POLL="0.05", FT_SBATCH_TIMEOUT="0.2")
+    proc = subprocess.Popen(["bash", str(HELPER), str(mbox), "/path/spare.sbatch"], env=env)
+    time.sleep(0.3)
+    try:
+        client = SlurmMailbox(mbox, timeout=5)
+        t0 = time.monotonic()
+        with pytest.raises(RuntimeError, match="SLURM helper: error"):
+            client.request_node()
+        elapsed = time.monotonic() - t0
+        assert elapsed < 1.5, f"Expected timeout < 1.5s, took {elapsed:.2f}s"
+    finally:
+        proc.terminate()
+        proc.wait(timeout=5)
+
