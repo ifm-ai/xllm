@@ -13,13 +13,14 @@ from .fused_ops import (
 from .causal_attention import repeat_kv
 
 
-class SlidingChunkAttention(nn.Module):
+class SlidingChunkSoftmaxAttention(nn.Module):
     """
-    Sliding Chunk attention
+    Sliding Chunk Softmax Attention
     """
 
     def __init__(
         self,
+        layer_id: int,
         n_heads: int,
         n_kv_heads: int,
         head_dim: int,
@@ -31,6 +32,7 @@ class SlidingChunkAttention(nn.Module):
         backend: Optional[str],
     ):
         super().__init__()
+        self.layer_id = layer_id
         self.n_heads = n_heads
         self.n_kv_heads = n_kv_heads
         self.head_dim = head_dim
@@ -46,6 +48,7 @@ class SlidingChunkAttention(nn.Module):
         xq: Tensor,
         xk: Tensor,
         xv: Tensor,
+        g: Optional[Tensor],
         freqs_cis: Optional[Tensor],
         prev_k: Optional[Tensor] = None,
         prev_v: Optional[Tensor] = None,
@@ -106,3 +109,34 @@ class SlidingChunkAttention(nn.Module):
             self.n_heads, self.n_kv_heads, self.head_dim, self.rope_head_dim, self.v_head_dim,
             self.chunk_size, self.scale, self.backend
         )
+
+
+class SlidingChunkSoftdeltaAttention(nn.Module):
+    """
+    Sliding Chunk Softdelta Attention
+    """
+
+    def __init__(
+        self,
+        layer_id: int,
+        n_heads: int,
+        n_kv_heads: int,
+        head_dim: int,
+        v_head_dim: int,
+        rope_head_dim: int,
+        chunk_size: int,
+        scale: Optional[float],
+        dropout: float,
+        backend: Optional[str],
+    ):
+        super().__init__()
+        self.layer_id = layer_id
+        self.n_heads = n_heads
+        self.n_kv_heads = n_kv_heads
+        self.head_dim = head_dim
+        self.v_head_dim = v_head_dim
+        self.rope_head_dim = rope_head_dim
+        self.chunk_size = chunk_size
+        self.scale = 1.0 / math.sqrt(self.head_dim) if scale is None else scale
+        self.dropout = dropout
+        self.backend = backend

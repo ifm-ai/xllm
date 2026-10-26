@@ -43,7 +43,7 @@ class CausalSoftmaxAttention(nn.Module):
 
     def __init__(
         self,
-        layer_id: Optional[int],
+        layer_id: int,
         n_heads: int,
         n_kv_heads: int,
         head_dim: int,
@@ -193,7 +193,7 @@ class CausalSoftdeltaAttention(nn.Module):
 
     def __init__(
         self,
-        layer_id: Optional[int],
+        layer_id: int,
         n_heads: int,
         n_kv_heads: int,
         head_dim: int,

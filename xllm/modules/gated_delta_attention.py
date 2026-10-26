@@ -3,6 +3,7 @@ import math
 import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
+from einops import rearrange
 
 from xllm.distributed import (
     get_model_parallel_world_size,
@@ -13,7 +14,10 @@ from xllm.health_metrics import get_active_health_collector
 from xllm.modules.rms_norm import GroupRMSNorm
 from xllm.modules.timestep_decay_norm import TimestepDecayNorm
 from xllm.modules.causal_conv import CausalConv1d
-from xllm.modules.sliding_chunk_attention import SlidingChunkAttention
+from xllm.modules.sliding_chunk_attention import (
+    SlidingChunkSoftmaxAttention,
+    SlidingChunkSoftdeltaAttention,
+)
 from xllm.modules.adaptive_working_memory import AdaptiveWorkingMemory
 from xllm.modules.residual import build_residual
 from xllm.modules.model_parallel import (
@@ -115,17 +119,22 @@ class GatedDeltaAttention(nn.Module):
         )
 
         init_fn = get_init_fn(init_mode, dim=mdim, std=init_std)
-        nq = {"softmax": 1, "softdelta": 2}[attn_act_func]
-        assert nq is not None
+
+        # query project
+        qheads = {
+            "softmax": self.n_heads,
+            "softdelta": self.n_heads + self.n_kv_heads
+        }[attn_act_func]
         self.wq = ColumnParallelLinear(
             mdim,
-            qdim * nq,
+            qheads * self.head_dim,
             bias=False,
             input_is_parallel=False,
             disable_input_reduce=True,
             gather_output=False,
             init_method=init_fn
         )
+        # key & value projections
         self.wk = ColumnParallelLinear(
             mdim,
             kdim,
@@ -145,8 +154,9 @@ class GatedDeltaAttention(nn.Module):
             init_method=init_fn
         )
 
+        # qkv shortconvs
         self.q_conv = CausalConv1d(
-            qdim * nq,
+            qheads * self.head_dim,
             causal_conv_width,
             bias=False,
             apply_weight_normalization=causal_conv_weight_normalization,
@@ -170,9 +180,10 @@ class GatedDeltaAttention(nn.Module):
             backend=causal_conv_backend,
         )
 
+        # qk-norm
         self.query_norm = GroupRMSNorm(
-            qdim * nq,
-            num_groups=self.num_heads,
+            qheads * self.head_dim,
+            num_groups=qheads,
             elementwise_affine=True,
             eps=rmsnorm_eps,
             memory_efficient=False,
@@ -185,9 +196,11 @@ class GatedDeltaAttention(nn.Module):
             memory_efficient=True,  # for knorm, always use efficient memory
         )
 
+        # attention gate projection
+        rdim = {"softmax": hdim, "softdelta": hdim + self.n_heads}[attn_act_func]
         self.wr = ColumnParallelLinear(
             mdim,
-            hdim,
+            rdim,
             bias=apply_bias_term,
             input_is_parallel=False,
             disable_input_reduce=True,
@@ -195,16 +208,15 @@ class GatedDeltaAttention(nn.Module):
             init_method=init_fn
         )
 
-        self.wg = RowParallelLinear(
-            mdim,
-            self.num_heads,
-            bias=False,
-            input_is_parallel=True,
-            parallel_output=True,
-            init_method=init_fn
-        ) if self.attn_act_func == "softdelta" else None
+        if self.attn_act_func == "softmax":
+            sca_cls = SlidingChunkSoftmaxAttention
+        elif self.attn_act_func == "softdelta":
+            sca_cls = SlidingChunkSoftdeltaAttention
+        else:
+            raise ValueError(f"Unknown attention activation function: {self.attn_act_func}")
 
-        self.sliding_chunk_attention = SlidingChunkAttention(
+        self.sliding_chunk_attention = sca_cls(
+            self.layer_id,
             self.local_heads,
             self.local_kv_heads,
             self.head_dim,
@@ -369,8 +381,6 @@ class GatedDeltaAttention(nn.Module):
 
         # B x L x D/TP
         x, prev_count, prev_mean, prev_var = self.timenorm(x, bos_mask_curr, prev_count, prev_mean, prev_var)
-        # B x L x H
-        g = torch.sigmoid(self.wg(x)) if self.wg is not None else None
         # B x L x D
         mx = gather_copy_model_parallel_region(x)
 
@@ -391,6 +401,19 @@ class GatedDeltaAttention(nn.Module):
         # qk-norm
         sq = self.query_norm(xq)
         sk = self.key_norm(xk)
+
+        rg = rearrange(self.wr(x), 'b l (h v) -> b l h v', h=self.local_heads)
+        # B x L x H*V
+        r = rearrange(rg[:, :, :, :self.v_head_dim], 'b l h v -> b l (h v)')
+        if self.attn_gate_fn == "silu":
+            r = F.silu(r)
+        elif self.attn_gate_fn == "softplus":
+            r = F.softplus(r, beta=math.log(2))
+        else:
+            raise ValueError(f"Unknown attention gate function {self.attn_gate_fn}")
+        # B x L x H
+        g = rg[:, :, :, -1] if self.attn_act_func == 'softdelta' else None
+
         health_collector = get_active_health_collector()
         if health_collector is not None:
             sca_key_l2 = None
@@ -406,21 +429,18 @@ class GatedDeltaAttention(nn.Module):
                 sca_key_l2=sca_key_l2,
             )
 
-        # B x L x E/TP
-        if self.attn_gate_fn == "silu":
-            r = F.silu(self.wr(mx))
-        elif self.attn_gate_fn == "softplus":
-            r = F.softplus(self.wr(mx), beta=math.log(2))
-        else:
-            raise ValueError(f"Unknown attention gate function {self.attn_gate_fn}")
-
         prev_sv = prev_v
         prev_av = prev_v.transpose(1, 2) if prev_v is not None else None
-        # B x L x E/TP
+        # SCA
         sca, prev_sk, prev_v = self.sliding_chunk_attention(
-            sq, sk, v, freqs_cis, prev_sk, prev_sv,
+            sq, sk, v, g, freqs_cis, prev_sk, prev_sv,
             bos_mask, segment_idx, stability_control, deterministic
         )
+        # AWM
+        if self.attn_act_func == 'softdelta':
+            n_rep = self.local_heads // self.local_kv_heads
+            xq = rearrange(xq, 'b l (k n s) -> b l k n s', k=self.local_kv_heads, n=n_rep + 1)
+            xq = rearrange(xq[:, :, :, :n_rep], 'b l k n s -> b l (k n s)')
         awk, awk_mask, memory, log_norm_term, prev_aqk, prev_akk, _ = self.adaptive_working_memory(
             xq, xk, xk, v, memory, log_norm_term, prev_aqk, prev_akk, prev_av,
             segment_idx, prev_segment_count,

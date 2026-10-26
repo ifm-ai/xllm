@@ -12,7 +12,7 @@ from torch.nn import Parameter
 from .rms_norm import GroupRMSNorm
 from .timestep_decay_norm import TimestepDecayNorm
 from .complex_exponential_moving_average import MultiHeadComplexEMA
-from .sliding_chunk_attention import SlidingChunkAttention
+from .sliding_chunk_attention import SlidingChunkSoftmaxAttention
 from .adaptive_working_memory import AdaptiveWorkingMemory
 from .residual import (
     BaseResidual,
@@ -185,7 +185,7 @@ class MovingAverageGatedAttention(nn.Module):
             parallel_output=True,
             init_method=get_init_fn(init_mode, dim=hdim, std=init_std)
         )
-        self.sliding_chunk_attention = SlidingChunkAttention(
+        self.sliding_chunk_attention = SlidingChunkSoftmaxAttention(
             self.local_heads,
             self.local_heads,
             self.head_dim,
