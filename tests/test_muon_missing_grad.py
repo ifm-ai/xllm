@@ -39,7 +39,7 @@ def cpu_transport(monkeypatch):
 
     monkeypatch.setattr(torch, "empty", cpu_empty)
     monkeypatch.setattr(muon, "newton_schulz5", muon.newton_schulz5._torchdynamo_orig_callable)
-    return lambda opt: monkeypatch.setattr(opt, "_exchange", lambda send, shapes: send)
+    return lambda opt: monkeypatch.setattr(opt, "_exchange", lambda send, shapes: lambda: send)
 
 
 @pytest.mark.parametrize("nesterov", [False, True])

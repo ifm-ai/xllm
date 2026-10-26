@@ -89,6 +89,7 @@ class OptimConf(Config):
     muon_adjust_lr: Optional[str] = "spectral_norm"  # Muon update scaling: spectral_norm, rms_norm or None
     muon_block_scale: str = "block"  # Update scale of a row block (from the layers' `muon` marks): block (its own shape) or matrix (its whole matrix's shape)
     muon_weight_decay: Optional[float] = None  # Decoupled weight decay of the Muon matrices; None = weight_decay
+    muon_batch_numel: int = 250_000_000  # Muon steps the matrices without communication (routed experts, heads) in batches of one block shape and about this many elements of a rank, one after another: the step's temporary buffers are the size of a batch; 0 = one batch per block shape
     warmup: int = 2000  # Num of steps for LR warmup. 0 means no warmup
     weight_decay: float = 0.1  # Decoupled weight decay
     epsilon: float = 1e-8
@@ -107,6 +108,7 @@ class OptimConf(Config):
         assert self.muon_adjust_lr in [None, "spectral_norm", "rms_norm"]
         assert self.muon_block_scale in ['block', 'matrix']
         assert self.muon_weight_decay is None or self.muon_weight_decay >= 0
+        assert self.muon_batch_numel >= 0
         assert self.scheduler in ['linear', 'cosine', 'constant', 'wsd']
         assert self.warmup >= 0
         if self.scheduler == 'wsd':
