@@ -56,6 +56,9 @@ CFG_MATRIX_SCALE = OptimConf(optimizer="muon", lr=1e-3, muon_lr=0.02, muon_momen
                              beta1=0.9, beta2=0.95, epsilon=1e-8, muon_block_scale="matrix")
 CFG_ADAMW = OptimConf(optimizer="muon", lr=1e-3, muon_lr=0.02, weight_decay=0.1, beta1=0.9, beta2=0.95,
                       epsilon=1e-8)
+# every local matrix in a batch of its own (the default batches all of a block shape at these sizes)
+CFG_BATCHED = OptimConf(optimizer="muon", lr=1e-3, muon_lr=0.02, muon_momentum=0.95, weight_decay=0.0,
+                        beta1=0.9, beta2=0.95, epsilon=1e-8, muon_batch_numel=1)
 STEPS = 3
 
 
@@ -238,7 +241,7 @@ def check_tensor_parallel(rep=1, tp=2):
     ]
     local_specs = [muon_spec(tp_dim=d, **kw) for _, d, kw in cases]
     global_specs = [muon_spec(**kw) for _, _, kw in cases]
-    for cfg in (CFG, CFG_MATRIX_SCALE):
+    for cfg in (CFG, CFG_MATRIX_SCALE, CFG_BATCHED):
         torch.manual_seed(3)
         full = [torch.randn(s, device="cuda") for s, _, _ in cases]
         grads = [[torch.randn_like(t) for t in full] for _ in range(STEPS)]
@@ -258,7 +261,8 @@ def check_tensor_parallel(rep=1, tp=2):
             dist.all_gather(parts, p.full_tensor().contiguous(), group=tp_group)
             got.append(torch.cat(parts, dim=d))
         want = dense_muon([x.clone() for x in full], global_specs, grads, cfg)
-        check(f"muon TP={tp} replicas={rep} dp={dp} scale={cfg.muon_block_scale} vs dense reference", got, want, full, 3e-2)
+        check(f"muon TP={tp} replicas={rep} dp={dp} scale={cfg.muon_block_scale} batch={cfg.muon_batch_numel} "
+              f"vs dense reference", got, want, full, 3e-2)
         if cfg is CFG and tp > 1:  # negative control: orthogonalizing each rank's half on its own is a different update
             cut = [2, 3, 4, 5]  # the weights whose matrix TP cuts
             ref_whole_halves = []
@@ -281,14 +285,14 @@ def main():
     mesh = init_device_mesh("cuda", (dist.get_world_size(),))
     n = len(MATRICES)
 
-    for heads, cfg in ((True, CFG), (False, CFG), (True, CFG_PLAIN_RMS), (True, CFG_MATRIX_SCALE)):
+    for heads, cfg in ((True, CFG), (False, CFG), (True, CFG_PLAIN_RMS), (True, CFG_MATRIX_SCALE), (True, CFG_BATCHED)):
         specs = [spec if heads else WHOLE for _, spec in MATRICES]  # heads=False: every matrix one block
         full, vecs, grads, params = make(mesh, seed=0)
         got = run_sharded(Muon, mesh, params[:n], [g[:n] for g in grads], muon_params=params[:n],
                           specs=specs, adamw_params=[], mesh=mesh, cfg=cfg)
         want = dense_muon([x.clone() for x in full], specs, [g[:n] for g in grads], cfg)
         check(f"muon heads={heads} scale={cfg.muon_block_scale} nesterov={cfg.muon_nesterov} "
-              f"adjust={cfg.muon_adjust_lr} vs dense reference", got, want, full, 3e-2)
+              f"adjust={cfg.muon_adjust_lr} batch={cfg.muon_batch_numel} vs dense reference", got, want, full, 3e-2)
         if heads and cfg is CFG:
             # negative controls: per-head vs whole-matrix, and block vs matrix scale, must differ far beyond the tolerance
             whole_ref = dense_muon([x.clone() for x in full], [WHOLE] * n, [g[:n] for g in grads], cfg)
