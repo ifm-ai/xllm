@@ -21,6 +21,17 @@ Terminology, for one Muon matrix W of shape [rows, cols]:
   it, then the least loaded one.
 - slice: the overlap of a Block with one rank's region, a box. A Block is assembled from
   its slices.
+- local / remote Block: the local Blocks of a matrix on a rank lie within its region, span its
+  columns and follow each other with one height (experts, heads inside a shard): the rank
+  owns them and orthogonalizes them in place, as one [M, R, cols] view of its shard, without
+  communication. Every other Block is remote: gathered to its owner and scattered back.
+- local / remote matrix: on a rank, a matrix whose shard is exactly its local Blocks is local
+  (routed experts, heads); the others (with remote Blocks, or none of it stored there) are remote.
+- batch: local matrices whose Blocks have one shape, stepped together: their updates are views of
+  one bf16 [B, R, C] buffer, tall Blocks stored transposed, so Newton-Schulz runs once on it in
+  place. Batches step one after another, so the step's temporary buffers are the size of a batch.
+- plan (MatrixPlan): one matrix's Blocks compiled for one rank: its local Blocks as a view,
+  the slices of its remote Blocks it sends and, for those it owns, receives.
 
 Example: wk [8, 4] in 2 row Blocks of 4 rows on 3 ranks (torch.chunk: rows 0-2, 3-5, 6-7):
 
@@ -29,10 +40,12 @@ Example: wk [8, 4] in 2 row Blocks of 4 rows on 3 ranks (torch.chunk: rows 0-2, 
     rank 2  rows 6-7  c          b1 and b2 are rank 1's slices of blocks 0 and 1
 """
 import math
-from collections import defaultdict
+from collections import Counter, defaultdict
+from itertools import accumulate
 from logging import getLogger
 import re
-from typing import Dict, List, Optional, Tuple
+from dataclasses import dataclass, field
+from typing import Callable, Dict, List, Optional, Tuple
 
 import torch
 import torch.distributed as dist
@@ -57,7 +70,27 @@ NS_COEFFS = (
 )
 
 Box = Tuple[int, int, int, int]  # rows [r0, r1) x cols [c0, c1) of a matrix
+Index = Tuple[slice, slice]  # a box as an index into a tensor
 
+
+@dataclass
+class LocalBlocks:
+    """A rank's local blocks of one matrix: `count` blocks of `height` rows and `cols` columns, rows
+    row0 : row0 + count * height of its shard."""
+    row0: int
+    count: int
+    height: int
+    cols: int
+
+
+@dataclass
+class MatrixPlan:
+    """How one Muon matrix steps on this rank. The slice lists follow the block order, so a
+    sender's list matches its receiver's."""
+    send: List[List[Index]]  # [r]: my slices of the remote blocks rank r owns, as boxes of my shard
+    recv: List[List[Tuple[int, Index]]]  # [r]: rank r's slices of the remote blocks I own, as (index in owned, box of the block)
+    owned: List[int] = field(default_factory=list)  # the remote blocks I own (indices into Muon.blocks)
+    local: Optional[LocalBlocks] = None  # my local blocks of the matrix, if it has any here
 
 
 def split_muon_params(model: nn.Module):
@@ -92,6 +125,20 @@ def _shape(index: Tuple[slice, slice]) -> Tuple[int, int]:
     return rows.stop - rows.start, cols.stop - cols.start
 
 
+def _split(sizes: List[int], limit: int) -> List[Tuple[int, int]]:
+    """Cut range(len(sizes)) into consecutive [lo, hi), each closed once its sizes add up to `limit`
+    (the last one may fall short); a single range if limit is 0."""
+    bounds, lo, total = [], 0, 0
+    for i, size in enumerate(sizes):
+        total += size
+        if limit and total >= limit:
+            bounds.append((lo, i + 1))
+            lo, total = i + 1, 0
+    if lo < len(sizes) or not bounds:
+        bounds.append((lo, len(sizes)))
+    return bounds
+
+
 @torch.compile(fullgraph=True)
 def newton_schulz5(X: Tensor, eps: float) -> Tensor:
     """Orthogonalize a stack of matrices [B, m, n] with m <= n."""
@@ -103,19 +150,35 @@ def newton_schulz5(X: Tensor, eps: float) -> Tensor:
     return X
 
 
-def orthogonalize(mats: List[Tensor], eps: float) -> List[Tensor]:
-    """Newton-Schulz on each matrix, batched over matrices of the same shape.
-    Tall matrices are transposed (NS(X^T) = NS(X)^T), so [m, n] and [n, m] share a batch."""
-    by_shape = defaultdict(list)
-    for k, x in enumerate(mats):
-        by_shape[(min(x.shape), max(x.shape))].append(k)
-    out = list(mats)
-    for idx in by_shape.values():
-        tall = [mats[k].shape[0] > mats[k].shape[1] for k in idx]
-        X = newton_schulz5(torch.stack([mats[k].mT if t else mats[k] for k, t in zip(idx, tall)]), eps)
-        for j, (k, t) in enumerate(zip(idx, tall)):
-            out[k] = X[j].mT if t else X[j]
-    return out
+def orthogonalize_(X: Tensor, eps: float):
+    """Newton-Schulz in place on a stack of matrices [M, R, C]; tall ones are transposed (NS(X^T) = NS(X)^T),
+    contiguous so that newton_schulz5 compiles once per shape, not once per stride."""
+    tall = X.shape[-2] > X.shape[-1]
+    Y = newton_schulz5(X.mT.contiguous() if tall else X, eps)
+    X.copy_(Y.mT if tall else Y)
+
+
+def _rows_as_blocks(x: Tensor, local: LocalBlocks) -> Tensor:
+    """The local blocks of x [rows, cols] as [count, height, cols], a view."""
+    return x[local.row0:local.row0 + local.count * local.height].view(local.count, local.height, x.shape[1])
+
+
+def _packed(blocks: List[Tuple[int, int, int]]) -> Tuple[List[Tensor], List[Tensor]]:
+    """One bf16 [B, R, C] buffer per shape of block, wide (R <= C), for blocks given as (count, rows, cols).
+    Returns each entry's blocks as a [count, rows, cols] view, of the transposed buffer if they are tall, and
+    the buffers: Newton-Schulz runs on a buffer in place, without transposing a copy."""
+    wide = [(min(r, c), max(r, c)) for _, r, c in blocks]
+    sizes = Counter()
+    for (m, _, _), s in zip(blocks, wide):
+        sizes[s] += m
+    buffers = {s: torch.empty(n, *s, dtype=torch.bfloat16, device="cuda") for s, n in sizes.items()}
+    taken = Counter()
+    views = []
+    for (m, r, c), s in zip(blocks, wide):
+        x = buffers[s][taken[s]:taken[s] + m]
+        views.append(x.mT if r > c else x)
+        taken[s] += m
+    return views, list(buffers.values())
 
 
 def group_hparams(cfg: OptimConf, algorithm: str) -> Dict:
@@ -131,10 +194,14 @@ class Muon(Optimizer):
     """Muon for FSDP2 parameters sharded on dim 0, with AdamW for the rest.
 
     Each step:
-    1. update the momentum on the local shard;
-    2. gather: one all-to-all sends every slice to its block's owner;
-    3. each owner runs Newton-Schulz on its blocks;
-    4. scatter: one all-to-all sends the slices back; each rank applies its update.
+    1. remote matrices: update the momentum on the local shard; gather: an asynchronous all-to-all sends
+       every slice of a remote block to the block's owner;
+    2. meanwhile the local matrices, one batch after another (cfg.muon_batch_numel): momentum, Newton-Schulz
+       in place on the batch, update; no communication;
+    3. remote matrices: Newton-Schulz on their local blocks, then on the remote blocks I own; scatter: an
+       all-to-all sends the slices back; each rank applies its update.
+    Owners are balanced over all the blocks, so the step waits once for the slowest rank, at the scatter.
+    FSDP2 already balances the local blocks: every rank stores as many experts / heads.
 
     With tensor parallelism each rank holds its TP-local shard of a weight, and FSDP2 shards that over
     its dp group. TP is just one more way the weight is sharded: Blocks are defined on the whole weight,
@@ -154,6 +221,8 @@ class Muon(Optimizer):
         """specs[i]: how muon_params[i] maps to Newton-Schulz matrices (register_muon / muon_spec).
         tp_group: the tensor-parallel group, if any: the params are then each rank's TP-local shard. Muon
         works over the plane of the dp mesh x TP group, TP being one more way the weight is sharded."""
+        # one compiled Newton-Schulz per stack shape (block shapes x batch sizes), far more than the default 8
+        torch._dynamo.config.cache_size_limit = max(torch._dynamo.config.cache_size_limit, 64)
         defaults = dict(weight_decay=cfg.weight_decay, eps=cfg.epsilon)
         super().__init__(
             [
@@ -162,12 +231,12 @@ class Muon(Optimizer):
             ],
             defaults,
         )
-        self._plan([tuple(p.shape) for p in muon_params], specs, mesh, tp_group)
+        self._plan([tuple(p.shape) for p in muon_params], specs, mesh, tp_group, cfg.muon_batch_numel)
 
     # ---- plan: built once from the global shapes, identical on every rank ----
 
     def _plan(self, shapes: List[Tuple[int, int]], specs: List[MuonSpec], mesh: DeviceMesh,
-              tp_group: Optional[dist.ProcessGroup]):
+              tp_group: Optional[dist.ProcessGroup], batch_numel: int):
         # Ranks: the plane of the dp mesh x TP group that shards a weight. self.coords[r] is the
         # (dp index, tp index) of its rank r, in the process group's order.
         self.tp = 1 if tp_group is None else dist.get_world_size(tp_group)
@@ -213,8 +282,32 @@ class Muon(Optimizer):
             overlaps = [(r, _overlap(block, region)) for r, region in enumerate(regions[b.param])]
             slices.append([(r, box) for r, box in overlaps if box is not None])
 
-        # owner: the rank that stores most of the block (no transfer for that part), then the least
-        # loaded; blocks are placed by decreasing Newton-Schulz cost m * n * min(m, n)
+        self._assign_owners(slices)
+        local, mine = self._local_blocks(slices, regions)
+        # plans[i]: matrix i on this rank
+        self.plans = [MatrixPlan([[] for _ in range(self.world)], [[] for _ in range(self.world)], local=mine.get(i))
+                      for i in range(len(shapes))]
+        for k in range(len(self.blocks)):
+            if k not in local:
+                self._plan_block(k, slices[k], regions)
+        # has_remote: some rank has a remote block, so every rank joins the all-to-alls
+        self.has_remote = len(local) < len(self.blocks)
+        # remote: the matrices this rank steps around the all-to-alls (it sends or owns a remote block, or stores
+        # none of the matrix); batches: the others, whose shard is exactly their local blocks
+        self.remote = [i for i, plan in enumerate(self.plans) if plan.local is None or any(plan.send)]
+        # a rank that owns a remote block stores part of it, so it has something to send (to itself at least)
+        assert all(plan.local is None or any(plan.send) or not plan.owned for plan in self.plans)
+        self.batches = self._batches(batch_numel)
+        # owned_slices[r]: rank r's slices of the remote blocks I own, as (index among the owned blocks of
+        # the remote matrices, box of the block)
+        first = list(accumulate((len(self.plans[i].owned) for i in self.remote), initial=0))
+        self.owned_slices = [[(j0 + j, box) for j0, i in zip(first, self.remote) for j, box in self.plans[i].recv[r]]
+                             for r in range(self.world)]
+
+    def _assign_owners(self, slices: List[List[Tuple[int, Box]]]):
+        """owner: the rank that stores most of the block (no transfer for that part), then the least loaded;
+        blocks are placed by decreasing Newton-Schulz cost m * n * min(m, n), all of them together: the step
+        waits for the most loaded rank once, at the scatter."""
         load = [0] * self.world
         for k in sorted(range(len(self.blocks)), key=lambda k: -self._ns_cost(self.blocks[k])):
             stored = dict.fromkeys(range(self.world), 0)
@@ -224,19 +317,48 @@ class Muon(Optimizer):
             b.owner = min(range(self.world), key=lambda r: (-stored[r], load[r]))
             load[b.owner] += self._ns_cost(b)
 
-        # my_slices[r]: my slices of the blocks rank r owns, as (matrix, box of my region)
-        # owned_slices[r]: rank r's slices of the blocks I own, as (index in self.owned, box of the block)
-        # Both lists follow the block order, so a sender's list matches its receiver's.
-        self.owned = [k for k, b in enumerate(self.blocks) if b.owner == self.rank]
-        index = {k: j for j, k in enumerate(self.owned)}
-        self.my_slices = [[] for _ in range(self.world)]
-        self.owned_slices = [[] for _ in range(self.world)]
-        for k, b in enumerate(self.blocks):
-            for r, box in slices[k]:
+    def _local_blocks(self, slices: List[List[Tuple[int, Box]]], regions: List[List[Box]]) -> Tuple[set, Dict[int, LocalBlocks]]:
+        """The blocks that every rank orthogonalizes in place: for each matrix and rank, the blocks within
+        the rank's region and across its columns, if they follow each other with one height (one view).
+        Returns them (indices into self.blocks) and, per matrix, this rank's."""
+        runs = defaultdict(list)
+        for k in range(len(self.blocks)):
+            b, r = self.blocks[k], slices[k][0][0]
+            if len(slices[k]) == 1 and (b.c0, b.c1) == regions[b.param][r][2:]:
+                runs[b.param, r].append(k)
+        local, mine = set(), {}
+        for (i, r), run in runs.items():
+            blocks = sorted((self.blocks[k] for k in run), key=lambda b: b.r0)
+            if all(a.r1 == b.r0 and a.shape == b.shape for a, b in zip(blocks, blocks[1:])):
+                local.update(run)
                 if r == self.rank:
-                    self.my_slices[b.owner].append((b.param, _local_box(box, regions[b.param][r])))
-                if b.owner == self.rank:
-                    self.owned_slices[r].append((index[k], _local_box(box, (b.r0, b.r1, b.c0, b.c1))))
+                    mine[i] = LocalBlocks(blocks[0].r0 - regions[i][r][0], len(blocks), blocks[0].r1 - blocks[0].r0,
+                                          blocks[0].c1 - blocks[0].c0)
+        return local, mine
+
+    def _plan_block(self, k: int, slices: List[Tuple[int, Box]], regions: List[List[Box]]):
+        """Add remote block k to its matrix's plan on this rank."""
+        b = self.blocks[k]
+        plan = self.plans[b.param]
+        if b.owner == self.rank:
+            plan.owned.append(k)
+        for r, box in slices:
+            if r == self.rank:
+                plan.send[b.owner].append(_local_box(box, regions[b.param][r]))
+            if b.owner == self.rank:
+                plan.recv[r].append((len(plan.owned) - 1, _local_box(box, (b.r0, b.r1, b.c0, b.c1))))
+
+    def _batches(self, limit: int) -> List[List[int]]:
+        """The local matrices in batches: by the shape of their blocks, transposed if tall (one buffer per batch),
+        consecutive ones until a batch holds `limit` elements of this rank (0: one batch per shape)."""
+        remote = set(self.remote)
+        by_shape = defaultdict(list)
+        for i, plan in enumerate(self.plans):
+            if i not in remote:
+                b = plan.local
+                by_shape[min(b.height, b.cols), max(b.height, b.cols)].append((i, b.count * b.height * b.cols))
+        return [[i for i, _ in matrices[lo:hi]]
+                for matrices in by_shape.values() for lo, hi in _split([n for _, n in matrices], limit)]
 
     def _regions(self, spec: MuonSpec, shape: Tuple[int, int]) -> List[Box]:
         """The box of a (global) matrix that each rank stores. TP gives rank (i, t) the t-th chunk of the
@@ -270,73 +392,111 @@ class Muon(Optimizer):
 
     # ---- step ----
 
-    def _exchange(self, send: List[List[Tensor]], recv_shapes: List[List[Tuple[int, int]]]) -> List[List[Tensor]]:
-        """all-to-all of bf16 tensors: send[r] goes to rank r; returns the tensors received from each rank."""
+    def _exchange(self, send: List[List[Tensor]],
+                  recv_shapes: List[List[Tuple[int, int]]]) -> Callable[[], List[List[Tensor]]]:
+        """Launch an all-to-all of bf16 tensors, send[r] going to rank r. Returns a function that waits
+        for it and returns the tensors received from each rank."""
         send_sizes = [sum(t.numel() for t in ts) for ts in send]
         recv_sizes = [sum(m * n for m, n in shapes) for shapes in recv_shapes]
         flat = [t.reshape(-1) for ts in send for t in ts]
         send_buf = torch.cat(flat) if flat else torch.empty(0, dtype=torch.bfloat16, device="cuda")
         recv_buf = torch.empty(sum(recv_sizes), dtype=torch.bfloat16, device="cuda")
-        dist.all_to_all_single(recv_buf, send_buf, recv_sizes, send_sizes, group=self.process_group)
-        out = []
-        for chunk, shapes in zip(recv_buf.split(recv_sizes), recv_shapes):
-            out.append([t.view(shape) for t, shape in zip(chunk.split([m * n for m, n in shapes]), shapes)])
-        return out
+        work = dist.all_to_all_single(recv_buf, send_buf, recv_sizes, send_sizes, group=self.process_group,
+                                      async_op=True)
 
-    def _momentum(self, params: List[Tensor], group: Dict) -> List[Tensor]:
-        """Momentum update on the local shards (one batched call per step); returns the bf16 update directions."""
+        def wait():
+            work.wait()
+            return [[t.view(shape) for t, shape in zip(part.split([m * n for m, n in shapes]), shapes)]
+                    for part, shapes in zip(recv_buf.split(recv_sizes), recv_shapes)]
+        return wait
+
+    def _momentum(self, params: List[Tensor], group: Dict, out: List[Tensor]):
+        """Momentum update on the local shards (one batched call); writes the bf16 update directions into `out`,
+        tensors of the shards' sizes in any shape (row-major order), zeros for the params without a gradient."""
         # Keep the fixed communication plan, but do not create or decay state for
         # a parameter without a gradient (the same semantics as AdamW).
         mu = group["momentum"]
-        updates = [None] * len(params)
         live = []
         for i, p in enumerate(params):
             if p.grad is None:
-                updates[i] = torch.zeros_like(_local(p), dtype=torch.bfloat16)
+                out[i].zero_()
                 continue
             state = self.state[p]
             if "momentum" not in state:
                 state["momentum"] = torch.zeros_like(p, dtype=torch.float32)
             live.append(i)
+        if not live:
+            return
         ms = [_local(self.state[params[i]]["momentum"]) for i in live]
         gs = [_local(params[i].grad) for i in live]
         torch._foreach_mul_(ms, mu)
         torch._foreach_add_(ms, gs)
         us = torch._foreach_add(gs, ms, alpha=mu) if group["nesterov"] else ms
-        out = [torch.empty_like(u, dtype=torch.bfloat16) for u in us]
-        torch._foreach_copy_(out, us)
-        for i, u in zip(live, out):
-            updates[i] = u
-        return updates
+        torch._foreach_copy_([out[i] for i in live], [u.view(out[i].shape) for i, u in zip(live, us)])
 
-    def _gather(self, updates: List[Tensor]) -> List[Tensor]:
-        """Send my slices to their blocks' owners; return the whole blocks I own."""
-        send = [[updates[i][box] for i, box in self.my_slices[r]] for r in range(self.world)]
-        recv = self._exchange(send, [[_shape(box) for _, box in self.owned_slices[r]] for r in range(self.world)])
-        blocks = [torch.empty(self.blocks[k].shape, dtype=torch.bfloat16, device="cuda") for k in self.owned]
-        for r in range(self.world):
-            for (j, box), t in zip(self.owned_slices[r], recv[r]):
-                blocks[j][box] = t
-        return blocks
+    def _gather(self, updates: List[Tensor], plans: List[MatrixPlan]) -> Callable[[], Tuple[List[Tensor], List[Tensor]]]:
+        """Launch sending my slices of remote blocks to their owners. Returns a function that waits and
+        returns the remote blocks I own, in plan order, and the [M, R, C] buffers that hold them."""
+        send = [[u[box] for u, plan in zip(updates, plans) for box in plan.send[r]] for r in range(self.world)]
+        recv = self._exchange(send, [[_shape(box) for plan in plans for _, box in plan.recv[r]] for r in range(self.world)])
 
-    def _scatter(self, results: List[Tensor], updates: List[Tensor]):
-        """Send each rank its slices of the blocks I own; write the slices I receive into `updates`."""
-        send = [[results[j][box] for j, box in self.owned_slices[r]] for r in range(self.world)]
-        recv = self._exchange(send, [[_shape(box) for _, box in self.my_slices[r]] for r in range(self.world)])
-        for r in range(self.world):
-            for (i, box), t in zip(self.my_slices[r], recv[r]):
-                updates[i][box] = t
+        def wait():
+            views, buffers = _packed([(1, *self.blocks[k].shape) for plan in plans for k in plan.owned])
+            out = [v[0] for v in views]
+            for r, ts in enumerate(recv()):
+                for (j, box), t in zip(self.owned_slices[r], ts):
+                    out[j][box] = t
+            return out, buffers
+        return wait
+
+    def _scatter(self, blocks: List[Tensor], updates: List[Tensor], plans: List[MatrixPlan]):
+        """Send each rank its slices of the remote blocks I own; write the slices I receive into `updates`."""
+        send = [[blocks[j][box] for j, box in self.owned_slices[r]] for r in range(self.world)]
+        recv = self._exchange(send, [[_shape(box) for plan in plans for box in plan.send[r]] for r in range(self.world)])
+        for r, ts in enumerate(recv()):
+            for dst, t in zip([u[box] for u, plan in zip(updates, plans) for box in plan.send[r]], ts):
+                dst.copy_(t)
 
     @torch.no_grad()
     def _muon_step(self, group: Dict):
-        params, lr, wd = group["params"], group["lr"], group["weight_decay"]
-        updates = self._momentum(params, group)                            # 1. local shards
-        gathered = self._gather(updates)                                   # 2. whole owned blocks
-        self._scatter(orthogonalize(gathered, group["eps"]), updates)      # 3. Newton-Schulz, 4. back
+        eps = group["eps"]
         scales = [self._scale(*fans, group["adjust_lr"]) for fans in self._fans[group["block_scale"]]]
+        params = [group["params"][i] for i in self.remote]
+        plans = [self.plans[i] for i in self.remote]
+        updates = [torch.empty_like(_local(p), dtype=torch.bfloat16) for p in params]
+        self._momentum(params, group, updates)                                  # 1. remote matrices: momentum,
+        gathered = self._gather(updates, plans) if self.has_remote else None    #    remote blocks on the wire
+        for batch in self.batches:                                              # 2. meanwhile the local matrices
+            self._step_local([group["params"][i] for i in batch], [self.plans[i] for i in batch],
+                             [scales[i] for i in batch], group)
+        for u, plan in zip(updates, plans):                                     # 3. remote matrices: local blocks,
+            if plan.local:
+                orthogonalize_(_rows_as_blocks(u, plan.local), eps)
+        if self.has_remote:
+            blocks, buffers = gathered()                                        #    the remote blocks I own,
+            del gathered                                                        #    (frees the receive buffer)
+            for X in buffers:
+                orthogonalize_(X, eps)
+            self._scatter(blocks, updates, plans)                               #    back
+        self._update(params, updates, [scales[i] for i in self.remote], group["lr"], group["weight_decay"])
+
+    def _step_local(self, params: List[Tensor], plans: List[MatrixPlan], scales: List[float], group: Dict):
+        """One batch of local matrices: momentum into one buffer per block shape, Newton-Schulz on it in place, update."""
+        updates, buffers = _packed([(plan.local.count, plan.local.height, plan.local.cols) for plan in plans])
+        self._momentum(params, group, updates)
+        for X in buffers:
+            orthogonalize_(X, group["eps"])
+        self._update(params, updates, scales, group["lr"], group["weight_decay"])
+
+    @staticmethod
+    def _update(params: List[Tensor], updates: List[Tensor], scales: List[float], lr: float, wd: float):
+        """W <- (1 - lr * wd) W - lr * scale * update, in fp32, for the params with a gradient; updates[i] holds the
+        shard's elements in any shape (its blocks, maybe transposed views)."""
         live = [i for i, p in enumerate(params) if p.grad is not None]
-        xs = [_local(params[i]) for i in live]
-        step = [torch.empty_like(x) for x in xs]                           # 5. scaled update in fp32
+        if not live:
+            return
+        xs = [_local(params[i]).view(updates[i].shape) for i in live]
+        step = [torch.empty_like(x) for x in xs]
         torch._foreach_copy_(step, [updates[i] for i in live])
         torch._foreach_mul_(step, [-lr * scales[i] for i in live])
         torch._foreach_mul_(xs, 1 - lr * wd)
