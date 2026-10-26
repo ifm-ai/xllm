@@ -19,7 +19,7 @@ except ImportError:
     XATTN_SCA_ENABLED = False
 
 
-class SlidingChunkAttentionFunc(torch.autograd.Function):
+class SlidingChunkSoftmaxAttentionFunc(torch.autograd.Function):
 
     @staticmethod
     def forward(
@@ -40,7 +40,7 @@ class SlidingChunkAttentionFunc(torch.autograd.Function):
         training: bool = True,
     ) -> Tensor:
         p = dropout if training else 0.0
-        y, y_for_save, aux = sliding_chunk_attention_fwd(
+        y, y_for_save, aux = sliding_chunk_softmax_attention_fwd(
             q, k, v, chunk_size, scale, prev_k, prev_v, bos_mask,
             segment_idx, p, high_precision_level, backend, training
         )
@@ -71,7 +71,7 @@ class SlidingChunkAttentionFunc(torch.autograd.Function):
         high_precision_level = ctx.high_precision_level
         deterministic = ctx.deterministic
         backend = ctx.backend
-        q_grad, k_grad, v_grad, prev_k_grad, prev_v_grad = sliding_chunk_attention_bwd(
+        q_grad, k_grad, v_grad, prev_k_grad, prev_v_grad = sliding_chunk_softmax_attention_bwd(
             y_grad, q, k, v, y, aux, chunk_size, scale, prev_k, prev_v,
             bos_mask, segment_idx, high_precision_level, deterministic, backend
         )
@@ -80,7 +80,7 @@ class SlidingChunkAttentionFunc(torch.autograd.Function):
             None, None, None, None, None, None, None
 
 
-sliding_chunk_attention = SlidingChunkAttentionFunc.apply
+sliding_chunk_softmax_attention = SlidingChunkSoftmaxAttentionFunc.apply
 
 
 def _sequential_sliding_chunk_attention_fwd(
@@ -222,7 +222,7 @@ def _sequential_sliding_chunk_attention_bwd(
     return query_grad, key_grad, value_grad, prev_key_grad, prev_value_grad
 
 
-def sliding_chunk_attention_fwd(
+def sliding_chunk_softmax_attention_fwd(
     q: Tensor,
     k: Tensor,
     v: Tensor,
@@ -267,7 +267,7 @@ def sliding_chunk_attention_fwd(
         raise ValueError(f"Unknown backend: {backend}.")
 
 
-def sliding_chunk_attention_bwd(
+def sliding_chunk_softmax_attention_bwd(
     y_grad: Tensor,
     q: Tensor,
     k: Tensor,

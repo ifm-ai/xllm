@@ -19,8 +19,8 @@ from xllm.modules.fused_ops import (
     xattn_causal_flash_attn_bwd as xattn_bwd,
     causal_conv1d_fwd as conv1d_fwd,
     causal_conv1d_bwd as conv1d_bwd,
-    sliding_chunk_attention_fwd as sca_fwd,
-    sliding_chunk_attention_bwd as sca_bwd,
+    sliding_chunk_softmax_attention_fwd as sca_fwd,
+    sliding_chunk_softmax_attention_bwd as sca_bwd,
     multi_group_matmul_fwd,
     multi_group_matmul_bwd,
 )

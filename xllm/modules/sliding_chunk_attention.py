@@ -6,7 +6,7 @@ from einops import rearrange
 
 from .rotary_positional_embedding import apply_rotary_embeddings
 from .fused_ops import (
-    sliding_chunk_attention,
+    sliding_chunk_softmax_attention,
     swift_efficient_attention,
     xattn_causal_flash_attn
 )
@@ -73,7 +73,7 @@ class SlidingChunkSoftmaxAttention(nn.Module):
 
         if slen >= self.chunk_size:
             assert slen % self.chunk_size == 0
-            output = sliding_chunk_attention(
+            output = sliding_chunk_softmax_attention(
                 xq, xk, xv, self.chunk_size, self.scale, prev_k, prev_v, bos_mask,
                 segment_idx, self.dropout, stability_control, deterministic, self.backend, self.training
             )

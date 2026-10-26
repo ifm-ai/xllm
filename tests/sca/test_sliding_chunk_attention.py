@@ -5,8 +5,8 @@ import torch.nn.functional as F
 import fire
 
 from xllm.modules.fused_ops import (
-    sliding_chunk_attention_fwd,
-    sliding_chunk_attention_bwd,
+    sliding_chunk_softmax_attention_fwd,
+    sliding_chunk_softmax_attention_bwd,
 )
 from xllm.modules.causal_attention import repeat_kv
 
@@ -149,7 +149,7 @@ def test(B: int, L: int, H: int, HKV: int, D: int, V: int, chunk_size: int, prev
             atol = {"fp32": 1e-6, "bf16": 1e-3, "fp16": 2e-4}[dtype]
             rtol = {"fp32": 1e-5, "bf16": 1e-2, "fp16": 1e-3}[dtype]
 
-            y_sca, y_bwd, aux = sliding_chunk_attention_fwd(
+            y_sca, y_bwd, aux = sliding_chunk_softmax_attention_fwd(
                 q, k, v, chunk_size, 1.0, prev_k, prev_v, bmask, segidx,
                 0.0, level, backend, requires_grad=True
             )
@@ -161,7 +161,7 @@ def test(B: int, L: int, H: int, HKV: int, D: int, V: int, chunk_size: int, prev
             rtol = {"fp32": 1e-5, "bf16": 1e-2, "fp16": 1e-3}[dtype]
 
             # non-deterministic
-            q_grad_sca, k_grad_sca, v_grad_sca, prev_k_grad_sca, prev_v_grad_sca = sliding_chunk_attention_bwd(
+            q_grad_sca, k_grad_sca, v_grad_sca, prev_k_grad_sca, prev_v_grad_sca = sliding_chunk_softmax_attention_bwd(
                 y_grad, q, k, v, y_bwd, aux, chunk_size, 1.0,
                 prev_k, prev_v, bmask, segidx, level, False, backend
             )
@@ -177,7 +177,7 @@ def test(B: int, L: int, H: int, HKV: int, D: int, V: int, chunk_size: int, prev
                   f"backend={backend}-{mode}-{suffix}-0, dtype={dtype}: pass bwd test")
 
             # deterministic
-            q_grad_sca, k_grad_sca, v_grad_sca, prev_k_grad_sca, prev_v_grad_sca = sliding_chunk_attention_bwd(
+            q_grad_sca, k_grad_sca, v_grad_sca, prev_k_grad_sca, prev_v_grad_sca = sliding_chunk_softmax_attention_bwd(
                 y_grad, q, k, v, y_bwd, aux, chunk_size, 1.0,
                 prev_k, prev_v, bmask, segidx, level, True, backend
             )
