@@ -122,8 +122,8 @@ class GatedDeltaAttention(nn.Module):
 
         # query project
         qheads = {
-            "softmax": self.n_heads,
-            "softdelta": self.n_heads + self.n_kv_heads
+            "softmax": self.num_heads,
+            "softdelta": self.num_heads + self.num_kv_heads
         }[attn_act_func]
         self.wq = ColumnParallelLinear(
             mdim,
@@ -197,7 +197,7 @@ class GatedDeltaAttention(nn.Module):
         )
 
         # attention gate projection
-        rdim = {"softmax": hdim, "softdelta": hdim + self.n_heads}[attn_act_func]
+        rdim = {"softmax": hdim, "softdelta": hdim + self.num_heads}[attn_act_func]
         self.wr = ColumnParallelLinear(
             mdim,
             rdim,
