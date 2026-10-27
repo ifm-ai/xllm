@@ -124,6 +124,7 @@ class ModelConf(Config):
     ffn_hidden_dim: int = 2048  # Hidden dimension in dense FFN. MoE expert dimensions is set by expert_inter_dim.
     # Adaptive Working Memory (AWM)
     awm_orthogonal_update: bool = False  # Whether to apply orthogonal update when updating the memory in AWM
+    apply_awm_gate: bool = False  # Whether to apply gating to AWM
     # MoE & MoVA
     num_values: int = 0  # Num of value projections available for routing to in MoVA. 0 means MoVA off. Requires using MoE as well when using MoVA.
     num_activated_values: int = 0  # Num of activated value projections per token (top-k) in MoVA
