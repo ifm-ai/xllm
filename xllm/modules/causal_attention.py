@@ -14,6 +14,7 @@ from xllm.modules.context_parallel import (
 from xllm.modules.fused_ops import (
     flash_attention,
     xattn_causal_flash_attn,
+    xattn_softdelta_attn,
     swift_efficient_attention,
     memory_efficient_dropout,
 )
@@ -214,7 +215,7 @@ class CausalSoftdeltaAttention(nn.Module):
 
     def forward(
         self,
-        xq: Tensor,
+        xqk: Tensor,
         xk: Tensor,
         xv: Tensor,
         g: Optional[Tensor],
@@ -225,21 +226,26 @@ class CausalSoftdeltaAttention(nn.Module):
         deterministic: bool = True,
         cache: Optional[Tuple[Tensor, Tensor, int]] = None,
     ):
-        bs, slen, _ = xq.shape
-        xq = rearrange(xq, 'b l (h k d) -> b l h k d', h=self.n_heads, k=2)
-        xq, kq = torch.unbind(xq, dim=3)
+        n_rep = self.n_heads // self.n_kv_heads
+        bs, slen, _ = xqk.shape
+        # B x L x K x (N+1) x S
+        xqk = rearrange(xqk, 'b l (k n s) -> b l k n s', k=self.n_kv_heads, n=n_rep + 1)
+        # B x L x H x S
+        xq = rearrange(xqk[:, :, :, :n_rep], 'b l k n s -> b l (k n) s')
+        # B x L x K x S
+        kq = xqk[:, :, :, -1]
         xk = rearrange(xk, 'b l (h d) -> b l h d', h=self.n_kv_heads)
         xv = rearrange(xv, 'b l (h d) -> b l h d', h=self.n_kv_heads)
 
         if self.rope_head_dim == self.head_dim:
-            xq, xk = apply_rotary_embeddings(xq, xk, freqs_cis=freqs_cis, backward=False)
-            kq = apply_rotary_embedding(kq, freqs_cis=freqs_cis, backward=False)
+            xq = apply_rotary_embedding(xq, freqs_cis=freqs_cis, backward=False)
+            kq, xk = apply_rotary_embeddings(kq, xk, freqs_cis=freqs_cis, backward=False)
         elif self.rope_head_dim > 0:
             xq_rope, xq_nope = torch.split(xq, [self.rope_head_dim, self.head_dim - self.rope_head_dim], dim=-1)
             kq_rope, kq_nope = torch.split(kq, [self.rope_head_dim, self.head_dim - self.rope_head_dim], dim=-1)
             xk_rope, xk_nope = torch.split(xk, [self.rope_head_dim, self.head_dim - self.rope_head_dim], dim=-1)
-            xq_rope, xk_rope = apply_rotary_embeddings(xq_rope, xk_rope, freqs_cis=freqs_cis, backward=False)
-            kq_rope = apply_rotary_embedding(kq_rope, freqs_cis=freqs_cis, backward=False)
+            xq_rope = apply_rotary_embedding(xq_rope, freqs_cis=freqs_cis, backward=False)
+            kq_rope, xk_rope = apply_rotary_embeddings(kq_rope, xk_rope, freqs_cis=freqs_cis, backward=False)
             xq = torch.cat([xq_rope, xq_nope], dim=-1)
             kq = torch.cat([kq_rope, kq_nope], dim=-1)
             xk = torch.cat([xk_rope, xk_nope], dim=-1)
@@ -265,6 +271,7 @@ class CausalSoftdeltaAttention(nn.Module):
 
         if self.backend is None:
             n_rep = self.n_heads // self.n_kv_heads
+            kq = repeat_kv(kq, n_rep)
             xk = repeat_kv(xk, n_rep)
             xv = repeat_kv(xv, n_rep)
 
@@ -297,8 +304,21 @@ class CausalSoftdeltaAttention(nn.Module):
             out2 = rearrange(torch.matmul(scores2, xv), 'b h l d -> b l h d')
             out2 = out2 * rearrange(g, 'b l h -> b l h 1')
             output = out1 - out2
+        elif self.backend == 'xattn':
+            if segments is not None:
+                segidx, total_seqlen_k = segments
+                xk = xk[:, -total_seqlen_k:]
+                xv = xv[:, -total_seqlen_k:]
+                bos_mask = bos_mask[:, -total_seqlen_k:]
+                segidx = segidx[:, -total_seqlen_k:]
+            else:
+                segidx = None
+
+            output = xattn_softdelta_attn(
+                xq, kq, xk, xv, g, self.scale, bos_mask, segidx, stability_control, deterministic
+            )
         else:
-            raise ValueError(f"Unknown causal attention backend: {self.backend}")
+            raise ValueError(f"Unknown softdelta attention backend: {self.backend}")
 
         output = rearrange(output, 'b l h d -> b l (h d)')
         return output, new_cache

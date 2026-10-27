@@ -32,6 +32,11 @@ from xllm.modules.fused_ops.attention.softmax.sca import (
     sliding_chunk_softmax_attention_fwd,
     sliding_chunk_softmax_attention_bwd
 )
+from xllm.modules.fused_ops.attention.softdelta.xattn import (
+    xattn_softdelta_attn,
+    xattn_softdelta_attn_fwd,
+    xattn_softdelta_attn_bwd
+)
 from .adaptive_working_memory import (
     adaptive_working_memory,
     adaptive_working_memory_fwd,

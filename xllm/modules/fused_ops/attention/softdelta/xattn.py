@@ -65,7 +65,7 @@ def xattn_softdelta_attn_fwd(
     return y, readers, lse
 
 
-def xattn_causal_flash_attn_bwd(
+def xattn_softdelta_attn_bwd(
     y_grad: Tensor,
     q: Tensor,
     qk: torch.Tensor,
@@ -85,7 +85,7 @@ def xattn_causal_flash_attn_bwd(
         segment_idx = None
 
     return group_softdelta_attention_bwd(
-        y_grad, q, k, v, y, lse, scale,
+        y_grad, q, k, v, g, readers, lse, qk, scale,
         bos_mask=bos_mask, segment_idx=segment_idx,
         high_precision_level=high_precision_level,
         deterministic=deterministic
