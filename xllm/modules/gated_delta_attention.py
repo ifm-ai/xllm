@@ -89,7 +89,6 @@ class GatedDeltaAttention(nn.Module):
         assert self.num_heads % self.num_kv_heads == 0
         assert 0 <= self.rope_head_dim <= self.head_dim
 
-        qdim = self.head_dim * self.num_heads
         kdim = self.head_dim * self.num_kv_heads
         vdim = self.v_head_dim * self.num_kv_heads
         hdim = self.v_head_dim * self.num_heads
@@ -402,17 +401,21 @@ class GatedDeltaAttention(nn.Module):
         sq = self.query_norm(xq)
         sk = self.key_norm(xk)
 
-        rg = rearrange(self.wr(x), 'b l (h v) -> b l h v', h=self.local_heads)
-        # B x L x H*V
-        r = rearrange(rg[:, :, :, :self.v_head_dim], 'b l h v -> b l (h v)')
+        r = self.wr(mx)
+        g = None
+        if self.attn_act_func == 'softdelta':
+            rg = rearrange(r, 'b l (h v) -> b l h v', h=self.local_heads)
+            # B x L x H*V
+            r = rearrange(rg[:, :, :, :self.v_head_dim], 'b l h v -> b l (h v)')
+            # B x L x H
+            g = rg[:, :, :, -1]
+
         if self.attn_gate_fn == "silu":
             r = F.silu(r)
         elif self.attn_gate_fn == "softplus":
             r = F.softplus(r, beta=math.log(2))
         else:
             raise ValueError(f"Unknown attention gate function {self.attn_gate_fn}")
-        # B x L x H
-        g = rg[:, :, :, -1] if self.attn_act_func == 'softdelta' else None
 
         health_collector = get_active_health_collector()
         if health_collector is not None:
