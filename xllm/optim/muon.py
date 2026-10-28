@@ -60,13 +60,19 @@ from .muon_spec import Block, MuonSpec, muon_spec, register_muon
 
 logger = getLogger()
 
-# Newton-Schulz 5 steps with per-step coefficients (microsoft/dion's zeropower_via_newtonschulz5; dion's default is Polar Express)
+# Newton-Schulz steps X <- a X + b (X X^T) X + c (X X^T)^2 X: each applies p(s) = a s + b s^3 + c s^5 to the
+# singular values. Polar Express (arXiv 2505.16932): each p is the minimax fit of 1 on the range the previous
+# steps leave, starting from [1e-3, 1.01]; fitted above a cushion of 0.05 of the range's top, so no p dips
+# near 0 inside it (rounding there would flip a sign), and 1% above its top. Remez in quad precision. In
+# exact arithmetic the 7 steps take every s in [1e-3, 1] to 1 +- 3e-7.
 NS_COEFFS = (
-    (4.0848, -6.8946, 2.9270),
-    (3.9505, -6.3029, 2.6377),
-    (3.7418, -5.5913, 2.3037),
-    (2.8769, -3.1427, 1.2046),
-    (2.8366, -3.0525, 1.2012),
+    (6.6855200767111675, -17.811269767700782, 12.619541303795451),
+    (4.016121039752612, -3.861087728177999, 0.9871918227003456),
+    (4.016121039752612, -3.861087728177999, 0.9871918227003456),
+    (3.795262478265412, -3.5559258715900817, 0.9017288960572022),
+    (2.3593913208894888, -1.696737173296388, 0.4096643411881119),
+    (1.8910694529512306, -1.2577697543810034, 0.3672643550538599),
+    (1.8657070833564235, -1.23145450650965, 0.36574763500927243),
 )
 
 Box = Tuple[int, int, int, int]  # rows [r0, r1) x cols [c0, c1) of a matrix
@@ -139,13 +145,23 @@ def _split(sizes: List[int], limit: int) -> List[Tuple[int, int]]:
     return bounds
 
 
-def newton_schulz5(X: Tensor, eps: float) -> Tensor:
-    """Orthogonalize a stack of matrices [B, m, n] with m <= n. The polynomial's sums run in the epilogues
-    of cuBLAS GEMMs (baddbmm's alpha / beta), accumulated in fp32: no pointwise kernels, one bf16 rounding
-    per product."""
+def newton_schulz(X: Tensor, eps: float) -> Tensor:
+    """Orthogonalize a stack of matrices [B, m, n] with m <= n: X = U S V^T -> U V^T, in fp16.
+
+    X is scaled by ||(X X^T)^2||_F^(1/4) >= s_max, from the first step's A A: within m^(1/8) of s_max where
+    ||X||_F is within m^(1/2), so the small singular values start higher. 5% more for rounding. The first step
+    runs in bf16, whose range holds A A of the Frobenius-normalized X; the others in fp16, whose 3 more
+    mantissa bits bring the singular values to 1 within ~1e-3. The polynomial's sums run in the epilogues of
+    cuBLAS GEMMs (baddbmm's alpha / beta), accumulated in fp32."""
     X = X.to(torch.bfloat16)
     X = X / (X.norm(dim=(-2, -1), keepdim=True) + eps)
-    for a, b, c in NS_COEFFS:
+    A = X @ X.mT
+    AA = A @ A
+    s = (AA.float().norm(dim=(-2, -1), keepdim=True).pow(0.25) * 1.05 + eps).to(X.dtype)
+    X, A, AA = X / s, A / s**2, AA / s**4
+    (a, b, c), *steps = NS_COEFFS
+    X = torch.baddbmm(X, AA.mul(c).add_(A, alpha=b), X, beta=a).half()  # the first step, from A and A A above
+    for a, b, c in steps:
         A = X @ X.mT
         B = torch.baddbmm(A, A, A, beta=b, alpha=c)  # b A + c A A
         X = torch.baddbmm(X, B, X, beta=a)  # a X + B X
@@ -155,7 +171,7 @@ def newton_schulz5(X: Tensor, eps: float) -> Tensor:
 def orthogonalize_(X: Tensor, eps: float):
     """Newton-Schulz in place on a stack of matrices [M, R, C]; tall ones are transposed (NS(X^T) = NS(X)^T)."""
     tall = X.shape[-2] > X.shape[-1]
-    Y = newton_schulz5(X.mT if tall else X, eps)
+    Y = newton_schulz(X.mT if tall else X, eps)
     X.copy_(Y.mT if tall else Y)
 
 
