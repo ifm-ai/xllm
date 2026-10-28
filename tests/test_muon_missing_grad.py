@@ -12,6 +12,7 @@ from torch import nn
 
 from xllm.config import OptimConf
 import xllm.optim.muon as muon
+from xllm.optim.muon_spec import muon_spec
 from xllm.optim import build_optimizer, build_lr_scheduler, restore_optimizer_config
 
 
@@ -47,7 +48,7 @@ def test_missing_grad_skips_state_and_weight_update(cpu_transport, nesterov, ini
     skipped = nn.Parameter(torch.ones(2, 3), requires_grad=initialized)
     active = nn.Parameter(torch.ones(2, 3))
     cfg = OptimConf(optimizer="muon", muon_lr=0.1, weight_decay=0.2, muon_nesterov=nesterov)
-    opt = muon.Muon([skipped, active], [muon.muon_spec()] * 2, [], LocalMesh(), cfg)
+    opt = muon.Muon([skipped, active], [muon_spec()] * 2, [], LocalMesh(), cfg)
     cpu_transport(opt)
 
     if initialized:
@@ -78,7 +79,7 @@ def test_state_roundtrip_restores_algorithm_and_next_update(cpu_transport):
     cfg = OptimConf(optimizer="muon", muon_lr=0.02, muon_momentum=0.8,
                     muon_nesterov=False, muon_adjust_lr="rms_norm", beta1=0.7, beta2=0.9)
     p, a = nn.Parameter(torch.ones(4, 3)), nn.Parameter(torch.ones(3))
-    spec = muon.muon_spec("(h d) m", fan_out="d", fan_in="m", d=2)
+    spec = muon_spec("(h d) m", fan_out="d", fan_in="m", d=2)
     old = muon.Muon([p], [spec], [a], LocalMesh(), cfg)
     cpu_transport(old)
     p.grad, a.grad = torch.arange(12.).view(4, 3), torch.ones_like(a)
@@ -116,7 +117,7 @@ def test_state_roundtrip_restores_algorithm_and_next_update(cpu_transport):
 
 def test_closure_computes_gradients_and_returns_loss(cpu_transport):
     p = nn.Parameter(torch.ones(2, 3))
-    opt = muon.Muon([p], [muon.muon_spec()], [], LocalMesh(), OptimConf(optimizer="muon"))
+    opt = muon.Muon([p], [muon_spec()], [], LocalMesh(), OptimConf(optimizer="muon"))
     cpu_transport(opt)
     calls = []
 
@@ -178,7 +179,7 @@ def test_dcp_checkpoint_roundtrip(cpu_transport, tmp_path):
 
     cfg = OptimConf(optimizer="muon", muon_momentum=0.8, weight_decay=0.2)
     model = nn.Linear(3, 2)
-    opt = muon.Muon([model.weight], [muon.muon_spec()], [model.bias], LocalMesh(), cfg)
+    opt = muon.Muon([model.weight], [muon_spec()], [model.bias], LocalMesh(), cfg)
     cpu_transport(opt)
     model.weight.grad = torch.ones_like(model.weight)
     model.bias.grad = torch.ones_like(model.bias)
@@ -186,7 +187,7 @@ def test_dcp_checkpoint_roundtrip(cpu_transport, tmp_path):
     opt.zero_grad(set_to_none=True)
     saved = get_optimizer_state_dict(model, opt)
     dcp.save(saved, checkpoint_id=tmp_path / "optimizer")
-    new = muon.Muon([model.weight], [muon.muon_spec()], [model.bias], LocalMesh(),
+    new = muon.Muon([model.weight], [muon_spec()], [model.bias], LocalMesh(),
                     OptimConf(optimizer="muon", muon_momentum=0.6, weight_decay=0.01))
     cpu_transport(new)
     template = get_optimizer_state_dict(model, new)
