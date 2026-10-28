@@ -1,5 +1,6 @@
 import abc
-from typing import Union, Dict, Tuple, List
+from collections import defaultdict
+from typing import Union, Dict, Tuple, List, Optional
 import types
 import warnings
 import math
@@ -82,7 +83,8 @@ class XLLModel(nn.Module):
 
     @torch.no_grad()
     def clip_grad_norm_(
-            self, max_norm: Union[float, int], norm_type: Union[float, int] = 2.0
+            self, max_norm: Union[float, int], norm_type: Union[float, int] = 2.0,
+            grad_scales: Optional[Dict[int, float]] = None,
     ) -> float:
         """
         Clip all gradients at this point in time. The norm is computed over all
@@ -92,6 +94,8 @@ class XLLModel(nn.Module):
         Args:
             max_norm (float or int): max norm of the gradients
             norm_type (float or int): type of the used p-norm. Can be ``'inf'``for infinity norm.
+            grad_scales: id(param) -> factor on its gradient in the norm (mup: the folded output
+                projections, xllm/optim/mup.py). Every gradient is still clipped by the same factor.
 
         Returns:
             Total norm of the parameters (viewed as a single vector).
@@ -119,9 +123,20 @@ class XLLModel(nn.Module):
         if len(grads) == 0:
             return 0.
 
-        total_norm = get_total_norm(grads, norm_type, False, None)
-        if isinstance(total_norm, DTensor):
-            total_norm = total_norm.full_tensor()
+        if grad_scales:
+            by_scale = defaultdict(list)
+            for p in parameters:
+                if p.grad is not None:
+                    by_scale[grad_scales.get(id(p), 1.0)].append(p.grad)
+            norms = []
+            for scale, scaled_grads in by_scale.items():
+                norm = get_total_norm(scaled_grads, norm_type, False, None)
+                norms.append(scale * (norm.full_tensor() if isinstance(norm, DTensor) else norm))
+            total_norm = get_total_norm(norms, norm_type, False, None)
+        else:
+            total_norm = get_total_norm(grads, norm_type, False, None)
+            if isinstance(total_norm, DTensor):
+                total_norm = total_norm.full_tensor()
 
         model_parallel_world_size = get_model_parallel_world_size()
         # Reconstruct the total gradient norm depending on the norm type

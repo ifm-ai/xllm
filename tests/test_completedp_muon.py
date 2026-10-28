@@ -336,6 +336,7 @@ def fold_pair(c):
 
 
 def train(model, opt, steps, clip=None):
+    """clip(model) runs between backward and the optimizer step."""
     torch.manual_seed(1)
     losses = []
     for _ in range(steps):
@@ -375,28 +376,75 @@ def float64_newton_schulz(monkeypatch):
     monkeypatch.setattr(muon, "newton_schulz5", newton_schulz)
 
 
-@pytest.mark.parametrize("alpha, tol", [(0.5, 0.0), (0.8, 1e-5)])
-def test_folded_training_matches_residual_multiplier(cpu_transport, monkeypatch, alpha, tol):
+def clipper(max_norm, grad_scales=None, norms=None):
+    """The model's clip_grad_norm_ (xllm/models/xllm.py) as a train() hook; appends each norm to `norms`."""
+    from xllm.models.xllm import XLLModel
+
+    def clip(model):
+        norm = XLLModel.clip_grad_norm_(model, max_norm, grad_scales=grad_scales)
+        if norms is not None:
+            norms.append(norm)
+    return clip
+
+
+# (alpha, clipping, Newton-Schulz in float64, tolerance)
+FOLD_CASES = [
+    (0.5, False, False, 0.0),
+    (0.8, False, True, 1e-5),
+    (0.5, True, True, 1e-5),
+    (0.8, True, True, 1e-5),
+]
+
+
+@pytest.mark.parametrize("alpha, clipping, float64, tol", FOLD_CASES)
+def test_folded_training_matches_residual_multiplier(cpu_transport, monkeypatch, alpha, clipping, float64, tol):
     """alpha 0.5: c = 0.5, a power of two, so Muon's bf16 Newton-Schulz gives bit-identical runs.
     alpha 0.8: c = 4^-0.8 = 0.33. bf16 rounds c * x differently from x, so bf16 Newton-Schulz differs at its own
-    error (about 2% of the largest element); in float64 the runs agree up to rounding."""
+    error (about 2% of the largest element); in float64 the runs agree up to rounding. So does clipping, whose
+    norms are summed in another order (the multiplier run has no grad_scales: its gradients are the unfolded ones)."""
     mup = resolved_mup(alpha=alpha)  # m_N = 2, m_L = 4: every role scaled
     c = mup.branch_scale
-    if tol:
+    if float64:
         float64_newton_schulz(monkeypatch)
     multiplier, folded = fold_pair(c)
     opt_multiplier = build_muon_cpu(multiplier, FOLD_CFG, mup, cpu_transport)
     opt_multiplier.update_scales = [1.0] * len(opt_multiplier.update_scales)  # c sits in the forward instead
     opt_folded = build_muon_cpu(folded, FOLD_CFG, mup, cpu_transport)
     assert sorted(set(opt_folded.update_scales)) == sorted({c, 1.0})
-    losses = [train(multiplier, opt_multiplier, 8), train(folded, opt_folded, 8)]
+    norms = []
+    clips = [clipper(0.5, norms=norms), clipper(0.5, mup_lib.clip_grad_scales(folded, mup))] if clipping else [None] * 2
+    losses = [train(multiplier, opt_multiplier, 8, clips[0]), train(folded, opt_folded, 8, clips[1])]
     assert max(abs(a - b) for a, b in zip(*losses)) <= tol * losses[0][0]
     assert losses[0][-1] < losses[0][0] - 0.5  # it trains
+    assert not clipping or min(norms) > 0.5  # every step clips
     assert fold_error(multiplier, folded, c) <= tol
 
-    # negative control: without the update scale the folded run drifts away
+    # negative control: without the update scale, or the gradient scale when clipping, the folded run drifts away
     _, unscaled = fold_pair(c)
     opt_unscaled = build_muon_cpu(unscaled, FOLD_CFG, mup, cpu_transport)
-    opt_unscaled.update_scales = [1.0] * len(opt_unscaled.update_scales)
-    train(unscaled, opt_unscaled, 8)
-    assert fold_error(multiplier, unscaled, c) > 0.1
+    if clipping:
+        train(unscaled, opt_unscaled, 8, clipper(0.5))
+    else:
+        opt_unscaled.update_scales = [1.0] * len(opt_unscaled.update_scales)
+        train(unscaled, opt_unscaled, 8)
+    assert fold_error(multiplier, unscaled, c) > 100 * max(tol, 1e-6)
+
+
+def test_clip_norm_counts_scaled_gradients():
+    from xllm.models.xllm import XLLModel
+    model = Toy()
+    torch.manual_seed(0)
+    for p in model.parameters():
+        p.grad = torch.randn_like(p)
+    out = {id(p) for p in mup_lib.out_projections(model)}
+    grad_scales = {i: 0.3 for i in out}
+    want = torch.cat([(p.grad * (0.3 if id(p) in out else 1.0)).flatten() for p in model.parameters()]).norm()
+    grads = [p.grad.clone() for p in model.parameters()]
+    norm = XLLModel.clip_grad_norm_(model, 1e9, grad_scales=grad_scales)
+    assert math.isclose(norm, want.item(), rel_tol=1e-6)
+    assert all(torch.equal(p.grad, g) for p, g in zip(model.parameters(), grads))  # under max_norm: unclipped
+    XLLModel.clip_grad_norm_(model, norm / 4, grad_scales=grad_scales)
+    for p, g in zip(model.parameters(), grads):  # every gradient by the same factor
+        torch.testing.assert_close(p.grad, g / 4, rtol=1e-5, atol=0)
+    plain = torch.cat([g.flatten() for g in grads]).norm().item()
+    assert math.isclose(XLLModel.clip_grad_norm_(model, 1e9) * 4, plain, rel_tol=1e-6)  # without grad_scales

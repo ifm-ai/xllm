@@ -273,7 +273,12 @@ def main(cfg: TrainerConf):
     tflops_per_token = model.tflops_per_token(cfg.seq_len)
 
     # build optimizer / scheduler
-    optimizer, scheduler = build_optimizer(model, cfg.optim, cfg.steps, cfg.dtype)
+    optimizer, scheduler = build_optimizer(model, cfg.optim, cfg.steps, cfg.dtype, mup=cfg.mup)
+    grad_scales = None
+    if cfg.mup is not None:
+        # the folded output projections' gradients count x c in the clipping norm
+        from xllm.optim.mup import clip_grad_scales
+        grad_scales = clip_grad_scales(model, cfg.mup)
 
     # setup loggers
     enable_loggers = cfg.slurm.is_master and not cfg.disable_logging
@@ -367,7 +372,7 @@ def main(cfg: TrainerConf):
             del reloaded_optim_state_dict
 
     if cfg.optim.optimizer == "muon":
-        restore_optimizer_config(optimizer, cfg.optim)
+        restore_optimizer_config(optimizer, cfg.optim, cfg.mup)
         # Full resume uses the restored scheduler position; base-model loading
         # keeps the newly constructed schedule, including its warmup LR.
         for group, lr in zip(optimizer.param_groups, scheduler.get_last_lr()):
@@ -467,7 +472,7 @@ def main(cfg: TrainerConf):
         timings.forward_backward += s_clip - s_fwd_bwd
 
         clip_max_norm = cfg.optim.clip * state.scale
-        grad_norm = clip_grad_norm_(fsdp_module=model, max_norm=clip_max_norm)
+        grad_norm = clip_grad_norm_(fsdp_module=model, max_norm=clip_max_norm, grad_scales=grad_scales)
 
         # update scale / status
         overflow = False
@@ -521,8 +526,9 @@ def main(cfg: TrainerConf):
             aux_losses.append(aux_loss)
         grad_norms.append(grad_norm)
         if cfg.optim.optimizer == "muon":
-            group_lrs = {group["algorithm"]: float(group["lr"]) for group in optimizer.param_groups}
-            curr_lr = group_lrs["muon"]
+            # adamw_lr, or with mup one per role: embed_lr, hidden_vector_lr, final_norm_lr, readout_lr
+            group_lrs = {group.get("role", group["algorithm"]): float(group["lr"]) for group in optimizer.param_groups}
+            curr_lr = group_lrs.pop("muon")
         else:
             curr_lr = float(optimizer.param_groups[0]["lr"])
         assert math.isfinite(curr_loss), f"loss is not finite:{curr_loss}"
@@ -532,7 +538,7 @@ def main(cfg: TrainerConf):
         optim_metrics = {
             "step": state.step,
             "lr": curr_lr,
-            **({"adamw_lr": group_lrs["adamw"]} if cfg.optim.optimizer == "muon" else {}),
+            **({f"{role}_lr": lr for role, lr in group_lrs.items()} if cfg.optim.optimizer == "muon" else {}),
             "avg_loss": reduce_scalar(curr_loss, op='mean'),
             "max_loss": reduce_scalar(curr_loss, op='max'),
         }
