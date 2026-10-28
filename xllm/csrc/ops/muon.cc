@@ -69,6 +69,23 @@ void MuonUpdateCPU(const std::vector<torch::Tensor>& param, const std::vector<to
   }
 }
 
+void BatchedCopyCPU(const std::vector<torch::Tensor>& dst, const std::vector<torch::Tensor>& src) {
+  AT_DISPATCH_REDUCED_FLOATING_TYPES(src[0].scalar_type(), "BatchedCopyCPU", [&] {
+    using S = scalar_t;
+    AT_DISPATCH_REDUCED_FLOATING_TYPES(dst[0].scalar_type(), "BatchedCopyCPU", [&] {
+      for (size_t i = 0; i < dst.size(); ++i) {
+        const StridedView sv = AsStridedView(src[i]);
+        const S* s = src[i].data_ptr<S>();
+        scalar_t* d = dst[i].data_ptr<scalar_t>();
+        ForEachElement(dst[i], [&](int64_t k, int64_t offset) {
+          const int64_t c = k % sv.C, r = k / sv.C % sv.R, b = k / (sv.C * sv.R);
+          d[offset] = scalar_t(static_cast<float>(s[b * sv.sB + r * sv.sR + c * sv.sC]));
+        });
+      }
+    });
+  });
+}
+
 void MuonMomentum(const std::vector<torch::Tensor>& momentum, const std::vector<torch::Tensor>& grad,
                   const std::vector<torch::Tensor>& out, double mu, bool nesterov) {
   CheckPairs(momentum, out);
@@ -103,9 +120,29 @@ void MuonUpdate(const std::vector<torch::Tensor>& param, const std::vector<torch
   }
 }
 
+void BatchedCopy(const std::vector<torch::Tensor>& dst, const std::vector<torch::Tensor>& src) {
+  TORCH_CHECK(dst.size() == src.size(), "expected lists of one length, got ", dst.size(), " and ", src.size());
+  if (dst.empty()) {
+    return;
+  }
+  for (size_t i = 0; i < dst.size(); ++i) {
+    TORCH_CHECK(dst[i].sizes() == src[i].sizes(), "copy ", i, ": shapes ", dst[i].sizes(), " and ", src[i].sizes());
+    TORCH_CHECK(dst[i].scalar_type() == dst[0].scalar_type() && src[i].scalar_type() == src[0].scalar_type(),
+                "expected one dtype per list");
+    TORCH_CHECK(dst[i].device() == dst[0].device() && src[i].device() == dst[0].device(),
+                "expected tensors on one device");
+  }
+  if (dst[0].is_cuda()) {
+    BatchedCopyCUDA(dst, src);
+  } else {
+    BatchedCopyCPU(dst, src);
+  }
+}
+
 void DefineMuonOp(py::module& m) {
   m.def("muon_momentum_", &MuonMomentum, "Muon momentum: m <- mu m + g; out <- bf16(nesterov ? g + mu m : m)")
-      .def("muon_update_", &MuonUpdate, "Muon update: p <- p - lr (wd p + scale update)");
+      .def("muon_update_", &MuonUpdate, "Muon update: p <- p - lr (wd p + scale update)")
+      .def("batched_copy_", &BatchedCopy, "dst[i] <- src[i], views of one shape in any layouts");
 }
 
 }  // namespace ops
