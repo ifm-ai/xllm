@@ -50,6 +50,14 @@ void MuonUpdateCPU(const std::vector<torch::Tensor>& param, const std::vector<to
 void MuonUpdateCUDA(const std::vector<torch::Tensor>& param, const std::vector<torch::Tensor>& update,
                     const std::vector<double>& scale, double lr, double weight_decay);
 
+// dst[i] <- src[i] for views of one shape in any layouts, bf16 or fp16 (one dtype per list); the gathers and
+// scatters of Muon's all-to-alls.
+void BatchedCopy(const std::vector<torch::Tensor>& dst, const std::vector<torch::Tensor>& src);
+
+void BatchedCopyCPU(const std::vector<torch::Tensor>& dst, const std::vector<torch::Tensor>& src);
+
+void BatchedCopyCUDA(const std::vector<torch::Tensor>& dst, const std::vector<torch::Tensor>& src);
+
 void DefineMuonOp(py::module& m);
 
 }  // namespace ops

@@ -28,8 +28,8 @@ Terminology, for one Muon matrix W of shape [rows, cols]:
 - local / remote matrix: on a rank, a matrix whose shard is exactly its local Blocks is local
   (routed experts, heads); the others (with remote Blocks, or none of it stored there) are remote.
 - batch: local matrices whose Blocks have one shape, stepped together: their updates are views of
-  one bf16 [B, R, C] buffer, tall Blocks stored transposed, so Newton-Schulz runs once on it in
-  place. Batches step one after another, so the step's temporary buffers are the size of a batch.
+  one bf16 [B, R, C] buffer, so Newton-Schulz runs once on it in place. Batches step one after
+  another, so the step's temporary buffers are the size of a batch.
 - plan (MatrixPlan): one matrix's Blocks compiled for one rank: its local Blocks as a view,
   the slices of its remote Blocks it sends and, for those it owns, receives.
 
@@ -147,34 +147,37 @@ def _split(sizes: List[int], limit: int) -> List[Tuple[int, int]]:
 
 
 def newton_schulz(X: Tensor, eps: float) -> Tensor:
-    """Orthogonalize a stack of matrices [B, m, n] with m <= n: X = U S V^T -> U V^T, in fp16.
+    """Orthogonalize a stack of matrices [B, m, n]: X = U S V^T -> U V^T, in fp16, in X's layout.
 
-    X is scaled by s = ||(X X^T)^2||_F^(1/4) >= s_max, 5% more for rounding: within m^(1/8) of s_max where
-    ||X||_F is within m^(1/2), so the small singular values start higher. s comes from the first step's A A,
-    so the scaling folds into that step: p(X / s) = (a X + (b A / s^2 + c A A / s^4) X) / s, an m x m
-    polynomial and the division of the output, which also casts it to fp16. The first step runs in bf16, whose
-    range holds any X; the others in fp16, whose 3 more mantissa bits bring the singular values to 1 within
-    ~1e-3. The polynomial's sums run in the epilogues of cuBLAS GEMMs (baddbmm's alpha / beta), accumulated
-    in fp32."""
+    The steps run on the smaller Gram matrix A: X X^T with X <- a X + B X, or for a tall X, X^T X with
+    X <- a X + X B (B is symmetric), so a tall X is never transposed into a copy.
+    X is scaled by s = ||A^2||_F^(1/4) >= s_max, 5% more for rounding: within k^(1/8) of s_max where ||X||_F
+    is within k^(1/2) (k = min(m, n)), so the small singular values start higher. s comes from the first
+    step's A A, so the scaling folds into that step: p(X / s) = (a X + (b A / s^2 + c A A / s^4) X) / s, a
+    k x k polynomial and the division of the output, which also casts it to fp16. The first step runs in bf16,
+    whose range holds any X; the others in fp16, whose 3 more mantissa bits bring the singular values to 1
+    within ~1e-3. The polynomial's sums run in the epilogues of cuBLAS GEMMs (baddbmm's alpha / beta),
+    accumulated in fp32."""
+    if X.shape[-2] > X.shape[-1]:  # tall: A = X^T X, a X + X B
+        gram, poly = lambda X: X.mT @ X, lambda X, B, a: torch.baddbmm(X, X, B, beta=a)
+    else:  # A = X X^T, a X + B X
+        gram, poly = lambda X: X @ X.mT, lambda X, B, a: torch.baddbmm(X, B, X, beta=a)
     X = X.to(torch.bfloat16)
-    A = X @ X.mT
+    A = gram(X)
     AA = A @ A
     s = AA.float().norm(dim=(-2, -1), keepdim=True).pow(0.25) * 1.05 + eps
     (a, b, c), *steps = NS_COEFFS
     B = (AA.float() * (c / s**4) + A.float() * (b / s**2)).bfloat16()
-    X = torch.div(torch.baddbmm(X, B, X, beta=a), s, out=torch.empty_like(X, dtype=torch.half))
+    X = torch.div(poly(X, B, a), s, out=torch.empty_like(X, dtype=torch.half))
     for a, b, c in steps:
-        A = X @ X.mT
-        B = torch.baddbmm(A, A, A, beta=b, alpha=c)  # b A + c A A
-        X = torch.baddbmm(X, B, X, beta=a)  # a X + B X
+        A = gram(X)
+        X = poly(X, torch.baddbmm(A, A, A, beta=b, alpha=c), a)  # B = b A + c A A
     return X
 
 
 def orthogonalize_(X: Tensor, eps: float):
-    """Newton-Schulz in place on a stack of matrices [M, R, C]; tall ones are transposed (NS(X^T) = NS(X)^T)."""
-    tall = X.shape[-2] > X.shape[-1]
-    Y = newton_schulz(X.mT if tall else X, eps)
-    X.copy_(Y.mT if tall else Y)
+    """Newton-Schulz in place on a stack of matrices [M, R, C]."""
+    X.copy_(newton_schulz(X, eps))
 
 
 def _rows_as_blocks(x: Tensor, local: LocalBlocks) -> Tensor:
@@ -184,26 +187,28 @@ def _rows_as_blocks(x: Tensor, local: LocalBlocks) -> Tensor:
 
 def _copy_(dst: List[List[Tensor]], src: List[List[Tensor]]):
     """dst[r][i].copy_(src[r][i]) for every rank r and i, in one launch."""
-    dst, src = [t for ts in dst for t in ts], [t for ts in src for t in ts]
-    if dst:
-        torch._foreach_copy_(dst, src)
+    xllm_ops.batched_copy_([t for ts in dst for t in ts], [t for ts in src for t in ts])
+
+
+def _views(buf: Tensor, shapes: List[List[Tuple[int, int]]]) -> List[List[Tensor]]:
+    """buf cut into one view of each shape, rank after rank."""
+    parts = iter(buf.split([m * n for ss in shapes for m, n in ss]))
+    return [[next(parts).view(shape) for shape in ss] for ss in shapes]
 
 
 def _packed(blocks: List[Tuple[int, int, int]]) -> Tuple[List[Tensor], List[Tensor]]:
-    """One bf16 [B, R, C] buffer per shape of block, wide (R <= C), for blocks given as (count, rows, cols).
-    Returns each entry's blocks as a [count, rows, cols] view, of the transposed buffer if they are tall, and
-    the buffers: Newton-Schulz runs on a buffer in place, without transposing a copy."""
-    wide = [(min(r, c), max(r, c)) for _, r, c in blocks]
+    """One bf16 [B, R, C] buffer per shape of block, for blocks given as (count, rows, cols). Returns each
+    entry's blocks as a [count, rows, cols] view of its buffer, and the buffers: Newton-Schulz runs on a
+    buffer in place."""
     sizes = Counter()
-    for (m, _, _), s in zip(blocks, wide):
-        sizes[s] += m
+    for m, r, c in blocks:
+        sizes[r, c] += m
     buffers = {s: torch.empty(n, *s, dtype=torch.bfloat16, device="cuda") for s, n in sizes.items()}
     taken = Counter()
     views = []
-    for (m, r, c), s in zip(blocks, wide):
-        x = buffers[s][taken[s]:taken[s] + m]
-        views.append(x.mT if r > c else x)
-        taken[s] += m
+    for m, r, c in blocks:
+        views.append(buffers[r, c][taken[r, c]:taken[r, c] + m])
+        taken[r, c] += m
     return views, list(buffers.values())
 
 
@@ -373,14 +378,14 @@ class Muon(Optimizer):
                 plan.recv[r].append((len(plan.owned) - 1, _local_box(box, (b.r0, b.r1, b.c0, b.c1))))
 
     def _batches(self, limit: int) -> List[List[int]]:
-        """The local matrices in batches: by the shape of their blocks, transposed if tall (one buffer per batch),
-        consecutive ones until a batch holds `limit` elements of this rank (0: one batch per shape)."""
+        """The local matrices in batches: by the shape of their blocks (one buffer per batch), consecutive ones
+        until a batch holds `limit` elements of this rank (0: one batch per shape)."""
         remote = set(self.remote)
         by_shape = defaultdict(list)
         for i, plan in enumerate(self.plans):
             if i not in remote:
                 b = plan.local
-                by_shape[min(b.height, b.cols), max(b.height, b.cols)].append((i, b.count * b.height * b.cols))
+                by_shape[b.height, b.cols].append((i, b.count * b.height * b.cols))
         return [[i for i, _ in matrices[lo:hi]]
                 for matrices in by_shape.values() for lo, hi in _split([n for _, n in matrices], limit)]
 
@@ -420,18 +425,18 @@ class Muon(Optimizer):
                   recv_shapes: List[List[Tuple[int, int]]]) -> Callable[[], List[List[Tensor]]]:
         """Launch an all-to-all of bf16 tensors, send[r] going to rank r. Returns a function that waits
         for it and returns the tensors received from each rank."""
-        send_sizes = [sum(t.numel() for t in ts) for ts in send]
+        send_shapes = [[tuple(t.shape) for t in ts] for ts in send]
+        send_sizes = [sum(m * n for m, n in shapes) for shapes in send_shapes]
         recv_sizes = [sum(m * n for m, n in shapes) for shapes in recv_shapes]
-        flat = [t.reshape(-1) for ts in send for t in ts]
-        send_buf = torch.cat(flat) if flat else torch.empty(0, dtype=torch.bfloat16, device="cuda")
+        send_buf = torch.empty(sum(send_sizes), dtype=torch.bfloat16, device="cuda")
+        _copy_(_views(send_buf, send_shapes), send)
         recv_buf = torch.empty(sum(recv_sizes), dtype=torch.bfloat16, device="cuda")
         work = dist.all_to_all_single(recv_buf, send_buf, recv_sizes, send_sizes, group=self.process_group,
                                       async_op=True)
 
         def wait():
             work.wait()
-            return [[t.view(shape) for t, shape in zip(part.split([m * n for m, n in shapes]), shapes)]
-                    for part, shapes in zip(recv_buf.split(recv_sizes), recv_shapes)]
+            return _views(recv_buf, recv_shapes)
         return wait
 
     def _momentum(self, params: List[Tensor], group: Dict, out: List[Tensor]):
@@ -509,7 +514,7 @@ class Muon(Optimizer):
     @staticmethod
     def _update(params: List[Tensor], updates: List[Tensor], scales: List[float], lr: float, wd: float):
         """W <- W - lr (wd W + scale update), in fp32, for the params with a gradient; updates[i] holds the
-        shard's elements in any shape (its blocks, maybe transposed views)."""
+        shard's elements in any shape (its blocks)."""
         live = [i for i, p in enumerate(params) if p.grad is not None]
         xllm_ops.muon_update_([_local(params[i]) for i in live], [updates[i] for i in live],
                               [scales[i] for i in live], lr, wd)

@@ -72,3 +72,42 @@ def test_many_tensors_split_over_launches():
     xllm_ops.muon_update_(ps, us, [1.0] * len(us), 0.125, 0.0)
     for p, e in zip(ps, exact):
         assert_within_ulp(p, e)
+
+
+def copy_pairs(device, src_dtype, dst_dtype):
+    """(dst, src) views of one shape in the layouts Muon copies between: slices of shards (some columns), blocks
+    of packed buffers (transposed when tall), contiguous all-to-all buffers."""
+    pairs = []
+    for count, rows, cols in BLOCKS:
+        shape = (count, rows, cols)
+        packed = torch.randn(count, min(rows, cols), max(rows, cols), device=device).to(src_dtype)
+        src = packed.mT if rows > cols else packed
+        flat = torch.empty(count * rows * cols, dtype=dst_dtype, device=device).view(shape)
+        wide = torch.empty(count, rows, cols + 7, dtype=dst_dtype, device=device)[..., 3:3 + cols]  # some columns
+        tall = torch.empty(count, cols, rows, dtype=dst_dtype, device=device).mT
+        unaligned = torch.empty(count * rows * cols + 3, dtype=dst_dtype, device=device)[3:].view(shape)  # contiguous
+        contiguous_src = flat.to(src_dtype).copy_(src)
+        pairs += [(flat, src), (wide, src), (tall, src), (tall.clone(), contiguous_src), (unaligned, contiguous_src)]
+    return pairs
+
+
+@pytest.mark.parametrize("device", DEVICES)
+@pytest.mark.parametrize("src_dtype, dst_dtype", [(torch.bfloat16, torch.bfloat16), (torch.float16, torch.bfloat16),
+                                                  (torch.bfloat16, torch.float16)])
+def test_batched_copy(device, src_dtype, dst_dtype):
+    torch.manual_seed(0)
+    pairs = copy_pairs(device, src_dtype, dst_dtype)
+    xllm_ops.batched_copy_([d for d, _ in pairs], [s for _, s in pairs])
+    for d, s in pairs:
+        torch.testing.assert_close(d, s.to(dst_dtype), rtol=0, atol=0)
+
+
+def test_batched_copy_split_over_launches():
+    """More copies than one launch's argument list holds (192)."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA only")
+    src = [torch.randn(40, 9, device="cuda").bfloat16().mT for _ in range(300)]
+    dst = [torch.empty(9, 40, device="cuda", dtype=torch.bfloat16) for _ in src]
+    xllm_ops.batched_copy_(dst, src)
+    for d, s in zip(dst, src):
+        torch.testing.assert_close(d, s, rtol=0, atol=0)
