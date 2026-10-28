@@ -190,7 +190,6 @@ def main():
     torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
     dist.init_process_group("nccl")
     initialize_model_parallel(TP, 1, timeout=600)
-    torch._dynamo.config.cache_size_limit = 64  # Newton-Schulz compiles once per expert shape
     dp = dist.get_world_size() // TP
     dp_mesh = get_device_mesh(dp, 1, TP)
     for n, inter, dim in SHAPES:

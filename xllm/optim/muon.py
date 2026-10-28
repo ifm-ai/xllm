@@ -139,28 +139,36 @@ def _split(sizes: List[int], limit: int) -> List[Tuple[int, int]]:
     return bounds
 
 
-@torch.compile(fullgraph=True)
 def newton_schulz5(X: Tensor, eps: float) -> Tensor:
-    """Orthogonalize a stack of matrices [B, m, n] with m <= n."""
+    """Orthogonalize a stack of matrices [B, m, n] with m <= n. The polynomial's sums run in the epilogues
+    of cuBLAS GEMMs (baddbmm's alpha / beta), accumulated in fp32: no pointwise kernels, one bf16 rounding
+    per product."""
     X = X.to(torch.bfloat16)
     X = X / (X.norm(dim=(-2, -1), keepdim=True) + eps)
     for a, b, c in NS_COEFFS:
         A = X @ X.mT
-        X = a * X + (b * A + c * (A @ A)) @ X
+        B = torch.baddbmm(A, A, A, beta=b, alpha=c)  # b A + c A A
+        X = torch.baddbmm(X, B, X, beta=a)  # a X + B X
     return X
 
 
 def orthogonalize_(X: Tensor, eps: float):
-    """Newton-Schulz in place on a stack of matrices [M, R, C]; tall ones are transposed (NS(X^T) = NS(X)^T),
-    contiguous so that newton_schulz5 compiles once per shape, not once per stride."""
+    """Newton-Schulz in place on a stack of matrices [M, R, C]; tall ones are transposed (NS(X^T) = NS(X)^T)."""
     tall = X.shape[-2] > X.shape[-1]
-    Y = newton_schulz5(X.mT.contiguous() if tall else X, eps)
+    Y = newton_schulz5(X.mT if tall else X, eps)
     X.copy_(Y.mT if tall else Y)
 
 
 def _rows_as_blocks(x: Tensor, local: LocalBlocks) -> Tensor:
     """The local blocks of x [rows, cols] as [count, height, cols], a view."""
     return x[local.row0:local.row0 + local.count * local.height].view(local.count, local.height, x.shape[1])
+
+
+def _copy_(dst: List[List[Tensor]], src: List[List[Tensor]]):
+    """dst[r][i].copy_(src[r][i]) for every rank r and i, in one launch."""
+    dst, src = [t for ts in dst for t in ts], [t for ts in src for t in ts]
+    if dst:
+        torch._foreach_copy_(dst, src)
 
 
 def _packed(blocks: List[Tuple[int, int, int]]) -> Tuple[List[Tensor], List[Tensor]]:
@@ -221,8 +229,6 @@ class Muon(Optimizer):
         """specs[i]: how muon_params[i] maps to Newton-Schulz matrices (register_muon / muon_spec).
         tp_group: the tensor-parallel group, if any: the params are then each rank's TP-local shard. Muon
         works over the plane of the dp mesh x TP group, TP being one more way the weight is sharded."""
-        # one compiled Newton-Schulz per stack shape (block shapes x batch sizes), far more than the default 8
-        torch._dynamo.config.cache_size_limit = max(torch._dynamo.config.cache_size_limit, 64)
         defaults = dict(weight_decay=cfg.weight_decay, eps=cfg.epsilon)
         super().__init__(
             [
@@ -434,28 +440,24 @@ class Muon(Optimizer):
         us = torch._foreach_add(gs, ms, alpha=mu) if group["nesterov"] else ms
         torch._foreach_copy_([out[i] for i in live], [u.view(out[i].shape) for i, u in zip(live, us)])
 
-    def _gather(self, updates: List[Tensor], plans: List[MatrixPlan]) -> Callable[[], Tuple[List[Tensor], List[Tensor]]]:
-        """Launch sending my slices of remote blocks to their owners. Returns a function that waits and
-        returns the remote blocks I own, in plan order, and the [M, R, C] buffers that hold them."""
-        send = [[u[box] for u, plan in zip(updates, plans) for box in plan.send[r]] for r in range(self.world)]
-        recv = self._exchange(send, [[_shape(box) for plan in plans for _, box in plan.recv[r]] for r in range(self.world)])
+    def _gather(self, mine: List[List[Tensor]], plans: List[MatrixPlan]) -> Callable[[], Tuple[List[Tensor], List[Tensor]]]:
+        """Launch sending my slices of remote blocks (mine[r]: those rank r owns) to their owners. Returns a
+        function that waits and returns the remote blocks I own, in plan order, and the [M, R, C] buffers that
+        hold them."""
+        recv = self._exchange(mine, [[_shape(box) for _, box in slices] for slices in self.owned_slices])
 
         def wait():
             views, buffers = _packed([(1, *self.blocks[k].shape) for plan in plans for k in plan.owned])
             out = [v[0] for v in views]
-            for r, ts in enumerate(recv()):
-                for (j, box), t in zip(self.owned_slices[r], ts):
-                    out[j][box] = t
+            _copy_([[out[j][box] for j, box in slices] for slices in self.owned_slices], recv())
             return out, buffers
         return wait
 
-    def _scatter(self, blocks: List[Tensor], updates: List[Tensor], plans: List[MatrixPlan]):
-        """Send each rank its slices of the remote blocks I own; write the slices I receive into `updates`."""
-        send = [[blocks[j][box] for j, box in self.owned_slices[r]] for r in range(self.world)]
-        recv = self._exchange(send, [[_shape(box) for plan in plans for box in plan.send[r]] for r in range(self.world)])
-        for r, ts in enumerate(recv()):
-            for dst, t in zip([u[box] for u, plan in zip(updates, plans) for box in plan.send[r]], ts):
-                dst.copy_(t)
+    def _scatter(self, blocks: List[Tensor], mine: List[List[Tensor]]):
+        """Send each rank its slices of the remote blocks I own; write the slices I receive into `mine`."""
+        send = [[blocks[j][box] for j, box in slices] for slices in self.owned_slices]
+        recv = self._exchange(send, [[t.shape for t in ts] for ts in mine])
+        _copy_(mine, recv())
 
     @torch.no_grad()
     def _muon_step(self, group: Dict):
@@ -465,7 +467,9 @@ class Muon(Optimizer):
         plans = [self.plans[i] for i in self.remote]
         updates = [torch.empty_like(_local(p), dtype=torch.bfloat16) for p in params]
         self._momentum(params, group, updates)                                  # 1. remote matrices: momentum,
-        gathered = self._gather(updates, plans) if self.has_remote else None    #    remote blocks on the wire
+        # mine[r]: my slices of the remote blocks rank r owns, views of the updates: sent, then overwritten
+        mine = [[u[box] for u, plan in zip(updates, plans) for box in plan.send[r]] for r in range(self.world)]
+        gathered = self._gather(mine, plans) if self.has_remote else None       #    remote blocks on the wire
         for batch in self.batches:                                              # 2. meanwhile the local matrices
             self._step_local([group["params"][i] for i in batch], [self.plans[i] for i in batch],
                              [scales[i] for i in batch], group)
@@ -477,7 +481,7 @@ class Muon(Optimizer):
             del gathered                                                        #    (frees the receive buffer)
             for X in buffers:
                 orthogonalize_(X, eps)
-            self._scatter(blocks, updates, plans)                               #    back
+            self._scatter(blocks, mine)                                         #    back
         self._update(params, updates, [scales[i] for i in self.remote], group["lr"], group["weight_decay"])
 
     def _step_local(self, params: List[Tensor], plans: List[MatrixPlan], scales: List[float], group: Dict):

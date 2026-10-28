@@ -214,7 +214,6 @@ def check_tensor_parallel(rep=1, tp=2):
     context-parallel ranks sit). Blocks may sit inside a TP rank (heads), be cut by TP (wo, FFN) or straddle
     the TP boundary; TP, FSDP and the replicas are independent. The result must match the dense reference on
     the whole (TP=1) weights, on every replica."""
-    torch._dynamo.config.cache_size_limit = 64  # this test compiles Newton-Schulz for many more shapes
     dp = dist.get_world_size() // (rep * tp)
     if rep == 1:
         mesh3 = init_device_mesh("cuda", (dp, tp), mesh_dim_names=("dp", "tp"))
