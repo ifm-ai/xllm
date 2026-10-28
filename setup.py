@@ -41,6 +41,7 @@ CSRCS = [
     os.path.join(PATH, "xllm/csrc/ops/group_rms_norm_kernel.cu"),
     os.path.join(PATH, "xllm/csrc/ops/muon.cc"),
     os.path.join(PATH, "xllm/csrc/ops/muon_kernel.cu"),
+    os.path.join(PATH, "xllm/csrc/ops/muon_copy_kernel.cu"),
     os.path.join(PATH, "xllm/csrc/ops/sequence_norm.cc"),
     os.path.join(PATH, "xllm/csrc/ops/sequence_norm_kernel.cu"),
     os.path.join(PATH, "xllm/csrc/ops/timestep_norm.cc"),
