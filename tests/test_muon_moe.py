@@ -26,7 +26,7 @@ from xllm.distributed import get_model_parallel_group, get_model_parallel_rank, 
 from xllm.distributed.utils import get_device_mesh
 from xllm.distributed.wrap import enable_wrap, wrap
 from xllm.modules.moe.expert import Expert
-from xllm.optim.muon import build_muon, newton_schulz5
+from xllm.optim.muon import build_muon, newton_schulz
 
 TP = int(os.environ.get("TP", "1"))
 STEPS = 3
@@ -72,7 +72,7 @@ def per_expert_muon(w, grads, n, cfg):
         for e in range(n):
             x = u[e * rows:(e + 1) * rows]
             wide = x.shape[0] <= x.shape[1]
-            o = newton_schulz5((x if wide else x.mT)[None], cfg.epsilon)[0]
+            o = newton_schulz((x if wide else x.mT)[None], cfg.epsilon)[0]
             o = (o if wide else o.mT).float()
             w[e * rows:(e + 1) * rows] += -cfg.muon_lr * math.sqrt(x.shape[0] / x.shape[1]) * o
     return w
