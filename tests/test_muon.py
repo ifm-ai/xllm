@@ -20,7 +20,7 @@ from torch.distributed.tensor import Replicate, Shard, distribute_tensor
 from xllm.config import OptimConf
 from xllm.distributed import initialize_model_parallel
 from xllm.distributed.wrap import enable_wrap, wrap
-from xllm.optim.muon import Muon, newton_schulz5, split_muon_params
+from xllm.optim.muon import Muon, newton_schulz, split_muon_params
 from xllm.optim.muon_spec import muon_spec, register_muon
 from xllm.optim import restore_optimizer_config
 
@@ -82,7 +82,7 @@ def dense_muon(full, specs, grads, cfg):
             out = torch.empty_like(u)
             for b in spec.blocks(tuple(x.shape)):
                 blk = u[b.r0:b.r1, b.c0:b.c1]
-                o = newton_schulz5((blk if blk.shape[0] <= blk.shape[1] else blk.mT)[None], cfg.epsilon)[0]
+                o = newton_schulz((blk if blk.shape[0] <= blk.shape[1] else blk.mT)[None], cfg.epsilon)[0]
                 out[b.r0:b.r1, b.c0:b.c1] = o if blk.shape[0] <= blk.shape[1] else o.mT
             fan_out, fan_in = spec.fans(tuple(x.shape), per_block=cfg.muon_block_scale == "block")
             scale = 0.2 * math.sqrt(max(fan_out, fan_in)) if cfg.muon_adjust_lr == "rms_norm" else math.sqrt(fan_out / fan_in)

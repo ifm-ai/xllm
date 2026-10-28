@@ -55,7 +55,7 @@
   2. A fixed plan assigns every block to one rank (balanced by size). One all-to-all sends
      each block's pieces to its owner.
   3. The owner stacks its blocks by shape (tall blocks transposed) and runs one batched
-     Newton-Schulz 5 per shape, then scales each block by its own shape
+     Newton-Schulz per shape (Polar Express coefficients), then scales each block by its own shape
      (`--optim.muon_block_scale block`, default) or its whole matrix's shape (`matrix`):
      `sqrt(rows / cols)` for `--optim.muon_adjust_lr spectral_norm` (default),
      `0.2 * sqrt(max(rows, cols))` for `rms_norm`.
