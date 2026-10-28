@@ -76,3 +76,28 @@
 --optim.optimizer muon --optim.muon_lr 0.01 --optim.lr 2e-3 \
 --dcp_for_optimizer true
 ```
+
+## Complete(d)P with Muon (`--mup.*`, experimental)
+
+Width / depth scaling relative to a base model (arXiv:2512.22382; `MuPConf` in `xllm/config.py`,
+groups in `xllm/optim/mup.py`). Scale `num_heads`, `num_kv_heads` and `ffn_hidden_dim` with
+`model_dim`, keep `head_dim` fixed; the hyperparameters are the base model's.
+
+- m_N = model_dim / base_model_dim, m_L = num_layers / base_num_layers, c = m_L^-alpha.
+- Init: hidden std x m_N^-1/2, readout x m_N^-1, embedding unchanged; attention `wo` and FFN
+  `fc2` x c on top of the hidden std (`model.init_out_std`). Explicit init stds that disagree are rejected.
+- Muon: lr x m_L^(alpha-1); `wo` / `fc2` updates x c, their decay `lr * wd` unchanged.
+- AdamW per role (lr, eps, weight decay): embed (1, m_N^-1, 1), hidden_vector (m_L^(alpha-1),
+  m_N^-1 m_L^-alpha, 1), final_norm (1, 1, 1), readout (m_N^-1, 1, m_N).
+- Clipping counts `wo` / `fc2` gradients x c.
+
+The depth scale is folded into `wo` / `fc2` instead of a residual multiplier: the forward is a
+plain Transformer (checkpoints serve as they are), and training equals the multiplier version
+(`tests/test_completedp_muon.py`, `tests/test_completedp_muon_gpu.py`). Dense Transformers only,
+`init_mode gaussian`, `muon_adjust_lr spectral_norm`, `muon_block_scale block`.
+
+```bash
+--optim.optimizer muon --dcp_for_optimizer true --model.init_mode gaussian \
+--mup.base_model_dim 1024 --mup.base_num_layers 8 --mup.alpha 1.0 \
+--mup.base_init_hidden_std 0.02 --mup.base_init_embed_std 0.02 --mup.base_init_unembed_std 0.02
+```
