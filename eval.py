@@ -87,7 +87,7 @@ def main(eval_cfg: EvalConf):
         tokenizer=tokenizer,
         cfg=eval_cfg.valid,
         multi_segments=eval_cfg.multi_segments,
-        attn_stability_control=cfg.attn_stability_control,
+        attn_stability_control=eval_cfg.attn_stability_control,
         dump_dir=eval_cfg.dump_dir,
         world_rank=get_data_parallel_rank(),
         world_size=get_data_parallel_world_size(),
