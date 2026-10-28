@@ -169,6 +169,7 @@ def launch_sync_eval(
         tokenizer=tokenizer,
         cfg=cfg.valid,
         multi_segments=cfg.multi_segments,
+        attn_stability_control=cfg.attn_stability_control,
         dump_dir=str(dump_dir),
         world_rank=cfg.data_parallel_rank,
         world_size=cfg.data_parallel_size,
