@@ -407,6 +407,7 @@ class TrainerConf(Config):
     log_wandb: bool = False
     wandb_project: Optional[str] = None
     wandb_entity: Optional[str] = None
+    wandb_name: Optional[str] = None
 
     # Random seed
     seed: int = 1

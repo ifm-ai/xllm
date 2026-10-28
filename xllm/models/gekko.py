@@ -495,11 +495,9 @@ class Gekko(XLLModel):
         return not self.full_attention_layers
 
     def num_parameters(self):
-        if self.full_attention_layers:
-            total = sum(parameter.numel() for parameter in self.parameters())
-            embed = self.embed.weight.numel() + self.output.output.weight.numel()
-            return total, total, embed
         embed_params = self.model_dim * self.vocab_size * 2
+
+        # ---------------- GDA (linear-attention) block ----------------
         gda_params_per_block = self.model_dim * (self.num_heads + self.num_kv_heads) * (self.head_dim + self.v_head_dim)
         # out proj
         gda_params_per_block += self.model_dim * self.num_heads * self.v_head_dim
@@ -511,16 +509,37 @@ class Gekko(XLLModel):
         # conv params
         conv_params_per_block = self.causal_conv_width * (self.num_heads * self.head_dim + self.num_kv_heads * (self.head_dim + self.v_head_dim))
         # norm params
-        norm_params_per_block = self.model_dim * (3 if self.apply_rmsnorm else 4) + self.head_dim * self.num_heads
+        gda_norm_params_per_block = self.model_dim * (3 if self.apply_rmsnorm else 4) + self.head_dim * self.num_heads
         if self.attn_act_func == 'softdelta':
             gda_params_per_block += self.model_dim * self.num_heads * (self.head_dim + 1)
             conv_params_per_block += self.causal_conv_width * self.num_heads * self.head_dim
-            norm_params_per_block += self.head_dim * self.num_heads
-        # FFN
+            gda_norm_params_per_block += self.head_dim * self.num_heads
+        gda_layer_params = gda_params_per_block + conv_params_per_block + gda_norm_params_per_block
+
+        # ---------------- Full (softmax) attention block ----------------
+        attn_params_per_block = self.model_dim * (self.num_heads + self.num_kv_heads) * self.head_dim * 2
+        if self.attn_act_func == 'softdelta':
+            attn_params_per_block += self.model_dim * self.num_heads * (self.head_dim + 1)
+        if getattr(self, 'apply_attn_gate', False):
+            attn_params_per_block += self.model_dim * self.num_heads * self.head_dim
+        attn_params_per_block += num_params_in_residual(self.residual_func, self.model_dim, self.residual_heads, self.num_heads * self.head_dim)
+        attn_norm_params_per_block = self.model_dim * (2 if self.apply_rmsnorm else 4)
+        if getattr(self, 'qknorm', False):
+            attn_norm_params_per_block += self.head_dim * self.num_heads
+        attn_layer_params = attn_params_per_block + attn_norm_params_per_block
+
+        # ---------------- Layer mix ----------------
+        full_attn_ids = set(self.full_attention_layers or ())
+        assert all(0 <= i < self.num_layers for i in full_attn_ids), \
+            f"full_attention_layers {sorted(full_attn_ids)} out of range for num_layers={self.num_layers}"
+        num_full_attn_layers = len(full_attn_ids)
+        num_gda_layers = self.num_layers - num_full_attn_layers
+
+        # ---------------- FFN ----------------
         ffn_params_per_block = self.model_dim * self.ffn_hidden_dim * (3 if self.swiglu else 2)
         ffn_params_per_block += num_params_in_residual(self.residual_func, self.model_dim, self.residual_heads, self.ffn_hidden_dim)
 
-        activated_params = (gda_params_per_block + conv_params_per_block + norm_params_per_block) * self.num_layers
+        activated_params = gda_layer_params * num_gda_layers + attn_layer_params * num_full_attn_layers
         activated_params += ffn_params_per_block * self.num_dense_layers + embed_params
         total_params = activated_params
         if self.num_experts > 0:
