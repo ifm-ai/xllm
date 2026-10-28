@@ -29,7 +29,7 @@ class LocalMesh:
 @pytest.fixture
 def cpu_transport(monkeypatch):
     # Exercise the actual gather/scatter and update code on CPU, replacing only
-    # the CUDA allocation, compiled kernel wrapper, and single-rank transport.
+    # the CUDA allocation and single-rank transport.
     real_empty = torch.empty
 
     def cpu_empty(*args, **kwargs):
@@ -38,7 +38,6 @@ def cpu_transport(monkeypatch):
         return real_empty(*args, **kwargs)
 
     monkeypatch.setattr(torch, "empty", cpu_empty)
-    monkeypatch.setattr(muon, "newton_schulz5", muon.newton_schulz5._torchdynamo_orig_callable)
     return lambda opt: monkeypatch.setattr(opt, "_exchange", lambda send, shapes: lambda: send)
 
 
