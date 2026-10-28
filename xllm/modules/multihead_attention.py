@@ -59,6 +59,7 @@ class MultiheadAttention(nn.Module):
         residual_heads: Optional[int] = None,
         init_mode: str = 'he',
         init_std: Optional[float] = None,
+        init_out_std: Optional[float] = None,  # init std of wo; None = init_std
     ):
         super().__init__()
         self.layer_id = layer_id
@@ -191,7 +192,7 @@ class MultiheadAttention(nn.Module):
             bias=False,
             input_is_parallel=True,
             parallel_output=True,
-            init_method=init_fn,
+            init_method=init_fn if init_out_std is None else get_init_fn(init_mode, dim=mdim, std=init_out_std),
         )
 
         self.residual = build_residual(

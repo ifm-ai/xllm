@@ -34,7 +34,8 @@ class NormalizedFeedForwardNetwork(nn.Module):
         residual_func: str = 'base',
         residual_heads: Optional[int] = None,
         init_mode: str = 'gaussian',
-        init_std: Optional[float] = None
+        init_std: Optional[float] = None,
+        init_out_std: Optional[float] = None,  # init std of fc2; None = init_std
     ):
         super().__init__()
         self.layer_id = layer_id
@@ -73,7 +74,7 @@ class NormalizedFeedForwardNetwork(nn.Module):
             bias=False,
             input_is_parallel=True,
             parallel_output=True,
-            init_method=get_init_fn(init_mode, dim=ffn_hidden_dim, std=init_std),
+            init_method=get_init_fn(init_mode, dim=ffn_hidden_dim, std=init_std if init_out_std is None else init_out_std),
         )
         self.fc3 = ColumnParallelLinear(
             model_dim,

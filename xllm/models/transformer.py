@@ -91,6 +91,7 @@ class TransformerBlock(nn.Module):
             residual_heads=cfg.residual_heads,
             init_mode=cfg.init_mode,
             init_std=cfg.init_std,
+            init_out_std=cfg.init_out_std,
         )
 
         self.nffn = NormalizedFeedForwardNetwork(
@@ -110,6 +111,7 @@ class TransformerBlock(nn.Module):
             residual_heads=cfg.residual_heads,
             init_mode=cfg.init_mode,
             init_std=cfg.init_std,
+            init_out_std=cfg.init_out_std,
         )
 
     def forward(

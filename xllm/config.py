@@ -5,8 +5,10 @@ from pathlib import Path
 from typing import List, Dict
 import os
 import json
+import math
 
 from xllm.configuration import Config
+from xllm.configuration.configuration import NOCLI
 from xllm.distributed import (
     model_parallel_is_initialized,
     get_data_parallel_world_size,
@@ -161,6 +163,7 @@ class ModelConf(Config):
     init_std: Optional[float] = None  # Init std for gaussian; If None, deriving from input dimensions. he/xavier requires None
     init_embed_std: Optional[float] = None  # Std used to truncate normal init of embedding weights. If None, = 1 / sqrt(model_dim)
     init_logits_std: Optional[float] = None  # Std used to truncate normal init of output projection weights. If None, = 1 / sqrt(model_dim)
+    init_out_std: Optional[float] = NOCLI()  # Init std of the dense blocks' output projections (attention wo, FFN fc2). None = init_std. Set by the mup config.
     # Input & output
     vocab_size: int = -1  # Defined later by tokenizer
     # Normalization
@@ -249,6 +252,74 @@ class ModelConf(Config):
 
 
 @dataclass
+class MuPConf(Config):
+    """Complete(d)P width / depth scaling relative to a base model (arXiv:2512.22382), with Muon.
+
+    m_N = model_dim / base_model_dim, m_L = num_layers / base_num_layers. Scale num_heads, num_kv_heads
+    and ffn_hidden_dim with model_dim and keep head_dim fixed.
+    - Width: hidden init std x m_N^-1/2; readout init std and AdamW lr x m_N^-1. Muon needs no width
+      factor: its spectral_norm update scale already transfers across widths.
+    - Depth: the residual branches are scaled by c = m_L^-alpha without a multiplier in the forward. c is
+      folded into the output projections (attention wo, FFN fc2): their init std and Muon update are x c,
+      their gradients count x c in the clipping norm, and their decay lr * wd is unchanged. Training
+      then matches a residual multiplier c exactly (xllm/optim/mup.py).
+    """
+    base_model_dim: int  # model_dim of the base model the hyperparameters were tuned on
+    base_num_layers: int  # num_layers of the base model
+    base_init_hidden_std: float  # Init std of the hidden matrices at base width; x m_N^-1/2
+    base_init_embed_std: float  # Init std of the embedding, the same at every width
+    base_init_unembed_std: float  # Init std of the readout at base width; x m_N^-1
+    alpha: float = 1.0  # Depth exponent in [0.5, 1]: c = m_L^-alpha
+    width_multiplier: Optional[float] = NOCLI()  # m_N, set by resolve()
+    depth_multiplier: Optional[float] = NOCLI()  # m_L, set by resolve()
+    branch_scale: Optional[float] = NOCLI()  # c = m_L^-alpha, set by resolve()
+
+    def resolve(self, model: ModelConf, optim: OptimConf) -> None:
+        """Check that the run supports mup; set the multipliers and the model's init stds."""
+        for name in ("base_model_dim", "base_num_layers", "base_init_hidden_std", "base_init_embed_std",
+                     "base_init_unembed_std"):
+            value = getattr(self, name)
+            if not math.isfinite(value) or value <= 0:
+                raise ValueError(f"mup.{name} must be positive and finite, got {value}")
+        if not 0.5 <= self.alpha <= 1.0:
+            raise ValueError(f"mup.alpha must be in [0.5, 1], got {self.alpha}")
+        for name, actual, supported in (
+            ("model.arch", model.arch, ["transformer"]),
+            ("model.init_mode", model.init_mode, ["gaussian"]),
+            ("model.num_experts", model.num_experts, [0]),
+            ("model.num_values", model.num_values, [0]),
+            ("model.scale_emb", model.scale_emb, [False]),
+            ("model.residual_func", model.residual_func, ["base", "add"]),  # the folded c needs a plain residual add
+            ("optim.optimizer", optim.optimizer, ["muon"]),
+            ("optim.muon_adjust_lr", optim.muon_adjust_lr, ["spectral_norm"]),
+            ("optim.muon_block_scale", optim.muon_block_scale, ["block"]),  # per-head blocks, head_dim fixed
+        ):
+            if actual not in supported:
+                raise ValueError(f"mup requires {name} in {supported}, got {actual!r}")
+
+        self.width_multiplier = model.model_dim / self.base_model_dim
+        self.depth_multiplier = model.num_layers / self.base_num_layers
+        self.branch_scale = self.depth_multiplier ** -self.alpha
+        init_std = self.base_init_hidden_std / math.sqrt(self.width_multiplier)
+        # model init std -> (value at this size, the mup setting it comes from)
+        resolved = {
+            "init_std": (init_std, "base_init_hidden_std"),
+            "init_out_std": (init_std * self.branch_scale, "base_init_hidden_std"),
+            "init_embed_std": (self.base_init_embed_std, "base_init_embed_std"),
+            "init_logits_std": (self.base_init_unembed_std / self.width_multiplier, "base_init_unembed_std"),
+        }
+        for name, (value, source) in resolved.items():
+            current = getattr(model, name)
+            # an equal value is allowed: the config.json of a mup run
+            if current is not None and not math.isclose(current, value, rel_tol=1e-9):
+                raise ValueError(
+                    f"model.{name}={current} conflicts with mup, which sets it to {value}. "
+                    f"Unset model.{name} and set mup.{source} (its value at the base size) instead."
+                )
+            setattr(model, name, value)
+
+
+@dataclass
 class ValidConf(Config):
     # Tasks to evaluate
     ppl_file_list: str = ""  # Comma separated list of files to eval PPL
@@ -324,6 +395,7 @@ class TrainerConf(Config):
     valid: ValidConf
     tokenizer: TokenizerConf
     dataloader: DataLoaderConfig  # Configs for multi-source data loading.
+    mup: Optional[MuPConf] = None  # Complete(d)P width / depth scaling, with optim.optimizer=muon. None leaves training unchanged.
 
     # Training data / iterator
     data: str = ""  # Comma seperated data mix. Each mix is formatted as path:weight:json_key:source_format. Weights need not sum to 1.
@@ -437,6 +509,8 @@ class TrainerConf(Config):
             assert self.model.ddp_backend == "fsdp2", "Muon requires FSDP2."
             assert self.model.num_experts == 0, "Muon does not support MoE."
             assert self.dcp_for_optimizer, "Muon requires dcp_for_optimizer (sharded momentum)."
+        if self.mup is not None:
+            self.mup.resolve(self.model, self.optim)
 
         # MoE
         if self.model.num_experts > 0:
