@@ -82,8 +82,8 @@ class CausalSoftmaxAttention(nn.Module):
         bs, slen, _ = xq.shape
         # B x L x H x D/H
         xq = rearrange(xq, 'b l (h d) -> b l h d', h=self.n_heads)
-        xk = rearrange(xk, 'b l (h d) -> b l h d', h=self.n_kv_heads)
-        xv = rearrange(xv, 'b l (h d) -> b l h d', h=self.n_kv_heads)
+        xk = rearrange(xk, 'b l (k d) -> b l k d', k=self.n_kv_heads)
+        xv = rearrange(xv, 'b l (k d) -> b l k d', k=self.n_kv_heads)
 
         if self.rope_head_dim == self.head_dim:
             xq, xk = apply_rotary_embeddings(xq, xk, freqs_cis=freqs_cis, backward=False)
@@ -234,8 +234,8 @@ class CausalSoftdeltaAttention(nn.Module):
         xq = rearrange(xqk[:, :, :, :n_rep], 'b l k n s -> b l (k n) s')
         # B x L x K x S
         kq = xqk[:, :, :, -1]
-        xk = rearrange(xk, 'b l (h d) -> b l h d', h=self.n_kv_heads)
-        xv = rearrange(xv, 'b l (h d) -> b l h d', h=self.n_kv_heads)
+        xk = rearrange(xk, 'b l (k s) -> b l k s', k=self.n_kv_heads)
+        xv = rearrange(xv, 'b l (k s) -> b l k s', k=self.n_kv_heads)
 
         if self.rope_head_dim == self.head_dim:
             xq = apply_rotary_embedding(xq, freqs_cis=freqs_cis, backward=False)
