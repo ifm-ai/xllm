@@ -60,7 +60,7 @@
      `sqrt(rows / cols)` for `--optim.muon_adjust_lr spectral_norm` (default),
      `0.2 * sqrt(max(rows, cols))` for `rms_norm`.
   4. A second all-to-all returns the pieces; each rank applies
-     `p = p * (1 - lr * wd) - lr * update` to its shard.
+     `p = p - lr * (wd * p + update)` to its shard.
 - **Checkpoints.** Momentum and AdamW moments are DTensors like the parameters, so DCP
   reshards them if the mesh changes; the block plan is rebuilt from the global shapes.
 - **Resume.** `state_dict()` includes momentum, moments and algorithm hyperparameters in

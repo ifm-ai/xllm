@@ -49,6 +49,7 @@ from typing import Callable, Dict, List, Optional, Tuple
 
 import torch
 import torch.distributed as dist
+import xllm_extension.ops as xllm_ops
 from torch import Tensor, nn
 from torch.distributed.device_mesh import DeviceMesh
 from torch.optim import Optimizer
@@ -449,12 +450,8 @@ class Muon(Optimizer):
             live.append(i)
         if not live:
             return
-        ms = [_local(self.state[params[i]]["momentum"]) for i in live]
-        gs = [_local(params[i].grad) for i in live]
-        torch._foreach_mul_(ms, mu)
-        torch._foreach_add_(ms, gs)
-        us = torch._foreach_add(gs, ms, alpha=mu) if group["nesterov"] else ms
-        torch._foreach_copy_([out[i] for i in live], [u.view(out[i].shape) for i, u in zip(live, us)])
+        xllm_ops.muon_momentum_([_local(self.state[params[i]]["momentum"]) for i in live],
+                                [_local(params[i].grad) for i in live], [out[i] for i in live], mu, group["nesterov"])
 
     def _gather(self, mine: List[List[Tensor]], plans: List[MatrixPlan]) -> Callable[[], Tuple[List[Tensor], List[Tensor]]]:
         """Launch sending my slices of remote blocks (mine[r]: those rank r owns) to their owners. Returns a
@@ -510,17 +507,11 @@ class Muon(Optimizer):
 
     @staticmethod
     def _update(params: List[Tensor], updates: List[Tensor], scales: List[float], lr: float, wd: float):
-        """W <- (1 - lr * wd) W - lr * scale * update, in fp32, for the params with a gradient; updates[i] holds the
+        """W <- W - lr (wd W + scale update), in fp32, for the params with a gradient; updates[i] holds the
         shard's elements in any shape (its blocks, maybe transposed views)."""
         live = [i for i, p in enumerate(params) if p.grad is not None]
-        if not live:
-            return
-        xs = [_local(params[i]).view(updates[i].shape) for i in live]
-        step = [torch.empty_like(x) for x in xs]
-        torch._foreach_copy_(step, [updates[i] for i in live])
-        torch._foreach_mul_(step, [-lr * scales[i] for i in live])
-        torch._foreach_mul_(xs, 1 - lr * wd)
-        torch._foreach_add_(xs, step)
+        xllm_ops.muon_update_([_local(params[i]) for i in live], [updates[i] for i in live],
+                              [scales[i] for i in live], lr, wd)
 
     @torch.no_grad()
     def _adamw_step(self, group: Dict):

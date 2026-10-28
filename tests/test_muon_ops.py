@@ -1,0 +1,74 @@
+"""xllm_extension's fused Muon momentum and update against the same formulas in fp64, on views like Muon's:
+shards, and blocks of packed bf16 buffers, transposed when tall. Each fp32 result must be within one ulp of
+the exact value (fused multiply-adds round once), each bf16 output within one bf16 ulp."""
+import pytest
+import torch
+import xllm_extension.ops as xllm_ops
+
+DEVICES = ["cpu"] + (["cuda"] if torch.cuda.is_available() else [])
+# (count, rows, cols) per tensor, as Muon packs them: one shard, heads, tall (transposed) blocks, odd sizes
+BLOCKS = [(1, 96, 160), (6, 64, 96), (3, 100, 40), (2, 33, 70), (1, 0, 8)]
+
+
+def views(device):
+    """bf16 views of packed wide buffers, transposed for tall blocks (muon._packed)."""
+    out = []
+    for count, rows, cols in BLOCKS:
+        buf = torch.empty(count, min(rows, cols), max(rows, cols), dtype=torch.bfloat16, device=device)
+        out.append(buf.mT if rows > cols else buf)
+    return out
+
+
+def assert_within_ulp(x, exact, extra=0.0):
+    """|x - exact| <= one ulp of x, in x's dtype (fp32: 24 significant bits, bf16: 8), plus `extra`."""
+    bits = {torch.float32: 24, torch.bfloat16: 8}[x.dtype]
+    tol = torch.ldexp(torch.ones_like(exact), torch.frexp(x.float())[1].double() - bits) + extra
+    assert ((x.double() - exact).abs() <= tol).all(), ((x.double() - exact).abs() / tol).max()
+
+
+@pytest.mark.parametrize("device", DEVICES)
+@pytest.mark.parametrize("nesterov", [False, True])
+@pytest.mark.parametrize("grad_dtype", [torch.float32, torch.bfloat16])
+def test_momentum(device, nesterov, grad_dtype):
+    torch.manual_seed(0)
+    mu = 0.95
+    outs = views(device)
+    ms = [torch.randn(o.numel(), device=device) for o in outs]
+    gs = [torch.randn(o.numel(), device=device).to(grad_dtype) for o in outs]
+    exact_ms = [float(torch.tensor(mu, dtype=torch.float32)) * m.double() + g.double() for m, g in zip(ms, gs)]
+    xllm_ops.muon_momentum_(ms, gs, outs, mu, nesterov)
+    for m, exact, g, o in zip(ms, exact_ms, gs, outs):
+        assert_within_ulp(m, exact)
+        # the output is the bf16 rounding of an fp32 value (itself an fma of the stored m when nesterov)
+        u = float(torch.tensor(mu, dtype=torch.float32)) * m.double() + g.double() if nesterov else m.double()
+        assert_within_ulp(o.reshape(-1), u)
+
+
+@pytest.mark.parametrize("device", DEVICES)
+@pytest.mark.parametrize("lr, wd", [(0.02, 0.1), (3e-4, 0.06)])
+def test_update(device, lr, wd):
+    torch.manual_seed(0)
+    us = views(device)
+    for u in us:
+        u.copy_(torch.randn(u.shape))
+    ps = [torch.randn(u.numel(), device=device) for u in us]
+    scales = [0.5 + i for i in range(len(us))]
+    f32 = lambda v: float(torch.tensor(v, dtype=torch.float32))  # the kernels take lr, wd and scales in fp32
+    inner = [f32(wd) * p.double() + f32(s) * u.reshape(-1).double() for p, u, s in zip(ps, us, scales)]
+    exact = [p.double() - f32(lr) * i for p, i in zip(ps, inner)]
+    xllm_ops.muon_update_(ps, us, scales, lr, wd)
+    for p, e, i in zip(ps, exact, inner):
+        # one rounding of p - lr inner, and lr times the fp32 rounding of inner = wd p + s u
+        assert_within_ulp(p, e, extra=f32(lr) * i.abs() * 2 ** -24)
+
+
+def test_many_tensors_split_over_launches():
+    """More tensors than one launch's argument list holds (256)."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA only")
+    us = [torch.randn(3, 8, 5, device="cuda").bfloat16() for _ in range(600)]
+    ps = [torch.randn(120, device="cuda") for _ in us]
+    exact = [p.double() - 0.125 * u.reshape(-1).double() for p, u in zip(ps, us)]
+    xllm_ops.muon_update_(ps, us, [1.0] * len(us), 0.125, 0.0)
+    for p, e in zip(ps, exact):
+        assert_within_ulp(p, e)
