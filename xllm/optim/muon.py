@@ -149,19 +149,20 @@ def _split(sizes: List[int], limit: int) -> List[Tuple[int, int]]:
 def newton_schulz(X: Tensor, eps: float) -> Tensor:
     """Orthogonalize a stack of matrices [B, m, n] with m <= n: X = U S V^T -> U V^T, in fp16.
 
-    X is scaled by ||(X X^T)^2||_F^(1/4) >= s_max, from the first step's A A: within m^(1/8) of s_max where
-    ||X||_F is within m^(1/2), so the small singular values start higher. 5% more for rounding. The first step
-    runs in bf16, whose range holds A A of the Frobenius-normalized X; the others in fp16, whose 3 more
-    mantissa bits bring the singular values to 1 within ~1e-3. The polynomial's sums run in the epilogues of
-    cuBLAS GEMMs (baddbmm's alpha / beta), accumulated in fp32."""
+    X is scaled by s = ||(X X^T)^2||_F^(1/4) >= s_max, 5% more for rounding: within m^(1/8) of s_max where
+    ||X||_F is within m^(1/2), so the small singular values start higher. s comes from the first step's A A,
+    so the scaling folds into that step: p(X / s) = (a X + (b A / s^2 + c A A / s^4) X) / s, an m x m
+    polynomial and the division of the output, which also casts it to fp16. The first step runs in bf16, whose
+    range holds any X; the others in fp16, whose 3 more mantissa bits bring the singular values to 1 within
+    ~1e-3. The polynomial's sums run in the epilogues of cuBLAS GEMMs (baddbmm's alpha / beta), accumulated
+    in fp32."""
     X = X.to(torch.bfloat16)
-    X = X / (X.norm(dim=(-2, -1), keepdim=True) + eps)
     A = X @ X.mT
     AA = A @ A
-    s = (AA.float().norm(dim=(-2, -1), keepdim=True).pow(0.25) * 1.05 + eps).to(X.dtype)
-    X, A, AA = X / s, A / s**2, AA / s**4
+    s = AA.float().norm(dim=(-2, -1), keepdim=True).pow(0.25) * 1.05 + eps
     (a, b, c), *steps = NS_COEFFS
-    X = torch.baddbmm(X, AA.mul(c).add_(A, alpha=b), X, beta=a).half()  # the first step, from A and A A above
+    B = (AA.float() * (c / s**4) + A.float() * (b / s**2)).bfloat16()
+    X = torch.div(torch.baddbmm(X, B, X, beta=a), s, out=torch.empty_like(X, dtype=torch.half))
     for a, b, c in steps:
         A = X @ X.mT
         B = torch.baddbmm(A, A, A, beta=b, alpha=c)  # b A + c A A
