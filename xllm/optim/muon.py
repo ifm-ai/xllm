@@ -54,7 +54,7 @@ from torch.distributed.device_mesh import DeviceMesh
 from torch.optim import Optimizer
 from torch.optim.adamw import adamw
 
-from xllm.config import OptimConf
+from xllm.config import MuPConf, OptimConf
 from .muon_spec import Block, MuonSpec, muon_spec, register_muon
 
 
@@ -213,24 +213,33 @@ class Muon(Optimizer):
         self,
         muon_params: List[nn.Parameter],
         specs: List[MuonSpec],
-        adamw_params: List[nn.Parameter],
+        adamw_params: List,
         mesh: DeviceMesh,
         cfg: OptimConf,
         tp_group: Optional[dist.ProcessGroup] = None,
+        muon_group: Optional[Dict] = None,
+        update_scales: Optional[List[float]] = None,
     ):
         """specs[i]: how muon_params[i] maps to Newton-Schulz matrices (register_muon / muon_spec).
+        adamw_params: the AdamW parameters, or AdamW param groups: dicts whose keys replace the configured values.
         tp_group: the tensor-parallel group, if any: the params are then each rank's TP-local shard. Muon
-        works over the plane of the dp mesh x TP group, TP being one more way the weight is sharded."""
+        works over the plane of the dp mesh x TP group, TP being one more way the weight is sharded.
+        muon_group: keys that replace the configured values of the Muon group.
+        update_scales[i]: factor on the update of muon_params[i], not on its weight decay; default 1.
+        mup sets the param groups, muon_group and update_scales (xllm/optim/mup.py)."""
         # one compiled Newton-Schulz per stack shape (block shapes x batch sizes), far more than the default 8
         torch._dynamo.config.cache_size_limit = max(torch._dynamo.config.cache_size_limit, 64)
         defaults = dict(weight_decay=cfg.weight_decay, eps=cfg.epsilon)
+        adamw_groups = adamw_params if adamw_params and isinstance(adamw_params[0], dict) else [dict(params=adamw_params)]
         super().__init__(
             [
-                dict(params=muon_params, lr=cfg.muon_lr, algorithm="muon", **group_hparams(cfg, "muon")),
-                dict(params=adamw_params, lr=cfg.lr, algorithm="adamw", **group_hparams(cfg, "adamw")),
+                dict(params=muon_params, lr=cfg.muon_lr, algorithm="muon", **group_hparams(cfg, "muon")) | (muon_group or {}),
+                *(dict(lr=cfg.lr, algorithm="adamw", **group_hparams(cfg, "adamw")) | group for group in adamw_groups),
             ],
             defaults,
         )
+        self.update_scales = [1.0] * len(muon_params) if update_scales is None else list(update_scales)
+        assert len(self.update_scales) == len(muon_params)
         self._plan([tuple(p.shape) for p in muon_params], specs, mesh, tp_group, cfg.muon_batch_numel)
 
     # ---- plan: built once from the global shapes, identical on every rank ----
@@ -460,7 +469,8 @@ class Muon(Optimizer):
     @torch.no_grad()
     def _muon_step(self, group: Dict):
         eps = group["eps"]
-        scales = [self._scale(*fans, group["adjust_lr"]) for fans in self._fans[group["block_scale"]]]
+        scales = [self._scale(*fans, group["adjust_lr"]) * update_scale
+                  for fans, update_scale in zip(self._fans[group["block_scale"]], self.update_scales)]
         params = [group["params"][i] for i in self.remote]
         plans = [self.plans[i] for i in self.remote]
         updates = [torch.empty_like(_local(p), dtype=torch.bfloat16) for p in params]
@@ -547,8 +557,9 @@ def _warn_unregistered(model: nn.Module, muon_ids: set):
         logger.warning(f"Muon: unregistered weights use AdamW: {dict(missed)}")
 
 
-def build_muon(model: nn.Module, cfg: OptimConf) -> Optimizer:
-    """The model must be wrapped with FSDP2; Muon works over the shard dimension of the mesh its parameters live on."""
+def build_muon(model: nn.Module, cfg: OptimConf, mup: Optional[MuPConf] = None) -> Optimizer:
+    """The model must be wrapped with FSDP2; Muon works over the shard dimension of the mesh its parameters live on.
+    mup: Complete(d)P param groups and update scales (xllm/optim/mup.py)."""
     from xllm.distributed import get_model_parallel_group, get_model_parallel_world_size
     tp = get_model_parallel_world_size()
     muon_params, specs, names, adamw_params = split_muon_params(model)
@@ -565,8 +576,19 @@ def build_muon(model: nn.Module, cfg: OptimConf) -> Optimizer:
     mesh = muon_params[0].device_mesh
     shard_mesh = mesh if mesh.ndim == 1 else mesh["dp"]
     tp_group = get_model_parallel_group() if tp > 1 else None
-    optimizer = Muon(muon_params, specs, adamw_params, shard_mesh, cfg, tp_group=tp_group)
+    muon_group = update_scales = None
+    if mup is not None:
+        from .mup import param_groups
+        muon_group, adamw_params, update_scales = param_groups(model, cfg, mup, muon_params)
+    optimizer = Muon(muon_params, specs, adamw_params, shard_mesh, cfg, tp_group=tp_group,
+                     muon_group=muon_group, update_scales=update_scales)
+    adamw = [p for group in optimizer.param_groups if group["algorithm"] == "adamw" for p in group["params"]]
     logger.info(f"Muon: {len(muon_params)} matrices / {len(optimizer.blocks)} blocks (scale={cfg.muon_block_scale}) / "
-                f"{sum(p.numel() for p in muon_params)} params; AdamW: {len(adamw_params)} tensors / "
-                f"{sum(p.numel() for p in adamw_params)} params")
+                f"{sum(p.numel() for p in muon_params)} params; AdamW: {len(adamw)} tensors / "
+                f"{sum(p.numel() for p in adamw)} params")
+    if mup is not None:
+        for group in optimizer.param_groups:
+            logger.info(f"mup {group['role']}: {len(group['params'])} tensors, lr {group['lr']:.6g}, "
+                        f"eps {group['eps']:.6g}, weight_decay {group['weight_decay']:.6g}")
+        logger.info(f"mup: wo / fc2 updates x c = {mup.branch_scale:.6g}")
     return optimizer

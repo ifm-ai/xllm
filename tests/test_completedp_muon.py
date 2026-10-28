@@ -110,3 +110,293 @@ def test_out_projection_init_is_c_times_plain_init():
         else:
             assert torch.equal(b, a), name
     assert n_out == 2 * 4
+
+
+# ---- optimizer: Muon on CPU (single rank, as in tests/test_muon_missing_grad.py) ----
+
+import torch.nn.functional as F
+from torch import nn
+
+import xllm.optim.muon as muon
+from xllm.optim import mup as mup_lib
+from xllm.optim import restore_optimizer_config
+from xllm.optim.muon_spec import register_muon
+
+
+class LocalMesh:
+    def get_group(self):
+        return None
+
+    def size(self):
+        return 1
+
+    def get_local_rank(self):
+        return 0
+
+
+@pytest.fixture
+def cpu_transport(monkeypatch):
+    # the real gather / scatter and update code on CPU: only the CUDA allocation, the compiled kernel
+    # wrapper and the single-rank transport are replaced
+    real_empty = torch.empty
+
+    def cpu_empty(*args, **kwargs):
+        if kwargs.get("device") == "cuda":
+            kwargs["device"] = "cpu"
+        return real_empty(*args, **kwargs)
+
+    monkeypatch.setattr(torch, "empty", cpu_empty)
+    monkeypatch.setattr(muon, "newton_schulz5", muon.newton_schulz5._torchdynamo_orig_callable)
+    return lambda opt: monkeypatch.setattr(opt, "_exchange", lambda send, shapes: lambda: send)
+
+
+# m_N = 2, m_L = 4, alpha = 0.5: c = 0.5 and m_L^(alpha - 1) = 0.5
+CFG = OptimConf(optimizer="muon", lr=1e-3, muon_lr=0.02, epsilon=1e-8, weight_decay=0.1, muon_weight_decay=0.05)
+
+
+def resolved_mup(**kw):
+    mup = mup_conf(**kw)
+    mup.resolve(model_conf(), OptimConf(optimizer="muon"))
+    return mup
+
+
+def build_muon_cpu(model, cfg, mup, cpu_transport):
+    """build_muon without FSDP2: the same split, groups and update scales."""
+    muon_params, specs, _, adamw_params = muon.split_muon_params(model)
+    muon_group = update_scales = None
+    if mup is not None:
+        muon_group, adamw_params, update_scales = mup_lib.param_groups(model, cfg, mup, muon_params)
+    opt = muon.Muon(muon_params, specs, adamw_params, LocalMesh(), cfg, muon_group=muon_group,
+                    update_scales=update_scales)
+    cpu_transport(opt)
+    return opt
+
+
+def transformer(num_layers=4):
+    from xllm.models.transformer import Transformer
+    cfg = model_conf(model_dim=64, num_layers=num_layers, num_heads=4, ffn_hidden_dim=128, vocab_size=32,
+                     apply_rmsnorm=True, qknorm=True, swiglu=True, init_std=0.02)
+    torch.manual_seed(0)
+    return Transformer(cfg, SimpleNamespace(bos_id=1, eos_id=2, pad_id=0))
+
+
+def test_param_groups_on_transformer(cpu_transport):
+    model = transformer()
+    opt = build_muon_cpu(model, CFG, resolved_mup(), cpu_transport)
+    groups = {g["role"]: g for g in opt.param_groups}
+    # role: (lr, eps, weight_decay, tensors)
+    want = {
+        "muon": (0.01, 1e-8, 0.05, 4 * 7),  # wq wk wv wo fc1 fc2 fc3
+        "embed": (1e-3, 5e-9, 0.1, 1),
+        "hidden_vector": (5e-4, 2.5e-9, 0.1, 4 * 3),  # attention norm, query_norm, FFN norm
+        "final_norm": (1e-3, 1e-8, 0.1, 1),
+        "readout": (5e-4, 1e-8, 0.2, 1),
+    }
+    assert list(groups) == list(want)
+    for role, (lr, eps, wd, n) in want.items():
+        g = groups[role]
+        assert math.isclose(g["lr"], lr, rel_tol=1e-12), role
+        assert math.isclose(g["eps"], eps, rel_tol=1e-12), role
+        assert math.isclose(g["weight_decay"], wd, rel_tol=1e-12), role
+        assert len(g["params"]) == n, role
+        assert g["algorithm"] == ("muon" if role == "muon" else "adamw")
+    assert groups["muon"]["momentum"] == CFG.muon_momentum and groups["embed"]["betas"] == (CFG.beta1, CFG.beta2)
+    assert groups["embed"]["params"][0] is model.embed.weight
+    assert groups["readout"]["params"][0] is model.output.output.weight
+    out = {id(layer.attention.wo.weight) for layer in model.layers} | {id(layer.nffn.fc2.weight) for layer in model.layers}
+    assert [s for p, s in zip(groups["muon"]["params"], opt.update_scales) if id(p) in out] == [0.5] * 8
+    assert [s for p, s in zip(groups["muon"]["params"], opt.update_scales) if id(p) not in out] == [1.0] * 20
+
+
+def test_param_groups_reject_unassigned_matrices(cpu_transport):
+    model = transformer(num_layers=1)
+    model.layers[0].attention.extra = nn.Parameter(torch.zeros(4, 4))
+    with pytest.raises(ValueError, match="layers.0.attention.extra"):
+        build_muon_cpu(model, CFG, resolved_mup(), cpu_transport)
+    model = transformer(num_layers=1)
+    del vars(model.layers[0].attention.wo)["muon_specs"]
+    with pytest.raises(ValueError, match="wo and FFN fc2 must be Muon"):
+        build_muon_cpu(model, CFG, resolved_mup(), cpu_transport)
+
+
+def test_mup_at_base_size_matches_plain_muon(cpu_transport):
+    """m_N = m_L = 1: every factor is 1, so mup's groups step exactly like the two plain groups."""
+    plain, scaled = transformer(), transformer()
+    mup = mup_conf(base_model_dim=512, base_num_layers=16)
+    mup.resolve(model_conf(), OptimConf(optimizer="muon"))
+    assert (mup.width_multiplier, mup.depth_multiplier, mup.branch_scale) == (1.0, 1.0, 1.0)
+    opts = [build_muon_cpu(plain, CFG, None, cpu_transport), build_muon_cpu(scaled, CFG, mup, cpu_transport)]
+    assert [len(o.param_groups) for o in opts] == [2, 5]
+    torch.manual_seed(1)
+    for _ in range(3):
+        grads = [torch.randn_like(p) for p in plain.parameters()]
+        for model, opt in zip((plain, scaled), opts):
+            for p, g in zip(model.parameters(), grads):
+                p.grad = g.clone()
+            opt.step()
+    for (name, a), b in zip(plain.named_parameters(), scaled.parameters()):
+        assert torch.equal(a, b), name
+
+
+def test_restore_applies_role_values(cpu_transport):
+    mup = resolved_mup()
+    opt = build_muon_cpu(transformer(num_layers=1), CFG, mup, cpu_transport)
+    for group in opt.param_groups:  # what an optimizer state reload from another config would leave
+        group.update(lr=1.0, initial_lr=1.0, eps=1.0, weight_decay=1.0)
+    cfg = OptimConf(**dict(vars(CFG), muon_lr=0.04, lr=2e-3))
+    restore_optimizer_config(opt, cfg, mup)
+    groups = {g["role"]: g for g in opt.param_groups}
+    for role, (initial_lr, eps, wd) in {"muon": (0.02, 1e-8, 0.05), "embed": (2e-3, 5e-9, 0.1),
+                                        "hidden_vector": (1e-3, 2.5e-9, 0.1), "final_norm": (2e-3, 1e-8, 0.1),
+                                        "readout": (1e-3, 1e-8, 0.2)}.items():
+        g = groups[role]
+        assert math.isclose(g["initial_lr"], initial_lr, rel_tol=1e-12), role
+        assert math.isclose(g["eps"], eps, rel_tol=1e-12), role
+        assert math.isclose(g["weight_decay"], wd, rel_tol=1e-12), role
+        assert g["lr"] == 1.0  # the current lr comes from the scheduler (train.py)
+
+
+# ---- the fold: training with c in wo / fc2 equals training with a residual multiplier c ----
+
+class Norm(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.weight = nn.Parameter(torch.zeros(dim))  # gain 1 + weight, as GroupRMSNorm
+
+    def forward(self, x):
+        return F.rms_norm(x, (x.shape[-1],)) * (1 + self.weight)
+
+
+class Attention(nn.Module):
+    def __init__(self, dim, heads, multiplier):
+        super().__init__()
+        self.multiplier = multiplier
+        self.norm, self.query_norm = Norm(dim), Norm(dim)
+        self.wq = nn.Linear(dim, dim, bias=False)
+        self.wo = nn.Linear(dim, dim, bias=False)
+        register_muon(self.wq, layout="(h d) m", fan_out="d", fan_in="m", d=dim // heads)
+        register_muon(self.wo)
+
+    def forward(self, x):
+        h = self.query_norm(self.wq(self.norm(x)))
+        h = torch.cumsum(h, dim=1) / torch.arange(1, x.shape[1] + 1)[:, None]  # causal mixing over tokens
+        return x + self.multiplier * self.wo(torch.tanh(h))
+
+
+class FFN(nn.Module):
+    def __init__(self, dim, hidden, multiplier):
+        super().__init__()
+        self.multiplier = multiplier
+        self.norm = Norm(dim)
+        self.fc1 = nn.Linear(dim, hidden, bias=False)
+        self.fc2 = nn.Linear(hidden, dim, bias=False)
+        register_muon(self.fc1)
+        register_muon(self.fc2)
+
+    def forward(self, x):
+        return x + self.multiplier * self.fc2(F.silu(self.fc1(self.norm(x))))
+
+
+class Toy(nn.Module):
+    """The parameter layout of xllm's Transformer (embed, layers.*.attention / nffn, output.final_norm /
+    output) with a residual multiplier on the branches, runnable on CPU."""
+
+    def __init__(self, multiplier=1.0, vocab=48, dim=32, hidden=64, heads=4, num_layers=4):
+        super().__init__()
+        self.embed = nn.Embedding(vocab, dim)
+        self.layers = nn.ModuleList()
+        for _ in range(num_layers):
+            block = nn.Module()
+            block.attention, block.nffn = Attention(dim, heads, multiplier), FFN(dim, hidden, multiplier)
+            self.layers.append(block)
+        self.output = nn.Module()
+        self.output.final_norm, self.output.output = Norm(dim), nn.Linear(dim, vocab, bias=False)
+
+    def forward(self, tokens, targets):
+        x = self.embed(tokens)
+        for layer in self.layers:
+            x = layer.nffn(layer.attention(x))
+        logits = self.output.output(self.output.final_norm(x))
+        return F.cross_entropy(logits.flatten(0, 1), targets.flatten())
+
+
+FOLD_CFG = OptimConf(optimizer="muon", lr=1e-2, muon_lr=0.05, epsilon=1e-8, weight_decay=0.1, muon_weight_decay=0.2)
+
+
+def fold_pair(c):
+    """multiplier: residual multiplier c, plain init. folded: no multiplier, wo / fc2 x c."""
+    torch.manual_seed(0)
+    multiplier = Toy(multiplier=c)
+    folded = Toy()
+    folded.load_state_dict(multiplier.state_dict())
+    with torch.no_grad():
+        for p in mup_lib.out_projections(folded):
+            p.mul_(c)
+    return multiplier, folded
+
+
+def train(model, opt, steps, clip=None):
+    torch.manual_seed(1)
+    losses = []
+    for _ in range(steps):
+        tokens = torch.randint(0, 48, (4, 16))
+        loss = model(tokens, (5 * tokens + 1) % 48)  # learnable targets
+        loss.backward()
+        if clip is not None:
+            clip(model)
+        opt.step()
+        opt.zero_grad()
+        losses.append(loss.item())
+    return losses
+
+
+def fold_error(multiplier, folded, c):
+    """Max relative difference between the folded weights and the multiplier run's (wo / fc2 x c)."""
+    out = {id(p) for p in mup_lib.out_projections(folded)}
+    err = 0.0
+    for a, b in zip(multiplier.parameters(), folded.parameters()):
+        want = a * c if id(b) in out else a
+        err = max(err, ((b - want).abs().max() / want.abs().max()).item())
+    return err
+
+
+def float64_newton_schulz(monkeypatch):
+    """Muon's Newton-Schulz iteration and update buffers in float64 instead of bf16."""
+    def newton_schulz(X, eps):
+        X = X.double()
+        X = X / (X.norm(dim=(-2, -1), keepdim=True) + eps)
+        for a, b, c in muon.NS_COEFFS:
+            A = X @ X.mT
+            X = a * X + (b * A + c * (A @ A)) @ X
+        return X
+    empty = torch.empty  # already moved to CPU by cpu_transport
+    monkeypatch.setattr(torch, "empty", lambda *a, **k: empty(*a, **(k | {"dtype": torch.float64}
+                                                                     if k.get("dtype") == torch.bfloat16 else k)))
+    monkeypatch.setattr(muon, "newton_schulz5", newton_schulz)
+
+
+@pytest.mark.parametrize("alpha, tol", [(0.5, 0.0), (0.8, 1e-5)])
+def test_folded_training_matches_residual_multiplier(cpu_transport, monkeypatch, alpha, tol):
+    """alpha 0.5: c = 0.5, a power of two, so Muon's bf16 Newton-Schulz gives bit-identical runs.
+    alpha 0.8: c = 4^-0.8 = 0.33. bf16 rounds c * x differently from x, so bf16 Newton-Schulz differs at its own
+    error (about 2% of the largest element); in float64 the runs agree up to rounding."""
+    mup = resolved_mup(alpha=alpha)  # m_N = 2, m_L = 4: every role scaled
+    c = mup.branch_scale
+    if tol:
+        float64_newton_schulz(monkeypatch)
+    multiplier, folded = fold_pair(c)
+    opt_multiplier = build_muon_cpu(multiplier, FOLD_CFG, mup, cpu_transport)
+    opt_multiplier.update_scales = [1.0] * len(opt_multiplier.update_scales)  # c sits in the forward instead
+    opt_folded = build_muon_cpu(folded, FOLD_CFG, mup, cpu_transport)
+    assert sorted(set(opt_folded.update_scales)) == sorted({c, 1.0})
+    losses = [train(multiplier, opt_multiplier, 8), train(folded, opt_folded, 8)]
+    assert max(abs(a - b) for a, b in zip(*losses)) <= tol * losses[0][0]
+    assert losses[0][-1] < losses[0][0] - 0.5  # it trains
+    assert fold_error(multiplier, folded, c) <= tol
+
+    # negative control: without the update scale the folded run drifts away
+    _, unscaled = fold_pair(c)
+    opt_unscaled = build_muon_cpu(unscaled, FOLD_CFG, mup, cpu_transport)
+    opt_unscaled.update_scales = [1.0] * len(opt_unscaled.update_scales)
+    train(unscaled, opt_unscaled, 8)
+    assert fold_error(multiplier, unscaled, c) > 0.1
