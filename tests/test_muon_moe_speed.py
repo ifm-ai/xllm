@@ -28,9 +28,8 @@ TP = int(os.environ.get("TP", "1"))
 LAYERS = int(os.environ.get("LAYERS", "4"))
 EXPERTS, INTER, MODEL = 128, 768, 2560
 WARMUP, ITERS = 3, 10
-BATCH = int(os.environ.get("BATCH", "250000000"))  # muon_batch_numel, elements of a rank; one layer's experts are 3 * 128 * 768 * 2560 / 8 = 94M at TP x dp = 8
 CFG = OptimConf(optimizer="muon", lr=1e-3, muon_lr=0.02, muon_momentum=0.95, weight_decay=0.01,
-                beta1=0.9, beta2=0.95, epsilon=1e-8, muon_batch_numel=BATCH)
+                beta1=0.9, beta2=0.95, epsilon=1e-8)
 
 
 def build(mesh, whole):
@@ -90,7 +89,7 @@ def main():
         print(f"EP(TP)={TP} dp={dp} layers={LAYERS} experts={EXPERTS} local weights/layer="
               f"{3 * EXPERTS // TP * INTER * MODEL / dp / 1e6:.1f}M params per rank")
         for name, blocks, remote, ms in rows:
-            print(f"SPEED TP={TP} dp={dp} {name:12s} blocks={blocks:5d} remote matrices={remote:3d} step {ms:8.2f} ms  "
+            print(f"SPEED TP={TP} dp={dp} {name:12s} blocks={blocks:5d} remote blocks={remote:4d} step {ms:8.2f} ms  "
                   f"({ms / base:5.2f}x adamw)", flush=True)
     dist.destroy_process_group()
 

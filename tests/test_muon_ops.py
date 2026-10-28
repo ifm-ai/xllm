@@ -11,7 +11,7 @@ BLOCKS = [(1, 96, 160), (6, 64, 96), (3, 100, 40), (2, 33, 70), (1, 0, 8)]
 
 
 def views(device):
-    """bf16 blocks of packed buffers (muon._packed), the last one 2 bytes off 16-byte alignment (no vector access)."""
+    """bf16 blocks of packed buffers (muon._pack), the last one 2 bytes off 16-byte alignment (no vector access)."""
     out = [torch.empty(shape, dtype=torch.bfloat16, device=device) for shape in BLOCKS]
     count, rows, cols = BLOCKS[1]
     out.append(torch.empty(count * rows * cols + 1, dtype=torch.bfloat16, device=device)[1:].view(BLOCKS[1]))

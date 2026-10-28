@@ -39,7 +39,10 @@ def cpu_transport(monkeypatch):
         return real_empty(*args, **kwargs)
 
     monkeypatch.setattr(torch, "empty", cpu_empty)
-    return lambda opt: monkeypatch.setattr(opt, "_exchange", lambda send, shapes: lambda: send)
+
+    def exchange(send, recv):  # one rank: what I send is what I receive
+        return lambda: [d.copy_(s) for ds, ss in zip(recv, send) for d, s in zip(ds, ss)]
+    return lambda opt: monkeypatch.setattr(opt, "_exchange", exchange)
 
 
 @pytest.mark.parametrize("nesterov", [False, True])

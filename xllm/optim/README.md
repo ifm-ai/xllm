@@ -52,8 +52,9 @@
 - **Step.**
   1. Each rank updates the momentum of its own shard (`m = mu * m + g`; Nesterov by default, `--optim.muon_nesterov`)
      and casts the update direction to bf16.
-  2. A fixed plan assigns every block to one rank (balanced by size). One all-to-all sends
-     each block's pieces to its owner.
+  2. A fixed plan assigns every block to one rank (the one storing most of it, then the least loaded). One
+     all-to-all sends each block's pieces to its owner; meanwhile the blocks that lie whole in their owner's
+     shard (heads, experts) are orthogonalized without communication, one buffer per block shape at a time.
   3. The owner stacks its blocks by shape and runs one batched
      Newton-Schulz per shape (Polar Express coefficients), then scales each block by its own shape
      (`--optim.muon_block_scale block`, default) or its whole matrix's shape (`matrix`):

@@ -2,7 +2,6 @@
 
     torchrun --nproc_per_node=8 tests/test_muon_moe.py            # FSDP2 only (TP=1)
     TP=2 torchrun --nproc_per_node=8 tests/test_muon_moe.py       # experts split over a 2-way model-parallel group
-    BATCH=1 torchrun --nproc_per_node=8 tests/test_muon_moe.py    # every local weight in a batch of its own (muon_batch_numel)
 
 The reference is written without MuonSpec: it cuts the full weight into n experts with a plain
 reshape and orthogonalizes each one on its own, so a wrong layout, fan_out / fan_in or tp_dim in
@@ -31,9 +30,8 @@ from xllm.optim.muon import build_muon, newton_schulz
 TP = int(os.environ.get("TP", "1"))
 STEPS = 3
 TOL = 3e-2
-BATCH = int(os.environ.get("BATCH", "0"))  # muon_batch_numel: 0 = one batch per block shape (weight1, weight2 transposed, weight3), 1 = one weight per batch
 CFG = OptimConf(optimizer="muon", lr=1e-3, muon_lr=0.02, muon_momentum=0.95, weight_decay=0.0,
-                beta1=0.9, beta2=0.95, epsilon=1e-8, muon_batch_numel=BATCH)
+                beta1=0.9, beta2=0.95, epsilon=1e-8)
 # (experts, inter dim, model dim): inter != model, so every expert is a non-square matrix
 SHAPES = [(8, 96, 160), (16, 96, 160), (6, 64, 96), (2, 64, 96)]
 
@@ -108,19 +106,20 @@ def check_synthetic(n, inter, dim, dp_mesh):
     init = [gather(p) for p in params]
     opt = build_muon(model, CFG)
     assert len(opt.blocks) == 3 * n, (len(opt.blocks), n)
-    # a weight is local on a rank (batched, no communication) if the rank's shard holds whole experts only
+    # a weight's blocks are all local on a rank (no communication) if the rank's shard holds whole experts only
     def whole(rows):
         total, i = n // TP * rows, dp_mesh.get_local_rank()
         step = math.ceil(total / dp_mesh.size())  # FSDP2's torch.chunk of the TP-local weight
         r0, r1 = min(i * step, total), min((i + 1) * step, total)
         return r1 > r0 and r0 % rows == 0 and r1 % rows == 0
     expert_rows = {id(model.weight1): inter, id(model.weight2): dim, id(model.weight3): inter}
+    cut = {b.param for b in opt.remote} | {i for sends in opt.send for i, _ in sends}  # weights with a remote block here
     for i, p in enumerate(opt.param_groups[0]["params"]):
-        assert (i not in opt.remote) == whole(expert_rows[id(p)]), (n, inter, dim, i)
+        assert (i not in cut) == whole(expert_rows[id(p)]), (n, inter, dim, i)
     everywhere = all(math.ceil(n // TP * rows / dp_mesh.size()) % rows == 0 for rows in expert_rows.values())
     assert opt.has_remote == (not everywhere), (n, opt.has_remote)
-    log(f"TP={TP} experts={n}: rank 0 batches {[len(b) for b in opt.batches]}, {len(opt.remote)} remote weights; "
-        f"all-to-alls: {opt.has_remote}")
+    log(f"TP={TP} experts={n}: rank 0 local blocks {[len(blocks) for _, blocks in opt.local]}, "
+        f"{len(opt.remote)} remote blocks owned; all-to-alls: {opt.has_remote}")
 
     torch.manual_seed(1)  # the same on every rank
     grads = [[torch.randn_like(w) for w in init] for _ in range(STEPS)]
