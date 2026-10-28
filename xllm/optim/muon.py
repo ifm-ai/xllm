@@ -56,7 +56,7 @@ from torch.optim import Optimizer
 from torch.optim.adamw import adamw
 
 from xllm.config import OptimConf
-from .muon_spec import Block, MuonSpec, muon_spec, register_muon
+from .muon_spec import Block, MuonSpec
 
 
 logger = getLogger()
@@ -147,31 +147,34 @@ def _split(sizes: List[int], limit: int) -> List[Tuple[int, int]]:
 
 
 def newton_schulz(X: Tensor, eps: float) -> Tensor:
-    """Orthogonalize a stack of matrices [B, m, n]: X = U S V^T -> U V^T, in fp16, in X's layout.
+    """U S V^T -> U V^T for a stack of matrices [B, m, n], in fp16, in X's layout.
 
-    The steps run on the smaller Gram matrix A: X X^T with X <- a X + B X, or for a tall X, X^T X with
-    X <- a X + X B (B is symmetric), so a tall X is never transposed into a copy.
-    X is scaled by s = ||A^2||_F^(1/4) >= s_max, 5% more for rounding: within k^(1/8) of s_max where ||X||_F
-    is within k^(1/2) (k = min(m, n)), so the small singular values start higher. s comes from the first
-    step's A A, so the scaling folds into that step: p(X / s) = (a X + (b A / s^2 + c A A / s^4) X) / s, a
-    k x k polynomial and the division of the output, which also casts it to fp16. The first step runs in bf16,
-    whose range holds any X; the others in fp16, whose 3 more mantissa bits bring the singular values to 1
-    within ~1e-3. The polynomial's sums run in the epilogues of cuBLAS GEMMs (baddbmm's alpha / beta),
-    accumulated in fp32."""
-    if X.shape[-2] > X.shape[-1]:  # tall: A = X^T X, a X + X B
-        gram, poly = lambda X: X.mT @ X, lambda X, B, a: torch.baddbmm(X, X, B, beta=a)
-    else:  # A = X X^T, a X + B X
-        gram, poly = lambda X: X @ X.mT, lambda X, B, a: torch.baddbmm(X, B, X, beta=a)
+    - The steps run on the smaller Gram matrix: A = X X^T and X <- a X + B X, or for a tall X, A = X^T X and
+      X <- a X + X B (B = b A + c A^2 is symmetric), so a tall X is never transposed into a copy.
+    - X is scaled by s = ||A^2||_F^(1/4) >= s_max, 5% more for rounding: within k^(1/8) of s_max where ||X||_F
+      is within k^(1/2) (k = min(m, n)), so the small singular values start higher. s comes from the first
+      step's A^2 and folds into that step: p(X / s) = (a X + (b / s^2 A + c / s^4 A^2) X) / s.
+    - The first step runs in bf16, whose range holds any X; the others in fp16, whose 3 more mantissa bits
+      bring the singular values to 1 within ~1e-3. The sums run in cuBLAS epilogues (baddbmm's alpha / beta),
+      accumulated in fp32."""
+    tall = X.shape[-2] > X.shape[-1]
+
+    def gram(X):
+        return X.mT @ X if tall else X @ X.mT
+
+    def step(X, B, a):  # a X + X B, or a X + B X
+        return torch.baddbmm(X, X, B, beta=a) if tall else torch.baddbmm(X, B, X, beta=a)
+
     X = X.to(torch.bfloat16)
     A = gram(X)
     AA = A @ A
     s = AA.float().norm(dim=(-2, -1), keepdim=True).pow(0.25) * 1.05 + eps
-    (a, b, c), *steps = NS_COEFFS
+    (a, b, c), *rest = NS_COEFFS
     B = (AA.float() * (c / s**4) + A.float() * (b / s**2)).bfloat16()
-    X = torch.div(poly(X, B, a), s, out=torch.empty_like(X, dtype=torch.half))
-    for a, b, c in steps:
+    X = torch.div(step(X, B, a), s, out=torch.empty_like(X, dtype=torch.half))
+    for a, b, c in rest:
         A = gram(X)
-        X = poly(X, torch.baddbmm(A, A, A, beta=b, alpha=c), a)  # B = b A + c A A
+        X = step(X, torch.baddbmm(A, A, A, beta=b, alpha=c), a)  # B = b A + c A^2
     return X
 
 
@@ -252,7 +255,7 @@ class Muon(Optimizer):
         """specs[i]: how muon_params[i] maps to Newton-Schulz matrices (register_muon / muon_spec).
         tp_group: the tensor-parallel group, if any: the params are then each rank's TP-local shard. Muon
         works over the plane of the dp mesh x TP group, TP being one more way the weight is sharded."""
-        defaults = dict(weight_decay=cfg.weight_decay, eps=cfg.epsilon)
+        defaults = dict(eps=cfg.epsilon)
         super().__init__(
             [
                 dict(params=muon_params, lr=cfg.muon_lr, algorithm="muon", **group_hparams(cfg, "muon")),
@@ -441,7 +444,7 @@ class Muon(Optimizer):
 
     def _momentum(self, params: List[Tensor], group: Dict, out: List[Tensor]):
         """Momentum update on the local shards (one batched call); writes the bf16 update directions into `out`,
-        tensors of the shards' sizes in any shape (row-major order), zeros for the params without a gradient."""
+        contiguous tensors of the shards' sizes in any shape, zeros for the params without a gradient."""
         # Keep the fixed communication plan, but do not create or decay state for
         # a parameter without a gradient (the same semantics as AdamW).
         mu = group["momentum"]
@@ -454,8 +457,6 @@ class Muon(Optimizer):
             if "momentum" not in state:
                 state["momentum"] = torch.zeros_like(p, dtype=torch.float32)
             live.append(i)
-        if not live:
-            return
         xllm_ops.muon_momentum_([_local(self.state[params[i]]["momentum"]) for i in live],
                                 [_local(params[i].grad) for i in live], [out[i] for i in live], mu, group["nesterov"])
 
@@ -514,7 +515,7 @@ class Muon(Optimizer):
     @staticmethod
     def _update(params: List[Tensor], updates: List[Tensor], scales: List[float], lr: float, wd: float):
         """W <- W - lr (wd W + scale update), in fp32, for the params with a gradient; updates[i] holds the
-        shard's elements in any shape (its blocks)."""
+        shard's elements, contiguous, in any shape (its blocks)."""
         live = [i for i, p in enumerate(params) if p.grad is not None]
         xllm_ops.muon_update_([_local(params[i]) for i in live], [updates[i] for i in live],
                               [scales[i] for i in live], lr, wd)

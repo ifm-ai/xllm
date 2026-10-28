@@ -4,6 +4,8 @@
 #include <c10/util/BFloat16.h>
 #include <c10/util/Half.h>
 
+#include <initializer_list>
+
 #include "ops/muon.h"
 
 namespace xllm {
@@ -11,78 +13,182 @@ namespace ops {
 
 namespace {
 
-// Each block steps one piece of one tensor of a list, with kThreads threads, in one of two ways:
-// - linear, when all of the entry's tensors are contiguous: kChunk consecutive elements, kVec per access
-//   (16 bytes of bf16) where the pointers are 16-byte aligned;
-// - tiled, otherwise (a transposed block, a slice of some columns): a kTile x kTile tile through shared
-//   memory, read along the source's contiguous dimension and written along the destination's (a warp per
-//   row or column of it, so 64 consecutive bf16 per access).
+// One launch steps a list of tensors; each CUDA block takes one piece of one tensor, with kThreads threads:
+// - kChunk consecutive elements of contiguous tensors, kVec per access (16 bytes of bf16) where every pointer
+//   is 16-byte aligned;
+// - for a copy between strided views (a slice of some columns, a transposed block), a kTile x kTile tile
+//   through shared memory, read along the source's contiguous dimension and written along the destination's
+//   (a warp per row or column of it, so 64 consecutive bf16 per access).
 constexpr int kThreads = 256;
 constexpr int kVec = 8;
 constexpr int kChunk = kThreads * kVec * 2;
 constexpr int kTile = 64;
 
-struct Entry {
-  StridedView view;  // the bf16 / destination side, which the tiles follow
-  int64_t numel;
-  bool linear;
-  bool aligned;
-};
-
-// The lists travel as kernel arguments, within CUDA's 32 KB parameter limit (sm_70+).
-constexpr int kMaxTensors = 224;
-struct TensorList {
-  int64_t size;
-  int64_t first_block[kMaxTensors + 1];  // block offsets, and the total
-  Entry entry[kMaxTensors];
-  float* contiguous[kMaxTensors];         // momentum / param
-  const void* grad[kMaxTensors];          // momentum only
-  c10::BFloat16* strided[kMaxTensors];    // out / update
-  float scale[kMaxTensors];               // update only
-};
-
-constexpr int kMaxCopies = 160;
-struct CopyList {
-  int64_t size;
-  int64_t first_block[kMaxCopies + 1];
-  Entry entry[kMaxCopies];  // of dst
-  void* dst[kMaxCopies];
-  const void* src[kMaxCopies];
-  StridedView src_view[kMaxCopies];
-};
-
 __host__ __device__ int64_t DivUp(int64_t a, int64_t b) { return (a + b - 1) / b; }
 
-int64_t NumBlocks(const Entry& e) {
-  const StridedView& v = e.view;
-  return e.linear ? DivUp(e.numel, kChunk) : v.B * DivUp(v.R, kTile) * DivUp(v.C, kTile);
-}
-
-// The block blockIdx.x of a list: its tensor and, within it, the block's index.
-template <typename List>
-__device__ void LocateBlock(const List& a, int& t, int64_t& local) {
-  const int64_t id = blockIdx.x;
-  int lo = 0, hi = static_cast<int>(a.size) - 1;  // the last tensor whose first block is <= id
-  while (lo < hi) {
-    const int mid = (lo + hi + 1) / 2;
-    if (a.first_block[mid] <= id) {
-      lo = mid;
-    } else {
-      hi = mid - 1;
+bool Aligned(std::initializer_list<const void*> ps) {
+  for (const void* p : ps) {
+    if (reinterpret_cast<uintptr_t>(p) % 16 != 0) {
+      return false;
     }
   }
-  t = lo;
-  local = id - a.first_block[lo];
+  return true;
 }
 
-// A tiled block's batch, first row and first column.
-struct Tile {
-  int64_t b, r0, c0;
+// The tensors of a launch and their first blocks. Lists travel as kernel arguments (__grid_constant__),
+// within the 32 KB CUDA allows them (12.1+, sm_70+).
+template <int N>
+struct Blocks {
+  static constexpr int kCapacity = N;
+  int size;
+  int64_t first[N + 1];  // tensor i's blocks are [first[i], first[i + 1])
+
+  // The tensor of block blockIdx.x, and the block's index within it.
+  __device__ int Locate(int64_t& local) const {
+    const int64_t id = blockIdx.x;
+    int lo = 0, hi = size - 1;  // the last tensor whose first block is <= id
+    while (lo < hi) {
+      const int mid = (lo + hi + 1) / 2;
+      if (first[mid] <= id) {
+        lo = mid;
+      } else {
+        hi = mid - 1;
+      }
+    }
+    local = id - first[lo];
+    return lo;
+  }
 };
 
-__device__ Tile LocateTile(const StridedView& v, int64_t local) {
-  const int64_t tiles_c = DivUp(v.C, kTile), per_batch = DivUp(v.R, kTile) * tiles_c, in_batch = local % per_batch;
-  return {local / per_batch, in_batch / tiles_c * kTile, in_batch % tiles_c * kTile};
+// Contiguous fp32 tensors (momentum / param), each paired with a contiguous tensor of its numel (grad / update).
+struct TensorList : Blocks<512> {
+  int64_t numel[kCapacity];
+  bool vec[kCapacity];
+  float* fp32[kCapacity];
+  const void* other[kCapacity];
+  c10::BFloat16* out[kCapacity];  // momentum only
+  float scale[kCapacity];         // update only
+};
+
+struct CopyList : Blocks<192> {
+  StridedView dst_view[kCapacity], src_view[kCapacity];
+  bool linear[kCapacity];  // both contiguous
+  bool vec[kCapacity];
+  void* dst[kCapacity];
+  const void* src[kCapacity];
+};
+
+// Fills a List with the tensors i < n for which fill(list, i, j) returns a positive number of blocks, as entry j,
+// and runs launch(list) on each full list and on the last.
+template <typename List, typename Fill, typename Launch>
+void ForEachList(size_t n, Fill fill, Launch launch) {
+  List a;
+  a.size = 0;
+  a.first[0] = 0;
+  for (size_t i = 0; i < n; ++i) {
+    const int64_t blocks = fill(a, i, a.size);
+    if (blocks == 0) {
+      continue;
+    }
+    a.first[a.size + 1] = a.first[a.size] + blocks;
+    if (++a.size == List::kCapacity) {
+      launch(a);
+      a.size = 0;
+    }
+  }
+  if (a.size > 0) {
+    launch(a);
+  }
+}
+
+// f(k, n, vec) for the runs of n <= kVec elements from k in chunk `local` of a numel-element tensor; vec: a
+// whole run at aligned pointers, one 16-byte access per tensor.
+template <typename F>
+__device__ void ForEachRun(int64_t numel, bool aligned, int64_t local, F f) {
+  const int64_t end = (local + 1) * kChunk < numel ? (local + 1) * kChunk : numel;
+  for (int64_t k = local * kChunk + threadIdx.x * kVec; k < end; k += kThreads * kVec) {
+    const int n = end - k < kVec ? static_cast<int>(end - k) : kVec;
+    f(k, n, aligned && n == kVec);
+  }
+}
+
+// n elements at p as floats, and back.
+template <typename T>
+__device__ void Load(const T* p, int n, bool vec, float (&v)[kVec]) {
+  if (vec && sizeof(T) == 4) {
+    const float4 x = reinterpret_cast<const float4*>(p)[0], y = reinterpret_cast<const float4*>(p)[1];
+    v[0] = x.x, v[1] = x.y, v[2] = x.z, v[3] = x.w, v[4] = y.x, v[5] = y.y, v[6] = y.z, v[7] = y.w;
+  } else if (vec) {
+    const uint4 raw = *reinterpret_cast<const uint4*>(p);
+    const T* h = reinterpret_cast<const T*>(&raw);
+#pragma unroll
+    for (int j = 0; j < kVec; ++j) {
+      v[j] = static_cast<float>(h[j]);
+    }
+  } else {
+    for (int j = 0; j < n; ++j) {
+      v[j] = static_cast<float>(p[j]);
+    }
+  }
+}
+
+template <typename T>
+__device__ void Store(T* p, int n, bool vec, const float (&v)[kVec]) {
+  if (vec && sizeof(T) == 4) {
+    reinterpret_cast<float4*>(p)[0] = make_float4(v[0], v[1], v[2], v[3]);
+    reinterpret_cast<float4*>(p)[1] = make_float4(v[4], v[5], v[6], v[7]);
+  } else if (vec) {
+    uint4 raw;
+    T* h = reinterpret_cast<T*>(&raw);
+#pragma unroll
+    for (int j = 0; j < kVec; ++j) {
+      h[j] = T(v[j]);
+    }
+    *reinterpret_cast<uint4*>(p) = raw;
+  } else {
+    for (int j = 0; j < n; ++j) {
+      p[j] = T(v[j]);
+    }
+  }
+}
+
+template <typename G, bool kNesterov>
+__global__ void __launch_bounds__(kThreads) MuonMomentumKernel(const __grid_constant__ TensorList a, float mu) {
+  int64_t local;
+  const int t = a.Locate(local);
+  float* m = a.fp32[t];
+  const G* g = static_cast<const G*>(a.other[t]);
+  c10::BFloat16* out = a.out[t];
+  ForEachRun(a.numel[t], a.vec[t], local, [&](int64_t k, int n, bool vec) {
+    float mv[kVec] = {}, gv[kVec] = {}, uv[kVec];
+    Load(m + k, n, vec, mv);
+    Load(g + k, n, vec, gv);
+#pragma unroll
+    for (int j = 0; j < kVec; ++j) {
+      mv[j] = __fmaf_rn(mu, mv[j], gv[j]);
+      uv[j] = kNesterov ? __fmaf_rn(mu, mv[j], gv[j]) : mv[j];
+    }
+    Store(m + k, n, vec, mv);
+    Store(out + k, n, vec, uv);
+  });
+}
+
+__global__ void __launch_bounds__(kThreads) MuonUpdateKernel(const __grid_constant__ TensorList a, float lr, float wd) {
+  int64_t local;
+  const int t = a.Locate(local);
+  float* p = a.fp32[t];
+  const c10::BFloat16* u = static_cast<const c10::BFloat16*>(a.other[t]);
+  const float s = a.scale[t];
+  ForEachRun(a.numel[t], a.vec[t], local, [&](int64_t k, int n, bool vec) {
+    float pv[kVec] = {}, uv[kVec] = {};
+    Load(p + k, n, vec, pv);
+    Load(u + k, n, vec, uv);
+#pragma unroll
+    for (int j = 0; j < kVec; ++j) {
+      pv[j] = __fmaf_rn(-lr, __fmaf_rn(wd, pv[j], __fmul_rn(s, uv[j])), pv[j]);  // p - lr (wd p + s u)
+    }
+    Store(p + k, n, vec, pv);
+  });
 }
 
 // f(ri, ci) for the elements of a tile, each warp's lanes running along its rows (rows_fast) or its columns.
@@ -98,226 +204,37 @@ __device__ void ForEachInTile(bool rows_fast, F f) {
   }
 }
 
-// kVec elements at p (16-byte aligned) as floats, and back.
-template <typename T>
-__device__ void LoadVec(const T* p, float (&v)[kVec]) {
-  if constexpr (sizeof(T) == 4) {
-    const float4 x = reinterpret_cast<const float4*>(p)[0], y = reinterpret_cast<const float4*>(p)[1];
-    v[0] = x.x, v[1] = x.y, v[2] = x.z, v[3] = x.w, v[4] = y.x, v[5] = y.y, v[6] = y.z, v[7] = y.w;
-  } else {
-    const uint4 raw = *reinterpret_cast<const uint4*>(p);
-    const T* h = reinterpret_cast<const T*>(&raw);
-    for (int j = 0; j < kVec; ++j) {
-      v[j] = static_cast<float>(h[j]);
-    }
-  }
-}
-
-template <typename T>
-__device__ void StoreVec(T* p, const float (&v)[kVec]) {
-  if constexpr (sizeof(T) == 4) {
-    reinterpret_cast<float4*>(p)[0] = make_float4(v[0], v[1], v[2], v[3]);
-    reinterpret_cast<float4*>(p)[1] = make_float4(v[4], v[5], v[6], v[7]);
-  } else {
-    uint4 raw;
-    T* h = reinterpret_cast<T*>(&raw);
-    for (int j = 0; j < kVec; ++j) {
-      h[j] = T(v[j]);
-    }
-    *reinterpret_cast<uint4*>(p) = raw;
-  }
-}
-
-// f(k, n) for the elements k .. k + kVec of a linear block, n = kVec where they can be accessed as one vector
-// (aligned, all within the tensor), else 0.
-template <typename F>
-__device__ void ForEachLinear(const Entry& e, int64_t local, F f) {
-  const int64_t end = (local + 1) * kChunk < e.numel ? (local + 1) * kChunk : e.numel;
-  for (int64_t k = local * kChunk + threadIdx.x * kVec; k < end; k += kThreads * kVec) {
-    f(k, e.aligned && k + kVec <= e.numel ? kVec : 0);
-  }
-}
-
-template <typename G, bool kNesterov>
-__global__ void __launch_bounds__(kThreads) MuonMomentumKernel(const __grid_constant__ TensorList a, float mu) {
-  __shared__ float tile[kTile][kTile + 1];
-  int t;
-  int64_t local;
-  LocateBlock(a, t, local);
-  const Entry& e = a.entry[t];
-  float* m = a.contiguous[t];
-  const G* g = static_cast<const G*>(a.grad[t]);
-  c10::BFloat16* out = a.strided[t];
-  const auto step = [mu](float& mk, float gk) {  // m <- mu m + g, then the update direction
-    mk = __fmaf_rn(mu, mk, gk);
-    return kNesterov ? __fmaf_rn(mu, mk, gk) : mk;
-  };
-  if (e.linear) {
-    ForEachLinear(e, local, [&](int64_t k, int n) {
-      if (n == kVec) {
-        float mv[kVec], gv[kVec], uv[kVec];
-        LoadVec(m + k, mv);
-        LoadVec(g + k, gv);
-        for (int j = 0; j < kVec; ++j) {
-          uv[j] = step(mv[j], gv[j]);
-        }
-        StoreVec(m + k, mv);
-        StoreVec(out + k, uv);
-      } else {
-        for (int64_t i = k; i < k + kVec && i < e.numel; ++i) {
-          float mk = m[i];
-          out[i] = c10::BFloat16(step(mk, static_cast<float>(g[i])));
-          m[i] = mk;
-        }
-      }
-    });
-    return;
-  }
-  // tiled: m and g along columns, out along its contiguous dimension
-  const StridedView& v = e.view;
-  const Tile x = LocateTile(v, local);
-  ForEachInTile(false, [&](int ri, int ci) {
-    const int64_t r = x.r0 + ri, c = x.c0 + ci;
-    if (r < v.R && c < v.C) {
-      const int64_t k = (x.b * v.R + r) * v.C + c;
-      float mk = m[k];
-      tile[ri][ci] = step(mk, static_cast<float>(g[k]));
-      m[k] = mk;
-    }
-  });
-  __syncthreads();
-  ForEachInTile(v.sC != 1, [&](int ri, int ci) {
-    const int64_t r = x.r0 + ri, c = x.c0 + ci;
-    if (r < v.R && c < v.C) {
-      out[x.b * v.sB + r * v.sR + c * v.sC] = c10::BFloat16(tile[ri][ci]);
-    }
-  });
-}
-
-__global__ void __launch_bounds__(kThreads) MuonUpdateKernel(const __grid_constant__ TensorList a, float lr, float wd) {
-  __shared__ float tile[kTile][kTile + 1];
-  int t;
-  int64_t local;
-  LocateBlock(a, t, local);
-  const Entry& e = a.entry[t];
-  float* p = a.contiguous[t];
-  const c10::BFloat16* u = a.strided[t];
-  const float s = a.scale[t];
-  const auto step = [lr, wd, s](float pk, float uk) {  // p - lr (wd p + s u)
-    return __fmaf_rn(-lr, __fmaf_rn(wd, pk, __fmul_rn(s, uk)), pk);
-  };
-  if (e.linear) {
-    ForEachLinear(e, local, [&](int64_t k, int n) {
-      if (n == kVec) {
-        float pv[kVec], uv[kVec];
-        LoadVec(p + k, pv);
-        LoadVec(u + k, uv);
-        for (int j = 0; j < kVec; ++j) {
-          pv[j] = step(pv[j], uv[j]);
-        }
-        StoreVec(p + k, pv);
-      } else {
-        for (int64_t i = k; i < k + kVec && i < e.numel; ++i) {
-          p[i] = step(p[i], static_cast<float>(u[i]));
-        }
-      }
-    });
-    return;
-  }
-  // tiled: u along its contiguous dimension, p along columns
-  const StridedView& v = e.view;
-  const Tile x = LocateTile(v, local);
-  ForEachInTile(v.sC != 1, [&](int ri, int ci) {
-    const int64_t r = x.r0 + ri, c = x.c0 + ci;
-    if (r < v.R && c < v.C) {
-      tile[ri][ci] = static_cast<float>(u[x.b * v.sB + r * v.sR + c * v.sC]);
-    }
-  });
-  __syncthreads();
-  ForEachInTile(false, [&](int ri, int ci) {
-    const int64_t r = x.r0 + ri, c = x.c0 + ci;
-    if (r < v.R && c < v.C) {
-      const int64_t k = (x.b * v.R + r) * v.C + c;
-      p[k] = step(p[k], tile[ri][ci]);
-    }
-  });
-}
-
 template <typename S, typename D>
 __global__ void __launch_bounds__(kThreads) BatchedCopyKernel(const __grid_constant__ CopyList a) {
   __shared__ float tile[kTile][kTile + 1];
-  int t;
   int64_t local;
-  LocateBlock(a, t, local);
-  const Entry& e = a.entry[t];
+  const int t = a.Locate(local);
   const S* src = static_cast<const S*>(a.src[t]);
   D* dst = static_cast<D*>(a.dst[t]);
-  if (e.linear) {
-    ForEachLinear(e, local, [&](int64_t k, int n) {
-      if (n == kVec) {
-        float v[kVec];
-        LoadVec(src + k, v);
-        StoreVec(dst + k, v);
-      } else {
-        for (int64_t i = k; i < k + kVec && i < e.numel; ++i) {
-          dst[i] = D(static_cast<float>(src[i]));
-        }
-      }
+  const StridedView &dv = a.dst_view[t], &sv = a.src_view[t];
+  if (a.linear[t]) {
+    ForEachRun(dv.B * dv.R * dv.C, a.vec[t], local, [&](int64_t k, int n, bool vec) {
+      float v[kVec];
+      Load(src + k, n, vec, v);
+      Store(dst + k, n, vec, v);
     });
     return;
   }
-  const StridedView &dv = e.view, &sv = a.src_view[t];
-  const Tile x = LocateTile(dv, local);
+  const int64_t tiles_c = DivUp(dv.C, kTile), per_batch = DivUp(dv.R, kTile) * tiles_c;
+  const int64_t b = local / per_batch, r0 = local % per_batch / tiles_c * kTile, c0 = local % tiles_c * kTile;
   ForEachInTile(sv.sC != 1, [&](int ri, int ci) {
-    const int64_t r = x.r0 + ri, c = x.c0 + ci;
+    const int64_t r = r0 + ri, c = c0 + ci;
     if (r < dv.R && c < dv.C) {
-      tile[ri][ci] = static_cast<float>(src[x.b * sv.sB + r * sv.sR + c * sv.sC]);
+      tile[ri][ci] = static_cast<float>(src[b * sv.sB + r * sv.sR + c * sv.sC]);
     }
   });
   __syncthreads();
   ForEachInTile(dv.sC != 1, [&](int ri, int ci) {
-    const int64_t r = x.r0 + ri, c = x.c0 + ci;
+    const int64_t r = r0 + ri, c = c0 + ci;
     if (r < dv.R && c < dv.C) {
-      dst[x.b * dv.sB + r * dv.sR + c * dv.sC] = D(tile[ri][ci]);
+      dst[b * dv.sB + r * dv.sR + c * dv.sC] = D(tile[ri][ci]);
     }
   });
-}
-
-bool Aligned(const void* p) { return reinterpret_cast<uintptr_t>(p) % 16 == 0; }
-
-// Fills Lists with the non-empty entries i, tiled by views[i] and linear if all tensors[.][i] are contiguous
-// (vector accesses if they are all aligned); fill(list, i, j) sets entry j's pointers. Runs launch(list) on
-// each full list and on the last.
-template <typename List, typename Fill, typename Launch>
-void ForEachList(const std::vector<torch::Tensor>& views, const std::vector<std::vector<torch::Tensor>>& tensors,
-                 Fill fill, Launch launch) {
-  constexpr int64_t kMax = sizeof(List::entry) / sizeof(Entry);
-  List a;
-  a.size = 0;
-  a.first_block[0] = 0;
-  for (size_t i = 0; i < views.size(); ++i) {
-    if (views[i].numel() == 0) {
-      continue;
-    }
-    const int j = static_cast<int>(a.size++);
-    Entry& e = a.entry[j];
-    e.view = AsStridedView(views[i]);
-    e.numel = views[i].numel();
-    e.linear = e.aligned = true;
-    for (const auto& list : tensors) {
-      e.linear &= list[i].is_contiguous();
-      e.aligned &= Aligned(list[i].data_ptr());
-    }
-    fill(a, i, j);
-    a.first_block[j + 1] = a.first_block[j] + NumBlocks(e);
-    if (a.size == kMax) {
-      launch(a);
-      a.size = 0;
-    }
-  }
-  if (a.size > 0) {
-    launch(a);
-  }
 }
 
 }  // namespace
@@ -328,15 +245,18 @@ void MuonMomentumCUDA(const std::vector<torch::Tensor>& momentum, const std::vec
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
   AT_DISPATCH_FLOATING_TYPES_AND2(at::kBFloat16, at::kHalf, grad[0].scalar_type(), "MuonMomentumCUDA", [&] {
     ForEachList<TensorList>(
-        out, {momentum, grad, out},
+        momentum.size(),
         [&](TensorList& a, size_t i, int j) {
-          a.contiguous[j] = momentum[i].data_ptr<float>();
-          a.grad[j] = grad[i].data_ptr<scalar_t>();
-          a.strided[j] = out[i].data_ptr<c10::BFloat16>();
+          a.numel[j] = momentum[i].numel();
+          a.fp32[j] = momentum[i].data_ptr<float>();
+          a.other[j] = grad[i].data_ptr<scalar_t>();
+          a.out[j] = out[i].data_ptr<c10::BFloat16>();
+          a.vec[j] = Aligned({a.fp32[j], a.other[j], a.out[j]});
+          return DivUp(a.numel[j], kChunk);
         },
         [&](const TensorList& a) {
           const auto kernel = nesterov ? MuonMomentumKernel<scalar_t, true> : MuonMomentumKernel<scalar_t, false>;
-          kernel<<<a.first_block[a.size], kThreads, 0, stream>>>(a, static_cast<float>(mu));
+          kernel<<<a.first[a.size], kThreads, 0, stream>>>(a, static_cast<float>(mu));
           C10_CUDA_KERNEL_LAUNCH_CHECK();
         });
   });
@@ -347,15 +267,18 @@ void MuonUpdateCUDA(const std::vector<torch::Tensor>& param, const std::vector<t
   const c10::cuda::CUDAGuard guard(param[0].device());
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
   ForEachList<TensorList>(
-      update, {param, update},
+      param.size(),
       [&](TensorList& a, size_t i, int j) {
-        a.contiguous[j] = param[i].data_ptr<float>();
-        a.strided[j] = update[i].data_ptr<c10::BFloat16>();
+        a.numel[j] = param[i].numel();
+        a.fp32[j] = param[i].data_ptr<float>();
+        a.other[j] = update[i].data_ptr<c10::BFloat16>();
         a.scale[j] = static_cast<float>(scale[i]);
+        a.vec[j] = Aligned({a.fp32[j], a.other[j]});
+        return DivUp(a.numel[j], kChunk);
       },
       [&](const TensorList& a) {
-        MuonUpdateKernel<<<a.first_block[a.size], kThreads, 0, stream>>>(a, static_cast<float>(lr),
-                                                                          static_cast<float>(weight_decay));
+        MuonUpdateKernel<<<a.first[a.size], kThreads, 0, stream>>>(a, static_cast<float>(lr),
+                                                                    static_cast<float>(weight_decay));
         C10_CUDA_KERNEL_LAUNCH_CHECK();
       });
 }
@@ -367,14 +290,19 @@ void BatchedCopyCUDA(const std::vector<torch::Tensor>& dst, const std::vector<to
     using S = scalar_t;
     AT_DISPATCH_REDUCED_FLOATING_TYPES(dst[0].scalar_type(), "BatchedCopyCUDA", [&] {
       ForEachList<CopyList>(
-          dst, {dst, src},
-          [&](CopyList& a, size_t i, int j) {
+          dst.size(),
+          [&](CopyList& a, size_t i, int j) -> int64_t {
+            const StridedView v = AsStridedView(dst[i]);
+            a.dst_view[j] = v;
+            a.src_view[j] = AsStridedView(src[i]);
             a.dst[j] = dst[i].data_ptr();
             a.src[j] = src[i].data_ptr();
-            a.src_view[j] = AsStridedView(src[i]);
+            a.linear[j] = dst[i].is_contiguous() && src[i].is_contiguous();
+            a.vec[j] = Aligned({a.dst[j], a.src[j]});
+            return a.linear[j] ? DivUp(dst[i].numel(), kChunk) : v.B * DivUp(v.R, kTile) * DivUp(v.C, kTile);
           },
           [&](const CopyList& a) {
-            BatchedCopyKernel<S, scalar_t><<<a.first_block[a.size], kThreads, 0, stream>>>(a);
+            BatchedCopyKernel<S, scalar_t><<<a.first[a.size], kThreads, 0, stream>>>(a);
             C10_CUDA_KERNEL_LAUNCH_CHECK();
           });
     });
