@@ -1,21 +1,20 @@
-"""xllm_extension's fused Muon momentum and update against the same formulas in fp64, on views like Muon's:
-shards, and blocks of packed bf16 buffers, transposed when tall. Each fp32 result must be within one ulp of
-the exact value (fused multiply-adds round once), each bf16 output within one bf16 ulp."""
+"""xllm_extension's Muon ops: the fused momentum and update against the same formulas in fp64, each fp32 result
+within one ulp of the exact value (fused multiply-adds round once) and each bf16 output within one bf16 ulp;
+the batched copy exactly, between the layouts Muon copies."""
 import pytest
 import torch
 import xllm_extension.ops as xllm_ops
 
 DEVICES = ["cpu"] + (["cuda"] if torch.cuda.is_available() else [])
-# (count, rows, cols) per tensor, as Muon packs them: one shard, heads, tall (transposed) blocks, odd sizes
+# (count, rows, cols) per tensor, as Muon packs them: one shard, heads, tall blocks, odd sizes
 BLOCKS = [(1, 96, 160), (6, 64, 96), (3, 100, 40), (2, 33, 70), (1, 0, 8)]
 
 
 def views(device):
-    """bf16 views of packed wide buffers, transposed for tall blocks (muon._packed)."""
-    out = []
-    for count, rows, cols in BLOCKS:
-        buf = torch.empty(count, min(rows, cols), max(rows, cols), dtype=torch.bfloat16, device=device)
-        out.append(buf.mT if rows > cols else buf)
+    """bf16 blocks of packed buffers (muon._packed), the last one 2 bytes off 16-byte alignment (no vector access)."""
+    out = [torch.empty(shape, dtype=torch.bfloat16, device=device) for shape in BLOCKS]
+    count, rows, cols = BLOCKS[1]
+    out.append(torch.empty(count * rows * cols + 1, dtype=torch.bfloat16, device=device)[1:].view(BLOCKS[1]))
     return out
 
 
@@ -63,7 +62,7 @@ def test_update(device, lr, wd):
 
 
 def test_many_tensors_split_over_launches():
-    """More tensors than one launch's argument list holds (256)."""
+    """More tensors than one launch's argument list holds (512)."""
     if not torch.cuda.is_available():
         pytest.skip("CUDA only")
     us = [torch.randn(3, 8, 5, device="cuda").bfloat16() for _ in range(600)]
@@ -75,8 +74,8 @@ def test_many_tensors_split_over_launches():
 
 
 def copy_pairs(device, src_dtype, dst_dtype):
-    """(dst, src) views of one shape in the layouts Muon copies between: slices of shards (some columns), blocks
-    of packed buffers (transposed when tall), contiguous all-to-all buffers."""
+    """(dst, src) views of one shape: slices of shards (some columns) and contiguous all-to-all buffers, as Muon
+    copies between, plus transposed blocks and unaligned buffers for the other paths."""
     pairs = []
     for count, rows, cols in BLOCKS:
         shape = (count, rows, cols)
