@@ -14,3 +14,5 @@ wandb
 tiktoken==0.8.0
 blobfile
 einops
+ninja
+packaging
