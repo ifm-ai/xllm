@@ -130,9 +130,9 @@ class Muon(Optimizer):
     def _plan(self, shapes: list[tuple[int, int]], specs: list[MuonSpec]):
         """From the whole weights' shapes, identical on every rank: blocks, with param and owner; fans[mode][i],
         (fan_out, fan_in) of weight i's blocks or of the weight. Then this rank's views of u and buffers: local, the
-        local blocks I own by shape; remote, the blocks I own with other ranks' slices, in buffers by shape; send,
-        my slices of the remote blocks, rank by rank, packed into send_buf for the all-to-all; recv, the ranks'
-        slices of the blocks I own, unpacked from recv_buf the same way."""
+        local blocks I own by shape; remote, the blocks I own with other ranks' slices, in buffers by shape; mine,
+        my slices of the remote blocks, rank by rank, packed into mine_buf for the all-to-all; theirs, the ranks'
+        slices of the blocks I own, unpacked from theirs_buf the same way."""
         self.fans = {mode: [spec.fans(shape, per_block=mode == "block") for spec, shape in zip(specs, shapes)]
                      for mode in ("block", "matrix")}
         self.blocks: list[Block] = [b for i, (spec, shape) in enumerate(zip(specs, shapes)) for b in spec.blocks(shape, i)]
@@ -150,49 +150,55 @@ class Muon(Optimizer):
         views, self.remote = _pack([b.shape for b in owned])
         slot = {id(b): view for b, view in zip(owned, views)}
         local = defaultdict(list)
-        send = [[] for _ in range(self.world)]
-        recv = [[] for _ in range(self.world)]
+        mine = [[] for _ in range(self.world)]
+        theirs = [[] for _ in range(self.world)]
         for b, held in zip(self.blocks, slices):
             for r, box in held:
                 if b.local and r == self.rank:
                     local[b.shape].append(self.u[b.param][box_index(box, regions[b.param][r])])
                 elif not b.local:
                     if r == self.rank:
-                        send[b.owner].append(self.u[b.param][box_index(box, regions[b.param][r])])
+                        mine[b.owner].append(self.u[b.param][box_index(box, regions[b.param][r])])
                     if b.owner == self.rank:
-                        recv[r].append(slot[id(b)][box_index(box, b.box)])
+                        theirs[r].append(slot[id(b)][box_index(box, b.box)])
         self.local = list(local.items())
-        self.send, self.send_buf, self.send_packed, self.send_sizes = _buffer(send)
-        self.recv, self.recv_buf, self.recv_packed, self.recv_sizes = _buffer(recv)
+        self.mine, self.mine_buf, self.mine_packed, self.mine_sizes = _buffer(mine)
+        self.theirs, self.theirs_buf, self.theirs_packed, self.theirs_sizes = _buffer(theirs)
 
     @torch.no_grad()
     def step(self, closure=None):
-        with torch.enable_grad():
-            loss = closure() if closure is not None else None
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
         for group in self.param_groups:
-            (self._muon_step if group["algorithm"] == "muon" else self._adamw_step)(group)
+            if group["algorithm"] == "muon":
+                self._muon_step(group)
+            else:
+                self._adamw_step(group)
         return loss
 
     def _muon_step(self, group: dict):
         eps = group["eps"]
         self._momentum(group)
-        if self.has_remote:  # my slices of the remote blocks to their owners
-            xllm_ops.batched_copy_(self.send_packed, self.send)
-            work = dist.all_to_all_single(self.recv_buf, self.send_buf, self.recv_sizes, self.send_sizes,
-                                          group=self.group, async_op=True)
-        for shape, views in self.local:  # meanwhile the local blocks, one buffer per shape
+        gather = None
+        if self.has_remote:  # my slices of the remote blocks go to their owners while the local blocks are done
+            xllm_ops.batched_copy_(self.mine_packed, self.mine)
+            gather = dist.all_to_all_single(self.theirs_buf, self.mine_buf, self.theirs_sizes, self.mine_sizes,
+                                            group=self.group, async_op=True)
+        for shape, views in self.local:  # one buffer per shape
             X = torch.empty(len(views), *shape, dtype=torch.bfloat16, device="cuda")
             xllm_ops.batched_copy_(list(X), views)
             X.copy_(newton_schulz(X, eps))
             xllm_ops.batched_copy_(views, list(X))
-        if self.has_remote:
-            work.wait()
-            xllm_ops.batched_copy_(self.recv, self.recv_packed)  # the remote blocks I own, assembled
+        if gather is not None:
+            gather.wait()  # the stream waits for the collective; the CPU goes on
+            xllm_ops.batched_copy_(self.theirs, self.theirs_packed)  # the remote blocks I own, assembled
             for X in self.remote:
                 X.copy_(newton_schulz(X, eps))
-            xllm_ops.batched_copy_(self.recv_packed, self.recv)  # and back the way they came
-            dist.all_to_all_single(self.send_buf, self.recv_buf, self.send_sizes, self.recv_sizes, group=self.group)
-            xllm_ops.batched_copy_(self.send, self.send_packed)
+            xllm_ops.batched_copy_(self.theirs_packed, self.theirs)  # and back the way they came
+            dist.all_to_all_single(self.mine_buf, self.theirs_buf, self.mine_sizes, self.theirs_sizes, group=self.group)
+            xllm_ops.batched_copy_(self.mine, self.mine_packed)
         self._update(group)
 
     def _momentum(self, group: dict):
