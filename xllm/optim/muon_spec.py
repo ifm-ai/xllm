@@ -24,6 +24,7 @@ class Block:
     c1: int
     param: int = -1  # index of its weight in the optimizer
     owner: int = 0  # rank that gathers the block and runs Newton-Schulz on it
+    local: bool = False  # the owner stores all of it: no communication
 
     @property
     def shape(self) -> tuple[int, int]:

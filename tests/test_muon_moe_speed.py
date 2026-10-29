@@ -80,7 +80,7 @@ def main():
             blocks, remote = 0, 0
         else:
             opt = build_muon(model, CFG)
-            blocks, remote = len(opt.blocks), len(opt.remote)
+            blocks, remote = len(opt.blocks), sum(not b.local for b in opt.blocks)
         rows.append((name, blocks, remote, timed(opt.step)))
         del opt, model
         torch.cuda.empty_cache()

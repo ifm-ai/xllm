@@ -113,13 +113,16 @@ def check_synthetic(n, inter, dim, dp_mesh):
         r0, r1 = min(i * step, total), min((i + 1) * step, total)
         return r1 > r0 and r0 % rows == 0 and r1 % rows == 0
     expert_rows = {id(model.weight1): inter, id(model.weight2): dim, id(model.weight3): inter}
-    cut = {b.param for b in opt.remote} | {i for sends in opt.send for i, _ in sends}  # weights with a remote block here
-    for i, p in enumerate(opt.param_groups[0]["params"]):
-        assert (i not in cut) == whole(expert_rows[id(p)]), (n, inter, dim, i)
+    name_of = {id(p): name for name, p in zip(names, params)}
+    for i, p in enumerate(opt.param_groups[0]["params"]):  # the blocks I store are all local iff my shard holds whole experts
+        spec = model.muon_specs[name_of[id(p)]]
+        region = spec.regions(spec.global_shape(tuple(p.shape), TP), opt.coords, opt.dp, opt.tp)[opt.rank]
+        stored = [b for b in opt.blocks if b.param == i and b.overlap(region)]
+        assert stored and all(b.local for b in stored) == whole(expert_rows[id(p)]), (n, inter, dim, name_of[id(p)])
     everywhere = all(math.ceil(n // TP * rows / dp_mesh.size()) % rows == 0 for rows in expert_rows.values())
     assert opt.has_remote == (not everywhere), (n, opt.has_remote)
-    log(f"TP={TP} experts={n}: rank 0 local blocks {[len(blocks) for _, blocks in opt.local]}, "
-        f"{len(opt.remote)} remote blocks owned; all-to-alls: {opt.has_remote}")
+    log(f"TP={TP} experts={n}: rank 0 local blocks {[len(views) for _, views in opt.local]}, "
+        f"{len(opt.remote)} buffers of remote blocks owned; all-to-alls: {opt.has_remote}")
 
     torch.manual_seed(1)  # the same on every rank
     grads = [[torch.randn_like(w) for w in init] for _ in range(STEPS)]
