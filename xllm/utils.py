@@ -168,12 +168,12 @@ def get_n_restarts(dump_dir: Path, rank: int) -> int:
 
 
 @contextlib.contextmanager
-def create_on_gpu():
+def create_on_gpu(dtype: torch.dtype = torch.float32):
     original_device = torch.get_default_device()
     original_dtype = torch.get_default_dtype()
     try:
         torch.set_default_device(torch.cuda.current_device())
-        torch.set_default_dtype(torch.float32)
+        torch.set_default_dtype(dtype)
         yield
     finally:
         torch.set_default_dtype(original_dtype)

@@ -5,6 +5,7 @@ from torch import nn
 from torch.optim import AdamW
 
 from xllm.config import OptimConf
+from .cpu_master_adamw import CPUMasterAdamW
 from .lr_scheduler import build_lr_scheduler
 
 
@@ -21,9 +22,9 @@ def rescale_grads(model: nn.Module, scale: float):
         p.grad /= scale
 
 
-def build_optimizer(model: nn.Module, cfg: OptimConf, total_steps: int, param_dtype: str):
+def build_optimizer(model: nn.Module, cfg: OptimConf, total_steps: int, param_dtype: str, offload: bool = False):
     logger.info("Starting build of optimizer...")
-    optimizer = AdamW(
+    optimizer = (CPUMasterAdamW if offload else AdamW)(
         model.parameters(),
         lr=cfg.lr,
         betas=(cfg.beta1, cfg.beta2),

@@ -252,7 +252,8 @@ class TopKRouter(torch.nn.Module):
         self.weight = Parameter(torch.empty(self.num_experts, self.input_size_per_partition))
         if bias:
             assert bias_update_rate is not None and bias_update_rate > 0.0, f"Invalid bias update rate: {bias_update_rate}"
-            self.register_buffer('bias', torch.zeros(self.num_experts))
+            # fp32 regardless of the default dtype: +-bias_update_rate steps vanish in bf16 once |bias| > ~0.25
+            self.register_buffer('bias', torch.zeros(self.num_experts, dtype=torch.float32))
         else:
             self.register_buffer("bias", None)
         self.bias_update_rate = bias_update_rate
