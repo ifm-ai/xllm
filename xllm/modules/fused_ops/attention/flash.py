@@ -1,4 +1,5 @@
 import os
+import re
 from typing import Optional, Tuple
 
 import torch
@@ -6,6 +7,21 @@ from torch.autograd.function import FunctionCtx
 
 FLASH_ATTN_3 = os.getenv("ENABLE_FLASH_ATTENTION_3", "FALSE").lower() == "true"
 FLASH_ATTN_4 = os.getenv("ENABLE_FLASH_ATTENTION_4", "FALSE").lower() == "true"
+
+
+def _varlen_fwd_extra_args(doc: Optional[str]) -> Optional[Tuple[int, ...]]:
+    """Trailing arguments for flash-attn 2's varlen_fwd, read from its pybind signature; None if unrecognized.
+
+    Builds that include Dao-AILab/flash-attention#2448 take a 22nd argument, num_splits; earlier builds take 21.
+    Both report version 2.8.4, so the package version cannot tell them apart. num_splits=0 keeps the kernel's
+    own heuristic.
+    """
+    first = (doc or "").split("\n", 1)[0]
+    n_args = len(set(re.findall(r"\barg(\d+):", first)))
+    return {21: (), 22: (0,)}.get(n_args)
+
+
+_VARLEN_FWD_EXTRA_ARGS: Optional[Tuple[int, ...]] = ()
 if FLASH_ATTN_4:
     from flash_attn.cute.interface import _flash_attn_fwd as _flash_attn_4_fwd
     from flash_attn.cute.interface import _flash_attn_bwd as _flash_attn_4_bwd
@@ -21,6 +37,7 @@ else:
     import flash_attn_2_cuda as flash_attn_gpu
     FLASH_ATTN_4 = False
     FLASH_ATTN_3 = False
+    _VARLEN_FWD_EXTRA_ARGS = _varlen_fwd_extra_args(flash_attn_gpu.varlen_fwd.__doc__)
 
 
 class FlashAttentionFunc(torch.autograd.Function):
@@ -172,10 +189,15 @@ def _flash_attention_varlen_fwd(
         )
         rng_state = None
     else:
+        if _VARLEN_FWD_EXTRA_ARGS is None:
+            raise RuntimeError(
+                "Unrecognized flash_attn_2_cuda.varlen_fwd signature: " + (flash_attn_gpu.varlen_fwd.__doc__ or "")[:200]
+            )
         out, softmax_lse, _, rng_state = flash_attn_gpu.varlen_fwd(
             q, k, v, None, cu_seqlens_q, cu_seqlens_k,
             None, None, None, None, max_seqlen_q, max_seqlen_k,
             dropout, scale, False, causal, -1, -1, 0.0, False, None,
+            *_VARLEN_FWD_EXTRA_ARGS,
         )
 
     return out, softmax_lse, rng_state
