@@ -84,3 +84,28 @@ def test_sync_masters_from_params_after_weights_are_loaded():
             g.copy_(w)  # what loading a checkpoint into the model does after the optimizer was built
     opt.sync_masters_from_params()
     assert all(torch.equal(m, w) for m, w in zip(opt.masters, loaded))
+
+
+def test_param_without_grad_is_not_updated():
+    gpu = [w.to("cuda", torch.bfloat16).requires_grad_() for w in _init()]
+    opt = CPUMasterAdamW(gpu, **KW)
+    before = [m.clone() for m in opt.masters]
+    (gpu[0].float().sum() + gpu[1].float().sum()).backward()  # gpu[2] gets no grad
+    opt.accumulate()
+    opt.step()
+    assert not torch.equal(opt.masters[0], before[0])
+    assert torch.equal(opt.masters[2], before[2])  # no weight decay, no momentum step
+    assert len(opt.state[opt.masters[2]]) == 0
+
+
+def test_loads_plain_adamw_state_and_keeps_the_fused_kernel():
+    params = [w.to("cuda").requires_grad_() for w in _init()]
+    plain = torch.optim.AdamW(params, **KW)
+    _loss(params, torch.randn(8, 256, device="cuda")).backward()
+    plain.step()
+    gpu = [p.detach().to(torch.bfloat16).requires_grad_() for p in params]
+    opt = CPUMasterAdamW(gpu, **KW)
+    opt.load_state_dict(plain.state_dict())
+    assert all(g["fused"] for g in opt.param_groups)
+    for m, p in zip(opt.masters, params):
+        assert torch.equal(opt.state[m]["exp_avg"], plain.state[p]["exp_avg"].cpu())

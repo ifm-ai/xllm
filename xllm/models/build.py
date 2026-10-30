@@ -142,9 +142,12 @@ def build_model_fsdp2(
         "reshard_after_forward": reshard_after_forward,
         "mp_policy": mixed_precision,
     }
+    if bf16_params:
+        # store the sharded params (and so their grads) in bf16; the fp32 masters live in the optimizer. The model is
+        # still built and initialized in fp32, and buffers stay fp32: wrap() casts only the params it shards.
+        fsdp_cfg["storage_dtype"] = torch.bfloat16
     model_cls = get_model_cls(model_cfg.arch)
-    # bf16_params: the sharded params (and so their grads) are stored in bf16; the fp32 masters live in the optimizer
-    with create_on_gpu(torch.bfloat16 if bf16_params else torch.float32):
+    with create_on_gpu():
         with enable_wrap(**fsdp_cfg):
             model = model_cls(model_cfg, tokenizer)
             model = wrap(model.cuda())

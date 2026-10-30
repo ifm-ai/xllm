@@ -1,13 +1,15 @@
 """AdamW with fp32 master weights and moment states in host memory (the ZeRO-Offload layout), for FSDP2 models
-whose sharded params and grads stay in bf16 on the GPU.
+whose sharded params and grads are stored in bf16 on the GPU.
 
-Per micro-batch, accumulate() copies the bf16 grad shards to pinned host buffers and adds them into fp32
-accumulators, so accumulation over micro-batches is exact and the GPU only ever holds one micro-batch of grads.
-The copy (side stream) and the add (host thread) overlap the next micro-batch's forward and backward.
-Per optimizer step: clip_grad_norm_() takes the norm of the host accumulators (one NCCL all-reduce), step() runs the
+After each backward, accumulate() copies the bf16 grad shards to pinned host memory and adds them into fp32
+accumulators, so accumulation over micro-batches is exact and the GPU holds one micro-batch of grads. The copy runs
+on a side stream and the add on a host thread; with several micro-batches per step both overlap the next one.
+Per optimizer step: clip_grad_norm_() takes the norm of the host accumulators (one all-reduce), step() runs the
 fused CPU AdamW kernel on the fp32 masters and copies the updated shards back to the GPU in bf16 once.
 Host memory per param: 4 (master) + 8 (moments) + 4 (accumulator) + 2 (pinned bf16 staging) bytes.
+The host AdamW uses torch's intra-op threads: torchrun sets OMP_NUM_THREADS=1 unless it is set.
 """
+import logging
 import threading
 
 import torch
@@ -15,6 +17,8 @@ import torch.distributed as dist
 from torch.distributed.tensor import DTensor
 
 from xllm.distributed.initialize import get_model_parallel_group, get_model_parallel_world_size
+
+logger = logging.getLogger()
 
 
 def _local(t: torch.Tensor) -> torch.Tensor:
@@ -30,41 +34,53 @@ class CPUMasterAdamW(torch.optim.AdamW):
         super().__init__(masters, fused=True, **kwargs)
         self.masters = masters
         self.acc = [torch.zeros_like(m) for m in masters]
-        self.stage = [torch.empty(l.shape, dtype=l.dtype, pin_memory=True) for l in locals_]
-        for m, a in zip(masters, self.acc):
-            m.grad = a
+        # one pinned buffer: per-tensor pinned allocations are rounded up to powers of two by the host allocator
+        flat = torch.empty(sum(l.numel() for l in locals_), dtype=torch.bfloat16, pin_memory=True)
+        self.stage = [st.view(l.shape) for st, l in zip(torch.split(flat, [l.numel() for l in locals_]), locals_)]
+        self.got_grad = [False] * len(masters)
         self.copy_stream = torch.cuda.Stream()
-        self.adder = None
-        dt = next((p for p in self.gpu_params if isinstance(p, DTensor)), None)
-        self.shard_groups = [] if dt is None else [
-            dt.device_mesh.get_group(d) for d, pl in enumerate(dt.placements) if pl.is_shard()
-        ]
+        self.adder, self.adder_error = None, None
+        dts = [p for p in self.gpu_params if isinstance(p, DTensor)]
+        if dts:
+            mesh, placements = dts[0].device_mesh, dts[0].placements
+            assert all(p.device_mesh == mesh and p.placements == placements for p in dts), \
+                "optimizer offload reduces the grad norm over one mesh; params are sharded on several"
+            self.shard_groups = [mesh.get_group(d) for d, pl in enumerate(placements) if pl.is_shard()]
+        else:
+            self.shard_groups = []
+        if torch.get_num_threads() == 1:
+            logger.warning("optimizer offload: torch uses 1 CPU thread (torchrun sets OMP_NUM_THREADS=1); "
+                           "set OMP_NUM_THREADS to the cores per rank or the host AdamW runs on one core")
 
     @torch.no_grad()
     def accumulate(self):
-        """Move this micro-batch's GPU grads into the fp32 host accumulators and free them on the GPU.
+        """Move this backward's GPU grads into the fp32 host accumulators and free them on the GPU.
 
-        Returns at once: the copies run on a side stream and the fp32 adds on a host thread, both overlapping the
-        next micro-batch. The previous micro-batch's adds finish first, since they read the same staging buffers.
+        Returns at once: the copies run on a side stream and the fp32 adds on a host thread. The previous adds
+        finish first, since they read the same staging buffers.
         """
         self._drain()
         self.copy_stream.wait_stream(torch.cuda.current_stream())
         live = []
         with torch.cuda.stream(self.copy_stream):
-            for p, st, a in zip(self.gpu_params, self.stage, self.acc):
+            for i, (p, st, a) in enumerate(zip(self.gpu_params, self.stage, self.acc)):
                 if p.grad is not None:
                     g = _local(p.grad)
                     st.copy_(g, non_blocking=True)
                     g.record_stream(self.copy_stream)  # the allocator keeps g until the copy is done
                     p.grad = None
+                    self.got_grad[i] = True
                     live.append((st, a))
         done = torch.cuda.Event()
         done.record(self.copy_stream)
 
         def add():
-            done.synchronize()
-            for st, a in live:
-                a.add_(st)
+            try:
+                done.synchronize()
+                for st, a in live:
+                    a.add_(st)
+            except BaseException as e:  # re-raised by _drain() on the training thread
+                self.adder_error = e
 
         self.adder = threading.Thread(target=add)
         self.adder.start()
@@ -73,6 +89,9 @@ class CPUMasterAdamW(torch.optim.AdamW):
         if self.adder is not None:
             self.adder.join()
             self.adder = None
+        if self.adder_error is not None:
+            e, self.adder_error = self.adder_error, None
+            raise RuntimeError("optimizer offload: grad accumulation on the host failed") from e
 
     @torch.no_grad()
     def _push_masters(self):
@@ -108,13 +127,17 @@ class CPUMasterAdamW(torch.optim.AdamW):
     @torch.no_grad()
     def step(self, closure=None):
         self._drain()
+        # params that got no grad since the last step are skipped, as AdamW skips params whose grad is None
+        for m, a, got in zip(self.masters, self.acc, self.got_grad):
+            m.grad = a if got else None
         loss = super().step(closure)
         self._push_masters()
         torch._foreach_zero_(self.acc)
+        self.got_grad = [False] * len(self.masters)
         return loss
 
     def zero_grad(self, set_to_none: bool = True):
-        # host accumulators are zeroed by step(); the GPU grads are freed by accumulate()
+        # the host accumulators are zeroed by step(); the GPU grads are freed by accumulate()
         for p in self.gpu_params:
             p.grad = None
 
@@ -126,15 +149,15 @@ class CPUMasterAdamW(torch.optim.AdamW):
 
     @torch.no_grad()
     def load_state_dict(self, state_dict):
+        """Restore a state saved by this class, or a plain AdamW state of the same params (its moments are
+        DTensors on the GPU; the masters then come from sync_masters_from_params(), i.e. the bf16 weights)."""
+        self._drain()
         state_dict = dict(state_dict)
         masters = state_dict.pop("masters", None)
-        # a plain AdamW state from a run without offload holds DTensor moments; the host optimizer keeps local shards
-        state_dict["state"] = {
-            k: {n: _local(v) for n, v in s.items()} for k, s in state_dict["state"].items()
-        }
+        state_dict["state"] = {k: {n: _local(v) for n, v in s.items()} for k, s in state_dict["state"].items()}
         super().load_state_dict(state_dict)
-        for m, a in zip(self.masters, self.acc):
-            m.grad = a
+        for group in self.param_groups:
+            group["fused"] = True  # load_state_dict takes the saved groups; a plain AdamW saved fused=None
         if masters is not None:
             for m, s in zip(self.masters, masters):
                 m.copy_(s)
