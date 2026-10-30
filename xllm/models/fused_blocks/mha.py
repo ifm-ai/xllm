@@ -22,6 +22,7 @@ from .utils import (
     flash_attention_bwd,
     recompute_flash_attention_lse,
     apply_rope,
+    apply_ropes
 )
 from .distributed import (
     reduce_scatter,
@@ -30,10 +31,12 @@ from .distributed import (
 
 
 def multihead_attention_fwd(
-    mx, freqs_cis, bos_mask, segments, wq, wk, wv, wr, wo, q_norm_w,
-    head_dim, rope_head_dim, local_heads, local_kv_heads, eps,
-    attn_gate_func, dropout, attention_dropout, hidden_dropout,
-    causal_attn_backend, stability_control, recompute_attn, layer_id=None,
+    layer_id, mx, freqs_cis, bos_mask, segments,
+    wq, wk, wv, wr, wo, q_norm_w, k_norm_w,
+    head_dim, rope_head_dim, local_heads, local_kv_heads,
+    attn_act_func, apply_attn_gate, attn_gate_func, eps,
+    dropout, attention_dropout, hidden_dropout,
+    causal_attn_backend, stability_control, recompute_attn,
 ):
     bsz, seq_len, _ = mx.shape
     attn_gate_fn = {"silu": F.silu, "softplus": partial(F.softplus, beta=math.log(2))}[attn_gate_func]
@@ -47,26 +50,40 @@ def multihead_attention_fwd(
 
     # compute k
     xk = F.linear(mx, wk)
-    xk_rstd = None
-    if q_norm_w is not None:
-        xk, xk_rstd = rmsnorm_fwd(xk, None, local_kv_heads, eps)
-    xk_ = rearrange(xk, 'b l (k s) -> b l k s', k=local_kv_heads)
-    xk_ = apply_rope(xk_, freqs_cis, head_dim, rope_head_dim, False)
+    xk_ = rmsnorm_fwd(xk, k_norm_w, local_kv_heads, eps)[0] if k_norm_w is not None else xk
+    xk_ = rearrange(xk_, 'b l (k s) -> b l k s', k=local_kv_heads)
+    if attn_act_func == 'softmax':
+        xk_ = apply_rope(xk_, freqs_cis, head_dim, rope_head_dim, False)
+    else:
+        assert attn_act_func == 'softdelta'
+        kq_ = xk_[:, :, :, :head_dim]
+        xk_ = xk_[:, :, :, head_dim:]
+        kq_, xk_ = apply_ropes(kq_, xk_, freqs_cis, head_dim, rope_head_dim, False)
     local_xk = xk_  # the all-gather below replaces xk_ with every context rank's keys
     xk_, handle_xk = all_gather(xk_, parallel_region='context', async_op=True)
 
     # compute q
     xq = F.linear(mx, wq)
-    if q_norm_w is not None:
-        xq_, _ = rmsnorm_fwd(xq, q_norm_w, local_heads, eps)
-    else:
-        xq_ = xq
+    xq_ = rmsnorm_fwd(xq, q_norm_w, local_heads, eps)[0] if q_norm_w is not None else xq
     xq_ = rearrange(xq_, 'b l (h s) -> b l h s', h=local_heads)
     xq_ = apply_rope(xq_, freqs_cis, head_dim, rope_head_dim, False)
     health_collector = get_active_health_collector()
     if health_collector is not None and layer_id is not None:
         # Local post-qk-norm, post-RoPE heads, before K is gathered across context ranks.
         health_collector.record_query_key_stats(layer_id, xq_, local_xk)
+
+    if wr is not None:
+        rg = rearrange(F.linear(mx, wr, None), 'b l (h s) -> b l h s', h=local_heads)
+        # B x L x H*S
+        if apply_attn_gate:
+            r = rearrange(rg[:, :, :, :head_dim], 'b l h s -> b l (h s)')
+            r = attn_gate_fn(r)
+        else:
+            r = None
+        # B x L x H
+        g = rg[:, :, :, -1] if attn_act_func == 'softdelta' else None
+    else:
+        r = g = None
 
     if handle_xv is not None:
         handle_xv.wait()
@@ -75,13 +92,16 @@ def multihead_attention_fwd(
         handle_xk.wait()
         xk_ = reshape_gathered_tensor_along_specific_dim(xk_, gather_dim=1)[:, :end_seq]
 
-    attn, attn_for_save, attn_lse, flash_rng_state, attn_rng_state = flash_attention_fwd(
-        xq_, xk_, xv_, bos_mask, segments, attn_scale, attention_dropout, stability_control,
-        backend=causal_attn_backend, save_aux= not recompute_attn
-    )
+    if attn_act_func == 'softmax':
+        attn, attn_for_save, attn_lse, flash_rng_state, attn_rng_state = flash_attention_fwd(
+            xq_, xk_, xv_, bos_mask, segments, attn_scale, attention_dropout, stability_control,
+            backend=causal_attn_backend, save_aux= not recompute_attn
+        )
+    else:
+        raise NotImplementedError
+
     attn = rearrange(attn, 'b l h v -> b l (h v)')
-    if wr is not None:
-        r = attn_gate_fn(F.linear(mx, wr, None))
+    if r is not None:
         attn = torch.mul(attn, r, out=r)
     attn, attn_out_rng_state = memory_efficient_dropout_fwd(attn, hidden_dropout, True)
 
@@ -89,7 +109,7 @@ def multihead_attention_fwd(
     xh, xh_rng_state = memory_efficient_dropout_fwd(xh, dropout, True)
 
     return (
-        (xq, xk, xv, xk_rstd), (attn_for_save, attn_lse), xh,
+        (xq, xk, xv), (attn_for_save, attn_lse), xh,
         (flash_rng_state, attn_rng_state, attn_out_rng_state, xh_rng_state), end_seq
     )
 
@@ -97,8 +117,8 @@ def multihead_attention_fwd(
 def multihead_attention_bwd(
     attn_grad, r_grad, attn_for_bwd, attn_lse, xq_, xk_, xv_, total_seqlen_k, end_seq,
     freqs_cis, bos_mask, segments, local_kv_heads, rope_head_dim,
-    xq, xk, xq_rstd, xk_rstd, rmx, mx, q_norm_w, wq, wk, wv, wr,
-    attn_scale, attn_gate_func, attention_dropout, flash_rng_state,
+    xq, xk, xq_rstd, xk_rstd, rmx, mx, q_norm_w, k_norm_w, wq, wk, wv, wr,
+    attn_scale, attn_act_func, apply_attn_gate, attn_gate_func, attention_dropout, flash_rng_state,
     causal_attn_backend, stability_control, deterministic,
     x_, x_mean, x_invvar, attn_norm_w, attn_norm_b, norm_groups,
     apply_rmsnorm, gather_before_norm,
@@ -111,11 +131,14 @@ def multihead_attention_bwd(
         "softplus": partial(torch.ops.aten.softplus_backward, beta=math.log(2), threshold=20)
     }[attn_gate_func]
 
-    xq_grad, xk_grad_, xv_grad_ = flash_attention_bwd(
-        attn_grad, attn_for_bwd, xq_, xk_, xv_, attn_lse, bos_mask, segments,
-        attn_scale, attention_dropout, flash_rng_state,
-        stability_control, deterministic, causal_attn_backend
-    )
+    if attn_act_func == 'softmax':
+        xq_grad, xk_grad_, xv_grad_ = flash_attention_bwd(
+            attn_grad, attn_for_bwd, xq_, xk_, xv_, attn_lse, bos_mask, segments,
+            attn_scale, attention_dropout, flash_rng_state,
+            stability_control, deterministic, causal_attn_backend
+        )
+    else:
+        raise NotImplementedError
 
     tail_seq = get_context_parallel_world_size() * seq_len - end_seq
     pre_seq = 0 if total_seqlen_k is None else end_seq - total_seqlen_k
@@ -150,9 +173,11 @@ def multihead_attention_bwd(
         handle_xk.wait()
 
     xk_grad = apply_rope(xk_grad, freqs_cis, head_dim, rope_head_dim, True)
-    if q_norm_w is not None:
+    if k_norm_w is not None:
         xk_grad = rearrange(xk_grad, 'b l k s -> b l (k s)')
-        xk_grad = mem_effn_rmsnorm_bwd(xk_grad, xk, xk_rstd, local_kv_heads)
+        xk_grad, k_norm_w_grad = rmsnorm_bwd(xk_grad, xk, xk_rstd, k_norm_w, local_kv_heads)
+    else:
+        k_norm_w_grad = None
     # B*L x H*D/H
     xk_grad = xk_grad.view(bsz * seq_len, local_kv_heads * head_dim)
     mx_grad = torch.addmm(mx_grad, xk_grad, wk, out=mx_grad)
@@ -199,35 +224,39 @@ def multihead_attention_bwd(
             mx_grad, x_, x_mean, x_invvar, attn_norm_w, attn_norm_b, norm_groups, apply_rmsnorm
         )
 
-    return x_grad, wq_grad, wk_grad, wv_grad, wr_grad, q_norm_w_grad, attn_norm_w_grad, attn_norm_b_grad
+    return x_grad, wq_grad, wk_grad, wv_grad, wr_grad, q_norm_w_grad, k_norm_w_grad, attn_norm_w_grad, attn_norm_b_grad
 
 
 def multihead_attention_recompute(
-    attn_for_save, attn_lse, xq, xk, xv, xk_rstd, end_seq,
-    mx, freqs_cis, bos_mask, segments, wq, wk, wv, wr, q_norm_w,
-    head_dim, rope_head_dim, local_heads, local_kv_heads, eps,
-    attn_scale, attn_gate_func, attention_dropout, attn_rng_state,
-    causal_attn_backend, stability_control
+    attn_for_save, attn_lse, xq, xk, xv, end_seq, mx, freqs_cis, bos_mask, segments,
+    wq, wk, wv, wr, q_norm_w, k_norm_w, head_dim, rope_head_dim, local_heads, local_kv_heads,
+    attn_scale, attn_act_func, apply_attn_gate, attn_gate_func, eps,
+    attention_dropout, attn_rng_state, causal_attn_backend, stability_control
 ):
     bsz, seq_len, _ = mx.shape
     attn_gate_fn = {"silu": F.silu, "softplus": partial(F.softplus, beta=math.log(2))}[attn_gate_func]
 
     # recompute kv
     if xv is None:
-        assert xk is None and xk_rstd is None
+        assert xk is None
         # compute v
         xv = F.linear(mx, wv).view(bsz, seq_len, local_kv_heads, head_dim)
         xv_, handle_xv = all_gather(xv, parallel_region='context', async_op=True)
 
         # compute k
         xk = F.linear(mx, wk)
-        if q_norm_w is not None:
-            xk, xk_rstd = rmsnorm_fwd(xk, None, local_kv_heads, eps)
     else:
         xv_, handle_xv = all_gather(xv, parallel_region='context', async_op=True)
 
+    xk_, xk_rstd = rmsnorm_fwd(xk, None, local_kv_heads, eps) if k_norm_w is not None else (xk, None)
     xk_ = rearrange(xk, 'b l (k s) -> b l k s', k=local_kv_heads)
-    xk_ = apply_rope(xk_, freqs_cis, head_dim, rope_head_dim, False)
+    if attn_act_func == 'softmax':
+        xk_ = apply_rope(xk_, freqs_cis, head_dim, rope_head_dim, False)
+    else:
+        assert attn_act_func == 'softdelta'
+        kq_ = xk_[:, :, :, :head_dim]
+        xk_ = xk_[:, :, :, head_dim:]
+        kq_, xk_ = apply_ropes(kq_, xk_, freqs_cis, head_dim, rope_head_dim, False)
     xk_, handle_xk = all_gather(xk_, parallel_region='context', async_op=True)
 
     # compute q
@@ -238,11 +267,17 @@ def multihead_attention_recompute(
     xq_ = apply_rope(xq_, freqs_cis, head_dim, rope_head_dim, False)
 
     if wr is not None:
-        # B x L x D
-        rmx = F.linear(mx, wr, None)
-        r = attn_gate_fn(rmx)
+        rg = rearrange(F.linear(mx, wr, None), 'b l (h s) -> b l h s', h=local_heads)
+        # B x L x H*S
+        if apply_attn_gate:
+            rmx = rearrange(rg[:, :, :, :head_dim], 'b l h s -> b l (h s)')
+            r = attn_gate_fn(rmx)
+        else:
+            r, rmx = None, None
+        # B x L x H
+        g = rg[:, :, :, -1] if attn_act_func == 'softdelta' else None
     else:
-        rmx, r = None, None
+        r = rmx = g = None
 
     # recompute attention output
     if attn_for_save is None:

@@ -101,13 +101,9 @@ class MultiheadAttention(nn.Module):
         init_fn = get_init_fn(init_mode, dim=mdim, std=init_std)
 
         # query project
-        qheads = {
-            "softmax": self.n_heads,
-            "softdelta": self.n_heads + self.n_kv_heads
-        }[attn_act_func]
         self.wq = ColumnParallelLinear(
             mdim,
-            qheads * self.head_dim,
+            self.n_heads * self.head_dim,
             bias=False,
             input_is_parallel=False,
             disable_input_reduce=True,
@@ -116,9 +112,10 @@ class MultiheadAttention(nn.Module):
         )
 
         # key & value projections
+        nk = {"softmax": 1, "softdelta": 2}[attn_act_func]
         self.wk = ColumnParallelLinear(
             mdim,
-            self.n_kv_heads * self.head_dim,
+            self.n_kv_heads * self.head_dim * nk,
             bias=False,
             input_is_parallel=False,
             disable_input_reduce=True,
@@ -152,19 +149,19 @@ class MultiheadAttention(nn.Module):
 
         # qk-norm
         self.query_norm = GroupRMSNorm(
-            qheads * self.head_dim,
-            num_groups=qheads,
+            self.n_heads * self.head_dim,
+            num_groups=self.n_heads,
             elementwise_affine=True,
             eps=rmsnorm_eps,
             memory_efficient=False,
         ) if self.qknorm else None
 
         self.key_norm = GroupRMSNorm(
-            self.n_kv_heads * self.head_dim,
-            num_groups=self.n_kv_heads,
-            elementwise_affine=False,
+            self.n_kv_heads * self.head_dim * nk,
+            num_groups=self.n_kv_heads * nk,
+            elementwise_affine=True,
             eps=rmsnorm_eps,
-            memory_efficient=True,  # for knorm, always use efficient memory
+            memory_efficient=False,
         ) if self.qknorm else None
 
         if self.attn_act_func == "softmax":

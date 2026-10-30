@@ -35,7 +35,7 @@ def recv_prev_count(x, bos_mask):
 
 def recv_prev_mean_var(x, n_groups):
     bsz, seq_len, _ = x.size()
-    prev_tensor = torch.empty((bsz, n_groups, 2), dtype=x.dtype, device=x.device)
+    prev_tensor = torch.empty((bsz, n_groups, 2), dtype=torch.float32, device=x.device)
     prev_tensor, handle = _receive_tensor_from_prev(None, prev_tensor, async_op=True)
     return prev_tensor, handle
 
@@ -60,7 +60,7 @@ def send_mean_var_to_next(prev_mean, prev_var):
 
 def recv_mean_var_grad_from_next(x, n_groups):
     bsz, seq_len, _ = x.size()
-    prev_tensor = torch.empty((bsz, n_groups, 2), dtype=x.dtype, device=x.device)
+    prev_tensor = torch.empty((bsz, n_groups, 2), dtype=torch.float32, device=x.device)
     prev_tensor, handle = _receive_grad_from_next(None, prev_tensor, async_op=True)
     return prev_tensor, handle
 
