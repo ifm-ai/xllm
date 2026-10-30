@@ -121,7 +121,7 @@ def check_synthetic(n, inter, dim, dp_mesh):
         assert stored and all(b.local for b in stored) == whole(expert_rows[id(p)]), (n, inter, dim, name_of[id(p)])
     everywhere = all(math.ceil(n // TP * rows / dp_mesh.size()) % rows == 0 for rows in expert_rows.values())
     assert opt.has_remote == (not everywhere), (n, opt.has_remote)
-    log(f"TP={TP} experts={n}: rank 0 local blocks {[len(views) for _, views in opt.local]}, "
+    log(f"TP={TP} experts={n}: rank 0 local blocks {[len(X) for X in opt.local]}, "
         f"{len(opt.remote)} buffers of remote blocks owned; all-to-alls: {opt.has_remote}")
 
     torch.manual_seed(1)  # the same on every rank

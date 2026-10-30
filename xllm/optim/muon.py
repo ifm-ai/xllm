@@ -18,7 +18,7 @@ Example: wk [8, 4] in 2 row Blocks of 4 rows on 3 ranks (torch.chunk: rows 0-2, 
     rank 2  rows 6-7  c          b1 and b2 are rank 1's slices of blocks 0 and 1
 """
 import math
-from collections import Counter, defaultdict
+from collections import Counter
 from logging import getLogger
 
 import torch
@@ -37,16 +37,21 @@ logger = getLogger()
 
 # Newton-Schulz steps X <- a X + b (X X^T) X + c (X X^T)^2 X: each applies p(s) = a s + b s^3 + c s^5 to the singular
 # values. Polar Express (arXiv 2505.16932): each p is the minimax fit of 1 on the range the previous steps leave,
-# from [1e-3, 1.01]; fitted above a cushion of 0.05 of the range's top (so no p dips near 0 inside it, where rounding
-# would flip a sign) and 1% above it. Remez in quad precision; in exact arithmetic s in [1e-3, 1] ends within 3e-7 of 1.
+# from [5e-6, 1.01]; fitted above a cushion of 0.05 of the range's top (so no p dips near 0 inside it, where rounding
+# would flip a sign) and 1% above it. Remez in quad precision (ns-kda/remez.c: ./remez 5e-6 10 0.01 0.05); in exact
+# arithmetic s in [5e-6, 1] ends within 6.4e-4 of 1. One step of maximal slope, six growth steps (x4 on the small
+# singular values each), three that settle at 1; a decade more range costs 1.7 growth steps.
 NS_COEFFS = (
     (6.6855200767111675, -17.811269767700782, 12.619541303795451),
     (4.016121039752612, -3.861087728177999, 0.9871918227003456),
     (4.016121039752612, -3.861087728177999, 0.9871918227003456),
-    (3.795262478265412, -3.5559258715900817, 0.9017288960572022),
-    (2.3593913208894888, -1.696737173296388, 0.4096643411881119),
-    (1.8910694529512306, -1.2577697543810034, 0.3672643550538599),
-    (1.8657070833564235, -1.23145450650965, 0.36574763500927243),
+    (4.016121039752612, -3.861087728177999, 0.9871918227003456),
+    (4.016121039752612, -3.861087728177999, 0.9871918227003456),
+    (4.016121039752612, -3.861087728177999, 0.9871918227003456),
+    (4.016121039752612, -3.861087728177999, 0.9871918227003456),
+    (3.5317473485934125, -3.1933510939607896, 0.8003768663284491),
+    (2.208349178851437, -1.5644228507785432, 0.39619085595596076),
+    (1.875462903821662, -1.2413664092067973, 0.36605354058469686),
 )
 
 
@@ -59,7 +64,8 @@ def newton_schulz(X: Tensor, eps: float) -> Tensor:
       within k^(1/2) (k = min(m, n)), so the small singular values start higher. s comes from the first step's A^2
       and folds into that step: p(X / s) = (a X + (b / s^2 A + c / s^4 A^2) X) / s.
     - The first step runs in bf16, whose range holds any X; the others in fp16, whose 3 more mantissa bits bring the
-      singular values to 1 within ~1e-3. The sums run in cuBLAS epilogues (baddbmm's alpha / beta), in fp32."""
+      singular values above 5e-6 of the largest to 1 within ~1e-3 (smaller ones stay proportionally small: noise
+      directions are not lifted). The sums run in cuBLAS epilogues (baddbmm's alpha / beta), in fp32."""
     tall = X.shape[-2] > X.shape[-1]
 
     def gram(X):
@@ -103,8 +109,15 @@ class Muon(Optimizer):
                   dict(params=adamw_params, lr=cfg.lr, algorithm="adamw", **group_hparams(cfg, "adamw"))]
         super().__init__(groups, {"eps": cfg.epsilon})
         self._ranks(mesh, tp_group)
-        self.u = [torch.empty_like(_local(p), dtype=torch.bfloat16) for p in muon_params]  # the shards' update directions
+        self.w = [_local(p) for p in muon_params]  # shards: weights, momenta (state, from the first gradient), directions
+        self.m: list[Tensor | None] = [None] * len(muon_params)
+        self.u = [torch.empty_like(w, dtype=torch.bfloat16) for w in self.w]
         self._plan([spec.global_shape(tuple(p.shape), self.tp) for spec, p in zip(specs, muon_params)], specs)
+
+    def load_state_dict(self, state_dict: dict):
+        super().load_state_dict(state_dict)
+        self.m = [_local(self.state[p]["momentum"]) if "momentum" in self.state[p] else None
+                  for p in self.param_groups[0]["params"]]
 
     def _ranks(self, mesh: DeviceMesh, tp_group: dist.ProcessGroup | None):
         """The process group over the dp x TP plane that shards a weight, my rank in it, each rank's (dp index, tp index)."""
@@ -114,27 +127,33 @@ class Muon(Optimizer):
             self.group, self.rank = mesh.get_group(), mesh.get_local_rank()
             self.coords = [(r, 0) for r in range(self.dp)]
         else:
-            every = [None] * dist.get_world_size()  # [g]: the dp ranks and the tp ranks of global rank g
-            dist.all_gather_object(every, (dist.get_process_group_ranks(mesh.get_group()),
-                                           dist.get_process_group_ranks(tp_group)))
-            plane = lambda g: sorted(h for d in every[g][0] for h in every[d][1])
-            for ranks in sorted({tuple(plane(g)) for g in range(len(every))}):  # every rank creates every group
+            groups = [None] * dist.get_world_size()
+            dist.all_gather_object(groups, (dist.get_process_group_ranks(mesh.get_group()),
+                                            dist.get_process_group_ranks(tp_group)))
+            dp_ranks = [dp for dp, _ in groups]  # [g]: the global ranks of g's dp group
+            tp_ranks = [tp for _, tp in groups]  # [g]: the global ranks of g's tp group
+
+            def plane(g):  # the dp x TP plane of global rank g: the tp groups of its dp group
+                return sorted(h for d in dp_ranks[g] for h in tp_ranks[d])
+
+            for ranks in sorted({tuple(plane(g)) for g in range(len(groups))}):  # every rank creates every group
                 group = dist.new_group(list(ranks))
                 if dist.get_rank() in ranks:
                     self.group = group
             mine = plane(dist.get_rank())
             self.rank = mine.index(dist.get_rank())
-            self.coords = [(every[g][0].index(g), every[g][1].index(g)) for g in mine]
+            self.coords = [(dp_ranks[g].index(g), tp_ranks[g].index(g)) for g in mine]
         self.world = len(self.coords)
 
     def _plan(self, shapes: list[tuple[int, int]], specs: list[MuonSpec]):
         """From the whole weights' shapes, identical on every rank: blocks, with param and owner; fans[mode][i],
-        (fan_out, fan_in) of weight i's blocks or of the weight. Then this rank's views of u and buffers: local, the
-        local blocks I own by shape; remote, the blocks I own with other ranks' slices, in buffers by shape; mine,
-        my slices of the remote blocks, rank by rank, packed into mine_buf for the all-to-all; theirs, the ranks'
-        slices of the blocks I own, unpacked from theirs_buf the same way."""
-        self.fans = {mode: [spec.fans(shape, per_block=mode == "block") for spec, shape in zip(specs, shapes)]
-                     for mode in ("block", "matrix")}
+        (fan_out, fan_in) of weight i's blocks or of the weight. Then this rank's buffers, one per shape, and the views
+        copied in and out of them: local, the local blocks I own, from local_views (of u) via local_packed; remote,
+        the blocks I own with other ranks' slices; mine, my slices of the remote blocks, rank by rank, packed into
+        mine_buf for the all-to-all; theirs, the ranks' slices of the blocks I own, unpacked from theirs_buf the
+        same way."""
+        self.fans = {"block": [spec.fans(shape, per_block=True) for spec, shape in zip(specs, shapes)],
+                     "matrix": [spec.fans(shape, per_block=False) for spec, shape in zip(specs, shapes)]}
         self.blocks: list[Block] = [b for i, (spec, shape) in enumerate(zip(specs, shapes)) for b in spec.blocks(shape, i)]
         regions = [spec.regions(shape, self.coords, self.dp, self.tp) for spec, shape in zip(specs, shapes)]
         slices = [[(r, box) for r, region in enumerate(regions[b.param]) if (box := b.overlap(region))]
@@ -146,22 +165,22 @@ class Muon(Optimizer):
             load[b.owner] += b.cost
             b.local = len(held) == 1
         self.has_remote = not all(b.local for b in self.blocks)  # then every rank joins the all-to-alls
-        owned = [b for b in self.blocks if b.owner == self.rank and not b.local]
-        views, self.remote = _pack([b.shape for b in owned])
-        slot = {id(b): view for b, view in zip(owned, views)}
-        local = defaultdict(list)
+        local = [b for b in self.blocks if b.owner == self.rank and b.local]  # each one slice: the whole block, in my region
+        self.local_packed, self.local = _pack([b.shape for b in local])
+        self.local_views = [self.u[b.param][box_index(b.box, regions[b.param][self.rank])] for b in local]
+        remote = [b for b in self.blocks if b.owner == self.rank and not b.local]
+        views, self.remote = _pack([b.shape for b in remote])
+        slot = {id(b): view for b, view in zip(remote, views)}
         mine = [[] for _ in range(self.world)]
         theirs = [[] for _ in range(self.world)]
         for b, held in zip(self.blocks, slices):
+            if b.local:
+                continue
             for r, box in held:
-                if b.local and r == self.rank:
-                    local[b.shape].append(self.u[b.param][box_index(box, regions[b.param][r])])
-                elif not b.local:
-                    if r == self.rank:
-                        mine[b.owner].append(self.u[b.param][box_index(box, regions[b.param][r])])
-                    if b.owner == self.rank:
-                        theirs[r].append(slot[id(b)][box_index(box, b.box)])
-        self.local = list(local.items())
+                if r == self.rank:
+                    mine[b.owner].append(self.u[b.param][box_index(box, regions[b.param][r])])
+                if b.owner == self.rank:
+                    theirs[r].append(slot[id(b)][box_index(box, b.box)])
         self.mine, self.mine_buf, self.mine_packed, self.mine_sizes = _buffer(mine)
         self.theirs, self.theirs_buf, self.theirs_packed, self.theirs_sizes = _buffer(theirs)
 
@@ -180,17 +199,17 @@ class Muon(Optimizer):
 
     def _muon_step(self, group: dict):
         eps = group["eps"]
-        self._momentum(group)
+        live = [i for i, p in enumerate(group["params"]) if p.grad is not None]
+        self._momentum(group, live)
         gather = None
         if self.has_remote:  # my slices of the remote blocks go to their owners while the local blocks are done
             xllm_ops.batched_copy_(self.mine_packed, self.mine)
             gather = dist.all_to_all_single(self.theirs_buf, self.mine_buf, self.theirs_sizes, self.mine_sizes,
                                             group=self.group, async_op=True)
-        for shape, views in self.local:  # one buffer per shape
-            X = torch.empty(len(views), *shape, dtype=torch.bfloat16, device="cuda")
-            xllm_ops.batched_copy_(list(X), views)
+        xllm_ops.batched_copy_(self.local_packed, self.local_views)
+        for X in self.local:
             X.copy_(newton_schulz(X, eps))
-            xllm_ops.batched_copy_(views, list(X))
+        xllm_ops.batched_copy_(self.local_views, self.local_packed)
         if gather is not None:
             gather.wait()  # the stream waits for the collective; the CPU goes on
             xllm_ops.batched_copy_(self.theirs, self.theirs_packed)  # the remote blocks I own, assembled
@@ -199,28 +218,26 @@ class Muon(Optimizer):
             xllm_ops.batched_copy_(self.theirs_packed, self.theirs)  # and back the way they came
             dist.all_to_all_single(self.mine_buf, self.theirs_buf, self.mine_sizes, self.theirs_sizes, group=self.group)
             xllm_ops.batched_copy_(self.mine, self.mine_packed)
-        self._update(group)
+        self._update(group, live)
 
-    def _momentum(self, group: dict):
-        """m <- mu m + g on the shards (fp32); the bf16 directions (Nesterov: g + mu m) into u. No gradient: zeros,
-        no state, no decay (as with AdamW); the plan stays fixed."""
+    def _momentum(self, group: dict, live: list[int]):
+        """m <- mu m + g on the shards (fp32); the bf16 directions (Nesterov: g + mu m) into u, for the params with a
+        gradient (live). No gradient: zeros, no state, no decay (as with AdamW); the plan stays fixed."""
         params = group["params"]
         for i, p in enumerate(params):
             if p.grad is None:
                 self.u[i].zero_()
-            elif "momentum" not in self.state[p]:
+            elif self.m[i] is None:
                 self.state[p]["momentum"] = torch.zeros_like(p, dtype=torch.float32)
-        live = [i for i, p in enumerate(params) if p.grad is not None]
-        xllm_ops.muon_momentum_([_local(self.state[params[i]]["momentum"]) for i in live],
-                                [_local(params[i].grad) for i in live], [self.u[i] for i in live],
-                                group["momentum"], group["nesterov"])
+                self.m[i] = _local(self.state[p]["momentum"])
+        xllm_ops.muon_momentum_([self.m[i] for i in live], [_local(params[i].grad) for i in live],
+                                [self.u[i] for i in live], group["momentum"], group["nesterov"])
 
-    def _update(self, group: dict):
+    def _update(self, group: dict, live: list[int]):
         """W <- W - lr (wd W + scale u) for the params with a gradient, in fp32. The scale multiplies the update, not
         the decay: from the fans of the block, or of the whole weight (block_scale)."""
-        params, fans = group["params"], self.fans[group["block_scale"]]
-        live = [i for i, p in enumerate(params) if p.grad is not None]
-        xllm_ops.muon_update_([_local(params[i]) for i in live], [self.u[i] for i in live],
+        fans = self.fans[group["block_scale"]]
+        xllm_ops.muon_update_([self.w[i] for i in live], [self.u[i] for i in live],
                               [_scale(*fans[i], group["adjust_lr"]) for i in live], group["lr"], group["weight_decay"])
 
     def _adamw_step(self, group: dict):
@@ -241,7 +258,9 @@ def _scale(fan_out: int, fan_in: int, adjust_lr: str | None) -> float:
     """sqrt(fan_out / fan_in) for adjust_lr spectral_norm, 0.2 sqrt(max(fan_out, fan_in)) for rms_norm, else 1."""
     if adjust_lr == "spectral_norm":
         return math.sqrt(fan_out / fan_in)
-    return 0.2 * math.sqrt(max(fan_out, fan_in)) if adjust_lr == "rms_norm" else 1.0
+    if adjust_lr == "rms_norm":
+        return 0.2 * math.sqrt(max(fan_out, fan_in))
+    return 1.0
 
 
 def _local(t: Tensor) -> Tensor:
@@ -251,8 +270,11 @@ def _local(t: Tensor) -> Tensor:
 def _pack(shapes: list[tuple[int, int]]) -> tuple[list[Tensor], list[Tensor]]:
     """One bf16 [B, R, C] buffer per shape; returns a [R, C] view per entry, and the buffers."""
     buffers = {shape: torch.empty(n, *shape, dtype=torch.bfloat16, device="cuda") for shape, n in Counter(shapes).items()}
-    parts = {shape: iter(buffer.unbind(0)) for shape, buffer in buffers.items()}
-    return [next(parts[shape]) for shape in shapes], list(buffers.values())
+    views, used = [], Counter()
+    for shape in shapes:
+        views.append(buffers[shape][used[shape]])
+        used[shape] += 1
+    return views, list(buffers.values())
 
 
 def _buffer(views: list[list[Tensor]]) -> tuple[list[Tensor], Tensor, list[Tensor], list[int]]:
@@ -272,19 +294,25 @@ def build_muon(model: nn.Module, cfg: OptimConf) -> Optimizer:
     muon_params, specs, names, adamw_params = split_muon_params(model)
     if not muon_params or not hasattr(muon_params[0], "device_mesh"):
         raise ValueError("Muon requires a model wrapped with FSDP2 and at least one registered weight.")
-    for name, (spec, p) in dict(zip(names, zip(specs, muon_params))).items():  # one line per kind of weight
+    seen = set()
+    for name, spec, p in zip(names, specs, muon_params):  # one line per kind of weight
+        if name in seen:
+            continue
+        seen.add(name)
         fan_out, fan_in = spec.fans(spec.global_shape(tuple(p.shape), tp), per_block=True)
         logger.info(f"Muon {name} {list(p.shape)} {str(spec)!r}: {len(spec.blocks(tuple(p.shape)))} blocks of "
                     f"fan_out {fan_out} x fan_in {fan_in}, tp_dim {spec.tp_dim}")
-    muon_ids = {id(p) for p in muon_params}  # 2-D weights of parallel layers in the blocks left to AdamW: say which
-    missed = Counter(name_pattern(f"{fqn}.weight") for fqn, m in model.named_modules() if "layers." in fqn
-                     and isinstance(m, (ColumnParallelLinear, RowParallelLinear)) and id(m.weight) not in muon_ids)
+    muon_ids = {id(p) for p in muon_params}
+    missed = Counter()  # 2-D weights of parallel layers in the blocks left to AdamW, by kind: say which
+    for fqn, m in model.named_modules():
+        if "layers." in fqn and isinstance(m, (ColumnParallelLinear, RowParallelLinear)) and id(m.weight) not in muon_ids:
+            missed[name_pattern(f"{fqn}.weight")] += 1
     if missed:
         logger.warning(f"Muon: unregistered weights use AdamW: {dict(missed)}")
     mesh = muon_params[0].device_mesh
     optimizer = Muon(muon_params, specs, adamw_params, mesh if mesh.ndim == 1 else mesh["dp"], cfg,
                      tp_group=get_model_parallel_group() if tp > 1 else None)
-    numel = lambda ps: sum(p.numel() for p in ps)
-    logger.info(f"Muon: {len(muon_params)} matrices / {len(optimizer.blocks)} blocks / {numel(muon_params)} params; "
-                f"AdamW: {len(adamw_params)} tensors / {numel(adamw_params)} params")
+    logger.info(f"Muon: {len(muon_params)} matrices / {len(optimizer.blocks)} blocks / "
+                f"{sum(p.numel() for p in muon_params)} params; AdamW: {len(adamw_params)} tensors / "
+                f"{sum(p.numel() for p in adamw_params)} params")
     return optimizer
