@@ -14,22 +14,81 @@ from xllm.modules.fused_ops import (
 )
 from xllm.modules.moe.router import calc_probs
 from .utils import (
-    fused_permute_y_fwd,
-    fused_permute_y_bwd_y_grad,
-    fused_permute_y_bwd_scores_grad,
     grouped_experts_fwd,
     grouped_experts_bwd,
+    rmsnorm_fwd,
+    rmsnorm_bwd,
+)
+from .routing import (
+    routing_fwd,
+    routing_weights_fwd,
+    routing_bwd,
+    routing_permutation,
+    permute_y_fwd,
+    permute_y_bwd_y_grad,
+    permute_y_bwd_scores_grad,
+    permute_x_bwd,
+    router_bias_reduce,
+    router_bias_update,
 )
 from .distributed import (
     all_gather,
     all_reduce,
     all_to_all,
+    reduce_scatter,
+    scatter,
 )
+
+
+def latent_norm_fwd(latent, weight, eps):
+    # RMSNorm over the full latent width, on B x L x latent_dim/TP shards
+    latent_full, _ = all_gather(latent, parallel_region='model', async_op=False)
+    weight_full = all_gather(weight, parallel_region='model', async_op=False)[0] if weight is not None else None
+    out, rstd = rmsnorm_fwd(latent_full, weight_full, 1, eps)
+    return scatter(out, parallel_region='model').contiguous(), (latent_full, rstd, weight_full)
+
+
+def latent_norm_bwd(out_grad, saved):
+    latent_full, rstd, weight_full = saved
+    out_grad_full, _ = all_gather(out_grad, parallel_region='model', async_op=False)
+    latent_grad, weight_grad = rmsnorm_bwd(out_grad_full, latent_full, rstd, weight_full, 1)
+    latent_grad = scatter(latent_grad, parallel_region='model').contiguous()
+    if weight_grad is not None:
+        weight_grad = scatter(weight_grad, parallel_region='model').contiguous()
+    return latent_grad, weight_grad
+
+
+def grouped_experts_recompute(
+    xp, handle_xp, expert_w1, expert_w2, expert_w3, n_local_experts, world_size, curr_bsz, group_sizes,
+    expert_backend, hidden_dropout, expert_hidden_rng_state,
+):
+    if handle_xp is not None:
+        handle_xp.wait()
+
+    # B' x routed_dim
+    if curr_bsz > 0:
+        ew1 = rearrange(expert_w1, '(n s) d -> n s d', n=n_local_experts)
+        ew2 = rearrange(expert_w2, '(n s) d -> n s d', n=n_local_experts)
+        ew3 = rearrange(expert_w3, '(n s) d -> n s d', n=n_local_experts)
+        xp = rearrange(xp, '(w b) d -> b (w d)', w=world_size)
+        y2, eh1, eh1s, eh3, eh, expert_hidden_noise = grouped_experts_fwd(
+            xp, ew1, ew2, ew3, group_sizes, expert_backend, False, hidden_dropout, expert_hidden_rng_state
+        )
+        y2 = rearrange(y2, 'b (w d) -> (w b) d', w=world_size)
+    else:
+        y2 = xp
+        eh1, eh1s, eh3, eh = None, None, None, None
+        ew1, ew2, ew3 = None, None, None
+        expert_hidden_noise = None
+
+    return xp, y2, (ew1, ew2, ew3), (eh1, eh1s, eh3, eh, expert_hidden_noise)
 
 
 def moe_fwd(
     xf, router_w, router_bias, routing_score_func, routing_scaling_factor, router_load_balancing_type,
-    fc1_w, fc2_w, fc3_w, n_experts, n_local_experts, expert_start_idx, expert_end_idx, topk,
+    fc1_w, fc2_w, fc3_w, w_down, w_up, latent_norm_w, latent_post_rmsnorm, rmsnorm_eps,
+    n_experts, n_local_experts, expert_start_idx, expert_end_idx, topk,
+    routing_type, qb_globalnorm,
     expert_w1, expert_w2, expert_w3, expert_backend, moe_permutation_backend,
     hidden_dropout, recompute_fc1_out, recompute_fc3_out,
 ):
@@ -44,6 +103,12 @@ def moe_fwd(
     else:
         h1, handle_h1 = None, None
 
+    if w_down is not None:
+        # B x L x latent_dim/TP
+        latent_x, handle_latent_x = reduce_scatter(F.linear(xf, w_down), parallel_region='model', async_op=True)
+    else:
+        latent_x, handle_latent_x = xf, None
+
     # Router indices
     if routing_score_func == 'softmax':
         routing_score_fn = partial(F.softmax, dim=-1, dtype=torch.float32)
@@ -55,21 +120,13 @@ def moe_fwd(
     if handle_router is not None:
         handle_router.wait()
     # B x L x N
-    routing_scores = routing_score_fn(routing_logits)
-    original_scores = routing_scores
-    if router_bias is not None:
-        routing_scores = routing_scores + router_bias.to(routing_scores)
-    # B x L x K
-    routing_indices = torch.topk(routing_scores, topk, dim=-1)[1]
-    org_topk_scores = torch.gather(original_scores, dim=-1, index=routing_indices)
-    topk_scores = org_topk_scores / org_topk_scores.sum(dim=-1, keepdim=True) if topk > 1 else org_topk_scores
-    topk_scores = (topk_scores * routing_scaling_factor if routing_scaling_factor else topk_scores).to(xf)
-    # B*L*K
-    routing_indices_flat = routing_indices.flatten()
-    # N
-    tokens_per_expert = torch.bincount(routing_indices_flat, minlength=n_experts)
-    sorted_indices = torch.argsort(routing_indices_flat, stable=True)
-    permute_indices = sorted_indices // topk
+    original_scores = routing_score_fn(routing_logits)
+    # B x L x K for top-k, or routes for dynamic QB
+    routing_indices, token_indices, org_topk_scores, topk_scores, tokens_per_expert = routing_fwd(
+        original_scores, router_bias, routing_type, routing_score_func, routing_scaling_factor,
+        bsz * seq_len, n_experts, topk, qb_globalnorm, xf.dtype
+    )
+    sorted_indices, permute_indices = routing_permutation(routing_indices, token_indices, routing_type, topk)
 
     if router_load_balancing_type is None:
         aux_loss = None
@@ -92,8 +149,11 @@ def moe_fwd(
     curr_bsz = input_splits[rank]
     output_splits = [curr_bsz for _ in range(world_size)]
 
-    # B*L*K x D/TP
-    permuted_x = torch.index_select(xf.view(bsz * seq_len, -1), 0, permute_indices)
+    if handle_latent_x is not None:
+        handle_latent_x.wait()
+
+    # B*L*K x routed_dim/TP
+    permuted_x = torch.index_select(latent_x.view(bsz * seq_len, -1), 0, permute_indices)
     xp, handle_xp = all_to_all(permuted_x, input_splits, output_splits, parallel_region='model', async_op=True)
 
     if fc3_w is not None:
@@ -111,7 +171,7 @@ def moe_fwd(
     if handle_xp is not None:
         handle_xp.wait()
 
-    # B' x D
+    # B' x routed_dim
     if curr_bsz > 0:
         ew1 = rearrange(expert_w1, '(n s) d -> n s d', n=n_local_experts)
         ew2 = rearrange(expert_w2, '(n s) d -> n s d', n=n_local_experts)
@@ -146,26 +206,51 @@ def moe_fwd(
         handle_y2.wait()
 
     # permute y2
-    y2, _ = fused_permute_y_fwd(sorted_indices, y2, topk_scores, bsz, seq_len, topk, moe_permutation_backend)
+    y2, _ = permute_y_fwd(
+        sorted_indices, token_indices, y2, topk_scores, routing_type, bsz, seq_len, topk, moe_permutation_backend
+    )
+
+    if latent_post_rmsnorm:
+        # B x L x latent_dim/TP
+        y2, _ = latent_norm_fwd(y2, latent_norm_w, rmsnorm_eps)
+
+    if w_up is not None:
+        # B x L x D/TP
+        y2, _ = reduce_scatter(F.linear(y2, w_up), parallel_region='model', async_op=False)
 
     # combine shared expert
     out = torch.add(y1, y2, out=y2) if y1 is not None else y2
 
     return (
-        out, aux_loss, (original_scores, routing_indices, org_topk_scores, tokens_per_expert), (h1, h3),
+        out, aux_loss, (original_scores, routing_indices, org_topk_scores, token_indices, tokens_per_expert), (h1, h3),
         (group_sizes, input_splits, output_splits, curr_bsz), (expert_hidden_rng_state, shared_hidden_rng_state)
     )
 
 
 def moe_bwd(
-    out_grad, aux_loss_grad, xf, xf_flat, original_scores, routing_indices, org_topk_scores, tokens_per_expert,
+    out_grad, aux_loss_grad, xf, xf_flat, original_scores, routing_indices, org_topk_scores, token_indices, tokens_per_expert,
     router_w, router_bias, router_bias_update_rate, routing_score_func, routing_scaling_factor, router_load_balancing_type,
-    h1, h3, fc1_w, fc2_w, fc3_w, n_experts, n_local_experts, topk, expert_w1, expert_w2, expert_w3,
+    h1, h3, fc1_w, fc2_w, fc3_w, w_down, w_up, latent_norm_w, latent_post_rmsnorm, rmsnorm_eps,
+    n_experts, n_local_experts, topk,
+    routing_type, qb_update_method, qb_decay, qb_globalnorm,
+    expert_w1, expert_w2, expert_w3,
     expert_backend, moe_permutation_backend, hidden_dropout, group_sizes, input_splits, output_splits, curr_bsz,
     expert_hidden_rng_state, shared_hidden_rng_state, gather_before_norm,
 ):
     bsz, seq_len, _ = xf.size()
     world_size = len(output_splits)
+    # recompute latent_x
+    if w_down is not None:
+        # B x L x latent_dim/TP
+        latent_x, handle_latent_x = reduce_scatter(F.linear(xf, w_down), parallel_region='model', async_op=True)
+    else:
+        latent_x, handle_latent_x = xf, None
+
+    # gather the full output grad for w_up
+    if w_up is not None:
+        # B x L x D
+        out_grad_full, handle_out_grad = all_gather(out_grad, parallel_region='model', async_op=True)
+
     # recompute router
     if original_scores is None:
         routing_logits = F.linear(xf, router_w).to(torch.float32)
@@ -191,26 +276,47 @@ def moe_bwd(
     else:
         handle_h3 = None
 
-    if topk > 1:
-        topk_scores_denom = org_topk_scores.sum(dim=-1, keepdim=True)
-        topk_scores = org_topk_scores / topk_scores_denom
-    else:
-        topk_scores_denom = None
-        topk_scores = org_topk_scores
-    scaled_topk_scores = (topk_scores * routing_scaling_factor if routing_scaling_factor else topk_scores).to(xf)
-
-    # B*L*K
-    sorted_indices = torch.argsort(routing_indices.flatten(), stable=True)
+    scaled_topk_scores = routing_weights_fwd(
+        org_topk_scores, token_indices, routing_type, routing_scaling_factor, bsz * seq_len, topk, qb_globalnorm, xf.dtype
+    )
+    sorted_indices, permute_indices = routing_permutation(routing_indices, token_indices, routing_type, topk)
 
     # recompute xp
-    # B*L*K x D/TP
-    permute_indices = sorted_indices // topk
-    permuted_x = torch.index_select(xf.view(bsz * seq_len, -1), 0, permute_indices)
+    if handle_latent_x is not None:
+        handle_latent_x.wait()
+    # B*L*K x routed_dim/TP
+    permuted_x = torch.index_select(latent_x.view(bsz * seq_len, -1), 0, permute_indices)
     xp, handle_xp = all_to_all(permuted_x, input_splits, output_splits, parallel_region='model', async_op=True)
 
-    # B*L*K x D/TP
-    y2_grad, inverse_indices = fused_permute_y_bwd_y_grad(
-        out_grad, sorted_indices, scaled_topk_scores, bsz, seq_len, topk, moe_permutation_backend
+    if w_up is not None:
+        if handle_out_grad is not None:
+            handle_out_grad.wait()
+            out_grad_full = reshape_gathered_tensor_along_specific_dim(out_grad_full, gather_dim=2)
+        # (B x L x D) x (D x latent_dim/TP) -> B x L x latent_dim/TP
+        routed_out_grad = out_grad_full.matmul(w_up)
+    else:
+        routed_out_grad = out_grad
+
+    if latent_post_rmsnorm:
+        # the norm backward needs the routed mixture, so the experts are recomputed first
+        xp, y2, expert_ws, expert_saved = grouped_experts_recompute(
+            xp, handle_xp, expert_w1, expert_w2, expert_w3, n_local_experts, world_size, curr_bsz, group_sizes,
+            expert_backend, hidden_dropout, expert_hidden_rng_state,
+        )
+        y2, _ = all_to_all(y2, output_splits, input_splits, parallel_region='model', async_op=False)
+        # B x L x latent_dim/TP
+        latent_out, _ = permute_y_fwd(
+            sorted_indices, token_indices, y2, scaled_topk_scores, routing_type, bsz, seq_len, topk, moe_permutation_backend
+        )
+        # the w_up input, and the grad of the mixture
+        latent_out, latent_norm_saved = latent_norm_fwd(latent_out, latent_norm_w, rmsnorm_eps)
+        routed_out_grad, latent_norm_w_grad = latent_norm_bwd(routed_out_grad, latent_norm_saved)
+    else:
+        latent_norm_w_grad = None
+
+    # B*L*K x routed_dim/TP
+    y2_grad, inverse_indices = permute_y_bwd_y_grad(
+        routed_out_grad, sorted_indices, token_indices, scaled_topk_scores, routing_type, bsz, seq_len, topk, moe_permutation_backend
     )
     y2_grad, handle_y2_grad = all_to_all(y2_grad, input_splits, output_splits, parallel_region='model', async_op=True)
 
@@ -252,31 +358,21 @@ def moe_bwd(
         h_grad, fc2_w_grad, h1s = None, None, None
         handle_h, h_noise = None, None
 
-    if handle_xp is not None:
-        handle_xp.wait()
-
-    # B' x D
-    if curr_bsz > 0:
-        ew1 = rearrange(expert_w1, '(n s) d -> n s d', n=n_local_experts)
-        ew2 = rearrange(expert_w2, '(n s) d -> n s d', n=n_local_experts)
-        ew3 = rearrange(expert_w3, '(n s) d -> n s d', n=n_local_experts)
-        xp = rearrange(xp, '(w b) d -> b (w d)', w=world_size)
-        y2, eh1, eh1s, eh3, eh, expert_hidden_noise = grouped_experts_fwd(
-            xp, ew1, ew2, ew3, group_sizes, expert_backend, False, hidden_dropout, expert_hidden_rng_state
+    if not latent_post_rmsnorm:
+        xp, y2, expert_ws, expert_saved = grouped_experts_recompute(
+            xp, handle_xp, expert_w1, expert_w2, expert_w3, n_local_experts, world_size, curr_bsz, group_sizes,
+            expert_backend, hidden_dropout, expert_hidden_rng_state,
         )
-        y2 = rearrange(y2, 'b (w d) -> (w b) d', w=world_size)
+        y2, handle_y2 = all_to_all(y2, output_splits, input_splits, parallel_region='model', async_op=True)
     else:
-        y2 = xp
-        eh1, eh1s, eh3, eh = None, None, None, None
-        ew1, ew2, ew3 = None, None, None
-        expert_hidden_noise = None
-
-    y2, handle_y2 = all_to_all(y2, output_splits, input_splits, parallel_region='model', async_op=True)
+        handle_y2 = None
+    ew1, ew2, ew3 = expert_ws
+    eh1, eh1s, eh3, eh, expert_hidden_noise = expert_saved
 
     if handle_y2_grad is not None:
         handle_y2_grad.wait()
 
-    # B*L*K x D/TP
+    # B*L*K x routed_dim/TP
     if curr_bsz > 0:
         y2_grad = rearrange(y2_grad, '(w b) d -> b (w d)', w=world_size)
         xp_grad, ew1_grad, ew2_grad, ew3_grad = grouped_experts_bwd(
@@ -315,9 +411,20 @@ def moe_bwd(
         handle_y2.wait()
 
     # router grad
-    topk_scores_grad = fused_permute_y_bwd_scores_grad(
-        out_grad, inverse_indices, y2, bsz, seq_len, topk, moe_permutation_backend
+    topk_scores_grad = permute_y_bwd_scores_grad(
+        routed_out_grad, inverse_indices, token_indices, y2, routing_type, bsz, seq_len, topk, moe_permutation_backend
     )
+
+    if w_up is not None:
+        if not latent_post_rmsnorm:
+            # B x L x latent_dim/TP
+            latent_out, _ = permute_y_fwd(
+                sorted_indices, token_indices, y2, scaled_topk_scores, routing_type, bsz, seq_len, topk, moe_permutation_backend
+            )
+        # (D x B*L) x (B*L x latent_dim/TP) -> D x latent_dim/TP
+        w_up_grad = out_grad_full.flatten(end_dim=-2).t().matmul(latent_out.flatten(end_dim=-2))
+    else:
+        w_up_grad = None
 
     if router_load_balancing_type is None:
         assert aux_loss_grad is None
@@ -344,19 +451,12 @@ def moe_bwd(
             raise ValueError(f"Unknown score function: {routing_score_func}.")
 
     # reduce tokens/expert for router bias updating
-    if router_bias is not None:
-        tokens_per_expert, handle_bias = all_reduce(tokens_per_expert, parallel_region='hybrid_shard', async_op=True)
-    else:
-        handle_bias = None
+    tokens_per_expert, handle_bias = router_bias_reduce(tokens_per_expert, router_bias, routing_type)
 
-    topk_scores_grad = topk_scores_grad.float()
-    if routing_scaling_factor is not None:
-        topk_scores_grad = topk_scores_grad * routing_scaling_factor
-
-    if topk > 1:
-        topk_scores_grad = (topk_scores_grad - (topk_scores_grad * topk_scores).sum(dim=-1, keepdim=True)) / topk_scores_denom
-
-    original_scores_grad = torch.zeros_like(original_scores).scatter(-1, routing_indices, topk_scores_grad)
+    original_scores_grad = routing_bwd(
+        topk_scores_grad, original_scores, routing_indices, token_indices, org_topk_scores,
+        routing_type, routing_score_func, routing_scaling_factor, topk, qb_globalnorm
+    )
     if original_scores_grad_aux is not None:
         original_scores_grad = original_scores_grad + original_scores_grad_aux
 
@@ -374,21 +474,20 @@ def moe_bwd(
     # xf grad from expert
     if handle_xp_grad is not None:
         handle_xp_grad.wait()
-    # re-order
-    xp_grad = torch.index_select(xp_grad, 0, inverse_indices)
-    # B x L x K x D/TP -> B x L x D/TP
-    xf_grad = xp_grad.view(bsz, seq_len, topk, -1).sum(dim=2)
+    # B x L x routed_dim/TP
+    latent_x_grad = permute_x_bwd(xp_grad, inverse_indices, token_indices, routing_type, bsz, seq_len, topk)
 
-    if xf_grad_shared is not None:
-        xf_grad = torch.add(xf_grad, xf_grad_shared, out=xf_grad)
+    if w_down is not None:
+        # B x L x latent_dim
+        latent_x_grad, handle_latent_x_grad = all_gather(latent_x_grad, parallel_region='model', async_op=True)
+    else:
+        handle_latent_x_grad = None
 
     # update router bias
-    if router_bias is not None:
-        if handle_bias is not None:
-            handle_bias.wait()
-        average_tokens = tokens_per_expert.sum() / n_experts
-        bias_update = torch.sign(average_tokens - tokens_per_expert)
-        router_bias.add_(bias_update, alpha=router_bias_update_rate)
+    router_bias_update(
+        router_bias, tokens_per_expert, handle_bias, original_scores, routing_type, router_bias_update_rate,
+        routing_score_func, n_experts, topk, qb_update_method, qb_decay, qb_globalnorm
+    )
 
     if handle_logits is not None:
         handle_logits.wait()
@@ -396,6 +495,21 @@ def moe_bwd(
     routing_logits_grad = routing_logits_grad.to(xf)
     # (B x L x N) x (N x D/TP) -> B x L x D/TP
     xf_grad_router = routing_logits_grad.matmul(router_w)
+
+    if w_down is not None:
+        if handle_latent_x_grad is not None:
+            handle_latent_x_grad.wait()
+            latent_x_grad = reshape_gathered_tensor_along_specific_dim(latent_x_grad, gather_dim=2)
+        # (B x L x latent_dim) x (latent_dim x D/TP) -> B x L x D/TP
+        xf_grad = latent_x_grad.matmul(w_down)
+        # (latent_dim x B*L) x (B*L x D/TP) -> latent_dim x D/TP
+        w_down_grad = latent_x_grad.flatten(end_dim=-2).t().matmul(xf_flat)
+    else:
+        xf_grad = latent_x_grad
+        w_down_grad = None
+
+    if xf_grad_shared is not None:
+        xf_grad = torch.add(xf_grad, xf_grad_shared, out=xf_grad)
     xf_grad = torch.add(xf_grad, xf_grad_router, out=xf_grad)
 
     if gather_before_norm:
@@ -412,4 +526,7 @@ def moe_bwd(
         handle_xf.wait()
         xf_grad = reshape_gathered_tensor_along_specific_dim(xf_grad, gather_dim=2)
 
-    return xf_grad, ew1_grad, ew2_grad, ew3_grad, fc1_w_grad, fc2_w_grad, fc3_w_grad, router_w_grad
+    return (
+        xf_grad, ew1_grad, ew2_grad, ew3_grad, fc1_w_grad, fc2_w_grad, fc3_w_grad, router_w_grad,
+        w_down_grad, w_up_grad, latent_norm_w_grad
+    )

@@ -133,10 +133,16 @@ class ModelConf(Config):
     num_shared_experts: int = 0  # Num of shared experts for each token, in addition to routed experts
     num_dense_layers: Optional[int] = None  # Number of initial dense layers. If None, defaults to 0 when MoE is enabled, otherwise to all layers.
     expert_inter_dim: int = 0  # Hidden dimension of the FFN in a single expert.
+    moe_latent_alpha: Optional[int] = None  # LatentMoE: routed experts run in a model_dim/alpha latent space, with alpha times the experts and top-k. None disables it.
+    moe_latent_post_rmsnorm: bool = False  # Whether LatentMoE normalizes the routed mixture with RMSNorm before the up-projection.
     moe_router_score_func: str = 'sigmoid'  # sigmoid or softmax
     moe_router_bias: bool = False  # Whether to include the router bias, only affects top-k selection.
     moe_router_bias_update_rate: Optional[float] = None  # Update rate for the router bias during backprop
     moe_router_scaling_factor: Optional[float] = None  # The scaling factor for outputs from selected experts. None means no scaling
+    moe_router_type: str = 'topk'  # topk, or dynamic_qb which routes tokens to experts with scores above per-expert quantile thresholds
+    moe_router_dynamic_qb_update_method: str = 'average'  # Quantile estimator of the dynamic QB thresholds: average, histogram, or binary_search
+    moe_router_dynamic_qb_decay: float = 0.3  # EMA decay of the dynamic QB thresholds
+    moe_router_dynamic_qb_globalnorm: bool = True  # Whether dynamic QB thresholds apply to globally normalized scores
     moe_expert_backend: str = 'sequential'  # sequential, nested, torch, or te
     moe_permutation_backend: str = 'torch'  # Token permutation and unpermutation backend: torch or triton
     # Causal conv1d
@@ -188,6 +194,19 @@ class ModelConf(Config):
 
     recompute_logits: bool = False  # Whether to recompute logits in output layer. Independent of fused_block. True = recompute logits and compute grad_X/grad_W during backward, False = precompute grad_X/grad_W during forward.
 
+    @property
+    def effective_num_experts(self) -> int:
+        # routed experts instantiated by the model
+        return self.num_experts * (self.moe_latent_alpha or 1)
+
+    @property
+    def effective_num_activated_experts(self) -> int:
+        return self.num_activated_experts * (self.moe_latent_alpha or 1)
+
+    @property
+    def moe_latent_dim(self) -> Optional[int]:
+        return self.model_dim // self.moe_latent_alpha if self.moe_latent_alpha is not None else None
+
     def __post_init__(self):
         assert self.arch in ['transformer', 'gekko']
         assert self.ddp_backend in ['fsdp1', 'fsdp2']
@@ -214,13 +233,29 @@ class ModelConf(Config):
             assert 0 < self.num_activated_values <= self.num_values
             assert self.num_experts > 0, "MoVA requires MoE."
 
+        if self.moe_latent_alpha is not None:
+            assert self.arch == 'transformer'
+            assert self.num_experts > 0, "LatentMoE requires routed experts."
+            assert self.num_values == 0, "LatentMoE is not supported by MoVA blocks."
+            assert isinstance(self.moe_latent_alpha, int) and self.moe_latent_alpha > 1
+            assert self.model_dim % self.moe_latent_alpha == 0
+        else:
+            assert not self.moe_latent_post_rmsnorm, "moe_latent_post_rmsnorm requires moe_latent_alpha."
+
         if self.num_experts > 0:
             assert 0 < self.num_activated_experts <= self.num_experts
             assert self.num_dense_layers is None or self.num_dense_layers <= self.num_layers
             assert self.expert_inter_dim > 0
             assert self.moe_router_score_func in ['softmax', 'sigmoid']
+            assert self.moe_router_type in ['topk', 'dynamic_qb']
             if self.moe_router_bias:
                 assert self.moe_router_bias_update_rate > 0.0, f"Invalid MoE router bias update rate: {self.moe_router_bias_update_rate}"
+            if self.moe_router_type == 'dynamic_qb':
+                assert not self.moe_router_bias, "Dynamic QB keeps its thresholds in the router bias."
+                assert self.moe_router_dynamic_qb_update_method in ['average', 'histogram', 'binary_search']
+                assert 0.0 <= self.moe_router_dynamic_qb_decay < 1.0
+                if self.fused_block:
+                    assert self.num_values == 0, "Dynamic QB is not supported by fused MoVA blocks."
         else:
             assert self.num_dense_layers is None
 
@@ -424,9 +459,12 @@ class TrainerConf(Config):
 
         # MoE
         if self.model.num_experts > 0:
-            assert self.model.num_experts % self.model_parallel_size == 0, f"{self.model.num_experts}/{self.model_parallel_size}"
+            assert self.model.effective_num_experts % self.model_parallel_size == 0, f"{self.model.effective_num_experts}/{self.model_parallel_size}"
+        if self.model.moe_latent_dim is not None:
+            assert self.model.moe_latent_dim % self.model_parallel_size == 0, f"{self.model.moe_latent_dim}/{self.model_parallel_size}"
         if self.moe_router_load_balancing_type is not None:
             assert self.moe_router_load_balancing_type in ['dot', 'entropy']
+            assert self.model.moe_router_type == 'topk', "Dynamic QB does not use auxiliary load-balancing loss."
             assert self.moe_aux_loss_coeff >= 0.0
         # freq checks
         assert self.dump_freq % self.log_freq == 0
@@ -445,6 +483,7 @@ class TrainerConf(Config):
         if self.health_moe_stats:
             assert self.health_metrics, "MoE statistics require health_metrics=true"
             assert self.model.num_experts > 0, "MoE statistics require model.num_experts > 0"
+            assert self.model.moe_router_type == "topk", "MoE statistics currently require moe_router_type=topk"
         if self.health_mova_stats:
             assert self.health_metrics, "MoVA statistics require health_metrics=true"
             assert self.model.num_values > 0, "MoVA statistics require model.num_values > 0"
