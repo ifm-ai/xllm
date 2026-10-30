@@ -58,6 +58,7 @@ from xllm.utils import (
 )
 from xllm.models import build_model
 from xllm.optim import build_optimizer, rescale_grads, restore_optimizer_config
+from xllm.optim.roles import clip_grad_scales, init_roles
 from xllm.monitor import GPUMonitor, Timings
 from xllm.metrics import MetricLogger, build_mlogger
 from xllm.health_metrics import HealthMetricCollector
@@ -251,13 +252,14 @@ def main(cfg: TrainerConf):
 
     logger.info("Start building of model...")
     cfg.model.vocab_size = tokenizer.vocab_size
-    model = build_model(
-        cfg.model, dtype=cfg.dtype,
-        fully_sharded_size=cfg.fully_sharded_size,
-        fp32_reduce_scatter=cfg.fp32_reduce_scatter,
-        reshard_after_forward=cfg.reshard_after_forward,
-        forward_prefetch=cfg.forward_prefetch, tokenizer=tokenizer
-    )
+    with init_roles(cfg.roles):  # the roles' init stds
+        model = build_model(
+            cfg.model, dtype=cfg.dtype,
+            fully_sharded_size=cfg.fully_sharded_size,
+            fp32_reduce_scatter=cfg.fp32_reduce_scatter,
+            reshard_after_forward=cfg.reshard_after_forward,
+            forward_prefetch=cfg.forward_prefetch, tokenizer=tokenizer
+        )
     torch.cuda.empty_cache()
     gc.collect(2)
     logger.info(model)
@@ -273,7 +275,8 @@ def main(cfg: TrainerConf):
     tflops_per_token = model.tflops_per_token(cfg.seq_len)
 
     # build optimizer / scheduler
-    optimizer, scheduler = build_optimizer(model, cfg.optim, cfg.steps, cfg.dtype)
+    optimizer, scheduler = build_optimizer(model, cfg.optim, cfg.steps, cfg.dtype, roles=cfg.roles)
+    grad_scales = clip_grad_scales(model, cfg.roles)  # the roles' clip_scale in the clipping norm
 
     # setup loggers
     enable_loggers = cfg.slurm.is_master and not cfg.disable_logging
@@ -367,7 +370,7 @@ def main(cfg: TrainerConf):
             del reloaded_optim_state_dict
 
     if cfg.optim.optimizer == "muon":
-        restore_optimizer_config(optimizer, cfg.optim)
+        restore_optimizer_config(optimizer, cfg.optim, cfg.roles)
         # Full resume uses the restored scheduler position; base-model loading
         # keeps the newly constructed schedule, including its warmup LR.
         for group, lr in zip(optimizer.param_groups, scheduler.get_last_lr()):
@@ -467,7 +470,7 @@ def main(cfg: TrainerConf):
         timings.forward_backward += s_clip - s_fwd_bwd
 
         clip_max_norm = cfg.optim.clip * state.scale
-        grad_norm = clip_grad_norm_(fsdp_module=model, max_norm=clip_max_norm)
+        grad_norm = clip_grad_norm_(fsdp_module=model, max_norm=clip_max_norm, grad_scales=grad_scales)
 
         # update scale / status
         overflow = False
@@ -521,8 +524,9 @@ def main(cfg: TrainerConf):
             aux_losses.append(aux_loss)
         grad_norms.append(grad_norm)
         if cfg.optim.optimizer == "muon":
-            group_lrs = {group["algorithm"]: float(group["lr"]) for group in optimizer.param_groups}
-            curr_lr = group_lrs["muon"]
+            # adamw_lr, or with roles one per AdamW role: embed_lr, hidden_vector_lr, final_norm_lr, readout_lr
+            group_lrs = {group.get("role", group["algorithm"]): float(group["lr"]) for group in optimizer.param_groups}
+            curr_lr = group_lrs.pop("muon")
         else:
             curr_lr = float(optimizer.param_groups[0]["lr"])
         assert math.isfinite(curr_loss), f"loss is not finite:{curr_loss}"
@@ -532,7 +536,7 @@ def main(cfg: TrainerConf):
         optim_metrics = {
             "step": state.step,
             "lr": curr_lr,
-            **({"adamw_lr": group_lrs["adamw"]} if cfg.optim.optimizer == "muon" else {}),
+            **({f"{role}_lr": lr for role, lr in group_lrs.items()} if cfg.optim.optimizer == "muon" else {}),
             "avg_loss": reduce_scalar(curr_loss, op='mean'),
             "max_loss": reduce_scalar(curr_loss, op='max'),
         }
