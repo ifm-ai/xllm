@@ -338,7 +338,7 @@ def clip_grad_norm_(
         max_norm (float or int): max norm of the gradients
         norm_type (float or int): type of the used p-norm. Can be ``'inf'``
             for infinity norm.
-        grad_scales: id(param) -> factor on its gradient in the norm (mup).
+        grad_scales: id(param) -> factor on its gradient in the norm (roles, xllm/optim/roles.py).
 
     Returns:
         Total norm of the parameters (viewed as a single vector).

@@ -77,23 +77,42 @@
 --dcp_for_optimizer true
 ```
 
+## Parameter roles (`--roles.*`)
+
+Every parameter has a role, declared where it is created with `register_role(module, name, role)`
+(`xllm/optim/roles.py`; the tag lives on the module, so it survives FSDP2): `embed`,
+`hidden_matrix`, `residual_out` (attention `wo`, FFN `fc2`), `hidden_vector` (norm gains and
+biases in the blocks), `final_norm`, `readout`. Each role (`RolesConf` in `xllm/config.py`) has
+- `lr`, `eps`, `weight_decay`: factors on the configured values. AdamW steps one param group
+  per role; Muon scales each matrix's lr and weight decay (`lr_scales`, `wd_scales`), its decay
+  `lr * weight_decay` taking both, as AdamW's. `eps` is AdamW's only.
+- `init_std`: a truncated normal init in the module's `__init__`, before wrapping (`init_roles`).
+- `clip_scale`: a factor on the role's gradients in the clipping norm.
+
+At their defaults nothing changes. E.g. `--roles.readout.lr 0.5 --roles.readout.weight_decay 0`.
+
 ## Complete(d)P with Muon (`--mup.*`, experimental)
 
-Width / depth scaling relative to a base model (arXiv:2512.22382; `MuPConf` in `xllm/config.py`,
-groups in `xllm/optim/mup.py`). Scale `num_heads`, `num_kv_heads` and `ffn_hidden_dim` with
+Width / depth scaling relative to a base model (arXiv:2512.22382; `MuPConf` in `xllm/config.py`): a
+preset that fills in the roles. Scale `num_heads`, `num_kv_heads` and `ffn_hidden_dim` with
 `model_dim`, keep `head_dim` fixed; the hyperparameters are the base model's.
+m_N = model_dim / base_model_dim, m_L = num_layers / base_num_layers, c = m_L^-alpha,
+sigma_h = base_init_hidden_std m_N^-1/2:
 
-- m_N = model_dim / base_model_dim, m_L = num_layers / base_num_layers, c = m_L^-alpha.
-- Init: hidden std x m_N^-1/2, readout x m_N^-1, embedding unchanged; attention `wo` and FFN
-  `fc2` x c on top of the hidden std (`model.init_out_std`). Explicit init stds that disagree are rejected.
-- Muon: lr x m_L^(alpha-1); `wo` / `fc2` updates x c, their decay `lr * wd` unchanged.
-- AdamW per role (lr, eps, weight decay): embed (1, m_N^-1, 1), hidden_vector (m_L^(alpha-1),
-  m_N^-1 m_L^-alpha, 1), final_norm (1, 1, 1), readout (m_N^-1, 1, m_N).
-- Clipping counts `wo` / `fc2` gradients x c.
+| role            | lr              | eps                | weight_decay | init_std                    | clip_scale |
+|-----------------|-----------------|--------------------|--------------|-----------------------------|------------|
+| `embed`         | 1               | m_N^-1             | 1            | base_init_embed_std         | 1          |
+| `hidden_matrix` | m_L^(alpha-1)   | 1                  | 1            | sigma_h                     | 1          |
+| `residual_out`  | m_L^(alpha-1) c | 1                  | 1/c          | sigma_h c                   | c          |
+| `hidden_vector` | m_L^(alpha-1)   | m_N^-1 m_L^-alpha  | 1            | -                           | 1          |
+| `final_norm`    | 1               | 1                  | 1            | -                           | 1          |
+| `readout`       | m_N^-1          | 1                  | m_N          | base_init_unembed_std / m_N | 1          |
 
-The depth scale is folded into `wo` / `fc2` instead of a residual multiplier: the forward is a
+The depth scale c is folded into `residual_out` instead of a residual multiplier: the forward is a
 plain Transformer (checkpoints serve as they are), and training equals the multiplier version.
-Dense Transformers only, `init_mode gaussian`, `muon_adjust_lr spectral_norm`, `muon_block_scale block`.
+Roles set by hand that disagree with the preset are rejected, as are `model.init_std`,
+`init_embed_std` and `init_logits_std`. Dense Transformers only, `init_mode gaussian`,
+`muon_adjust_lr spectral_norm`, `muon_block_scale block`.
 
 ```bash
 --optim.optimizer muon --dcp_for_optimizer true --model.init_mode gaussian \

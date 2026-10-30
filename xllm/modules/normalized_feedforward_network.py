@@ -14,6 +14,7 @@ from xllm.modules.rms_norm import GroupRMSNorm
 from xllm.modules.residual import build_residual
 from xllm.utils import get_init_fn
 from xllm.optim.muon_spec import register_muon
+from xllm.optim.roles import register_role
 
 
 class NormalizedFeedForwardNetwork(nn.Module):
@@ -34,8 +35,7 @@ class NormalizedFeedForwardNetwork(nn.Module):
         residual_func: str = 'base',
         residual_heads: Optional[int] = None,
         init_mode: str = 'gaussian',
-        init_std: Optional[float] = None,
-        init_out_std: Optional[float] = None,  # init std of fc2; None = init_std
+        init_std: Optional[float] = None
     ):
         super().__init__()
         self.layer_id = layer_id
@@ -74,7 +74,7 @@ class NormalizedFeedForwardNetwork(nn.Module):
             bias=False,
             input_is_parallel=True,
             parallel_output=True,
-            init_method=get_init_fn(init_mode, dim=ffn_hidden_dim, std=init_std if init_out_std is None else init_out_std),
+            init_method=get_init_fn(init_mode, dim=ffn_hidden_dim, std=init_std),
         )
         self.fc3 = ColumnParallelLinear(
             model_dim,
@@ -91,9 +91,13 @@ class NormalizedFeedForwardNetwork(nn.Module):
             num_features=ffn_hidden_dim, eps=rmsnorm_eps, init_std=init_std
         )
 
-        for fc, tp_dim in ((self.fc1, 0), (self.fc2, 1), (self.fc3, 0)):  # column, row, column parallel
+        for fc, tp_dim, role in ((self.fc1, 0, "hidden_matrix"), (self.fc2, 1, "residual_out"),
+                                 (self.fc3, 0, "hidden_matrix")):  # column, row, column parallel
             if fc is not None:
                 register_muon(fc, tp_dim=tp_dim)  # Muon, one matrix (xllm/optim/muon.py)
+                register_role(fc, "weight", role)  # xllm/optim/roles.py
+        register_role(self.norm, "weight", "hidden_vector")
+        register_role(self.norm, "bias", "hidden_vector")
 
     def forward(
         self,

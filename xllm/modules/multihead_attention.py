@@ -25,6 +25,7 @@ from xllm.modules.fused_ops import (
 )
 from xllm.utils import get_init_fn
 from xllm.optim.muon_spec import register_muon
+from xllm.optim.roles import register_role
 
 
 class MultiheadAttention(nn.Module):
@@ -59,7 +60,6 @@ class MultiheadAttention(nn.Module):
         residual_heads: Optional[int] = None,
         init_mode: str = 'he',
         init_std: Optional[float] = None,
-        init_out_std: Optional[float] = None,  # init std of wo; None = init_std
     ):
         super().__init__()
         self.layer_id = layer_id
@@ -192,7 +192,7 @@ class MultiheadAttention(nn.Module):
             bias=False,
             input_is_parallel=True,
             parallel_output=True,
-            init_method=init_fn if init_out_std is None else get_init_fn(init_mode, dim=mdim, std=init_out_std),
+            init_method=init_fn,
         )
 
         self.residual = build_residual(
@@ -209,6 +209,16 @@ class MultiheadAttention(nn.Module):
         register_muon(self.wo, tp_dim=1)
         if self.wg is not None:
             register_muon(self.wg, tp_dim=1)
+
+        # roles (xllm/optim/roles.py)
+        for w in (self.wq, self.wk, self.wv, self.wr, self.wg):
+            if w is not None:
+                register_role(w, "weight", "hidden_matrix")
+        register_role(self.wo, "weight", "residual_out")
+        for norm in (self.norm, self.query_norm):
+            if norm is not None:
+                register_role(norm, "weight", "hidden_vector")
+                register_role(norm, "bias", "hidden_vector")
 
     def forward(
         self,

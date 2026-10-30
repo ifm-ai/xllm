@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field, fields
 from logging import getLogger
 from typing import Optional
 from pathlib import Path
@@ -163,7 +163,6 @@ class ModelConf(Config):
     init_std: Optional[float] = None  # Init std for gaussian; If None, deriving from input dimensions. he/xavier requires None
     init_embed_std: Optional[float] = None  # Std used to truncate normal init of embedding weights. If None, = 1 / sqrt(model_dim)
     init_logits_std: Optional[float] = None  # Std used to truncate normal init of output projection weights. If None, = 1 / sqrt(model_dim)
-    init_out_std: Optional[float] = NOCLI()  # Init std of the dense blocks' output projections (attention wo, FFN fc2). None = init_std. Set by the mup config.
     # Input & output
     vocab_size: int = -1  # Defined later by tokenizer
     # Normalization
@@ -252,17 +251,45 @@ class ModelConf(Config):
 
 
 @dataclass
-class MuPConf(Config):
-    """Complete(d)P width / depth scaling relative to a base model (arXiv:2512.22382), with Muon.
+class RoleConf(Config):
+    """Hyperparameters of the parameters of one role (register_role, xllm/optim/roles.py). The defaults change nothing."""
+    lr: float = 1.0  # x optim.lr (AdamW) or optim.muon_lr (Muon); the decay lr * weight_decay takes both factors
+    eps: float = 1.0  # x optim.epsilon; AdamW only
+    weight_decay: float = 1.0  # x the weight decay
+    init_std: Optional[float] = None  # Truncated normal init (at 3 std) as the model is built; None keeps the module's init
+    clip_scale: float = 1.0  # Factor on the gradients in the clipping norm; all gradients are still clipped alike
 
-    m_N = model_dim / base_model_dim, m_L = num_layers / base_num_layers. Scale num_heads, num_kv_heads
-    and ffn_hidden_dim with model_dim and keep head_dim fixed.
-    - Width: hidden init std x m_N^-1/2; readout init std and AdamW lr x m_N^-1. Muon needs no width
-      factor: its spectral_norm update scale already transfers across widths.
-    - Depth: the residual branches are scaled by c = m_L^-alpha without a multiplier in the forward. c is
-      folded into the output projections (attention wo, FFN fc2): their init std and Muon update are x c,
-      their gradients count x c in the clipping norm, and their decay lr * wd is unchanged. Training
-      then matches a residual multiplier c exactly (xllm/optim/mup.py).
+
+@dataclass
+class RolesConf(Config):
+    """Per-role hyperparameters (xllm/optim/roles.py); mup fills them in. At their defaults training is unchanged."""
+    embed: RoleConf = field(default_factory=RoleConf)
+    hidden_matrix: RoleConf = field(default_factory=RoleConf)  # Muon matrices in the blocks, but residual_out
+    residual_out: RoleConf = field(default_factory=RoleConf)  # attention wo and FFN fc2, the branches' outputs (Muon)
+    hidden_vector: RoleConf = field(default_factory=RoleConf)  # norm gains and biases in the blocks
+    final_norm: RoleConf = field(default_factory=RoleConf)
+    readout: RoleConf = field(default_factory=RoleConf)
+
+
+@dataclass
+class MuPConf(Config):
+    """Complete(d)P width / depth scaling relative to a base model (arXiv:2512.22382), with Muon: a preset of the
+    per-role hyperparameters (RolesConf).
+
+    m_N = model_dim / base_model_dim, m_L = num_layers / base_num_layers, c = m_L^-alpha. Scale num_heads,
+    num_kv_heads and ffn_hidden_dim with model_dim and keep head_dim fixed. Muon needs no width factor: its
+    spectral_norm update scale already transfers across widths. The residual branches are scaled by c without a
+    multiplier in the forward: c is folded into residual_out, whose init std and lr are x c, weight decay x 1/c
+    (lr * weight_decay unchanged) and gradients x c in the clipping norm. Training then matches a residual
+    multiplier c exactly. Factors on the configured values, and init stds (sigma_h = base_init_hidden_std m_N^-1/2):
+
+        role           lr               eps               weight_decay  init_std                     clip_scale
+        embed          1                m_N^-1            1             base_init_embed_std          1
+        hidden_matrix  m_L^(alpha-1)    1                 1             sigma_h                      1
+        residual_out   m_L^(alpha-1) c  1                 1/c           sigma_h c                    c
+        hidden_vector  m_L^(alpha-1)    m_N^-1 m_L^-alpha 1             -                            1
+        final_norm     1                1                 1             -                            1
+        readout        m_N^-1           1                 m_N           base_init_unembed_std / m_N  1
     """
     base_model_dim: int  # model_dim of the base model the hyperparameters were tuned on
     base_num_layers: int  # num_layers of the base model
@@ -274,8 +301,8 @@ class MuPConf(Config):
     depth_multiplier: Optional[float] = NOCLI()  # m_L, set by resolve()
     branch_scale: Optional[float] = NOCLI()  # c = m_L^-alpha, set by resolve()
 
-    def resolve(self, model: ModelConf, optim: OptimConf) -> None:
-        """Check that the run supports mup; set the multipliers and the model's init stds."""
+    def resolve(self, model: ModelConf, optim: OptimConf, roles: RolesConf) -> None:
+        """Check that the run supports mup; set the multipliers and the roles."""
         for name in ("base_model_dim", "base_num_layers", "base_init_hidden_std", "base_init_embed_std",
                      "base_init_unembed_std"):
             value = getattr(self, name)
@@ -286,6 +313,9 @@ class MuPConf(Config):
         for name, actual, supported in (
             ("model.arch", model.arch, ["transformer"]),
             ("model.init_mode", model.init_mode, ["gaussian"]),
+            ("model.init_std", model.init_std, [None]),  # the roles' init_std replace these
+            ("model.init_embed_std", model.init_embed_std, [None]),
+            ("model.init_logits_std", model.init_logits_std, [None]),
             ("model.num_experts", model.num_experts, [0]),
             ("model.num_values", model.num_values, [0]),
             ("model.scale_emb", model.scale_emb, [False]),
@@ -297,26 +327,26 @@ class MuPConf(Config):
             if actual not in supported:
                 raise ValueError(f"mup requires {name} in {supported}, got {actual!r}")
 
-        self.width_multiplier = model.model_dim / self.base_model_dim
-        self.depth_multiplier = model.num_layers / self.base_num_layers
-        self.branch_scale = self.depth_multiplier ** -self.alpha
-        init_std = self.base_init_hidden_std / math.sqrt(self.width_multiplier)
-        # model init std -> (value at this size, the mup setting it comes from)
-        resolved = {
-            "init_std": (init_std, "base_init_hidden_std"),
-            "init_out_std": (init_std * self.branch_scale, "base_init_hidden_std"),
-            "init_embed_std": (self.base_init_embed_std, "base_init_embed_std"),
-            "init_logits_std": (self.base_init_unembed_std / self.width_multiplier, "base_init_unembed_std"),
+        m_n = self.width_multiplier = model.model_dim / self.base_model_dim
+        m_l = self.depth_multiplier = model.num_layers / self.base_num_layers
+        c = self.branch_scale = m_l ** -self.alpha
+        depth_lr = m_l ** (self.alpha - 1)
+        hidden_std = self.base_init_hidden_std / math.sqrt(m_n)
+        preset = {
+            "embed": RoleConf(eps=1 / m_n, init_std=self.base_init_embed_std),
+            "hidden_matrix": RoleConf(lr=depth_lr, init_std=hidden_std),
+            "residual_out": RoleConf(lr=depth_lr * c, weight_decay=1 / c, init_std=hidden_std * c, clip_scale=c),
+            "hidden_vector": RoleConf(lr=depth_lr, eps=c / m_n),
+            "final_norm": RoleConf(),
+            "readout": RoleConf(lr=1 / m_n, weight_decay=m_n, init_std=self.base_init_unembed_std / m_n),
         }
-        for name, (value, source) in resolved.items():
-            current = getattr(model, name)
-            # an equal value is allowed: the config.json of a mup run
-            if current is not None and not math.isclose(current, value, rel_tol=1e-9):
-                raise ValueError(
-                    f"model.{name}={current} conflicts with mup, which sets it to {value}. "
-                    f"Unset model.{name} and set mup.{source} (its value at the base size) instead."
-                )
-            setattr(model, name, value)
+        for role, values in preset.items():
+            for f in fields(RoleConf):
+                # a default or an equal value is allowed: the config.json of a mup run holds the resolved ones
+                current, value = getattr(getattr(roles, role), f.name), getattr(values, f.name)
+                if current not in (f.default, value):
+                    raise ValueError(f"roles.{role}.{f.name}={current} conflicts with mup, which sets it to {value}")
+            setattr(roles, role, values)
 
 
 @dataclass
@@ -395,7 +425,8 @@ class TrainerConf(Config):
     valid: ValidConf
     tokenizer: TokenizerConf
     dataloader: DataLoaderConfig  # Configs for multi-source data loading.
-    mup: Optional[MuPConf] = None  # Complete(d)P width / depth scaling, with optim.optimizer=muon. None leaves training unchanged.
+    mup: Optional[MuPConf] = None  # Complete(d)P width / depth scaling, with optim.optimizer=muon: sets the roles
+    roles: RolesConf = field(default_factory=RolesConf)  # Per-role hyperparameters, with optim.optimizer=muon
 
     # Training data / iterator
     data: str = ""  # Comma seperated data mix. Each mix is formatted as path:weight:json_key:source_format. Weights need not sum to 1.
@@ -510,7 +541,7 @@ class TrainerConf(Config):
             assert self.model.num_experts == 0, "Muon does not support MoE."
             assert self.dcp_for_optimizer, "Muon requires dcp_for_optimizer (sharded momentum)."
         if self.mup is not None:
-            self.mup.resolve(self.model, self.optim)
+            self.mup.resolve(self.model, self.optim, self.roles)
 
         # MoE
         if self.model.num_experts > 0:

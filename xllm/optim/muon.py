@@ -54,7 +54,7 @@ from torch.distributed.device_mesh import DeviceMesh
 from torch.optim import Optimizer
 from torch.optim.adamw import adamw
 
-from xllm.config import MuPConf, OptimConf
+from xllm.config import OptimConf, RolesConf
 from .muon_spec import Block, MuonSpec, muon_spec, register_muon
 
 
@@ -217,29 +217,30 @@ class Muon(Optimizer):
         mesh: DeviceMesh,
         cfg: OptimConf,
         tp_group: Optional[dist.ProcessGroup] = None,
-        muon_group: Optional[Dict] = None,
-        update_scales: Optional[List[float]] = None,
+        lr_scales: Optional[List[float]] = None,
+        wd_scales: Optional[List[float]] = None,
     ):
         """specs[i]: how muon_params[i] maps to Newton-Schulz matrices (register_muon / muon_spec).
         adamw_params: the AdamW parameters, or AdamW param groups: dicts whose keys replace the configured values.
         tp_group: the tensor-parallel group, if any: the params are then each rank's TP-local shard. Muon
         works over the plane of the dp mesh x TP group, TP being one more way the weight is sharded.
-        muon_group: keys that replace the configured values of the Muon group.
-        update_scales[i]: factor on the update of muon_params[i], not on its weight decay; default 1.
-        mup sets the param groups, muon_group and update_scales (xllm/optim/mup.py)."""
+        lr_scales[i] / wd_scales[i]: muon_params[i] steps as if the group's lr / weight_decay were x these (default 1),
+        like an AdamW group's: its decay lr * weight_decay takes both. Roles set them and the AdamW groups
+        (xllm/optim/roles.py)."""
         # one compiled Newton-Schulz per stack shape (block shapes x batch sizes), far more than the default 8
         torch._dynamo.config.cache_size_limit = max(torch._dynamo.config.cache_size_limit, 64)
         defaults = dict(weight_decay=cfg.weight_decay, eps=cfg.epsilon)
         adamw_groups = adamw_params if adamw_params and isinstance(adamw_params[0], dict) else [dict(params=adamw_params)]
         super().__init__(
             [
-                dict(params=muon_params, lr=cfg.muon_lr, algorithm="muon", **group_hparams(cfg, "muon")) | (muon_group or {}),
+                dict(params=muon_params, lr=cfg.muon_lr, algorithm="muon", **group_hparams(cfg, "muon")),
                 *(dict(lr=cfg.lr, algorithm="adamw", **group_hparams(cfg, "adamw")) | group for group in adamw_groups),
             ],
             defaults,
         )
-        self.update_scales = [1.0] * len(muon_params) if update_scales is None else list(update_scales)
-        assert len(self.update_scales) == len(muon_params)
+        self.lr_scales = [1.0] * len(muon_params) if lr_scales is None else list(lr_scales)
+        self.wd_scales = [1.0] * len(muon_params) if wd_scales is None else list(wd_scales)
+        assert len(self.lr_scales) == len(self.wd_scales) == len(muon_params)
         self._plan([tuple(p.shape) for p in muon_params], specs, mesh, tp_group, cfg.muon_batch_numel)
 
     # ---- plan: built once from the global shapes, identical on every rank ----
@@ -469,8 +470,9 @@ class Muon(Optimizer):
     @torch.no_grad()
     def _muon_step(self, group: Dict):
         eps = group["eps"]
-        scales = [self._scale(*fans, group["adjust_lr"]) * update_scale
-                  for fans, update_scale in zip(self._fans[group["block_scale"]], self.update_scales)]
+        scales = [self._scale(*fans, group["adjust_lr"]) * lr_scale
+                  for fans, lr_scale in zip(self._fans[group["block_scale"]], self.lr_scales)]
+        decays = [lr_scale * wd_scale for lr_scale, wd_scale in zip(self.lr_scales, self.wd_scales)]
         params = [group["params"][i] for i in self.remote]
         plans = [self.plans[i] for i in self.remote]
         updates = [torch.empty_like(_local(p), dtype=torch.bfloat16) for p in params]
@@ -478,7 +480,7 @@ class Muon(Optimizer):
         gathered = self._gather(updates, plans) if self.has_remote else None    #    remote blocks on the wire
         for batch in self.batches:                                              # 2. meanwhile the local matrices
             self._step_local([group["params"][i] for i in batch], [self.plans[i] for i in batch],
-                             [scales[i] for i in batch], group)
+                             [scales[i] for i in batch], [decays[i] for i in batch], group)
         for u, plan in zip(updates, plans):                                     # 3. remote matrices: local blocks,
             if plan.local:
                 orthogonalize_(_rows_as_blocks(u, plan.local), eps)
@@ -488,20 +490,23 @@ class Muon(Optimizer):
             for X in buffers:
                 orthogonalize_(X, eps)
             self._scatter(blocks, updates, plans)                               #    back
-        self._update(params, updates, [scales[i] for i in self.remote], group["lr"], group["weight_decay"])
+        self._update(params, updates, [scales[i] for i in self.remote], [decays[i] for i in self.remote],
+                     group["lr"], group["weight_decay"])
 
-    def _step_local(self, params: List[Tensor], plans: List[MatrixPlan], scales: List[float], group: Dict):
+    def _step_local(self, params: List[Tensor], plans: List[MatrixPlan], scales: List[float], decays: List[float],
+                    group: Dict):
         """One batch of local matrices: momentum into one buffer per block shape, Newton-Schulz on it in place, update."""
         updates, buffers = _packed([(plan.local.count, plan.local.height, plan.local.cols) for plan in plans])
         self._momentum(params, group, updates)
         for X in buffers:
             orthogonalize_(X, group["eps"])
-        self._update(params, updates, scales, group["lr"], group["weight_decay"])
+        self._update(params, updates, scales, decays, group["lr"], group["weight_decay"])
 
     @staticmethod
-    def _update(params: List[Tensor], updates: List[Tensor], scales: List[float], lr: float, wd: float):
-        """W <- (1 - lr * wd) W - lr * scale * update, in fp32, for the params with a gradient; updates[i] holds the
-        shard's elements in any shape (its blocks, maybe transposed views)."""
+    def _update(params: List[Tensor], updates: List[Tensor], scales: List[float], decays: List[float], lr: float,
+                wd: float):
+        """W <- (1 - lr * wd * decay) W - lr * scale * update, in fp32, for the params with a gradient; updates[i]
+        holds the shard's elements in any shape (its blocks, maybe transposed views)."""
         live = [i for i, p in enumerate(params) if p.grad is not None]
         if not live:
             return
@@ -509,7 +514,7 @@ class Muon(Optimizer):
         step = [torch.empty_like(x) for x in xs]
         torch._foreach_copy_(step, [updates[i] for i in live])
         torch._foreach_mul_(step, [-lr * scales[i] for i in live])
-        torch._foreach_mul_(xs, 1 - lr * wd)
+        torch._foreach_mul_(xs, [1 - lr * wd * decays[i] for i in live])
         torch._foreach_add_(xs, step)
 
     @torch.no_grad()
@@ -557,9 +562,9 @@ def _warn_unregistered(model: nn.Module, muon_ids: set):
         logger.warning(f"Muon: unregistered weights use AdamW: {dict(missed)}")
 
 
-def build_muon(model: nn.Module, cfg: OptimConf, mup: Optional[MuPConf] = None) -> Optimizer:
+def build_muon(model: nn.Module, cfg: OptimConf, roles: Optional[RolesConf] = None) -> Optimizer:
     """The model must be wrapped with FSDP2; Muon works over the shard dimension of the mesh its parameters live on.
-    mup: Complete(d)P param groups and update scales (xllm/optim/mup.py)."""
+    roles: AdamW groups per role, Muon lr and weight decay factors per matrix (xllm/optim/roles.py)."""
     from xllm.distributed import get_model_parallel_group, get_model_parallel_world_size
     tp = get_model_parallel_world_size()
     muon_params, specs, names, adamw_params = split_muon_params(model)
@@ -576,19 +581,22 @@ def build_muon(model: nn.Module, cfg: OptimConf, mup: Optional[MuPConf] = None) 
     mesh = muon_params[0].device_mesh
     shard_mesh = mesh if mesh.ndim == 1 else mesh["dp"]
     tp_group = get_model_parallel_group() if tp > 1 else None
-    muon_group = update_scales = None
-    if mup is not None:
-        from .mup import param_groups
-        muon_group, adamw_params, update_scales = param_groups(model, cfg, mup, muon_params)
+    lr_scales = wd_scales = None
+    if roles is not None:
+        from .roles import param_groups
+        adamw_params, lr_scales, wd_scales = param_groups(model, cfg, roles, muon_params)
     optimizer = Muon(muon_params, specs, adamw_params, shard_mesh, cfg, tp_group=tp_group,
-                     muon_group=muon_group, update_scales=update_scales)
+                     lr_scales=lr_scales, wd_scales=wd_scales)
     adamw = [p for group in optimizer.param_groups if group["algorithm"] == "adamw" for p in group["params"]]
     logger.info(f"Muon: {len(muon_params)} matrices / {len(optimizer.blocks)} blocks (scale={cfg.muon_block_scale}) / "
                 f"{sum(p.numel() for p in muon_params)} params; AdamW: {len(adamw)} tensors / "
                 f"{sum(p.numel() for p in adamw)} params")
-    if mup is not None:
-        for group in optimizer.param_groups:
-            logger.info(f"mup {group['role']}: {len(group['params'])} tensors, lr {group['lr']:.6g}, "
+    if roles is not None:
+        from .roles import MUON_ROLES
+        for role in MUON_ROLES:
+            logger.info(f"role {role} (Muon): lr x {getattr(roles, role).lr:.6g}, "
+                        f"weight_decay x {getattr(roles, role).weight_decay:.6g}")
+        for group in optimizer.param_groups[1:]:
+            logger.info(f"role {group['role']} (AdamW): {len(group['params'])} tensors, lr {group['lr']:.6g}, "
                         f"eps {group['eps']:.6g}, weight_decay {group['weight_decay']:.6g}")
-        logger.info(f"mup: wo / fc2 updates x c = {mup.branch_scale:.6g}")
     return optimizer
