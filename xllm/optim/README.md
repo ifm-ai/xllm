@@ -92,9 +92,8 @@ groups in `xllm/optim/mup.py`). Scale `num_heads`, `num_kv_heads` and `ffn_hidde
 - Clipping counts `wo` / `fc2` gradients x c.
 
 The depth scale is folded into `wo` / `fc2` instead of a residual multiplier: the forward is a
-plain Transformer (checkpoints serve as they are), and training equals the multiplier version
-(`tests/test_completedp_muon.py`, `tests/test_completedp_muon_gpu.py`). Dense Transformers only,
-`init_mode gaussian`, `muon_adjust_lr spectral_norm`, `muon_block_scale block`.
+plain Transformer (checkpoints serve as they are), and training equals the multiplier version.
+Dense Transformers only, `init_mode gaussian`, `muon_adjust_lr spectral_norm`, `muon_block_scale block`.
 
 ```bash
 --optim.optimizer muon --dcp_for_optimizer true --model.init_mode gaussian \
