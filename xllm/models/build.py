@@ -41,6 +41,7 @@ def build_model(
     reshard_after_forward: bool,
     forward_prefetch: bool,
     tokenizer: Tokenizer,
+    bf16_params: bool = False,
 ) -> nn.Module:
     if model_cfg.ddp_backend == 'fsdp1':
         return build_model_fsdp1(
@@ -50,7 +51,7 @@ def build_model(
     elif model_cfg.ddp_backend == 'fsdp2':
         return build_model_fsdp2(
             model_cfg, dtype, fully_sharded_size, fp32_reduce_scatter,
-            reshard_after_forward, forward_prefetch, tokenizer
+            reshard_after_forward, forward_prefetch, tokenizer, bf16_params
         )
     else:
         raise ValueError(f"Unknown DDP backend: {model_cfg.ddp_backend}")
@@ -114,6 +115,7 @@ def build_model_fsdp2(
     reshard_after_forward: bool,
     forward_prefetch: bool,
     tokenizer: Tokenizer,
+    bf16_params: bool = False,
 ) -> nn.Module:
     from torch.distributed.fsdp import MixedPrecisionPolicy
     from xllm.distributed.wrap import enable_wrap, wrap
@@ -140,6 +142,10 @@ def build_model_fsdp2(
         "reshard_after_forward": reshard_after_forward,
         "mp_policy": mixed_precision,
     }
+    if bf16_params:
+        # store the sharded params (and so their grads) in bf16; the fp32 masters live in the optimizer. The model is
+        # still built and initialized in fp32, and buffers stay fp32: wrap() casts only the params it shards.
+        fsdp_cfg["storage_dtype"] = torch.bfloat16
     model_cls = get_model_cls(model_cfg.arch)
     with create_on_gpu():
         with enable_wrap(**fsdp_cfg):

@@ -246,7 +246,7 @@ def main(cfg: TrainerConf):
         fully_sharded_size=cfg.fully_sharded_size,
         fp32_reduce_scatter=cfg.fp32_reduce_scatter,
         reshard_after_forward=cfg.reshard_after_forward,
-        forward_prefetch=cfg.forward_prefetch, tokenizer=tokenizer
+        forward_prefetch=cfg.forward_prefetch, tokenizer=tokenizer, bf16_params=cfg.optimizer_offload
     )
     torch.cuda.empty_cache()
     gc.collect(2)
@@ -263,7 +263,7 @@ def main(cfg: TrainerConf):
     tflops_per_token = model.tflops_per_token(cfg.seq_len)
 
     # build optimizer / scheduler
-    optimizer, scheduler = build_optimizer(model, cfg.optim, cfg.steps, cfg.dtype)
+    optimizer, scheduler = build_optimizer(model, cfg.optim, cfg.steps, cfg.dtype, offload=cfg.optimizer_offload)
 
     # setup loggers
     enable_loggers = cfg.slurm.is_master and not cfg.disable_logging
@@ -320,6 +320,8 @@ def main(cfg: TrainerConf):
         dist_ckpt.load(reloaded_model_state_dict, checkpoint_id=model_path, process_group=hsdp_group)
         set_model_state(model, reloaded_model_state_dict, full_state=False)
         del reloaded_model_state_dict
+        if cfg.optimizer_offload:
+            optimizer.sync_masters_from_params()
         logger.info("Reloaded model.")
 
         # reload optimizer if available
@@ -349,6 +351,8 @@ def main(cfg: TrainerConf):
         dist_ckpt.load(reloaded_model_state_dict, checkpoint_id=base_model_path, process_group=hsdp_group)
         set_model_state(model, reloaded_model_state_dict, full_state=False)
         del reloaded_model_state_dict
+        if cfg.optimizer_offload:
+            optimizer.sync_masters_from_params()
         logger.info("Reloaded base model.")
 
         if cfg.reload_base_optim_state:
@@ -450,13 +454,18 @@ def main(cfg: TrainerConf):
         train_loss.backward()
         if enable_health:
             health_collector.record_matrix_norms(model, gradient_scale=state.scale)
+        if cfg.optimizer_offload:
+            optimizer.accumulate()  # after the health hooks, which read the GPU grads
 
         # grad clip
         s_clip = timer()
         timings.forward_backward += s_clip - s_fwd_bwd
 
         clip_max_norm = cfg.optim.clip * state.scale
-        grad_norm = clip_grad_norm_(fsdp_module=model, max_norm=clip_max_norm)
+        if cfg.optimizer_offload:
+            grad_norm = optimizer.clip_grad_norm_(clip_max_norm)
+        else:
+            grad_norm = clip_grad_norm_(fsdp_module=model, max_norm=clip_max_norm)
 
         # update scale / status
         overflow = False

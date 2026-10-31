@@ -361,6 +361,7 @@ class TrainerConf(Config):
     fp32_reduce_scatter: bool = True  # Whether to use fp32 for FSDP gradient reduction. Otherwise uses the training compute dtype.
     reshard_after_forward: bool = True  # Whether to release unsharded parameters after forward to save memory. Needs to gather them again for backward.
     forward_prefetch: bool = False  # Whether to prefetch parameters for better overlapping. Not supported by the current FSDP2 implementation.
+    optimizer_offload: bool = False  # FSDP2 only: keep sharded params and grads in bf16 on GPU and the fp32 master weights, AdamW states and grad accumulation in host memory.
 
     log_freq: int = 10  # Logs training metric summaries every N steps.
     dump_freq: int = 1000  # Saves checkpoint every N steps. Also save at the final step.
@@ -421,6 +422,10 @@ class TrainerConf(Config):
         assert self.dtype in ["bf16", "fp16", "fp32"]
         if self.dtype == "fp16":
             assert self.loss_rescaling, "loss rescaling needed for fp16!"
+        if self.optimizer_offload:
+            assert self.model.ddp_backend == "fsdp2", "optimizer_offload needs ddp_backend=fsdp2"
+            assert self.dtype == "bf16" and not self.loss_rescaling, "optimizer_offload needs bf16 without loss rescaling"
+            assert not self.dcp_for_optimizer, "optimizer_offload saves its host state with torch.save, not DCP"
 
         # MoE
         if self.model.num_experts > 0:
