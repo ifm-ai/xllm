@@ -43,9 +43,9 @@ class TransformerMoVABlockFunction(torch.autograd.Function):
         wk: torch.Tensor,  # (d/MP, d)
         wv: torch.Tensor,  # (n, v, d/MP)
         wr: Optional[torch.Tensor],  # (d/MP, d)
-        wg: Optional[torch.Tensor],  # (d/MP, d)
         wo: torch.Tensor,  # (d, v/MP)
         q_norm_w: Optional[torch.Tensor],  # (d/MP)
+        k_norm_w: Optional[torch.Tensor],  # (d/MP)
         local_heads: int,
         local_kv_heads: int,
         head_dim: int,
@@ -55,9 +55,10 @@ class TransformerMoVABlockFunction(torch.autograd.Function):
         mova_topk: int,
         mova_router_bias: Optional[torch.Tensor],
         value_backend: str,
+        attn_act_func: str,
+        apply_attn_gate: bool,
         attn_gate_func: str,
         causal_attn_backend: str,
-        mova_res_w: Optional[torch.Tensor],  # (d/MP, c)
         moe_norm_w: torch.Tensor,  # (d)
         moe_norm_b: Optional[torch.Tensor],  # (d)
         norm_local_groups: int,
@@ -80,7 +81,6 @@ class TransformerMoVABlockFunction(torch.autograd.Function):
         expert_w2: torch.Tensor,
         expert_w3: torch.Tensor,
         expert_backend: str,
-        moe_res_w: Optional[torch.Tensor],  # (d/MP, c)
         dropout: float,
         attention_dropout: float,
         hidden_dropout: float,
@@ -202,12 +202,11 @@ class TransformerMoVABlockFunction(torch.autograd.Function):
             wk,  # (d/MP, d)
             wv,  # (n, v, d/MP)
             wr,  # (d/MP, d)
-            wg,  # (h/MP, d)
             wo,  # (d, v/MP)
             q_norm_w,  # (d/MP)
+            k_norm_w,  # (d/MP)
             mova_router_w,
             mova_router_bias,
-            mova_res_w, # (d/MP, c)
             moe_norm_w,  # (d)
             moe_norm_b,  # (d)
             fc1_w,
@@ -218,10 +217,8 @@ class TransformerMoVABlockFunction(torch.autograd.Function):
             expert_w1,
             expert_w2,
             expert_w3,
-            moe_res_w,  # (d/MP, c)
             xq if not recompute_q else None,  # (bsz, slen, n_heads, head_dim)
             xk if not recompute_kv else None,  # (bsz, slen, n_kv_heads, head_dim)
-            xk_rstd if not recompute_kv else None,  # (bsz, slen, kv_heads)
             xv if not recompute_kv else None,  # (bsz, slen, n_kv_heads, head_dim)
             v_original_scores if not recompute_router else None,  # (bsz, slen, n_values)
             v_routing_indices,  # (bsz, slen, topk)
@@ -267,6 +264,8 @@ class TransformerMoVABlockFunction(torch.autograd.Function):
         # misc
         ctx.layernorm_eps = layernorm_eps
         ctx.rmsnorm_eps = rmsnorm_eps
+        ctx.attn_act_func = attn_act_func
+        ctx.apply_attn_gate = apply_attn_gate
         ctx.attn_gate_func = attn_gate_func
         ctx.dropout = dropout
         ctx.attention_dropout = attention_dropout
@@ -308,12 +307,11 @@ class TransformerMoVABlockFunction(torch.autograd.Function):
             wk,  # (d/MP, d)
             wv,  # (n, v, d/MP)
             wr,  # (d/MP, d)
-            wg,  # (h/MP, d)
             wo,  # (d, v/MP)
             q_norm_w,  # (d/MP)
+            k_norm_w,  # (d/MP)
             mova_router_w,
             mova_router_bias,
-            mova_res_w,  # (d/MP, c)
             moe_norm_w,  # (d)
             moe_norm_b,  # (d)
             fc1_w,
@@ -324,10 +322,8 @@ class TransformerMoVABlockFunction(torch.autograd.Function):
             expert_w1,
             expert_w2,
             expert_w3,
-            moe_res_w,  # (d/MP, c)
             xq,  # (bsz, slen, n_heads, head_dim)
             xk,  # (bsz, slen, n_kv_heads, head_dim)
-            xk_rstd,  # (bsz, slen, kv_heads)
             xv,  # (bsz, slen, n_kv_heads, head_dim)
             v_original_scores,  # (bsz, slen, n_values)
             v_routing_indices,  # (bsz, slen, topk)
@@ -381,6 +377,8 @@ class TransformerMoVABlockFunction(torch.autograd.Function):
         apply_rmsnorm = ctx.apply_rmsnorm
         gather_before_norm = ctx.gather_before_norm
         causal_attn_backend = ctx.causal_attn_backend
+        attn_act_func = ctx.attn_act_func
+        apply_attn_gate = ctx.apply_attn_gate
         attn_gate_func = ctx.attn_gate_func
         residual_func = ctx.residual_func
         residual_heads = ctx.residual_heads
@@ -550,9 +548,9 @@ class TransformerMoVABlockFunction(torch.autograd.Function):
             wk_grad,
             wv_grad,
             wr_grad,
-            None,
             wo_grad,
             q_norm_w_grad,
+            k_norm_w_grad,
             None,  # local_heads
             None,  # local_kv_heads
             None,  # head_dim
@@ -562,9 +560,10 @@ class TransformerMoVABlockFunction(torch.autograd.Function):
             None,  # mova_topk
             None,  # mova_router_bias
             None,  # value_backend
+            None,  # attn_act_func
+            None,  # apply_attn_gate
             None,  # attn_gate_func
             None,  # causal_attn_backend
-            None,  # attn_res_w
             moe_norm_w_grad,
             moe_norm_b_grad,
             None,  # norm_local_groups
@@ -587,7 +586,6 @@ class TransformerMoVABlockFunction(torch.autograd.Function):
             ew2_grad,
             ew3_grad,
             None,  # moe expert backend
-            None,  # moe_res_w
             None,  # dropout
             None,  # attention_dropout
             None,  # hidden_dropout

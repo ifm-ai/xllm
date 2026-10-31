@@ -64,7 +64,6 @@ class TransformerBlockFunction(torch.autograd.Function):
         fc1_w: torch.Tensor,
         fc2_w: torch.Tensor,
         fc3_w: Optional[torch.Tensor],
-        ffn_res_w: Optional[torch.Tensor],  # (d/MP, c)
         dropout: float,
         attention_dropout: float,
         hidden_dropout: float,
@@ -176,7 +175,6 @@ class TransformerBlockFunction(torch.autograd.Function):
             fc1_w,
             fc2_w,
             fc3_w,
-            ffn_res_w,  # (d/MP, c)
             xq if not recompute_q else None,  # (bsz, slen, n_heads, head_dim)
             xk if not recompute_kv else None,  # (bsz, slen, n_kv_heads, head_dim)
             xv if not recompute_kv else None,  # (bsz, slen, n_kv_heads, head_dim)
@@ -245,7 +243,6 @@ class TransformerBlockFunction(torch.autograd.Function):
             fc1_w,
             fc2_w,
             fc3_w,
-            ffn_res_w,  # (d/MP, c)
             xq,  # (bsz, slen, n_heads, head_dim)
             xk,  # (bsz, slen, n_kv_heads, head_dim)
             xv,  # (bsz, slen, n_kv_heads, head_dim)
@@ -453,7 +450,6 @@ class TransformerBlockFunction(torch.autograd.Function):
             fc1_w_grad,
             fc2_w_grad,
             fc3_w_grad,
-            None,  # ffn_res_w
             None,  # dropout
             None,  # attention_dropout
             None,  # hidden_dropout
