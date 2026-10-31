@@ -120,13 +120,9 @@ class GatedDeltaAttention(nn.Module):
         init_fn = get_init_fn(init_mode, dim=mdim, std=init_std)
 
         # query project
-        qheads = {
-            "softmax": self.num_heads,
-            "softdelta": self.num_heads + self.num_kv_heads
-        }[attn_act_func]
         self.wq = ColumnParallelLinear(
             mdim,
-            qheads * self.head_dim,
+            self.num_heads * self.head_dim,
             bias=False,
             input_is_parallel=False,
             disable_input_reduce=True,
@@ -134,9 +130,10 @@ class GatedDeltaAttention(nn.Module):
             init_method=init_fn
         )
         # key & value projections
+        nk = {"softmax": 1, "softdelta": 2}[attn_act_func]
         self.wk = ColumnParallelLinear(
             mdim,
-            kdim,
+            kdim * nk,
             bias=False,
             input_is_parallel=False,
             disable_input_reduce=True,
@@ -155,7 +152,7 @@ class GatedDeltaAttention(nn.Module):
 
         # qkv shortconvs
         self.q_conv = CausalConv1d(
-            qheads * self.head_dim,
+            self.num_heads * self.head_dim,
             causal_conv_width,
             bias=False,
             apply_weight_normalization=causal_conv_weight_normalization,
@@ -163,7 +160,7 @@ class GatedDeltaAttention(nn.Module):
             backend=causal_conv_backend,
         )
         self.k_conv = CausalConv1d(
-            kdim,
+            kdim * nk,
             causal_conv_width,
             bias=False,
             apply_weight_normalization=causal_conv_weight_normalization,
@@ -181,18 +178,18 @@ class GatedDeltaAttention(nn.Module):
 
         # qk-norm
         self.query_norm = GroupRMSNorm(
-            qheads * self.head_dim,
-            num_groups=qheads,
+            self.num_heads * self.head_dim,
+            num_groups=self.num_heads,
             elementwise_affine=True,
             eps=rmsnorm_eps,
             memory_efficient=False,
         )
         self.key_norm = GroupRMSNorm(
-            kdim,
-            num_groups=self.num_kv_heads,
-            elementwise_affine=False,
+            kdim * nk,
+            num_groups=self.num_kv_heads * nk,
+            elementwise_affine=True,
             eps=rmsnorm_eps,
-            memory_efficient=True,  # for knorm, always use efficient memory
+            memory_efficient=False,
         )
 
         # attention gate projection
@@ -440,13 +437,8 @@ class GatedDeltaAttention(nn.Module):
             bos_mask, segment_idx, stability_control, deterministic
         )
         # AWM
-        if self.attn_act_func == 'softdelta':
-            n_rep = self.local_heads // self.local_kv_heads
-            xq = rearrange(xq, 'b l (k n s) -> b l k n s', k=self.local_kv_heads, n=n_rep + 1)
-            xq = rearrange(xq[:, :, :, :n_rep], 'b l k n s -> b l (k n s)')
         awk, awk_mask, memory, log_norm_term, prev_aqk, prev_akk, _ = self.adaptive_working_memory(
-            xq, xk, xk, v, memory, log_norm_term, prev_aqk, prev_akk, prev_av,
-            segment_idx, prev_segment_count,
+            xq, xk, v, memory, log_norm_term, prev_aqk, prev_akk, prev_av, segment_idx, prev_segment_count,
         )
         if health_collector is not None:
             health_collector.record_gekko_branches(self.layer_id, sca, awk, r, awk_mask)

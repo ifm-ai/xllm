@@ -186,6 +186,7 @@ class MovingAverageGatedAttention(nn.Module):
             init_method=get_init_fn(init_mode, dim=hdim, std=init_std)
         )
         self.sliding_chunk_attention = SlidingChunkSoftmaxAttention(
+            self.layer_id,
             self.local_heads,
             self.local_heads,
             self.head_dim,
@@ -197,6 +198,7 @@ class MovingAverageGatedAttention(nn.Module):
             efficient_attn
         )
         self.adaptive_working_memory = AdaptiveWorkingMemory(
+            self.layer_id,
             self.local_heads,
             self.local_heads,
             self.head_dim,
@@ -204,7 +206,6 @@ class MovingAverageGatedAttention(nn.Module):
             self.chunk_size,
             False,
             rmsnorm_eps,
-            False
         )
         self.gamma = Parameter(torch.zeros(4 * self.head_dim * self.local_heads))
         self.beta = Parameter(torch.zeros(4 * self.head_dim * self.local_heads))

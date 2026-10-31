@@ -38,8 +38,7 @@ class AdaptiveWorkingMemory(nn.Module):
     def forward(
         self,
         xq: Tensor,  # B x L x (H*S)
-        xqk: Tensor,  # B x L x (K*S)
-        xkk: Tensor,  # B x L x (K*S)
+        xk: Tensor,  # B x L x (K*S)
         xv: Tensor,  # B x L x (K*V)
         memory: Optional[Tensor],  # B x K x S x V
         log_norm_term: Optional[Tensor],  # B x K x S
@@ -55,10 +54,16 @@ class AdaptiveWorkingMemory(nn.Module):
         # B x L x H*S -> B x H x L x S
         xq = rearrange(xq, 'b l (h s) -> b h l s', h=self.n_heads)
         xq = F.softmax(xq, dim=-1, dtype=torch.float32).to(xq)
-        # B x L x K*S|V -> B x K x L x S|V
-        xqk = rearrange(xqk, 'b l (k s) -> b k l s', k=self.n_kv_heads)
+        xk = rearrange(xk, 'b l (k s) -> b k l s', k=self.n_kv_heads)
+        if xk.shape[3] == self.head_dim:
+            xqk = xkk = xk  # shared qk & kk
+        else:
+            assert xk.shape[3] == 2 * self.head_dim  # separate qk & kk
+            # xqk = xk[:, :, :, :self.head_dim]
+            xkk = xk[:, :, :, self.head_dim:]
+            xqk = xkk  # v1
+        # softmax to qk
         xqk = F.softmax(xqk, dim=-1, dtype=torch.float32).to(xqk)
-        xkk = rearrange(xkk, 'b l (k s) -> b k l s', k=self.n_kv_heads)
         xv = rearrange(xv, 'b l (k v) -> b k l v', k=self.n_kv_heads)
 
         if seq_len >= self.chunk_size:
