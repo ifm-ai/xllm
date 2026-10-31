@@ -489,11 +489,11 @@ class Gekko(XLLModel):
         # conv params
         conv_params_per_block = self.causal_conv_width * (self.num_heads * self.head_dim + self.num_kv_heads * (self.head_dim + self.v_head_dim))
         # norm params
-        norm_params_per_block = self.model_dim * (3 if self.apply_rmsnorm else 4) + self.head_dim * self.num_heads
+        norm_params_per_block = self.model_dim * (3 if self.apply_rmsnorm else 4) + self.head_dim * (self.num_heads + self.num_kv_heads)
         if self.attn_act_func == 'softdelta':
-            gda_params_per_block += self.model_dim * self.num_heads * (self.head_dim + 1)
-            conv_params_per_block += self.causal_conv_width * self.num_heads * self.head_dim
-            norm_params_per_block += self.head_dim * self.num_heads
+            gda_params_per_block += self.model_dim * (self.num_kv_heads * self.head_dim + self.num_heads)
+            conv_params_per_block += self.causal_conv_width * self.num_kv_heads * self.head_dim
+            norm_params_per_block += self.num_kv_heads * self.head_dim
         # FFN
         ffn_params_per_block = self.model_dim * self.ffn_hidden_dim * (3 if self.swiglu else 2)
         ffn_params_per_block += num_params_in_residual(self.residual_func, self.model_dim, self.residual_heads, self.ffn_hidden_dim)
@@ -531,6 +531,11 @@ class Gekko(XLLModel):
         conv_flops = self.causal_conv_width * (q_dim + k_dim + v_dim) * 2
         sca_flops = self.model_dim * (q_dim + k_dim + v_dim + h_dim)
         sca_flops += (q_dim + h_dim) * self.chunk_size * 1.5
+        if self.attn_act_func == 'softdelta':
+            conv_flops += self.causal_conv_width * k_dim * 2
+            norm_flops += k_dim * 2
+            sca_flops += self.model_dim * (k_dim + self.num_heads)
+            sca_flops += k_dim * self.chunk_size * 1.5
         awk_flops = (k_dim * 2 + q_dim) * self.v_head_dim
         attn_flops = sca_flops + awk_flops + self.model_dim * h_dim
         ffn_flops = self.model_dim * self.ffn_hidden_dim * (3 if self.swiglu else 2)

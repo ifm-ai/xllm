@@ -782,16 +782,17 @@ class Transformer(XLLModel):
 
     def num_parameters(self):
         embed_params = self.model_dim * self.vocab_size * 2
-        attn_params_per_block = self.model_dim * (self.num_heads + self.num_kv_heads) * self.head_dim * 2
+        nk = {"softmax": 1, "softdelta": 2}[self.attn_act_func]
+        attn_params_per_block = self.model_dim * (self.num_heads * 2 + self.num_kv_heads * (nk + 1)) * self.head_dim
         if self.attn_act_func == 'softdelta':
-            attn_params_per_block += self.model_dim * (self.num_kv_heads * self.head_dim + self.num_heads)
+            attn_params_per_block += self.model_dim * self.num_heads
         if self.apply_attn_gate:
             attn_params_per_block += self.model_dim * self.num_heads * self.head_dim
         attn_params_per_block += num_params_in_residual(self.residual_func, self.model_dim, self.residual_heads, self.num_heads * self.head_dim)
         # Norm
         norm_params_per_block = self.model_dim * (2 if self.apply_rmsnorm else 4)
         if self.qknorm:
-            norm_params_per_block += (self.head_dim + self.num_kv_heads) * self.num_heads
+            norm_params_per_block += (self.num_heads + self.num_kv_heads * nk) * self.head_dim
         # FFN
         ffn_params_per_block = self.model_dim * self.ffn_hidden_dim * (3 if self.swiglu else 2)
         ffn_params_per_block += num_params_in_residual(self.residual_func, self.model_dim, self.residual_heads, self.ffn_hidden_dim)
@@ -800,9 +801,9 @@ class Transformer(XLLModel):
         activated_params += (attn_params_per_block + ffn_params_per_block) * self.num_dense_layers + embed_params
         total_params = activated_params
         if self.num_values > 0:
-            mova_qko_params = self.model_dim * (self.num_heads * 2 + self.num_kv_heads) * self.head_dim
+            mova_qko_params = self.model_dim * (self.num_heads * 2 + self.num_kv_heads * nk) * self.head_dim
             if self.attn_act_func == 'softdelta':
-                mova_qko_params += self.model_dim * (self.num_kv_heads * self.head_dim + self.num_heads)
+                mova_qko_params += self.model_dim * self.num_heads
             if self.apply_attn_gate:
                 mova_qko_params += self.model_dim * self.num_heads * self.head_dim
             mova_qko_params += num_params_in_residual(self.residual_func, self.model_dim, self.residual_heads, self.num_heads * self.head_dim)
@@ -832,10 +833,11 @@ class Transformer(XLLModel):
         expansion_factor = 6
         embed_flops = self.model_dim + self.vocab_size
         logits_flops = self.model_dim * self.vocab_size
+        nk = {"softmax": 1, "softdelta": 2}[self.attn_act_func]
         norm_flops = self.model_dim * (4 if self.apply_rmsnorm else 8)
         if self.qknorm:
-            norm_flops += self.head_dim * (self.num_heads + self.num_kv_heads) * 2
-        attn_flops = self.model_dim * (self.num_heads + self.num_kv_heads) * self.head_dim * 2
+            norm_flops += (self.num_heads + self.num_kv_heads * nk) * self.head_dim * 2
+        attn_flops = self.model_dim * (self.num_heads * 2 + self.num_kv_heads * (nk + 1)) * self.head_dim
 
         # FFN
         ffn_flops = self.model_dim * self.ffn_hidden_dim * (3 if self.swiglu else 2)
@@ -845,7 +847,7 @@ class Transformer(XLLModel):
         res_flops = 0.0
 
         # MoVA
-        mova_flops = self.model_dim * (self.num_heads * 2 + self.num_kv_heads) * self.head_dim
+        mova_flops = self.model_dim * (self.num_heads * 2 + self.num_kv_heads * nk) * self.head_dim
         mova_flops += self.model_dim * self.num_kv_heads * self.head_dim * self.num_activated_values
         mova_flops += self.model_dim * self.num_values
 
@@ -857,9 +859,9 @@ class Transformer(XLLModel):
             attn_flops += self.num_heads * self.head_dim * seq_len
             mova_flops += self.num_heads * self.head_dim * seq_len
         elif self.attn_act_func == 'softdelta':
-            attn_flops += self.model_dim * (self.num_kv_heads * self.head_dim + self.num_heads)
+            attn_flops += self.model_dim * self.num_heads
             attn_flops += (self.num_heads + self.num_kv_heads) * self.head_dim * seq_len  # qkv - kkv
-            mova_flops += self.model_dim * (self.num_kv_heads * self.head_dim + self.num_heads)
+            mova_flops += self.model_dim * self.num_heads
             mova_flops += (self.num_heads + self.num_kv_heads) * self.head_dim * seq_len  # qkv - kkv
         else:
             raise ValueError(f"Unknown attention activation function: {self.attn_act_func}")
