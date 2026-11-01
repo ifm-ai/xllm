@@ -683,10 +683,10 @@ class GekkoBlockFunction(torch.autograd.Function):
             causal_conv_weight_normalization, causal_conv_backend, deterministic
         )
 
-        sk_, sk_rstd = rmsnorm_fwd(xk_, None, local_kv_heads, rmsnorm_eps)
+        sk, sk_rstd = rmsnorm_fwd(xk_, knorm_w, local_kv_heads, rmsnorm_eps)
         sq, sq_rstd = rmsnorm_fwd(xq_, qnorm_w, local_heads, rmsnorm_eps)
         # B x L x H x S
-        sk = rearrange(sk_, 'b l (k s) -> b l k s', k=local_kv_heads)
+        sk = rearrange(sk, 'b l (k s) -> b l k s', k=local_kv_heads)
         sq = rearrange(sq, 'b l (h s) -> b l h s', h=local_heads)
         # apply rotary embeddings
         sq, sk = apply_ropes(sq, sk, freqs_cis, head_dim, rope_head_dim, False)
