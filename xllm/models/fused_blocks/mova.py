@@ -28,6 +28,7 @@ from .utils import (
     flash_attention_bwd,
     recompute_flash_attention_lse,
     apply_rope,
+    apply_ropes
 )
 from .distributed import (
     reduce_scatter,
@@ -38,12 +39,14 @@ from .distributed import (
 
 
 def mova_fwd(
-    mx, freqs_cis, bos_mask, segments, wq, wk, wv, wr, wo, q_norm_w,
+    layer_id, mx, freqs_cis, bos_mask, segments,
+    wq, wk, wv, wr, wo, q_norm_w, k_norm_w,
     head_dim, rope_head_dim, local_heads, local_kv_heads, eps, gather_before_norm,
     router_w, router_bias, routing_score_func, routing_scaling_factor, router_load_balancing_type,
-    n_values, topk, value_backend, moe_permutation_backend, attn_gate_func,
+    n_values, topk, value_backend, moe_permutation_backend,
+    attn_act_func, apply_attn_gate, attn_gate_func,
     dropout, attention_dropout, hidden_dropout,
-    causal_attn_backend, stability_control, recompute_attn, layer_id=None,
+    causal_attn_backend, stability_control, recompute_attn,
 ):
     bsz, seq_len, _ = mx.shape
     attn_gate_fn = {"silu": F.silu, "softplus": partial(F.softplus, beta=math.log(2))}[attn_gate_func]
@@ -122,16 +125,31 @@ def mova_fwd(
 
     # compute k
     xk = F.linear(mx, wk)
-    xk_rstd = None
-    if q_norm_w is not None:
-        xk, xk_rstd = rmsnorm_fwd(xk, None, local_kv_heads, eps)
-    xk_ = rearrange(xk, 'b l (k s) -> b l k s', k=local_kv_heads)
-    xk_ = apply_rope(xk_, freqs_cis, head_dim, rope_head_dim, False)
+    xk_ = rmsnorm_fwd(xk, k_norm_w, local_kv_heads, eps)[0] if k_norm_w is not None else xk
+    xk_ = rearrange(xk_, 'b l (k s) -> b l k s', k=local_kv_heads)
+    if attn_act_func == 'softmax':
+        xk_ = apply_rope(xk_, freqs_cis, head_dim, rope_head_dim, False)
+    else:
+        assert attn_act_func == 'softdelta'
+        kq_ = xk_[:, :, :, :head_dim]
+        xk_ = xk_[:, :, :, head_dim:]
+        kq_, xk_ = apply_ropes(kq_, xk_, freqs_cis, head_dim, rope_head_dim, False)
     local_xk = xk_  # the all-gather below replaces xk_ with every context rank's keys
     xk_, handle_xk = all_gather(xk_, parallel_region='context', async_op=True)
 
     # compute r
-    r = attn_gate_fn(F.linear(mx, wr, None)) if wr is not None else None
+    if wr is not None:
+        rg = rearrange(F.linear(mx, wr, None), 'b l (h s) -> b l h s', h=local_heads)
+        # B x L x H*S
+        if apply_attn_gate:
+            r = rearrange(rg[:, :, :, :head_dim], 'b l h s -> b l (h s)')
+            r = attn_gate_fn(r)
+        else:
+            r = None
+        # B x L x H
+        g = rg[:, :, :, -1] if attn_act_func == 'softdelta' else None
+    else:
+        r = g = None
 
     # compute v
     if handle_xv is not None:
@@ -147,10 +165,7 @@ def mova_fwd(
 
     # compute q
     xq = F.linear(mx, wq)
-    if q_norm_w is not None:
-        xq_, _ = rmsnorm_fwd(xq, q_norm_w, local_heads, eps)
-    else:
-        xq_ = xq
+    xq_ = rmsnorm_fwd(xq, q_norm_w, local_heads, eps)[0] if q_norm_w is not None else xq
     xq_ = rearrange(xq_, 'b l (h s) -> b l h s', h=local_heads)
     xq_ = apply_rope(xq_, freqs_cis, head_dim, rope_head_dim, False)
     health_collector = get_active_health_collector()
@@ -165,10 +180,14 @@ def mova_fwd(
         handle_xv.wait()
         xv_ = reshape_gathered_tensor_along_specific_dim(xv_, gather_dim=1)[:, :end_seq]
 
-    attn, attn_for_save, attn_lse, flash_rng_state, attn_rng_state = flash_attention_fwd(
-        xq_, xk_, xv_, bos_mask, segments, attn_scale, attention_dropout, stability_control,
-        backend=causal_attn_backend, save_aux=not recompute_attn
-    )
+    if attn_act_func == 'softmax':
+        attn, attn_for_save, attn_lse, flash_rng_state, attn_rng_state = flash_attention_fwd(
+            xq_, xk_, xv_, bos_mask, segments, attn_scale, attention_dropout, stability_control,
+            backend=causal_attn_backend, save_aux=not recompute_attn
+        )
+    else:
+        raise NotImplementedError
+
     attn = rearrange(attn, 'b l h v -> b l (h v)')
     if r is not None:
         attn = torch.mul(attn, r, out=r)
@@ -178,7 +197,7 @@ def mova_fwd(
     xh, xh_rng_state = memory_efficient_dropout_fwd(xh, dropout, True)
 
     return (
-        (xq, xk, xv, xk_rstd), (attn_for_save, attn_lse), xh, aux_loss,
+        (xq, xk, xv), (attn_for_save, attn_lse), xh, aux_loss,
         (flash_rng_state, attn_rng_state, attn_out_rng_state, xh_rng_state),
         (original_scores, routing_indices, org_topk_scores, tokens_per_expert, group_sizes),
         end_seq
@@ -188,8 +207,8 @@ def mova_fwd(
 def mova_bwd(
     attn_grad, r_grad, aux_loss_grad, attn_for_bwd, attn_lse, xq_, xk_, xv_, total_seqlen_k, end_seq,
     freqs_cis, bos_mask, segments, local_kv_heads, rope_head_dim,
-    xq, xk, xv, xvv_, xq_rstd, xk_rstd, rmx, mx, q_norm_w, wq, wk, wv, wr,
-    attn_scale, attn_gate_func, attention_dropout, flash_rng_state,
+    xq, xk, xv, xvv_, xq_rstd, xk_rstd, rmx, mx, q_norm_w, k_norm_w, wq, wk, wv, wr,
+    attn_scale, attn_act_func, apply_attn_gate, attn_gate_func, attention_dropout, flash_rng_state,
     causal_attn_backend, stability_control, deterministic,
     sx, permuted_sx, original_scores, routing_indices, org_topk_scores, tokens_per_expert,
     sorted_indices, inverse_indices, group_sizes, router_w, router_bias, router_bias_update_rate,
@@ -204,11 +223,14 @@ def mova_bwd(
         "softplus": partial(torch.ops.aten.softplus_backward, beta=math.log(2), threshold=20)
     }[attn_gate_func]
 
-    xq_grad, xk_grad_, xv_grad_ = flash_attention_bwd(
-        attn_grad, attn_for_bwd, xq_, xk_, xv_, attn_lse, bos_mask, segments,
-        attn_scale, attention_dropout, flash_rng_state,
-        stability_control, deterministic, causal_attn_backend
-    )
+    if attn_act_func == 'softmax':
+        xq_grad, xk_grad_, xv_grad_ = flash_attention_bwd(
+            attn_grad, attn_for_bwd, xq_, xk_, xv_, attn_lse, bos_mask, segments,
+            attn_scale, attention_dropout, flash_rng_state,
+            stability_control, deterministic, causal_attn_backend
+        )
+    else:
+        raise NotImplementedError
 
     tail_seq = get_context_parallel_world_size() * seq_len - end_seq
     pre_seq = 0 if total_seqlen_k is None else end_seq - total_seqlen_k
@@ -261,9 +283,11 @@ def mova_bwd(
     if handle_xk is not None:
         handle_xk.wait()
     xk_grad = apply_rope(xk_grad, freqs_cis, head_dim, rope_head_dim, True)
-    if q_norm_w is not None:
+    if k_norm_w is not None:
         xk_grad = rearrange(xk_grad, 'b l k s -> b l (k s)')
-        xk_grad = mem_effn_rmsnorm_bwd(xk_grad, xk, xk_rstd, local_kv_heads)
+        xk_grad, k_norm_w_grad = rmsnorm_bwd(xk_grad, xk, xk_rstd, k_norm_w, local_kv_heads)
+    else:
+        k_norm_w_grad = None
     # B*L x H*D/H
     xk_grad = xk_grad.view(bsz * seq_len, local_kv_heads * head_dim)
     mx_grad = torch.addmm(mx_grad, xk_grad, wk, out=mx_grad)
@@ -396,19 +420,18 @@ def mova_bwd(
     if handle_norm_b is not None:
         handle_norm_b.wait()
 
-    return x_grad, wq_grad, wk_grad, wv_grad, wr_grad, q_norm_w_grad, attn_norm_w_grad, attn_norm_b_grad, router_w_grad
+    return x_grad, wq_grad, wk_grad, wv_grad, wr_grad, q_norm_w_grad, k_norm_w_grad, attn_norm_w_grad, attn_norm_b_grad, router_w_grad
 
 
 def mova_recompute(
-    attn_for_save, attn_lse, xq, xk, xv, xk_rstd, end_seq,
-    sx, original_scores, routing_indices, org_topk_scores, group_sizes,
+    attn_for_save, attn_lse, xq, xk, xv, end_seq, sx,
+    original_scores, routing_indices, org_topk_scores, group_sizes,
     router_w, routing_score_func, routing_scaling_factor,
     n_values, topk, value_backend, moe_permutation_backend,
-    mx, freqs_cis, bos_mask, segments,
-    wq, wk, wv, wr, q_norm_w, head_dim, rope_head_dim,
-    local_heads, local_kv_heads, eps,
-    attn_scale, attn_gate_func, attention_dropout, attn_rng_state,
-    causal_attn_backend, stability_control
+    mx, freqs_cis, bos_mask, segments, wq, wk, wv, wr, q_norm_w, k_norm_w,
+    head_dim, rope_head_dim, local_heads, local_kv_heads, eps,
+    attn_scale, attn_act_func, apply_attn_gate, attn_gate_func,
+    attention_dropout, attn_rng_state, causal_attn_backend, stability_control
 ):
     bsz, seq_len, _ = mx.shape
     attn_gate_fn = {"silu": F.silu, "softplus": partial(F.softplus, beta=math.log(2))}[attn_gate_func]
@@ -433,7 +456,7 @@ def mova_recompute(
 
     # recompute v
     if xv is None:
-        assert xk is None and xk_rstd is None
+        assert xk is None
         # compute v
         wv = rearrange(wv, '(n v) d -> n v d', n=n_values)
         xv = multi_group_matmul_fwd(permuted_sx, wv, group_sizes, True, value_backend)
@@ -441,13 +464,18 @@ def mova_recompute(
         xv, handle_xv = reduce_scatter(xv, parallel_region='model', async_op=True)
         # compute k
         xk = F.linear(mx, wk)
-        if q_norm_w is not None:
-            xk, xk_rstd = rmsnorm_fwd(xk, None, local_kv_heads, eps)
     else:
         handle_xv = None
 
-    xk_ = rearrange(xk, 'b l (k s) -> b l k s', k=local_kv_heads)
-    xk_ = apply_rope(xk_, freqs_cis, head_dim, rope_head_dim, False)
+    xk_, xk_rstd = rmsnorm_fwd(xk, None, local_kv_heads, eps) if k_norm_w is not None else (xk, None)
+    xk_ = rearrange(xk_, 'b l (k s) -> b l k s', k=local_kv_heads)
+    if attn_act_func == 'softmax':
+        xk_ = apply_rope(xk_, freqs_cis, head_dim, rope_head_dim, False)
+    else:
+        assert attn_act_func == 'softdelta'
+        kq_ = xk_[:, :, :, :head_dim]
+        xk_ = xk_[:, :, :, head_dim:]
+        kq_, xk_ = apply_ropes(kq_, xk_, freqs_cis, head_dim, rope_head_dim, False)
     xk_, handle_xk = all_gather(xk_, parallel_region='context', async_op=True)
 
     if original_scores is None:
@@ -485,11 +513,17 @@ def mova_recompute(
     xq_ = apply_rope(xq_, freqs_cis, head_dim, rope_head_dim, False)
 
     if wr is not None:
-        # B x L x D
-        rmx = F.linear(mx, wr, None)
-        r = attn_gate_fn(rmx)
+        rg = rearrange(F.linear(mx, wr, None), 'b l (h s) -> b l h s', h=local_heads)
+        # B x L x H*S
+        if apply_attn_gate:
+            rmx = rearrange(rg[:, :, :, :head_dim], 'b l h s -> b l (h s)')
+            r = attn_gate_fn(rmx)
+        else:
+            r, rmx = None, None
+        # B x L x H
+        g = rg[:, :, :, -1] if attn_act_func == 'softdelta' else None
     else:
-        rmx, r = None, None
+        r = rmx = g = None
 
     # recompute attention output
     if attn_for_save is None:

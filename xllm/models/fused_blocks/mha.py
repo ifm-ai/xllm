@@ -17,7 +17,6 @@ from .utils import (
     layer_or_rmsnorm_bwd,
     rmsnorm_fwd,
     rmsnorm_bwd,
-    mem_effn_rmsnorm_bwd,
     flash_attention_fwd,
     flash_attention_bwd,
     recompute_flash_attention_lse,
@@ -95,7 +94,7 @@ def multihead_attention_fwd(
     if attn_act_func == 'softmax':
         attn, attn_for_save, attn_lse, flash_rng_state, attn_rng_state = flash_attention_fwd(
             xq_, xk_, xv_, bos_mask, segments, attn_scale, attention_dropout, stability_control,
-            backend=causal_attn_backend, save_aux= not recompute_attn
+            backend=causal_attn_backend, save_aux=not recompute_attn
         )
     else:
         raise NotImplementedError
@@ -249,7 +248,7 @@ def multihead_attention_recompute(
         xv_, handle_xv = all_gather(xv, parallel_region='context', async_op=True)
 
     xk_, xk_rstd = rmsnorm_fwd(xk, None, local_kv_heads, eps) if k_norm_w is not None else (xk, None)
-    xk_ = rearrange(xk, 'b l (k s) -> b l k s', k=local_kv_heads)
+    xk_ = rearrange(xk_, 'b l (k s) -> b l k s', k=local_kv_heads)
     if attn_act_func == 'softmax':
         xk_ = apply_rope(xk_, freqs_cis, head_dim, rope_head_dim, False)
     else:
