@@ -263,7 +263,7 @@ class MOVAttention(nn.Module):
             xk = self.key_norm(xk)
 
         if self.wr is not None:
-            rg = rearrange(self.wr(x), 'b l (h s) -> b l h s', h=self.local_heads)
+            rg = rearrange(self.wr(mx), 'b l (h s) -> b l h s', h=self.local_heads)
             # B x L x H*S
             r = rearrange(rg[:, :, :, :self.head_dim], 'b l h s -> b l (h s)') if self.apply_attn_gate else None
             # B x L x H
