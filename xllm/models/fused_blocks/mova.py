@@ -20,7 +20,6 @@ from .utils import (
     layer_or_rmsnorm_bwd,
     rmsnorm_fwd,
     rmsnorm_bwd,
-    mem_effn_rmsnorm_bwd,
     fused_permute_y_fwd,
     fused_permute_y_bwd_y_grad,
     fused_permute_y_bwd_scores_grad,
