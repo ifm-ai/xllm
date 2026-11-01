@@ -455,7 +455,7 @@ class TransformerMoVABlock(nn.Module):
                 self.mova.wr.weight if self.mova.wr is not None else None,
                 self.mova.wo.weight,
                 self.mova.query_norm.weight if self.mova.qknorm else None,
-                self.mova.key_norm.weight if self.attention.qknorm else None,
+                self.mova.key_norm.weight if self.mova.qknorm else None,
                 self.mova.local_heads,
                 self.mova.local_kv_heads,
                 self.mova.head_dim,
