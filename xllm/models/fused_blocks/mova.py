@@ -466,7 +466,7 @@ def mova_recompute(
     else:
         handle_xv = None
 
-    xk_, xk_rstd = rmsnorm_fwd(xk, None, local_kv_heads, eps) if k_norm_w is not None else (xk, None)
+    xk_, xk_rstd = rmsnorm_fwd(xk, k_norm_w, local_kv_heads, eps) if k_norm_w is not None else (xk, None)
     xk_ = rearrange(xk_, 'b l (k s) -> b l k s', k=local_kv_heads)
     if attn_act_func == 'softmax':
         xk_ = apply_rope(xk_, freqs_cis, head_dim, rope_head_dim, False)
