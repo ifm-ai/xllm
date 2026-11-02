@@ -109,7 +109,7 @@ def test_xattn_attention_speed(
         start = timer()
         for _ in range(epochs):
             xattn_causal_flash_attn_bwd(
-                out_grad, query, key, value, y_bwd, lse,
+                out_grad, query, key, value, y, lse,
                 scale, bos_mask, segment_idx, high_prevision_level, deterministic=False
             )
         torch.cuda.synchronize()
