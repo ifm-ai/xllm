@@ -234,3 +234,62 @@ def test_only_first_refill_total_time_is_logged():
     }
     assert records[0]["event"] == "first_refill"
     assert records[0]["total_seconds"] >= 0
+
+
+# sizes and step counts at which the saved packer state holds chunks of the dropped dataset that the
+# rebuilt slot would pack again when restored unfiltered
+@pytest.mark.parametrize("packing_type, dropped_len, steps, chunks_key", [
+    ("bestfit", 9, 3, "pending_chunks"),
+    ("simple", 6, 4, "leftover_chunks"),
+])
+def test_resume_drops_every_trace_of_a_dataset_removed_from_the_mix(packing_type, dropped_len, steps, chunks_key):
+    with tempfile.TemporaryDirectory() as root:
+        kept, dropped = os.path.join(root, "kept"), os.path.join(root, "dropped")
+        for d, length in ((kept, 6), (dropped, dropped_len)):
+            os.makedirs(d)
+            with open(os.path.join(d, "data.chunk0.jsonl"), "w", encoding="utf-8") as handle:
+                for i in range(64):
+                    handle.write(json.dumps({"text": (chr(97 + i % 26) * length)}) + "\n")
+
+        def build(mix):
+            loader = MultiSourceDataLoader(
+                tokenizer=_Tokenizer(), data_mix_str=mix, seq_len=4, batch_size=1, num_buffered_seq=2,
+                world_rank=0, world_size=1, packing_type=packing_type, num_workers=1,
+            )
+            loader.assembler._sync_refill = True
+            return loader
+
+        loader = build(f"{kept}:0.5:text:text,{dropped}:0.5:text:text")
+        restored = None
+        try:
+            for _ in range(steps):
+                next(loader)
+            state = copy.deepcopy(loader.get_state())
+            saved = state["assembler"]
+            # the checkpoint holds the dropped dataset's position, pending chunks and credit
+            assert dropped in saved["active_start_state"]
+            assert any(c[2].dataset == dropped for c in saved["active_packer_state"][chunks_key])
+            assert dropped in saved["active_token_credits_state"]
+            kept_pending = {c[2].line_num for c in saved["active_packer_state"][chunks_key] if c[2].dataset == kept}
+            kept_line = saved["active_start_state"][kept]["data_iterator"]["reader"]["line_num"]
+
+            restored = build(f"{kept}:1.0:text:text")
+            restored.set_state(state)
+            resumed = restored.assembler.get_state()
+            assert list(resumed["active_start_state"]) == [kept]
+            assert resumed["active_start_state"][kept] == saved["active_start_state"][kept]
+            assert all(c[2].dataset == kept for c in resumed["active_packer_state"][chunks_key])
+            assert list(resumed["active_token_credits_state"]) == [kept]
+
+            seen = []
+            for _ in range(8):
+                for seq_infos in next(restored).src_infos:
+                    seen.extend(seq_infos)
+            assert seen and all(info.dataset == kept for info in seen)
+            # the kept dataset continues from its saved position: its pending chunks, then lines at or after it
+            assert all(info.line_num >= kept_line or info.line_num in kept_pending for info in seen)
+            assert max(info.line_num for info in seen) > kept_line
+        finally:
+            loader.close()
+            if restored is not None:
+                restored.close()
