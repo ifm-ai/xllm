@@ -22,6 +22,8 @@ def manual_attention(
     kq = qkey.transpose(1, 2)
     xk = kkey.transpose(1, 2)
     xv = value.transpose(1, 2)
+    # B x H x L x D -> B x H x D x L
+    xk = xk.transpose(2, 3)
 
     # B x L1 x L2
     full_inf = torch.full((bsz, qlen, kvlen), float("-inf"), device=xq.device)
