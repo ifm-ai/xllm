@@ -47,7 +47,7 @@ def manual_attention(
     # B x H x L x D -> B x L x H x D
     out1 = rearrange(torch.matmul(scores1, xv), 'b h l d -> b l h d')
     out2 = rearrange(torch.matmul(scores2, xv), 'b h l d -> b l h d')
-    out2 = out2 * rearrange(g, 'b l h -> b l h 1')
+    out2 = out2 * rearrange(torch.sigmoid(g), 'b l h -> b l h 1')
     output = out1 - out2
     return output
 
