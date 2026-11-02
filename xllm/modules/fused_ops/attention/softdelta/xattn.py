@@ -4,9 +4,9 @@ import torch
 from torch import Tensor
 try:
     from xattn.ops import (
-        group_softdelta_attention,
-        group_softdelta_attention_fwd,
-        group_softdelta_attention_bwd
+        softdelta_attention,
+        softdelta_attention_fwd,
+        softdelta_attention_bwd
     )
     XATTN_SOFTDELTA_ATTN_ENABLED = True
 except ImportError:
@@ -29,8 +29,8 @@ def xattn_softdelta_attn(
     if bos_mask is not None:
         segment_idx = None
 
-    return group_softdelta_attention(
-        q, kk, v, g, qk, scale,
+    return softdelta_attention(
+        q, kk, qk, v, g, scale,
         bos_mask=bos_mask,
         segment_idx=segment_idx,
         high_precision_level=high_precision_level,
@@ -54,8 +54,8 @@ def xattn_softdelta_attn_fwd(
     if bos_mask is not None:
         segment_idx = None
 
-    y, readers, lse = group_softdelta_attention_fwd(
-        q, kk, v, g, qk, scale,
+    y, readers, lse = softdelta_attention_fwd(
+        q, kk, qk, v, g, scale,
         bos_mask=bos_mask,
         segment_idx=segment_idx,
         high_precision_level=high_precision_level
@@ -69,9 +69,10 @@ def xattn_softdelta_attn_bwd(
     y_grad: Tensor,
     q: Tensor,
     qk: torch.Tensor,
-    k: Tensor,
+    kk: Tensor,
     v: Tensor,
     g: torch.Tensor,
+    y: torch.Tensor,
     readers: Tensor,
     lse: Tensor,
     scale: Optional[float] = None,
@@ -84,9 +85,10 @@ def xattn_softdelta_attn_bwd(
     if bos_mask is not None:
         segment_idx = None
 
-    return group_softdelta_attention_bwd(
-        y_grad, q, k, v, g, readers, lse, qk, scale,
+    dq, dkk, dv, dg, dqk = softdelta_attention_bwd(
+        y_grad, q, kk, qk, v, g, y, readers, lse, scale,
         bos_mask=bos_mask, segment_idx=segment_idx,
         high_precision_level=high_precision_level,
         deterministic=deterministic
     )
+    return dq, dqk, dkk, dv, dg
