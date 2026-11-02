@@ -72,11 +72,11 @@ def test_xattn_attention_speed(
     with torch.no_grad():
         # warm up
         for _ in range(100):
-            y, y_bwd, lse = xattn_causal_flash_attn_fwd(
+            y, lse = xattn_causal_flash_attn_fwd(
                 query, key, value, scale, bos_mask, segment_idx, high_prevision_level, requires_grad=True
             )
             xattn_causal_flash_attn_bwd(
-                out_grad, query, key, value, y_bwd, lse,
+                out_grad, query, key, value, y, lse,
                 scale, bos_mask, segment_idx, high_prevision_level, deterministic=False
             )
 
@@ -87,7 +87,7 @@ def test_xattn_attention_speed(
 
         start = timer()
         for _ in range(epochs):
-            y, y_bwd, lse = xattn_causal_flash_attn_fwd(
+            y, lse = xattn_causal_flash_attn_fwd(
                 query, key, value, scale, bos_mask, segment_idx, high_prevision_level, requires_grad=True
             )
 
@@ -99,7 +99,7 @@ def test_xattn_attention_speed(
         start = timer()
         for _ in range(epochs):
             xattn_causal_flash_attn_bwd(
-                out_grad, query, key, value, y_bwd, lse,
+                out_grad, query, key, value, y, lse,
                 scale, bos_mask, segment_idx, high_prevision_level, deterministic=True
             )
         torch.cuda.synchronize()
@@ -149,7 +149,7 @@ def test(B: int, L: int, H: int, G: int, D: int, avg_len: int, dtype: str):
     print(f"B={B}, L={L}, H={H} ({G}), D={D}, AvgL={avg_len}, dtype={dtype}:")
     epochs = 5000
     test_flash_attention_speed(query, key, value, out_grad, cu_seqlens_k, max_seqlen_k, scale, epochs)
-    for level in range(5):
+    for level in range(2):
         test_xattn_attention_speed(query, key, value, out_grad, bos_mask, segment_idx, level, scale, epochs)
         test_xattn_attention_speed(query, key, value, out_grad, None, segment_idx, level, scale, epochs)
 

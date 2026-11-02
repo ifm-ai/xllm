@@ -45,20 +45,19 @@ def xattn_causal_flash_attn_fwd(
     segment_idx: Optional[Tensor] = None,
     high_precision_level: int = 0,
     requires_grad: bool = False
-) -> Tuple[Tensor, Optional[Tensor], Tensor]:
+) -> Tuple[Tensor, Optional[Tensor]]:
     assert XATTN_FLASH_ATTN_ENABLED, "xattn was not installed."
     if bos_mask is not None:
         segment_idx = None
 
-    y, y_fp32, lse = causal_flash_attn_fwd(
+    y, lse = causal_flash_attn_fwd(
         q, k, v, scale,
         bos_mask=bos_mask,
         segment_idx=segment_idx,
         high_precision_level=high_precision_level
     )
     lse = lse if requires_grad else None
-    y_for_bwd = (y if high_precision_level == 0 else y_fp32) if requires_grad else None
-    return y, y_for_bwd, lse
+    return y, lse
 
 
 def xattn_causal_flash_attn_bwd(

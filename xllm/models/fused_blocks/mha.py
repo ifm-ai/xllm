@@ -92,14 +92,14 @@ def multihead_attention_fwd(
         xk_ = reshape_gathered_tensor_along_specific_dim(xk_, gather_dim=1)[:, :end_seq]
 
     if attn_act_func == 'softmax':
-        attn, attn_for_save, attn_lse, flash_rng_state, attn_rng_state = flash_attention_fwd(
+        attn_out, attn_lse, flash_rng_state, attn_rng_state = flash_attention_fwd(
             xq_, xk_, xv_, bos_mask, segments, attn_scale, attention_dropout, stability_control,
             backend=causal_attn_backend, save_aux=not recompute_attn
         )
     else:
         raise NotImplementedError
 
-    attn = rearrange(attn, 'b l h v -> b l (h v)')
+    attn = rearrange(attn_out, 'b l h v -> b l (h v)')
     if r is not None:
         attn = torch.mul(attn, r, out=r)
     attn, attn_out_rng_state = memory_efficient_dropout_fwd(attn, hidden_dropout, True)
@@ -108,7 +108,7 @@ def multihead_attention_fwd(
     xh, xh_rng_state = memory_efficient_dropout_fwd(xh, dropout, True)
 
     return (
-        (xq, xk, xv), (attn_for_save, attn_lse), xh,
+        (xq, xk, xv), (attn_out, attn_lse), xh,
         (flash_rng_state, attn_rng_state, attn_out_rng_state, xh_rng_state), end_seq
     )
 
@@ -227,7 +227,7 @@ def multihead_attention_bwd(
 
 
 def multihead_attention_recompute(
-    attn_for_save, attn_lse, xq, xk, xv, end_seq, mx, freqs_cis, bos_mask, segments,
+    attn_out, attn_lse, xq, xk, xv, end_seq, mx, freqs_cis, bos_mask, segments,
     wq, wk, wv, wr, q_norm_w, k_norm_w, head_dim, rope_head_dim, local_heads, local_kv_heads,
     attn_scale, attn_act_func, apply_attn_gate, attn_gate_func, eps,
     attention_dropout, attn_rng_state, causal_attn_backend, stability_control
@@ -279,7 +279,7 @@ def multihead_attention_recompute(
         r = rmx = g = None
 
     # recompute attention output
-    if attn_for_save is None:
+    if attn_out is None:
         assert attn_lse is None
 
         if handle_xv is not None:
@@ -291,15 +291,11 @@ def multihead_attention_recompute(
             handle_xk = None
             xk_ = reshape_gathered_tensor_along_specific_dim(xk_, gather_dim=1)[:, :end_seq]
 
-        attn_out, attn_for_save, attn_lse, _ = recompute_flash_attention_lse(
+        attn_out, attn_lse, _ = recompute_flash_attention_lse(
             xq_, xk_, xv_, bos_mask, segments, attn_scale, attention_dropout,
             attn_rng_state, stability_control, backend=causal_attn_backend
         )
-    else:
-        attn_out = attn_for_save.to(xq.dtype)
 
-    # B x L x H x D/H -> B x L x D
-    attn_out = rearrange(attn_out, 'b l h v -> b l (h v)')
     return (
-        (attn_out, attn_for_save, attn_lse), (xq, xq_, xq_rstd), (xk, xk_, xk_rstd), (xv, xv_), (handle_xk, handle_xv), (rmx, r)
+        (attn_out, attn_lse), (xq, xq_, xq_rstd), (xk, xk_, xk_rstd), (xv, xv_), (handle_xk, handle_xv), (rmx, r)
     )

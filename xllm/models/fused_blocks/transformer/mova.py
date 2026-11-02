@@ -1,6 +1,7 @@
 from typing import Optional, Tuple, Any
 import math
 import torch
+from einops import rearrange
 
 from xllm.distributed.utils import reshape_gathered_tensor_along_specific_dim
 from xllm.health_metrics import get_active_health_collector
@@ -132,7 +133,7 @@ class TransformerMoVABlockFunction(torch.autograd.Function):
             causal_attn_backend, attn_stability_control, recompute_attention,
         )
         xq, xk, xv = xqkv
-        attn_for_save, attn_lse = attn_out
+        attn_out, attn_lse = attn_out
         flash_rng_state, attn_rng_state, attn_out_rng_state, xh_rng_state = rng_states
         v_original_scores, v_routing_indices, v_org_topk_scores, v_tokens_per_expert, v_group_sizes = routing_state
         health_collector = get_active_health_collector()
@@ -226,8 +227,8 @@ class TransformerMoVABlockFunction(torch.autograd.Function):
             v_routing_indices,  # (bsz, slen, topk)
             v_org_topk_scores,  # (bsz, slen, topk)
             v_tokens_per_expert,  # (n_experts)
-            attn_for_save,  # (bsz, slen, n_heads, head_dim)
-            attn_lse,  # (bsz, h/MP, slen, slen)
+            attn_out if not recompute_attention else None,  # (bsz, slen, n_heads, head_dim)
+            attn_lse if not recompute_attention else None,  # (bsz, h/MP, slen, slen)
             flash_rng_state,
             xo,  # (bsz, slen, d/MP)
             original_scores if not recompute_router else None,  # (bsz, slen, n_experts)
@@ -331,7 +332,7 @@ class TransformerMoVABlockFunction(torch.autograd.Function):
             v_routing_indices,  # (bsz, slen, topk)
             v_org_topk_scores,  # (bsz, slen, topk)
             v_tokens_per_expert,  # (n_experts)
-            attn_for_save,  # (bsz, slen, n_heads, head_dim)
+            attn_out,  # (bsz, slen, n_heads, head_dim)
             attn_lse,  # (bsz, h/MP, slen, slen)
             flash_rng_state,
             xo,  # (bsz, slen, d/MP)
@@ -476,7 +477,7 @@ class TransformerMoVABlockFunction(torch.autograd.Function):
             mx = reshape_gathered_tensor_along_specific_dim(mx, gather_dim=2)
 
         attn_outs, q_outs, k_outs, v_outs, handle_kv, attn_gate_outs, router_outs = mova_recompute(
-            attn_for_save, attn_lse, xq, xk, xv, end_seq, sx,
+            attn_out, attn_lse, xq, xk, xv, end_seq, sx,
             v_original_scores, v_routing_indices, v_org_topk_scores, v_group_sizes,
             mova_router_w, routing_score_func, routing_scaling_factor,
             n_values, mova_topk, value_backend, moe_permutation_backend,
@@ -485,7 +486,7 @@ class TransformerMoVABlockFunction(torch.autograd.Function):
             attn_scale, attn_act_func, apply_attn_gate, attn_gate_func,
             attention_dropout, attn_rng_state, causal_attn_backend, attn_stability_control
         )
-        attn_out, attn_for_save, attn_lse = attn_outs
+        attn_out, attn_lse = attn_outs
         xq, xq_, xq_rstd = q_outs
         xk, xk_, xk_rstd = k_outs
         xv, xvv_, xv_ = v_outs
@@ -493,7 +494,10 @@ class TransformerMoVABlockFunction(torch.autograd.Function):
         rmx, r = attn_gate_outs
         permuted_sx, v_original_scores, v_sorted_indices, v_inverse_indices = router_outs
 
-        attn = attn_out * r if r is not None else attn_out
+        # B x L x H x V -> B x L x H*V
+        attn = rearrange(attn_out, 'b l h v -> b l (h v)')
+        if r is not None:
+            attn = attn * r
         attn, attn_noise = memory_efficient_dropout_fwd(attn, hidden_dropout, True, attn_out_rng_state)
 
         if handle_xh is not None:
@@ -524,7 +528,7 @@ class TransformerMoVABlockFunction(torch.autograd.Function):
         attn_r_grad = attn_r_grad.view(bsz, seq_len, local_heads, head_dim)
         x_grad, wq_grad, wk_grad, wv_grad, wr_grad, \
         q_norm_w_grad, k_norm_w_grad, attn_norm_w_grad, attn_norm_b_grad, mova_router_w_grad = mova_bwd(
-            attn_r_grad, r_grad, aux_loss_grad, attn_for_save, attn_lse, xq_, xk_, xv_,
+            attn_r_grad, r_grad, aux_loss_grad, attn_out, attn_lse, xq_, xk_, xv_,
             total_seqlen_k, end_seq, freqs_cis, bos_mask, segments,local_kv_heads, rope_head_dim,
             xq, xk, xv, xvv_, xq_rstd , xk_rstd, rmx, mx, q_norm_w, k_norm_w, wq, wk, wv, wr,
             attn_scale, attn_act_func, apply_attn_gate, attn_gate_func, attention_dropout,

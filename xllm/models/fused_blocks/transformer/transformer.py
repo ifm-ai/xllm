@@ -114,7 +114,7 @@ class TransformerBlockFunction(torch.autograd.Function):
             causal_attn_backend, attn_stability_control, recompute_attention,
         )
         xq, xk, xv = xqkv
-        attn_for_save, attn_lse = attn_out
+        attn_out, attn_lse = attn_out
         flash_rng_state, attn_rng_state, attn_out_rng_state, xh_rng_state = rng_states
 
         if segments is not None:
@@ -178,8 +178,8 @@ class TransformerBlockFunction(torch.autograd.Function):
             xq if not recompute_q else None,  # (bsz, slen, n_heads, head_dim)
             xk if not recompute_kv else None,  # (bsz, slen, n_kv_heads, head_dim)
             xv if not recompute_kv else None,  # (bsz, slen, n_kv_heads, head_dim)
-            attn_for_save,  # (bsz, slen, n_heads, head_dim)
-            attn_lse,  # (bsz, h/MP, slen, slen)
+            attn_out if not recompute_attention else None,  # (bsz, slen, n_heads, head_dim)
+            attn_lse if not recompute_attention else None,  # (bsz, h/MP, slen, slen)
             flash_rng_state,
             xo,  # (bsz, slen, d/MP)
             h1 if not recompute_fc1_out else None,  # (bsz*slen, v/MP)
@@ -246,7 +246,7 @@ class TransformerBlockFunction(torch.autograd.Function):
             xq,  # (bsz, slen, n_heads, head_dim)
             xk,  # (bsz, slen, n_kv_heads, head_dim)
             xv,  # (bsz, slen, n_kv_heads, head_dim)
-            attn_for_save,  # (bsz, slen, n_heads, head_dim)
+            attn_out,  # (bsz, slen, n_heads, head_dim)
             attn_lse,  # (bsz, h/MP, slen, slen)
             flash_rng_state,
             xo,  # (bsz, slen, d/MP)
@@ -369,19 +369,22 @@ class TransformerBlockFunction(torch.autograd.Function):
             mx = reshape_gathered_tensor_along_specific_dim(mx, gather_dim=2)
 
         attn_outs, q_outs, k_outs, v_outs, handle_kv, attn_gate_outs = multihead_attention_recompute(
-            attn_for_save, attn_lse, xq, xk, xv, end_seq, mx, freqs_cis, bos_mask, segments,
+            attn_out, attn_lse, xq, xk, xv, end_seq, mx, freqs_cis, bos_mask, segments,
             wq, wk, wv, wr, q_norm_w, k_norm_w, head_dim, rope_head_dim, local_heads, local_kv_heads,
             attn_scale, attn_act_func, apply_attn_gate, attn_gate_func, rmsnorm_eps,
             attention_dropout, attn_rng_state, causal_attn_backend, attn_stability_control
         )
-        attn_out, attn_for_save, attn_lse = attn_outs
+        attn_out, attn_lse = attn_outs
         xq, xq_, xq_rstd = q_outs
         xk, xk_, xk_rstd = k_outs
         xv, xv_ = v_outs
         handle_xk, handle_xv = handle_kv
         rmx, r = attn_gate_outs
 
-        attn = attn_out * r if r is not None else attn_out
+        # B x L x H x V -> B x L x H*V
+        attn = rearrange(attn_out, 'b l h v -> b l (h v)')
+        if r is not None:
+            attn = attn * r
         attn, attn_noise = memory_efficient_dropout_fwd(attn, hidden_dropout, True, attn_out_rng_state)
 
         if handle_xh is not None:
@@ -409,7 +412,7 @@ class TransformerBlockFunction(torch.autograd.Function):
         attn_r_grad = attn_r_grad.view(bsz, seq_len, local_heads, head_dim)
         x_grad, wq_grad, wk_grad, wv_grad, wr_grad, \
         q_norm_w_grad, k_norm_w_grad, attn_norm_w_grad, attn_norm_b_grad = multihead_attention_bwd(
-            attn_r_grad, r_grad, attn_for_save, attn_lse, xq_, xk_, xv_, total_seqlen_k, end_seq,
+            attn_r_grad, r_grad, attn_out, attn_lse, xq_, xk_, xv_, total_seqlen_k, end_seq,
             freqs_cis, bos_mask, segments, local_kv_heads, rope_head_dim,
             xq, xk, xq_rstd, xk_rstd, rmx, mx, q_norm_w, k_norm_w, wq, wk, wv, wr,
             attn_scale, attn_act_func, apply_attn_gate, attn_gate_func, attention_dropout, flash_rng_state,
