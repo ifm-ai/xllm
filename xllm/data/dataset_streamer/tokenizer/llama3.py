@@ -86,7 +86,8 @@ class Llama3Tokenizer(Tokenizer):
         )
         tokens: List[int] = []
         for substr in substrs:
-            tokens.extend(self.model.encode(substr, allowed_special='all'))
+            # raw text never yields control tokens: a quoted "<|eot_id|>" is ordinary text here
+            tokens.extend(self.model.encode_ordinary(substr))
         return tokens
 
     def _decode(self, tokens: List[int]) -> str:
