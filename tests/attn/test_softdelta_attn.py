@@ -62,7 +62,7 @@ def test(B: int, L1: int, L2: int, H: int, D: int, multi_segment: bool, dtype: s
 
     with torch.no_grad():
         query = torch.randn(B, L1, H, D, requires_grad=False, dtype=pt_dtype, device="cuda")
-        qkey = torch.randn(B, L2, H, D, requires_grad=False, dtype=pt_dtype, device="cuda")
+        qkey = torch.randn(B, L1, H, D, requires_grad=False, dtype=pt_dtype, device="cuda")
         kkey = torch.randn(B, L2, H, D, requires_grad=False, dtype=pt_dtype, device="cuda")
         value = torch.randn(B, L2, H, D, requires_grad=False, dtype=pt_dtype, device="cuda")
         g = torch.randn(B, L1, H, requires_grad=False, dtype=pt_dtype, device="cuda")
@@ -106,10 +106,6 @@ def test(B: int, L1: int, L2: int, H: int, D: int, multi_segment: bool, dtype: s
     g_grad = g.grad
 
     with torch.no_grad():
-        # flash-attn
-        atol = {"fp32": 1e-6, "bf16": 4e-3, "fp16": 2e-4}[dtype]
-        rtol = {"fp32": 1e-5, "bf16": 1e-2, "fp16": 1e-3}[dtype]
-
         # xattn
         for level in range(2):
             atol = {"fp32": 1e-6, "bf16": 4e-3, "fp16": 2e-4}[dtype]
