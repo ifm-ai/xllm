@@ -62,7 +62,7 @@ from xllm.models import build_model
 from xllm.optim import (
     build_optimizer, check_param_groups, param_group_names, rescale_grads, restore_optimizer_config,
 )
-from xllm.optim.roles import clip_grad_scales, group_lrs, init_roles
+from xllm.optim.roles import clip_grad_scales, group_lrs, init_roles, require_roles
 from xllm.monitor import GPUMonitor, Timings
 from xllm.metrics import MetricLogger, build_mlogger
 from xllm.health_metrics import HealthMetricCollector
@@ -280,6 +280,8 @@ def main(cfg: TrainerConf):
     tflops_per_token = model.tflops_per_token(cfg.seq_len)
 
     # build optimizer / scheduler
+    if cfg.mup is not None:
+        require_roles(model)  # mup scales every parameter by its role
     optimizer, scheduler = build_optimizer(model, cfg.optim, cfg.steps, cfg.dtype, roles=cfg.roles)
     grad_scales = clip_grad_scales(model, cfg.roles)  # the roles' clip_scale in the clipping norm
 

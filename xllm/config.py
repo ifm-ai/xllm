@@ -8,6 +8,7 @@ import json
 import math
 
 from xllm.configuration import Config
+from xllm.configuration.configuration import NOCLI
 from xllm.distributed import (
     model_parallel_is_initialized,
     get_data_parallel_world_size,
@@ -267,14 +268,14 @@ MUON_ROLES = ("hidden_matrix", "residual_out")  # tag exactly Muon weights; the 
 
 @dataclass
 class RolesConf(Config):
-    """Per-role hyperparameters (xllm/optim/roles.py). Unset, training is unchanged."""
+    """Per-role hyperparameters (xllm/optim/roles.py); mup fills them in. Unset, training is unchanged."""
     embed: RoleConf = field(default_factory=RoleConf)
     hidden_matrix: RoleConf = field(default_factory=RoleConf)  # Muon matrices in the blocks, but residual_out
     residual_out: RoleConf = field(default_factory=RoleConf)  # attention wo and FFN fc2, the branches' outputs (Muon)
     hidden_vector: RoleConf = field(default_factory=RoleConf)  # norm gains and biases in the blocks
     final_norm: RoleConf = field(default_factory=RoleConf)
     readout: RoleConf = field(default_factory=RoleConf)
-    other: RoleConf = field(default_factory=RoleConf)  # the parameters no module tags (gekko, MoE)
+    other: RoleConf = field(default_factory=RoleConf)  # the parameters no module tags (gekko, MoE); none under mup
 
     def __post_init__(self):
         for f in fields(self):
@@ -287,6 +288,101 @@ class RolesConf(Config):
                     raise ValueError(f"roles.{f.name}.{name} must be finite and {bound}, got {value}")
         if self.other.init_std is not None:
             raise ValueError("roles.other.init_std: the parameters without a role keep their module's init")
+
+
+@dataclass
+class MuPConf(Config):
+    """Complete(d)P width / depth scaling relative to a base model (arXiv:2512.22382), with Muon: a preset of the
+    per-role hyperparameters (RolesConf).
+
+    m_N = model_dim / base_model_dim, m_L = num_layers / base_num_layers, c = m_L^-alpha. Scale num_heads,
+    num_kv_heads and ffn_hidden_dim with model_dim and keep head_dim fixed. Muon needs no width factor: its
+    spectral_norm update scale already transfers across widths. The residual branches are scaled by c without a
+    multiplier in the forward: c is folded into residual_out, whose init std and lr are x c, weight decay x 1/c
+    (lr * weight_decay unchanged) and gradients x c in the clipping norm. Training then matches a residual
+    multiplier c exactly. Factors on the configured values, and init stds (sigma_h = base_init_hidden_std m_N^-1/2):
+
+        role           lr               eps               weight_decay  init_std                     clip_scale
+        embed          1                m_N^-1            1             base_init_embed_std          1
+        hidden_matrix  m_L^(alpha-1)    1                 1             sigma_h                      1
+        residual_out   m_L^(alpha-1) c  1                 1/c           sigma_h c                    c
+        hidden_vector  m_L^(alpha-1)    m_N^-1 m_L^-alpha 1             -                            1
+        final_norm     1                1                 1             -                            1
+        readout        m_N^-1           1                 m_N           base_init_unembed_std / m_N  1
+
+    Every parameter must have one of these roles: none may be left to `other`. A --roles value set explicitly
+    must equal the table's.
+    """
+    base_model_dim: int  # model_dim of the base model the hyperparameters were tuned on
+    base_num_layers: int  # num_layers of the base model
+    base_init_hidden_std: float  # Init std of the hidden matrices at base width; x m_N^-1/2
+    base_init_embed_std: float  # Init std of the embedding, the same at every width
+    base_init_unembed_std: float  # Init std of the readout at base width; x m_N^-1
+    alpha: float = 1.0  # Depth exponent in [0.5, 1]: c = m_L^-alpha
+    base_head_dim: Optional[int] = None  # head_dim of the base model, checked to equal the model's
+    width_multiplier: Optional[float] = NOCLI()  # m_N, set by resolve()
+    depth_multiplier: Optional[float] = NOCLI()  # m_L, set by resolve()
+    branch_scale: Optional[float] = NOCLI()  # c = m_L^-alpha, set by resolve()
+
+    def preset(self) -> Dict[str, RoleConf]:
+        """The table at the resolved multipliers."""
+        m_n, m_l, c = self.width_multiplier, self.depth_multiplier, self.branch_scale
+        depth_lr = m_l ** (self.alpha - 1)
+        hidden_std = self.base_init_hidden_std / math.sqrt(m_n)
+        table = {
+            "embed": dict(eps=1 / m_n, init_std=self.base_init_embed_std),
+            "hidden_matrix": dict(lr=depth_lr, init_std=hidden_std),
+            "residual_out": dict(lr=depth_lr * c, weight_decay=1 / c, init_std=hidden_std * c, clip_scale=c),
+            "hidden_vector": dict(lr=depth_lr, eps=c / m_n),
+            "final_norm": {},
+            "readout": dict(lr=1 / m_n, weight_decay=m_n, init_std=self.base_init_unembed_std / m_n),
+            "other": {},
+        }
+        return {role: RoleConf(**(dict(lr=1.0, eps=1.0, weight_decay=1.0, clip_scale=1.0) | values))
+                for role, values in table.items()}
+
+    def resolve(self, model: ModelConf, optim: OptimConf, roles: RolesConf) -> None:
+        """Check that the run supports mup; set the multipliers and the roles."""
+        for name in ("base_model_dim", "base_num_layers", "base_init_hidden_std", "base_init_embed_std",
+                     "base_init_unembed_std"):
+            value = getattr(self, name)
+            if not math.isfinite(value) or value <= 0:
+                raise ValueError(f"mup.{name} must be positive and finite, got {value}")
+        if not 0.5 <= self.alpha <= 1.0:
+            raise ValueError(f"mup.alpha must be in [0.5, 1], got {self.alpha}")
+        for name, actual, supported in (
+            ("model.arch", model.arch, ["transformer"]),
+            ("model.init_mode", model.init_mode, ["gaussian"]),
+            ("model.init_std", model.init_std, [None]),  # the roles' init_std replace these
+            ("model.init_embed_std", model.init_embed_std, [None]),
+            ("model.init_logits_std", model.init_logits_std, [None]),
+            ("model.num_experts", model.num_experts, [0]),
+            ("model.num_values", model.num_values, [0]),
+            ("model.scale_emb", model.scale_emb, [False]),
+            ("model.residual_func", model.residual_func, ["base", "add"]),  # the folded c needs a plain residual add
+            ("optim.optimizer", optim.optimizer, ["muon"]),
+            ("optim.muon_adjust_lr", optim.muon_adjust_lr, ["spectral_norm"]),
+            ("optim.muon_block_scale", optim.muon_block_scale, ["block"]),  # per-head blocks, head_dim fixed
+        ):
+            if actual not in supported:
+                raise ValueError(f"mup requires {name} in {supported}, got {actual!r}")
+        head_dim = model.head_dim or model.model_dim // model.num_heads
+        if self.base_head_dim is not None and head_dim != self.base_head_dim:
+            raise ValueError(f"mup keeps head_dim fixed across widths: model {head_dim}, "
+                             f"mup.base_head_dim {self.base_head_dim}")
+
+        # already resolved (a run's config.json): the roles hold that preset, not values the user set
+        applied = self.preset() if self.width_multiplier is not None else {}
+        self.width_multiplier = model.model_dim / self.base_model_dim
+        self.depth_multiplier = model.num_layers / self.base_num_layers
+        self.branch_scale = self.depth_multiplier ** -self.alpha
+        for role, values in self.preset().items():
+            for f in fields(RoleConf):
+                current, value = getattr(getattr(roles, role), f.name), getattr(values, f.name)
+                user_set = current is not None and (role not in applied or current != getattr(applied[role], f.name))
+                if user_set and current != value:
+                    raise ValueError(f"roles.{role}.{f.name}={current} conflicts with mup, which sets it to {value}")
+            setattr(roles, role, values)
 
 
 @dataclass
@@ -365,6 +461,7 @@ class TrainerConf(Config):
     valid: ValidConf
     tokenizer: TokenizerConf
     dataloader: DataLoaderConfig  # Configs for multi-source data loading.
+    mup: Optional[MuPConf] = None  # Complete(d)P width / depth scaling, with optim.optimizer=muon: sets the roles
     roles: RolesConf = field(default_factory=RolesConf)  # Per-role hyperparameters, with optim.optimizer=muon
 
     # Training data / iterator
@@ -478,13 +575,15 @@ class TrainerConf(Config):
         if self.optim.optimizer == "muon":
             assert self.model.ddp_backend == "fsdp2", "Muon requires FSDP2."
             assert self.dcp_for_optimizer, "Muon requires dcp_for_optimizer (sharded momentum)."
+        if self.mup is not None:
+            self.mup.resolve(self.model, self.optim, self.roles)
         if self.roles != RolesConf():
-            assert self.optim.optimizer == "muon", "roles (--roles.*) require optim.optimizer=muon"
+            assert self.optim.optimizer == "muon", "roles (--roles.*, --mup) require optim.optimizer=muon"
             for role in MUON_ROLES:
                 assert getattr(self.roles, role).factor("eps") == 1, f"roles.{role}.eps: Muon has no eps to scale"
             if any(getattr(self.roles, f.name).init_std is not None for f in fields(RolesConf)):
                 # a tensor-parallel shard would draw the same values on every rank
-                assert self.model_parallel_size == 1, "roles' init_std need model_parallel_size 1"
+                assert self.model_parallel_size == 1, "roles' init_std (set by mup) need model_parallel_size 1"
 
         # MoE
         if self.model.num_experts > 0:

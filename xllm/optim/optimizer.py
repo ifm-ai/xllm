@@ -89,7 +89,7 @@ def check_param_groups(optimizer, training_state_dict: Dict, source: str):
         saved, current = len(training_state_dict["scheduler"]["base_lrs"]), len(current)
     if saved != current:
         raise ValueError(
-            f"{source} has optimizer param groups {saved}, this run {current}. Use the --roles it was saved "
-            f"with (some role's lr, eps or weight_decay other than 1 makes per-role groups), or load only "
+            f"{source} has optimizer param groups {saved}, this run {current}. Use the --mup / --roles it was "
+            f"saved with (some role's lr, eps or weight_decay other than 1 makes per-role groups), or load only "
             f"its weights (--base_model_dir without --reload_base_optim_state)."
         )

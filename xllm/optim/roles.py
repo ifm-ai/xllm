@@ -4,8 +4,8 @@ clipping-norm factor.
 A module declares the role of each parameter in its __init__ (register_role). The tag lives on the module, so it
 survives FSDP2 replacing the parameters, as register_muon's specs; a parameter no module tags is in role `other`.
 AdamW steps one param group per role; Muon scales each matrix's lr and weight decay by its role's (Muon's
-lr_scales / wd_scales). Unset values change nothing: no re-init, the optimizer's two groups (while no role's
-lr / eps / weight decay factor differs from 1), the plain clipping norm.
+lr_scales / wd_scales). MuPConf is one preset of the roles. Unset values change nothing: no re-init, the optimizer's
+two groups (while no role's lr / eps / weight decay factor differs from 1), the plain clipping norm.
 """
 from contextlib import contextmanager
 from dataclasses import fields
@@ -65,6 +65,14 @@ def param_roles(model: nn.Module) -> Dict[int, str]:
             if roles.setdefault(id(getattr(m, name)), role) != role:
                 raise ValueError(f"{fqn}.{name} has two roles: {roles[id(getattr(m, name))]} and {role}")
     return {id(p): roles.get(id(p), "other") for p in model.parameters()}
+
+
+def require_roles(model: nn.Module):
+    """mup scales every parameter by its role: none may be left to `other`."""
+    roles = param_roles(model)
+    untagged = [name for name, p in model.named_parameters() if roles[id(p)] == "other"]
+    if untagged:
+        raise ValueError(f"mup needs a role on every parameter (register_role), these have none: {untagged}")
 
 
 def grouped(roles: RolesConf) -> bool:
