@@ -133,7 +133,7 @@ class TransformerMoVABlockFunction(torch.autograd.Function):
             causal_attn_backend, attn_stability_control, recompute_attention,
         )
         xq, xk, xv = xqkv
-        attn_out, attn_lse = attn_out
+        attn_out, attn_readers, attn_lse = attn_out
         flash_rng_state, attn_rng_state, attn_out_rng_state, xh_rng_state = rng_states
         v_original_scores, v_routing_indices, v_org_topk_scores, v_tokens_per_expert, v_group_sizes = routing_state
         health_collector = get_active_health_collector()
@@ -228,6 +228,7 @@ class TransformerMoVABlockFunction(torch.autograd.Function):
             v_org_topk_scores,  # (bsz, slen, topk)
             v_tokens_per_expert,  # (n_experts)
             attn_out if not recompute_attention else None,  # (bsz, slen, n_heads, head_dim)
+            attn_readers if not recompute_attention else None,  # (bsz, slen, n_kv_heads, head_dim)
             attn_lse if not recompute_attention else None,  # (bsz, h/MP, slen, slen)
             flash_rng_state,
             xo,  # (bsz, slen, d/MP)
@@ -333,6 +334,7 @@ class TransformerMoVABlockFunction(torch.autograd.Function):
             v_org_topk_scores,  # (bsz, slen, topk)
             v_tokens_per_expert,  # (n_experts)
             attn_out,  # (bsz, slen, n_heads, head_dim)
+            attn_readers,  # (bsz, slen, n_kv_heads, head_dim)
             attn_lse,  # (bsz, h/MP, slen, slen)
             flash_rng_state,
             xo,  # (bsz, slen, d/MP)

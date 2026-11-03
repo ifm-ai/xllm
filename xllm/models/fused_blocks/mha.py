@@ -20,6 +20,7 @@ from .utils import (
     flash_attention_fwd,
     flash_attention_bwd,
     recompute_flash_attention_lse,
+    softdelta_attn_fwd,
     apply_rope,
     apply_ropes
 )
@@ -38,8 +39,9 @@ def multihead_attention_fwd(
     causal_attn_backend, stability_control, recompute_attn,
 ):
     bsz, seq_len, _ = mx.shape
+    nk = {"softmax": 1, "softdelta": 2}[attn_act_func]
     attn_gate_fn = {"silu": F.silu, "softplus": partial(F.softplus, beta=math.log(2))}[attn_gate_func]
-    assert attn_gate_fn is not None
+    assert nk is not None and attn_gate_fn is not None
 
     attn_scale = 1.0 / math.sqrt(head_dim)
     end_seq = (get_context_parallel_rank() + 1) * seq_len
@@ -49,10 +51,11 @@ def multihead_attention_fwd(
 
     # compute k
     xk = F.linear(mx, wk)
-    xk_ = rmsnorm_fwd(xk, k_norm_w, local_kv_heads, eps)[0] if k_norm_w is not None else xk
+    xk_ = rmsnorm_fwd(xk, k_norm_w, local_kv_heads * nk, eps)[0] if k_norm_w is not None else xk
     xk_ = rearrange(xk_, 'b l (k s) -> b l k s', k=local_kv_heads)
     if attn_act_func == 'softmax':
         xk_ = apply_rope(xk_, freqs_cis, head_dim, rope_head_dim, False)
+        kq_ = None
     else:
         assert attn_act_func == 'softdelta'
         kq_ = xk_[:, :, :, :head_dim]
@@ -92,8 +95,14 @@ def multihead_attention_fwd(
         xk_ = reshape_gathered_tensor_along_specific_dim(xk_, gather_dim=1)[:, :end_seq]
 
     if attn_act_func == 'softmax':
+        attn_readers = None
         attn_out, attn_lse, flash_rng_state, attn_rng_state = flash_attention_fwd(
             xq_, xk_, xv_, bos_mask, segments, attn_scale, attention_dropout, stability_control,
+            backend=causal_attn_backend, save_aux=not recompute_attn
+        )
+    elif attn_act_func == 'softdelta':
+        attn_out, attn_readers, attn_lse, flash_rng_state, attn_rng_state = softdelta_attn_fwd(
+            xq_, kq_, xk_, xv_, g, bos_mask, segments, attn_scale, attention_dropout, stability_control,
             backend=causal_attn_backend, save_aux=not recompute_attn
         )
     else:
@@ -108,7 +117,7 @@ def multihead_attention_fwd(
     xh, xh_rng_state = memory_efficient_dropout_fwd(xh, dropout, True)
 
     return (
-        (xq, xk, xv), (attn_out, attn_lse), xh,
+        (xq, xk, xv), (attn_out, attn_readers, attn_lse), xh,
         (flash_rng_state, attn_rng_state, attn_out_rng_state, xh_rng_state), end_seq
     )
 

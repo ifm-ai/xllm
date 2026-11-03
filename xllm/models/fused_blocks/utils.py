@@ -17,6 +17,8 @@ from xllm.modules.fused_ops import (
     flash_attention_bwd as flash_bwd,
     xattn_causal_flash_attn_fwd as xattn_fwd,
     xattn_causal_flash_attn_bwd as xattn_bwd,
+    xattn_softdelta_attn_fwd,
+    xattn_softdelta_attn_bwd,
     causal_conv1d_fwd as conv1d_fwd,
     causal_conv1d_bwd as conv1d_bwd,
     sliding_chunk_softmax_attention_fwd as sca_fwd,
@@ -470,6 +472,8 @@ def flash_attention_fwd(
         )
         lse = lse if save_aux else None
     elif backend == 'xattn':
+        assert dropout == 0, 'xattn causal attn does not support attention drop.'
+        flash_rng_state = None
         if segments is not None:
             segidx, total_seqlen_k = segments
             xk = xk[:, -total_seqlen_k:]
@@ -480,7 +484,6 @@ def flash_attention_fwd(
             segidx = None
 
         y, lse = xattn_fwd(xq, xk, xv, scale, bos_mask, segidx, stability_control, requires_grad=save_aux)
-        flash_rng_state = None
     else:
         raise ValueError(f"Unknown causal attention backend: {backend}")
 
@@ -530,6 +533,43 @@ def flash_attention_bwd(
         )
     else:
         raise ValueError(f"Unknown causal attention backend: {backend}")
+
+
+def softdelta_attn_fwd(
+    xq: torch.Tensor,
+    kq: torch.Tensor,
+    xk: torch.Tensor,
+    xv: torch.Tensor,
+    g: torch.Tensor,
+    bos_mask: Optional[Tensor],
+    segments: Optional[Any],
+    scale: Optional[float],
+    dropout: float,
+    stability_control: int,
+    backend: str,
+    save_aux: bool
+) -> Tuple[Tensor, Optional[Tensor], Tensor,
+           Optional[Tensor], Optional[Tensor]]:
+    rng_state = None if dropout == 0 else torch.cuda.get_rng_state()
+    if backend == 'xattn':
+        assert dropout == 0, 'xattn softdelta attn does not support attention drop.'
+        flash_rng_state = None
+        if segments is not None:
+            segidx, total_seqlen_k = segments
+            xk = xk[:, -total_seqlen_k:]
+            xv = xv[:, -total_seqlen_k:]
+            bos_mask = bos_mask[:, -total_seqlen_k:]
+            segidx = segidx[:, -total_seqlen_k:]
+        else:
+            segidx = None
+
+        y, readers, lse = xattn_softdelta_attn_fwd(
+            xq, kq, xk, xv, g, scale, bos_mask, segidx, stability_control, save_aux
+        )
+    else:
+        raise ValueError(f"Unknown softdelta attention backend: {backend}")
+
+    return y, readers, lse, flash_rng_state, rng_state
 
 
 def recompute_sliding_chunk_attention(

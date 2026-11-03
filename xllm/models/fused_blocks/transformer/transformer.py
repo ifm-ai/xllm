@@ -114,7 +114,7 @@ class TransformerBlockFunction(torch.autograd.Function):
             causal_attn_backend, attn_stability_control, recompute_attention,
         )
         xq, xk, xv = xqkv
-        attn_out, attn_lse = attn_out
+        attn_out, attn_readers, attn_lse = attn_out
         flash_rng_state, attn_rng_state, attn_out_rng_state, xh_rng_state = rng_states
 
         if segments is not None:
@@ -179,6 +179,7 @@ class TransformerBlockFunction(torch.autograd.Function):
             xk if not recompute_kv else None,  # (bsz, slen, n_kv_heads, head_dim)
             xv if not recompute_kv else None,  # (bsz, slen, n_kv_heads, head_dim)
             attn_out if not recompute_attention else None,  # (bsz, slen, n_heads, head_dim)
+            attn_readers if not recompute_attention else None,  # (bsz, slen, n_kv_heads, head_dim)
             attn_lse if not recompute_attention else None,  # (bsz, h/MP, slen, slen)
             flash_rng_state,
             xo,  # (bsz, slen, d/MP)
@@ -247,6 +248,7 @@ class TransformerBlockFunction(torch.autograd.Function):
             xk,  # (bsz, slen, n_kv_heads, head_dim)
             xv,  # (bsz, slen, n_kv_heads, head_dim)
             attn_out,  # (bsz, slen, n_heads, head_dim)
+            attn_readers,  # (bsz, slen, n_kv_heads, head_dim)
             attn_lse,  # (bsz, h/MP, slen, slen)
             flash_rng_state,
             xo,  # (bsz, slen, d/MP)
