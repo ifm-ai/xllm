@@ -1,10 +1,11 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field, fields
 from logging import getLogger
 from typing import Optional
 from pathlib import Path
 from typing import List, Dict
 import os
 import json
+import math
 
 from xllm.configuration import Config
 from xllm.distributed import (
@@ -247,6 +248,48 @@ class ModelConf(Config):
 
 
 @dataclass
+class RoleConf(Config):
+    """Hyperparameters of the parameters of one role (register_role, xllm/optim/roles.py). None: unchanged."""
+    lr: Optional[float] = None  # x optim.lr (AdamW) or optim.muon_lr (Muon); decay lr * weight_decay takes both
+    eps: Optional[float] = None  # x optim.epsilon; AdamW only
+    weight_decay: Optional[float] = None  # x the weight decay
+    init_std: Optional[float] = None  # Truncated normal init (at 3 std) as the model is built, 0: zeros
+    clip_scale: Optional[float] = None  # Factor on the gradients in the clipping norm; all are still clipped alike
+
+    def factor(self, name: str) -> float:
+        """lr, eps, weight_decay or clip_scale: the value, 1 if unset."""
+        value = getattr(self, name)
+        return 1.0 if value is None else value
+
+
+MUON_ROLES = ("hidden_matrix", "residual_out")  # tag exactly Muon weights; the others are AdamW's, `other` holds both
+
+
+@dataclass
+class RolesConf(Config):
+    """Per-role hyperparameters (xllm/optim/roles.py). Unset, training is unchanged."""
+    embed: RoleConf = field(default_factory=RoleConf)
+    hidden_matrix: RoleConf = field(default_factory=RoleConf)  # Muon matrices in the blocks, but residual_out
+    residual_out: RoleConf = field(default_factory=RoleConf)  # attention wo and FFN fc2, the branches' outputs (Muon)
+    hidden_vector: RoleConf = field(default_factory=RoleConf)  # norm gains and biases in the blocks
+    final_norm: RoleConf = field(default_factory=RoleConf)
+    readout: RoleConf = field(default_factory=RoleConf)
+    other: RoleConf = field(default_factory=RoleConf)  # the parameters no module tags (gekko, MoE)
+
+    def __post_init__(self):
+        for f in fields(self):
+            role = getattr(self, f.name)
+            for name, positive in (("lr", False), ("eps", True), ("weight_decay", False), ("init_std", False),
+                                   ("clip_scale", True)):
+                value = getattr(role, name)
+                if value is not None and not (math.isfinite(value) and (value > 0 if positive else value >= 0)):
+                    bound = '> 0' if positive else '>= 0'
+                    raise ValueError(f"roles.{f.name}.{name} must be finite and {bound}, got {value}")
+        if self.other.init_std is not None:
+            raise ValueError("roles.other.init_std: the parameters without a role keep their module's init")
+
+
+@dataclass
 class ValidConf(Config):
     # Tasks to evaluate
     ppl_file_list: str = ""  # Comma separated list of files to eval PPL
@@ -322,6 +365,7 @@ class TrainerConf(Config):
     valid: ValidConf
     tokenizer: TokenizerConf
     dataloader: DataLoaderConfig  # Configs for multi-source data loading.
+    roles: RolesConf = field(default_factory=RolesConf)  # Per-role hyperparameters, with optim.optimizer=muon
 
     # Training data / iterator
     data: str = ""  # Comma seperated data mix. Each mix is formatted as path:weight:json_key:source_format. Weights need not sum to 1.
@@ -434,6 +478,13 @@ class TrainerConf(Config):
         if self.optim.optimizer == "muon":
             assert self.model.ddp_backend == "fsdp2", "Muon requires FSDP2."
             assert self.dcp_for_optimizer, "Muon requires dcp_for_optimizer (sharded momentum)."
+        if self.roles != RolesConf():
+            assert self.optim.optimizer == "muon", "roles (--roles.*) require optim.optimizer=muon"
+            for role in MUON_ROLES:
+                assert getattr(self.roles, role).factor("eps") == 1, f"roles.{role}.eps: Muon has no eps to scale"
+            if any(getattr(self.roles, f.name).init_std is not None for f in fields(RolesConf)):
+                # a tensor-parallel shard would draw the same values on every rank
+                assert self.model_parallel_size == 1, "roles' init_std need model_parallel_size 1"
 
         # MoE
         if self.model.num_experts > 0:

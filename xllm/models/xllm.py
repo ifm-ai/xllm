@@ -1,5 +1,6 @@
 import abc
-from typing import Union, Dict, Tuple, List
+from collections import defaultdict
+from typing import Union, Dict, Tuple, List, Optional
 import types
 import warnings
 import math
@@ -82,8 +83,9 @@ class XLLModel(nn.Module):
 
     @torch.no_grad()
     def clip_grad_norm_(
-            self, max_norm: Union[float, int], norm_type: Union[float, int] = 2.0
-    ) -> float:
+            self, max_norm: Union[float, int], norm_type: Union[float, int] = 2.0,
+            grad_scales: Optional[Dict[int, float]] = None,
+    ) -> Tuple[float, float]:
         """
         Clip all gradients at this point in time. The norm is computed over all
         gradients together, as if they were concatenated into a single vector.
@@ -92,9 +94,12 @@ class XLLModel(nn.Module):
         Args:
             max_norm (float or int): max norm of the gradients
             norm_type (float or int): type of the used p-norm. Can be ``'inf'``for infinity norm.
+            grad_scales: id(param) -> factor on its gradient in the norm (the roles' clip_scale,
+                xllm/optim/roles.py). Every gradient is still clipped by the same factor.
 
         Returns:
-            Total norm of the parameters (viewed as a single vector).
+            (the norm clipping compares with max_norm, the total norm of the gradients, viewed as a single
+            vector); they differ only with grad_scales, the first then of the scaled gradients.
 
         .. warning:: This needs to be called on all ranks, since synchronization
             primitives will be used.
@@ -117,11 +122,24 @@ class XLLModel(nn.Module):
         max_norm = float(max_norm)
         norm_type = float(norm_type)
         if len(grads) == 0:
-            return 0.
+            return 0., 0.
 
-        total_norm = get_total_norm(grads, norm_type, False, None)
-        if isinstance(total_norm, DTensor):
-            total_norm = total_norm.full_tensor()
+        if grad_scales:
+            by_scale = defaultdict(list)
+            for p in parameters:
+                if p.grad is not None:
+                    by_scale[grad_scales.get(id(p), 1.0)].append(p.grad)
+            norms = []
+            for scale, scaled_grads in by_scale.items():
+                norm = get_total_norm(scaled_grads, norm_type, False, None)
+                norms.append(norm.full_tensor() if isinstance(norm, DTensor) else norm)
+            # [scaled norm, plain norm], reduced together
+            total_norm = torch.stack([get_total_norm([s * n for s, n in zip(by_scale, norms)], norm_type, False, None),
+                                      get_total_norm(norms, norm_type, False, None)])
+        else:
+            total_norm = get_total_norm(grads, norm_type, False, None)
+            if isinstance(total_norm, DTensor):
+                total_norm = total_norm.full_tensor()
 
         model_parallel_world_size = get_model_parallel_world_size()
         # Reconstruct the total gradient norm depending on the norm type
@@ -134,9 +152,12 @@ class XLLModel(nn.Module):
                 dist.all_reduce(total_norm, group=model_parallel_process_group)
                 total_norm = total_norm ** (1.0 / norm_type)
 
+        if grad_scales:
+            clip_grads_with_norm_(parameters, max_norm, total_norm[0], None)
+            return tuple(total_norm.tolist())
         clip_grads_with_norm_(parameters, max_norm, total_norm, None)
         total_norm_cpu = total_norm.item()
-        return total_norm_cpu
+        return total_norm_cpu, total_norm_cpu
 
     @abc.abstractmethod
     def support_multi_segments_with_cache(self) -> bool:

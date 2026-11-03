@@ -29,7 +29,7 @@ from torch.distributed.device_mesh import DeviceMesh
 from torch.optim import Optimizer
 from torch.optim.adamw import adamw
 
-from xllm.config import OptimConf
+from xllm.config import OptimConf, RolesConf
 
 from .muon_spec import Block, MuonSpec, box_index, name_pattern, split_muon_params
 
@@ -102,12 +102,21 @@ class Muon(Optimizer):
     are orthogonalized (one buffer per shape at a time); the owners orthogonalize the remote blocks and an
     all-to-all sends the slices back into u; each rank applies its update."""
 
-    def __init__(self, muon_params: list[nn.Parameter], specs: list[MuonSpec], adamw_params: list[nn.Parameter],
-                 mesh: DeviceMesh, cfg: OptimConf, tp_group: dist.ProcessGroup | None = None):
-        """specs[i]: muon_params[i]'s Blocks (register_muon); tp_group: the TP group, if any (params are then TP-local)."""
+    def __init__(self, muon_params: list[nn.Parameter], specs: list[MuonSpec], adamw_params: list,
+                 mesh: DeviceMesh, cfg: OptimConf, tp_group: dist.ProcessGroup | None = None,
+                 lr_scales: list[float] | None = None, wd_scales: list[float] | None = None):
+        """specs[i]: muon_params[i]'s Blocks (register_muon); tp_group: the TP group, if any (params are then TP-local).
+        adamw_params: the AdamW parameters, or AdamW param groups: dicts whose keys replace the configured values.
+        lr_scales[i] / wd_scales[i]: muon_params[i] steps as if the group's lr / weight_decay were x these (default 1),
+        like an AdamW group's: its decay lr * weight_decay takes both. Roles set them and the AdamW groups
+        (xllm/optim/roles.py)."""
+        adamw_groups = adamw_params if adamw_params and isinstance(adamw_params[0], dict) else [dict(params=adamw_params)]
         groups = [dict(params=muon_params, lr=cfg.muon_lr, algorithm="muon", **group_hparams(cfg, "muon")),
-                  dict(params=adamw_params, lr=cfg.lr, algorithm="adamw", **group_hparams(cfg, "adamw"))]
+                  *(dict(lr=cfg.lr, algorithm="adamw", **group_hparams(cfg, "adamw")) | g for g in adamw_groups)]
         super().__init__(groups, {"eps": cfg.epsilon})
+        self.lr_scales = [1.0] * len(muon_params) if lr_scales is None else list(lr_scales)
+        self.wd_scales = [1.0] * len(muon_params) if wd_scales is None else list(wd_scales)
+        assert len(self.lr_scales) == len(self.wd_scales) == len(muon_params)
         self._ranks(mesh, tp_group)
         self.w = [_local(p) for p in muon_params]  # shards: weights, momenta (state, from the first gradient), directions
         self.m: list[Tensor | None] = [None] * len(muon_params)
@@ -234,11 +243,17 @@ class Muon(Optimizer):
                                 [self.u[i] for i in live], group["momentum"], group["nesterov"])
 
     def _update(self, group: dict, live: list[int]):
-        """W <- W - lr (wd W + scale u) for the params with a gradient, in fp32. The scale multiplies the update, not
-        the decay: from the fans of the block, or of the whole weight (block_scale)."""
+        """W <- W - lr l (w wd W + scale u) for the params with a gradient, in fp32, l and w their lr_scales and
+        wd_scales. The scale multiplies the update, not the decay: from the fans of the block, or of the whole weight
+        (block_scale). One call per decay factor l w: the kernel takes one weight decay."""
         fans = self.fans[group["block_scale"]]
-        xllm_ops.muon_update_([self.w[i] for i in live], [self.u[i] for i in live],
-                              [_scale(*fans[i], group["adjust_lr"]) for i in live], group["lr"], group["weight_decay"])
+        by_decay: dict[float, list[int]] = {}
+        for i in live:
+            by_decay.setdefault(self.lr_scales[i] * self.wd_scales[i], []).append(i)
+        for decay, ids in by_decay.items():
+            xllm_ops.muon_update_([self.w[i] for i in ids], [self.u[i] for i in ids],
+                                  [_scale(*fans[i], group["adjust_lr"]) * self.lr_scales[i] for i in ids],
+                                  group["lr"], group["weight_decay"] * decay)
 
     def _adamw_step(self, group: dict):
         """torch.optim.AdamW's update (foreach) on the group's params."""
@@ -286,8 +301,9 @@ def _buffer(views: list[list[Tensor]]) -> tuple[list[Tensor], Tensor, list[Tenso
     return flat, buf, packed, [sum(t.numel() for t in ts) for ts in views]
 
 
-def build_muon(model: nn.Module, cfg: OptimConf) -> Optimizer:
-    """The model must be wrapped with FSDP2; Muon works over the shard dimension of the mesh its parameters live on."""
+def build_muon(model: nn.Module, cfg: OptimConf, roles: RolesConf | None = None) -> Optimizer:
+    """The model must be wrapped with FSDP2; Muon works over the shard dimension of the mesh its parameters live on.
+    roles: AdamW groups per role, Muon lr and weight decay factors per matrix (xllm/optim/roles.py)."""
     from xllm.distributed import get_model_parallel_group, get_model_parallel_world_size
     from xllm.modules.model_parallel import ColumnParallelLinear, RowParallelLinear
     tp = get_model_parallel_world_size()
@@ -310,9 +326,16 @@ def build_muon(model: nn.Module, cfg: OptimConf) -> Optimizer:
     if missed:
         logger.warning(f"Muon: unregistered weights use AdamW: {dict(missed)}")
     mesh = muon_params[0].device_mesh
-    optimizer = Muon(muon_params, specs, adamw_params, mesh if mesh.ndim == 1 else mesh["dp"], cfg,
-                     tp_group=get_model_parallel_group() if tp > 1 else None)
+    groups, lr_scales, wd_scales = adamw_params, None, None
+    if roles is not None:
+        from .roles import param_groups
+        groups, lr_scales, wd_scales = param_groups(model, cfg, roles, muon_params)
+    optimizer = Muon(muon_params, specs, groups, mesh if mesh.ndim == 1 else mesh["dp"], cfg,
+                     tp_group=get_model_parallel_group() if tp > 1 else None, lr_scales=lr_scales, wd_scales=wd_scales)
     logger.info(f"Muon: {len(muon_params)} matrices / {len(optimizer.blocks)} blocks / "
                 f"{sum(p.numel() for p in muon_params)} params; AdamW: {len(adamw_params)} tensors / "
                 f"{sum(p.numel() for p in adamw_params)} params")
+    if roles is not None:
+        from .roles import log_param_groups
+        log_param_groups(model, roles, optimizer)
     return optimizer

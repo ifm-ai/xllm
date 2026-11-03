@@ -77,3 +77,31 @@
 --optim.optimizer muon --optim.muon_lr 0.01 --optim.lr 2e-3 \
 --dcp_for_optimizer true
 ```
+
+## Parameter roles (`--roles.*`)
+
+A module declares the role of each parameter where it creates it, `register_role(module, name, role)`
+(`xllm/optim/roles.py`; the tag lives on the module, so it survives FSDP2). The Transformer's roles:
+`embed`, `hidden_matrix` (the Muon matrices in the blocks but `residual_out`), `residual_out`
+(attention `wo`, FFN `fc2`: the residual branches' outputs), `hidden_vector` (norm gains and biases
+in the blocks), `final_norm`, `readout`. A parameter no module tags is in `other` (gekko's, MoE's).
+
+Each role (`RolesConf` in `xllm/config.py`) has, unset by default (unset changes nothing):
+- `lr`, `eps`, `weight_decay`: factors on the configured values. AdamW steps one param group per
+  role; Muon scales each matrix's lr and weight decay (`lr_scales`, `wd_scales`), its decay
+  `lr * weight_decay` taking both factors, as AdamW's. `eps` is AdamW's only.
+- `init_std`: a truncated normal init (at 3 std; 0: zeros) as the model is built (`init_roles`).
+- `clip_scale`: a factor on the role's gradients in the clipping norm; every gradient is still
+  clipped by the same factor.
+
+Roles need `--optim.optimizer muon`, and `init_std` needs `--model_parallel_size 1` (a
+tensor-parallel shard would draw the same values on every rank); values are checked with the config.
+- **Param groups.** Only a role `lr`, `eps` or `weight_decay` other than 1 makes per-role groups;
+  `init_std` and `clip_scale` alone keep Muon's two. Checkpoints record their groups, and a resume
+  (or `--reload_base_optim_state`) into other groups fails before loading: resume with the roles a
+  checkpoint was saved with, or load its weights only.
+- **Logs.** `lr` is Muon's; then `adamw_lr`, or with role groups one `<role>_lr` per role (a Muon
+  role's: `lr` x its factor). `gnorm` / `g_norm` are the gradient norm; with clip scales,
+  `gnorm_clip` / `g_norm_clip` are the norm clipping compares.
+
+E.g. `--roles.readout.lr 0.5 --roles.readout.weight_decay 0`.

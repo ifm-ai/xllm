@@ -25,6 +25,8 @@ from xllm.checkpointing import (
     get_base_model_checkpoint_path,
     get_last_restart_step,
     make_checkpointer,
+    training_state_dir,
+    training_state_name,
 )
 from xllm.data.build import build_data_loader
 from xllm.data.dataloader import MultiSourceDataLoader
@@ -57,7 +59,10 @@ from xllm.utils import (
     collect_provenance,
 )
 from xllm.models import build_model
-from xllm.optim import build_optimizer, rescale_grads, restore_optimizer_config
+from xllm.optim import (
+    build_optimizer, check_param_groups, param_group_names, rescale_grads, restore_optimizer_config,
+)
+from xllm.optim.roles import clip_grad_scales, group_lrs, init_roles
 from xllm.monitor import GPUMonitor, Timings
 from xllm.metrics import MetricLogger, build_mlogger
 from xllm.health_metrics import HealthMetricCollector
@@ -160,6 +165,7 @@ def get_optim_state(
 ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     optim_state_dict = get_sharded_optimizer_state(model, optimizer, dcp)
     training_state_dict = {
+        "param_groups": param_group_names(optimizer),
         "scheduler": scheduler.state_dict(),
         "step": state.step,
         "scale": state.scale,
@@ -251,13 +257,14 @@ def main(cfg: TrainerConf):
 
     logger.info("Start building of model...")
     cfg.model.vocab_size = tokenizer.vocab_size
-    model = build_model(
-        cfg.model, dtype=cfg.dtype,
-        fully_sharded_size=cfg.fully_sharded_size,
-        fp32_reduce_scatter=cfg.fp32_reduce_scatter,
-        reshard_after_forward=cfg.reshard_after_forward,
-        forward_prefetch=cfg.forward_prefetch, tokenizer=tokenizer
-    )
+    with init_roles(cfg.roles):  # the roles' init stds
+        model = build_model(
+            cfg.model, dtype=cfg.dtype,
+            fully_sharded_size=cfg.fully_sharded_size,
+            fp32_reduce_scatter=cfg.fp32_reduce_scatter,
+            reshard_after_forward=cfg.reshard_after_forward,
+            forward_prefetch=cfg.forward_prefetch, tokenizer=tokenizer
+        )
     torch.cuda.empty_cache()
     gc.collect(2)
     logger.info(model)
@@ -273,7 +280,8 @@ def main(cfg: TrainerConf):
     tflops_per_token = model.tflops_per_token(cfg.seq_len)
 
     # build optimizer / scheduler
-    optimizer, scheduler = build_optimizer(model, cfg.optim, cfg.steps, cfg.dtype)
+    optimizer, scheduler = build_optimizer(model, cfg.optim, cfg.steps, cfg.dtype, roles=cfg.roles)
+    grad_scales = clip_grad_scales(model, cfg.roles)  # the roles' clip_scale in the clipping norm
 
     # setup loggers
     enable_loggers = cfg.slurm.is_master and not cfg.disable_logging
@@ -317,6 +325,11 @@ def main(cfg: TrainerConf):
 
     # reload model if available
     if model_path is not None:
+        assert training_state_path is not None
+        logger.info(f"Reloading training state checkpoint from {training_state_path} ...")
+        reloaded_training_state_dict = torch.load(training_state_path, map_location="cpu", weights_only=False)
+        check_param_groups(optimizer, reloaded_training_state_dict, f"checkpoint {training_state_path.parent.parent}")
+
         logger.info(f"Reloading model checkpoint from {model_path} ...")
         hsdp_group = get_hybrid_shard_data_parallel_group()
         # reload sharded model state
@@ -338,9 +351,6 @@ def main(cfg: TrainerConf):
         del reloaded_optim_state_dict
         logger.info("Reloaded optimizer.")
 
-        assert training_state_path is not None
-        logger.info(f"Reloading training state checkpoint from {training_state_path} ...")
-        reloaded_training_state_dict = torch.load(training_state_path, map_location="cpu", weights_only=False)
         set_optim_state(scheduler, reloaded_training_state_dict, state, data_iterator, timings, cfg.optim)
     elif cfg.base_model_dir is not None:
         base_model_path, base_optim_path = get_base_model_checkpoint_path(
@@ -357,6 +367,11 @@ def main(cfg: TrainerConf):
 
         if cfg.reload_base_optim_state:
             assert base_optim_path is not None, base_optim_path
+            base_state_path = (Path(cfg.base_model_dir) / training_state_dir()
+                               / training_state_name(cfg.slurm.global_rank))
+            if base_state_path.exists():
+                base_state = torch.load(base_state_path, map_location="cpu", weights_only=False)
+                check_param_groups(optimizer, base_state, f"base model {cfg.base_model_dir}")
             logger.info(f"Reloading base optimizer checkpoint from {base_optim_path} ...")
             if cfg.dcp_for_optimizer:
                 reloaded_optim_state_dict = get_sharded_optimizer_state(model, optimizer, cfg.dcp_for_optimizer)
@@ -367,7 +382,7 @@ def main(cfg: TrainerConf):
             del reloaded_optim_state_dict
 
     if cfg.optim.optimizer == "muon":
-        restore_optimizer_config(optimizer, cfg.optim)
+        restore_optimizer_config(optimizer, cfg.optim, cfg.roles)
         # Full resume uses the restored scheduler position; base-model loading
         # keeps the newly constructed schedule, including its warmup LR.
         for group, lr in zip(optimizer.param_groups, scheduler.get_last_lr()):
@@ -401,6 +416,7 @@ def main(cfg: TrainerConf):
     losses: List[float] = []
     aux_losses: List[float] = [] if cfg.moe_router_load_balancing_type is not None else None
     grad_norms: List[float] = []
+    clip_norms: List[float] = []  # the clipping norm, when roles scale gradients in it
     padding_ratios: List[float] = []
     truncation_ratios: List[float] = []
     gc.collect()
@@ -467,7 +483,7 @@ def main(cfg: TrainerConf):
         timings.forward_backward += s_clip - s_fwd_bwd
 
         clip_max_norm = cfg.optim.clip * state.scale
-        grad_norm = clip_grad_norm_(fsdp_module=model, max_norm=clip_max_norm)
+        clip_norm, grad_norm = clip_grad_norm_(fsdp_module=model, max_norm=clip_max_norm, grad_scales=grad_scales)
 
         # update scale / status
         overflow = False
@@ -496,7 +512,7 @@ def main(cfg: TrainerConf):
         # update step
         state.step += 1
 
-        if grad_norm > clip_max_norm:
+        if clip_norm > clip_max_norm:
             state.clip_cumulative += 1
 
         # optim step
@@ -520,9 +536,11 @@ def main(cfg: TrainerConf):
             aux_loss = aux_loss.item()
             aux_losses.append(aux_loss)
         grad_norms.append(grad_norm)
+        if grad_scales is not None:
+            clip_norms.append(clip_norm)
         if cfg.optim.optimizer == "muon":
-            group_lrs = {group["algorithm"]: float(group["lr"]) for group in optimizer.param_groups}
-            curr_lr = group_lrs["muon"]
+            other_lrs = group_lrs(optimizer, cfg.roles)  # adamw, or with role groups one per role
+            curr_lr = other_lrs.pop("muon")
         else:
             curr_lr = float(optimizer.param_groups[0]["lr"])
         assert math.isfinite(curr_loss), f"loss is not finite:{curr_loss}"
@@ -532,7 +550,7 @@ def main(cfg: TrainerConf):
         optim_metrics = {
             "step": state.step,
             "lr": curr_lr,
-            **({"adamw_lr": group_lrs["adamw"]} if cfg.optim.optimizer == "muon" else {}),
+            **({f"{name}_lr": lr for name, lr in other_lrs.items()} if cfg.optim.optimizer == "muon" else {}),
             "avg_loss": reduce_scalar(curr_loss, op='mean'),
             "max_loss": reduce_scalar(curr_loss, op='max'),
         }
@@ -543,6 +561,7 @@ def main(cfg: TrainerConf):
             })
         optim_metrics.update({
             "g_norm": grad_norm / state.scale,
+            **({"g_norm_clip": clip_norm / state.scale} if grad_scales is not None else {}),
             "clip_cumulative": state.clip_cumulative,
             "n_tokens": n_tokens,
         })
@@ -626,6 +645,8 @@ def main(cfg: TrainerConf):
                 "gnorm": avg_gnorm,
                 "gnorm (max)": max_gnorm,
             }
+            if clip_norms:  # the roles' clip_scale in the clipping norm: the norm clipping compared
+                metrics.update({"gnorm_clip": np.mean(clip_norms).item(), "gnorm_clip (max)": max(clip_norms)})
             if cfg.dataloader.packing_type == "bestfit":
                 metrics.update({
                     "padding ratio": padding_ratio,
@@ -649,6 +670,7 @@ def main(cfg: TrainerConf):
             if aux_losses is not None:
                 aux_losses.clear()
             grad_norms.clear()
+            clip_norms.clear()
             padding_ratios.clear()
             truncation_ratios.clear()
             t0 = timer()
