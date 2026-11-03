@@ -269,10 +269,11 @@ class GatedDeltaAttention(nn.Module):
 
     def _receive_prev_tensors(self, x):
         bsz, seq_len, _ = x.size()
+        nk = {"softmax": 1, "softdelta": 2}[self.attn_act_func]
         n_groups = self.timenorm.groups_per_partition
         csize = self.chunk_size
         width = self.q_conv.kernel_size - 1
-        cdim = self.local_heads * self.head_dim + self.local_kv_heads * (self.head_dim + self.v_head_dim)
+        cdim = self.local_heads * self.head_dim + self.local_kv_heads * (self.head_dim * nk + self.v_head_dim)
         sdim = self.local_kv_heads * (self.head_dim * 3 + self.v_head_dim)
         adim = self.local_kv_heads * (self.head_dim * self.v_head_dim + self.head_dim)
         prev_tensor = torch.empty(
@@ -301,6 +302,7 @@ class GatedDeltaAttention(nn.Module):
 
     def _unpack_prev_tensors(self, x, prev_tensor):
         bsz = x.size(0)
+        nk = {"softmax": 1, "softdelta": 2}[self.attn_act_func]
         n_groups = self.timenorm.groups_per_partition
         csize = self.chunk_size
         width = self.q_conv.kernel_size - 1
@@ -309,7 +311,7 @@ class GatedDeltaAttention(nn.Module):
         kdim = self.head_dim
         vdim = self.v_head_dim
         conv_q_size = width * n_heads * kdim
-        conv_k_size = width * n_kv_heads * kdim
+        conv_k_size = width * n_kv_heads * kdim * nk
         conv_v_size = width * n_kv_heads * vdim
         ksize = csize * n_kv_heads * kdim
         vsize = csize * n_kv_heads * vdim
@@ -323,7 +325,7 @@ class GatedDeltaAttention(nn.Module):
         prev_mean = prev_mean.to(x)
         prev_var = prev_var.to(x)
         conv_q = conv_q.view(bsz, width, n_heads * kdim).to(x)
-        conv_k = conv_k.view(bsz, width, n_kv_heads * kdim).to(x)
+        conv_k = conv_k.view(bsz, width, n_kv_heads * kdim * nk).to(x)
         conv_v = conv_v.view(bsz, width, n_kv_heads * vdim).to(x)
         prev_sk = prev_sk.view(bsz, csize, n_kv_heads, kdim).to(x)
         prev_aqk = prev_aqk.view(bsz, n_kv_heads, csize, kdim).to(x)
