@@ -450,9 +450,8 @@ class TransformerMoEBlockFunction(torch.autograd.Function):
 
         # B x L x H x V -> B x L x H*V
         attn = rearrange(attn_out, 'b l h v -> b l (h v)')
-        if r is not None:
-            attn = attn * r
-        attn, attn_noise = memory_efficient_dropout_fwd(attn, hidden_dropout, True, attn_out_rng_state)
+        gattn = attn * r if r is not None else attn
+        gattn, attn_noise = memory_efficient_dropout_fwd(gattn, hidden_dropout, True, attn_out_rng_state)
 
         if handle_xh is not None:
             handle_xh.wait()
@@ -461,10 +460,10 @@ class TransformerMoEBlockFunction(torch.autograd.Function):
         attn_grad = xh_grad.matmul(wo)
         attn_grad = memory_efficient_dropout_bwd(attn_grad, hidden_dropout, attn_out_rng_state, attn_noise)
         attn_r_grad = torch.mul(attn_grad, r, out=r) if r is not None else attn_grad
-        r_grad = torch.mul(attn_grad, attn_out, out=attn_grad) if r is not None else None
+        r_grad = torch.mul(attn_grad, attn, out=attn_grad) if r is not None else None
 
         # grads for wh2
-        attn_flat = attn.flatten(end_dim=-2)
+        attn_flat = gattn.flatten(end_dim=-2)
         wo_grad = xh_grad.flatten(end_dim=-2).t().matmul(attn_flat)
 
         if handle_xv is not None:
