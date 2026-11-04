@@ -10,6 +10,7 @@ from torch import nn
 
 from xllm.distributed import get_context_parallel_world_size, get_data_parallel_world_size
 from xllm.modules.model_parallel import ColumnParallelLinear, RowParallelLinear
+from .weight_decay import no_weight_decay_param_ids
 
 
 @torch.no_grad()
@@ -35,6 +36,15 @@ def parameter_groups(model, cfg):
         {'params': [], 'group_id': 'adamw', 'algorithm': 'adamw', 'lr': cfg.lr},
     ]
     membership = [[], []]
+    # optim.disable_wd_{emb,out}: a third, AdamW-only group without weight decay. Only added
+    # when a flag is set, so the default two-group layout (and checkpoints) are unchanged.
+    no_decay_ids = no_weight_decay_param_ids(model, cfg)
+    if no_decay_ids:
+        groups.append({
+            'params': [], 'group_id': 'adamw_no_wd', 'algorithm': 'adamw', 'lr': cfg.lr,
+            'weight_decay': 0.0,
+        })
+        membership.append([])
     seen = set()
     for name, parameter in model.named_parameters(remove_duplicate=False):
         if not parameter.requires_grad:
@@ -51,7 +61,12 @@ def parameter_groups(model, cfg):
         muon = name.startswith('layers.') and projection and leaf == 'weight'
         if muon and parameter.ndim != 2:
             raise ValueError(f'Muon projection {name} must be a matrix')
-        index = 0 if muon else 1
+        if id(parameter) in no_decay_ids:
+            if muon:
+                raise ValueError(f'No-weight-decay parameter {name} was routed to Muon')
+            index = 2
+        else:
+            index = 0 if muon else 1
         groups[index]['params'].append(parameter)
         membership[index].append((name, list(parameter.shape)))
     if not groups[0]['params']:
@@ -127,6 +142,8 @@ def build_dion_muon(model, cfg):
                 'beta1',
                 'beta2',
                 'weight_decay',
+                'disable_wd_emb',
+                'disable_wd_out',
                 'epsilon',
             )
         },
@@ -140,7 +157,7 @@ def validate_optimizer_contract(optimizer, training_state):
     if saved is not None and 'recipe' in saved:
         # Older checkpoints always used the unaccelerated path.
         saved = deepcopy(saved)
-        for name in ('muon_use_gram_newton_schulz', 'muon_use_triton'):
+        for name in ('muon_use_gram_newton_schulz', 'muon_use_triton', 'disable_wd_emb', 'disable_wd_out'):
             saved['recipe'].setdefault(name, False)
     if current != saved:
         raise ValueError(

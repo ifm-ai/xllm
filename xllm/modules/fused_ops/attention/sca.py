@@ -243,7 +243,6 @@ def sliding_chunk_attention_fwd(
         if bos_mask is not None:
             segment_idx = None
 
-        high_precision_level = high_precision_level if requires_grad else 0
         y, y_fp32, lse = flash_sca_fwd(
             q, k, v, chunk_size, scale, prev_k, prev_v,
             bos_mask=bos_mask, segment_idx=segment_idx,

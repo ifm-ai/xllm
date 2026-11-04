@@ -210,7 +210,7 @@ def main(cfg: TrainerConf):
     if has_wandb and cfg.slurm.is_master and cfg.log_wandb:
         # wandb.require(experiment="service")
         wandb.init(project=cfg.wandb_project, entity=cfg.wandb_entity,
-                   name=os.path.basename(cfg.dump_dir),
+                   name=cfg.wandb_name or Path(cfg.dump_dir).name,
                    config={
                        "training": cfg.to_dict(),
                        "provenance": collect_provenance(cfg),

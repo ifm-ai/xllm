@@ -125,11 +125,15 @@ def build_lr_scheduler(optimizer, cfg: OptimConf, total_steps: int):
 
 def load_lr_scheduler_state(scheduler, state, cfg: OptimConf):
     state = deepcopy(state)
+    num_groups = len(scheduler.optimizer.param_groups)
     if cfg.optimizer == 'dion_muon':
-        if len(state['base_lrs']) != 2:
-            raise ValueError('Dion checkpoint must contain Muon and AdamW learning rates')
-        # Preserve both saved group trajectories on normal resume.
+        if len(state['base_lrs']) != num_groups:
+            raise ValueError(
+                f'Dion checkpoint has {len(state["base_lrs"])} learning rates, optimizer has {num_groups} groups'
+            )
+        # Preserve all saved group trajectories on normal resume.
     else:
-        # Preserve the existing AdamW LR-override behavior.
-        state['base_lrs'] = [cfg.lr]
+        # Preserve the existing AdamW LR-override behavior, for every param group
+        # (optim.disable_wd_{emb,out} adds a second group with the same LR).
+        state['base_lrs'] = [cfg.lr] * num_groups
     scheduler.load_state_dict(state)

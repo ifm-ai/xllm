@@ -92,6 +92,8 @@ class OptimConf(Config):
     muon_use_triton: bool = False  # Use Dion's accelerated orthogonalization kernels
     warmup: int = 2000  # Num of steps for LR warmup. 0 means no warmup
     weight_decay: float = 0.1  # Decoupled weight decay
+    disable_wd_emb: bool = False  # Disable weight decay on the input embedding weights (adamw and dion_muon)
+    disable_wd_out: bool = False  # Disable weight decay on the output (readout) projection weights (adamw and dion_muon)
     epsilon: float = 1e-8
     beta1: float = 0.9
     beta2: float = 0.98
@@ -407,6 +409,7 @@ class TrainerConf(Config):
     log_wandb: bool = False
     wandb_project: Optional[str] = None
     wandb_entity: Optional[str] = None
+    wandb_name: Optional[str] = None
 
     # Random seed
     seed: int = 1

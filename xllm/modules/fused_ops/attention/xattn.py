@@ -50,7 +50,6 @@ def xattn_causal_flash_attn_fwd(
     if bos_mask is not None:
         segment_idx = None
 
-    high_precision_level = high_precision_level if requires_grad else 0
     y, y_fp32, lse = causal_flash_attn_fwd(
         q, k, v, scale,
         bos_mask=bos_mask,
