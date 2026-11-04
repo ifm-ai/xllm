@@ -5,6 +5,7 @@ from torch.nn import functional as F
 from einops import rearrange
 
 from xllm.distributed.utils import reshape_gathered_tensor_along_specific_dim
+from xllm.health_metrics import get_active_health_collector
 from xllm.modules.fused_ops import (
     memory_efficient_dropout_fwd,
     memory_efficient_dropout_bwd,
@@ -35,6 +36,7 @@ class TransformerBlockFunction(torch.autograd.Function):
     @staticmethod
     def forward(
         ctx: Any,
+        layer_id: int,
         x: torch.Tensor,  # (bsz, slen, d/MP)
         freqs_cis: Optional[torch.Tensor],  # (slen, d)
         bos_mask: Optional[torch.Tensor],
@@ -107,7 +109,7 @@ class TransformerBlockFunction(torch.autograd.Function):
             mx, freqs_cis, bos_mask, segments, wq, wk, wv, wr, wo, q_norm_w,
             head_dim, rope_head_dim, local_heads, local_kv_heads, rmsnorm_eps,
             attn_gate_func, dropout, attention_dropout, hidden_dropout,
-            causal_attn_backend, attn_stability_control, recompute_attention
+            causal_attn_backend, attn_stability_control, recompute_attention, layer_id,
         )
         xq, xk, xv, xk_rstd = xqkv
         attn_for_save, attn_lse = attn_out
@@ -420,6 +422,7 @@ class TransformerBlockFunction(torch.autograd.Function):
         x_grad = torch.add(x_grad, residual_grad, out=x_grad)
 
         return (
+            None,  # layer_id
             x_grad,
             None,  # freqs_cis
             None,  # bos mask
@@ -498,9 +501,23 @@ class TransformerOutputLayerFunction(torch.autograd.Function):
                 final_norm_b, _ = all_gather(final_norm_b, parallel_region='model', async_op=False)
 
         mx, _, _ = layer_or_rmsnorm_fwd(x, final_norm_w, final_norm_b, norm_local_groups, layernorm_eps, rmsnorm_eps, apply_rmsnorm)
-        loss, grad_mx, grad_wo = fused_linear_cross_entropy_fwd(
-            mx, wo, y, mask, compute_grad=(not recompute_logits), gather_input=(not gather_before_norm)
+        collector = get_active_health_collector()
+        output = fused_linear_cross_entropy_fwd(
+            mx, wo, y, mask, compute_grad=(not recompute_logits),
+            gather_input=(not gather_before_norm),
+            collect_logits_stats=(
+                collector is not None and collector.enable_logits_stats
+            ),
         )
+        if output.logits_stats is not None:
+            assert collector is not None
+            collector.record_logits_stats(
+                output.logits_stats.sum,
+                output.logits_stats.count,
+                output.logits_stats.minimum,
+                output.logits_stats.maximum,
+            )
+        loss, grad_mx, grad_wo = output.loss, output.grad_input, output.grad_weight
 
         ctx.save_for_backward(
             x,  # (bsz, slen, d/MP)

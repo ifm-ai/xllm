@@ -3,6 +3,7 @@ import math
 import torch
 
 from xllm.distributed.utils import reshape_gathered_tensor_along_specific_dim
+from xllm.health_metrics import get_active_health_collector
 from xllm.modules.fused_ops import (
     memory_efficient_dropout_fwd,
     memory_efficient_dropout_bwd,
@@ -31,6 +32,7 @@ class TransformerMoEBlockFunction(torch.autograd.Function):
     @staticmethod
     def forward(
         ctx: Any,
+        layer_id: int,
         x: torch.Tensor,  # (bsz, slen, d/MP)
         freqs_cis: Optional[torch.Tensor],  # (slen, d)
         bos_mask: Optional[torch.Tensor],
@@ -119,7 +121,7 @@ class TransformerMoEBlockFunction(torch.autograd.Function):
             mx, freqs_cis, bos_mask, segments, wq, wk, wv, wr, wo, q_norm_w,
             head_dim, rope_head_dim, local_heads, local_kv_heads, rmsnorm_eps,
             attn_gate_func, dropout, attention_dropout, hidden_dropout,
-            causal_attn_backend, attn_stability_control, recompute_attention
+            causal_attn_backend, attn_stability_control, recompute_attention, layer_id,
         )
         xq, xk, xv, xk_rstd = xqkv
         attn_for_save, attn_lse = attn_out
@@ -162,6 +164,11 @@ class TransformerMoEBlockFunction(torch.autograd.Function):
             hidden_dropout, recompute_fc1_out, recompute_fc3_out
         )
         original_scores, routing_indices, org_topk_scores, tokens_per_expert = routing_out
+        health_collector = get_active_health_collector()
+        if health_collector is not None:
+            health_collector.record_router_stats(
+                "moe", layer_id, tokens_per_expert, org_topk_scores, router_bias, aux_loss,
+            )
         h1, h3 = shared_hiddens
         group_sizes, input_splits, output_splits, curr_bsz = routing_state
         expert_hidden_rng_state, shared_hidden_rng_state = rng_states
@@ -482,6 +489,7 @@ class TransformerMoEBlockFunction(torch.autograd.Function):
         x_grad = torch.add(x_grad, residual_grad, out=x_grad)
 
         return (
+            None,  # layer_id
             x_grad,
             None,  # freqs_cis
             None,  # bos mask

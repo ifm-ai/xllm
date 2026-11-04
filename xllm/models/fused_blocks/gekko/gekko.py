@@ -6,6 +6,7 @@ from torch.nn import functional as F
 from einops import rearrange
 
 from xllm.distributed.utils import reshape_gathered_tensor_along_specific_dim
+from xllm.health_metrics import get_active_health_collector
 from xllm.modules.context_parallel import (
     should_send_to_next,
     should_recv_from_prev,
@@ -74,6 +75,7 @@ class GekkoBlockFunction(torch.autograd.Function):
     @staticmethod
     def forward(
         ctx: Any,
+        layer_id: int,
         x: torch.Tensor,  # (bsz, slen, d/MP)
         freqs_cis: Optional[torch.Tensor],  # (slen, d)
         bos_mask: Optional[torch.Tensor],  # (bsz, slen)
@@ -241,6 +243,11 @@ class GekkoBlockFunction(torch.autograd.Function):
 
         sk, _ = rmsnorm_fwd(xk_, None, local_kv_heads, rmsnorm_eps)
         sk = rearrange(sk, 'b l (k s) -> b l k s', k=local_kv_heads)
+        health_collector = get_active_health_collector()
+        # Partial RoPE mutates sk; reduce its pre-RoPE vectors before that update.
+        health_sca_key_l2 = None
+        if health_collector is not None and health_collector.enable_gekko_stats:
+            health_sca_key_l2 = torch.linalg.vector_norm(sk, dim=-1, dtype=torch.float32)
         # apply rotary embeddings
         sk = apply_rope(sk, freqs_cis, head_dim, rope_head_dim, False)
 
@@ -273,6 +280,14 @@ class GekkoBlockFunction(torch.autograd.Function):
 
         sq, _ = rmsnorm_fwd(xq_, qnorm_w, local_heads, rmsnorm_eps)
         sq = rearrange(sq, 'b l (h s) -> b l h s', h=local_heads)
+        if health_collector is not None:
+            # Both SCA norms are measured before RoPE.
+            health_collector.record_gekko_query_key_stats(
+                layer_id, xq_.reshape(bsz, seq_len, local_heads, head_dim),
+                xk_.reshape(bsz, seq_len, local_kv_heads, head_dim),
+                sq, sca_key_l2=health_sca_key_l2,
+            )
+        del health_sca_key_l2
         # apply rotary embeddings
         sq = apply_rope(sq, freqs_cis, head_dim, rope_head_dim, False)
 
@@ -308,7 +323,7 @@ class GekkoBlockFunction(torch.autograd.Function):
             awk_out, awk_mask, new_memory, new_lnt = adaptive_working_memory_fwd(
                 aq, aqk, akk, av, attention_chunk_size, memory, log_norm_term,
                 prev_aqk, prev_akk, prev_av, segment_idx, prev_segment_count,
-                awm_orthogonal_update, rmsnorm_eps
+                awm_orthogonal_update, rmsnorm_eps, health_layer_id=layer_id,
             )
 
             _, handle8 = send_memory_to_next(new_memory)
@@ -341,7 +356,7 @@ class GekkoBlockFunction(torch.autograd.Function):
             awk_out, awk_mask, new_memory, new_lnt = adaptive_working_memory_fwd(
                 aq, aqk, akk, av, attention_chunk_size, memory, log_norm_term,
                 prev_aqk, prev_akk, prev_av, segment_idx, prev_segment_count,
-                awm_orthogonal_update, rmsnorm_eps
+                awm_orthogonal_update, rmsnorm_eps, health_layer_id=layer_id,
             )
 
             handle8 = None
@@ -353,6 +368,8 @@ class GekkoBlockFunction(torch.autograd.Function):
         # B x L x E
         sca_out = rearrange(sca_out, 'b l h v -> b l (h v)')
         awk_out = rearrange(awk_out, 'b h l v -> b l (h v)')
+        if health_collector is not None:
+            health_collector.record_gekko_branches(layer_id, sca_out, awk_out, r, awk_mask)
         attn, _ = rmsnorm_fwd(sca_out + awk_out, None, local_heads, rmsnorm_eps)
         attn = torch.mul(attn, r, out=attn)
         attn, attn_out_rng_state = memory_efficient_dropout_fwd(attn, hidden_dropout, True)
@@ -989,6 +1006,7 @@ class GekkoBlockFunction(torch.autograd.Function):
             handle1.wait()
 
         return (
+            None,  # layer_id
             x_grad,
             None,  # freqs_cis
             None,  # bos mask
@@ -1112,7 +1130,22 @@ class GekkoOutputLayerFunction(torch.autograd.Function):
             handle1 = None
             handle2 = None
 
-        loss, grad_tsn, grad_wo = fused_linear_cross_entropy_fwd(out_tsn, wo, y, mask, compute_grad=(not recompute_logits))
+        collector = get_active_health_collector()
+        output = fused_linear_cross_entropy_fwd(
+            out_tsn, wo, y, mask, compute_grad=(not recompute_logits),
+            collect_logits_stats=(
+                collector is not None and collector.enable_logits_stats
+            ),
+        )
+        if output.logits_stats is not None:
+            assert collector is not None
+            collector.record_logits_stats(
+                output.logits_stats.sum,
+                output.logits_stats.count,
+                output.logits_stats.minimum,
+                output.logits_stats.maximum,
+            )
+        loss, grad_tsn, grad_wo = output.loss, output.grad_input, output.grad_weight
 
         if send_to_next:
             handle1.wait()

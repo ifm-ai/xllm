@@ -73,9 +73,11 @@ def test(B: int, L: int, D: int, W: int, avg_len: int, activation: str|None, dty
     print(f"B={B}, L={L}, D={D}, W={W}, AvgL={avg_len}, act={activation}, dtype={dtype}:")
     test_causal_conv1d(x, None, conv_w, None, y_grad, final_state_grad, bos_mask, epochs, activation, 'fla')
     test_causal_conv1d(x, None, conv_w, None, y_grad, final_state_grad, bos_mask, epochs, activation, 'triton')
+    test_causal_conv1d(x, None, conv_w.float(), None, y_grad, final_state_grad, bos_mask, epochs, activation, 'triton')
 
     test_causal_conv1d(x, init_states, conv_w, None, y_grad, final_state_grad, bos_mask, epochs, activation, 'fla')
     test_causal_conv1d(x, init_states, conv_w, None, y_grad, final_state_grad, bos_mask, epochs, activation, 'triton')
+    test_causal_conv1d(x, init_states, conv_w.float(), None, y_grad, final_state_grad, bos_mask, epochs, activation, 'triton')
     print("*" * 70)
 
 

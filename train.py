@@ -62,6 +62,9 @@ from xllm.optim.dion_muon import validate_optimizer_contract
 from xllm.optim.lr_scheduler import load_lr_scheduler_state
 from xllm.monitor import GPUMonitor, Timings
 from xllm.metrics import MetricLogger, build_mlogger
+from xllm.health_metrics import HealthMetricCollector
+from xllm.modules.moe.moe import moe_layer_ids
+from xllm.modules.moe.mova import mova_layer_ids
 from xllm.configuration import cfg_from_cli
 try:
     import wandb
@@ -267,13 +270,34 @@ def main(cfg: TrainerConf):
     # setup loggers
     enable_loggers = cfg.slurm.is_master and not cfg.disable_logging
     enable_wandb = cfg.slurm.is_master and cfg.log_wandb and has_wandb
+    enable_health = cfg.health_metrics and not cfg.disable_logging
     to_log = ["train", "optim", "timings", "cluster_checks"]
     if cfg.async_eval_ngpus < 1:
         to_log.append("eval")
+    if enable_health:
+        to_log.append("health")
 
     mloggers: Dict[str, MetricLogger] = {
-        k: build_mlogger(cfg.dump_dir, k, enable_loggers, enable_wandb) for k in to_log
+        k: build_mlogger(
+            cfg.dump_dir, k, enable_loggers, enable_wandb, enable_prefix_keys=k != "health"
+        ) for k in to_log
     }
+    router_stats_layers = {}
+    if cfg.health_moe_stats:
+        router_stats_layers["moe"] = moe_layer_ids(model)
+    if cfg.health_mova_stats:
+        router_stats_layers["mova"] = mova_layer_ids(model)
+    health_collector = HealthMetricCollector(
+        enabled=enable_health,
+        freq=cfg.health_log_freq,
+        num_layers=cfg.model.num_layers,
+        enable_query_key_stats=cfg.health_query_key_stats,
+        enable_weight_norms=cfg.health_weight_norms,
+        enable_gradient_norms=cfg.health_gradient_norms,
+        enable_logits_stats=cfg.health_logits_stats,
+        enable_gekko_stats=cfg.health_gekko_stats,
+        router_stats_layers=router_stats_layers,
+    )
 
     model.train()
     state = State(step=0, scale=1.0, scale_updates=0, clip_cumulative=0)
@@ -402,11 +426,15 @@ def main(cfg: TrainerConf):
 
         last_nw += y.nelement()
 
+        if enable_health:
+            health_collector.begin_step(state.step + 1)
         tok_loss, aux_loss, _ = model(
             tokens=x, targets=y, token_mask=mask, multi_segments=cfg.multi_segments,
             moe_router_load_balancing_type=cfg.moe_router_load_balancing_type,
             attn_stability_control=cfg.attn_stability_control, deterministic=cfg.deterministic
         )
+        if enable_health:
+            health_collector.end_forward()
 
         if mask is None:
             num_tokens = torch.tensor(tok_loss.numel(), dtype=torch.int64, device=tok_loss.device)
@@ -428,6 +456,8 @@ def main(cfg: TrainerConf):
             train_loss = state.scale * train_loss
 
         train_loss.backward()
+        if enable_health:
+            health_collector.record_matrix_norms(model, gradient_scale=state.scale)
 
         # grad clip
         s_clip = timer()
@@ -478,6 +508,8 @@ def main(cfg: TrainerConf):
         # logging
         s_logging = timer()
         timings.optimize += s_logging - s_optimize
+        if enable_health:
+            health_collector.flush(mloggers["health"], state.step)
 
         curr_loss = loss.item()
         losses.append(curr_loss)

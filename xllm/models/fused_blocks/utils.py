@@ -223,9 +223,10 @@ def causal_conv1d_fwd(
 ) -> Tuple[Tensor, Optional[Tensor], Any]:
     w = weight
     if apply_weight_normalization:
-        w = F.softmax(weight, dim=-1, dtype=torch.float32)
-        if backend != 'triton':
+        w = F.softmax(weight, dim=-1, dtype=torch.float32)  # fp32
+        if backend == 'fla':
             w = w.to(x)
+
     return conv1d_fwd(
         x, w, bias, initial_state, bos_mask, output_final_state, activation, backend, deterministic
     )
@@ -245,11 +246,12 @@ def causal_conv1d_bwd(
     deterministic: bool
 ) -> Tuple[Tensor, Optional[Tensor], Tensor, Optional[Tensor]]:
     if apply_weight_normalization:
-        w_fp32 = F.softmax(weight, dim=-1, dtype=torch.float32)
-        w = w_fp32 if backend == 'triton' else w_fp32.to(x)
+        w_fp32 = F.softmax(weight, dim=-1, dtype=torch.float32)  # fp32
+        w = w_fp32.to(x) if backend == 'fla' else w_fp32
     else:
         w = weight
         w_fp32 = None
+
     x_grad, initial_state_grad, w_grad, b_grad = conv1d_bwd(
         out_grad, final_state_grad, x, w, bias, initial_state, bos_mask,
         activation, backend, deterministic
@@ -473,7 +475,7 @@ def flash_attention_fwd(
             segidx, total_seqlen_k = segments
             xk = xk[:, -total_seqlen_k:]
             xv = xv[:, -total_seqlen_k:]
-            bos_mask = bos_mask[:, -total_seqlen_k:] if bos_mask is not None else None
+            bos_mask = bos_mask[:, -total_seqlen_k:]
             segidx = segidx[:, -total_seqlen_k:]
         else:
             segidx = None
@@ -519,7 +521,7 @@ def flash_attention_bwd(
             segidx, total_seqlen_k = segments
             xk = xk[:, -total_seqlen_k:]
             xv = xv[:, -total_seqlen_k:]
-            bos_mask = bos_mask[:, -total_seqlen_k:] if bos_mask is not None else None
+            bos_mask = bos_mask[:, -total_seqlen_k:]
             segidx = segidx[:, -total_seqlen_k:]
         else:
             segidx = None

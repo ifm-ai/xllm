@@ -289,7 +289,10 @@ def moe_bwd(
         ew3_grad = rearrange(ew3_grad, 'n s d -> (n s) d')
     else:
         xp_grad = y2_grad
-        ew1_grad, ew2_grad, ew3_grad = None, None, None
+        # FSDP must reduce the same parameters even when this rank has no expert tokens.
+        ew1_grad = torch.zeros_like(expert_w1)
+        ew2_grad = torch.zeros_like(expert_w2)
+        ew3_grad = torch.zeros_like(expert_w3)
 
     xp_grad, handle_xp_grad = all_to_all(xp_grad, output_splits, input_splits, parallel_region='model', async_op=True)
 

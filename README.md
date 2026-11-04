@@ -97,11 +97,12 @@ python -m pip install --no-build-isolation .
 
 The following is the corresponding `xattn` versions.
 
-| `xllm`            | `xattn`      |
-| ------------------ | ------------------ |
+| `xllm`             | `xattn`      |
+|--------------------| ------------------ |
 | `main` / `nightly` | `main` / `nightly` |
-| `1.0.0`             | `1.0.0`           |
-| `1.0.1`             | `1.1.1`           |
+| `1.0.0`            | `1.0.0`           |
+| `1.0.1`            | `1.1.1`           |
+| `1.0.2`            | `1.1.1`           |
 
 </details>
 

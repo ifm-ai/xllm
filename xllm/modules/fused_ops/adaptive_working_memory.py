@@ -6,6 +6,7 @@ from torch import Tensor
 from torch.autograd.function import FunctionCtx
 import torch.nn.functional as F
 from einops import rearrange, repeat
+from xllm.health_metrics import get_active_health_collector
 
 from xllm_extension.ops import (
     group_rms_norm_fwd,
@@ -36,11 +37,12 @@ class AdaptiveWorkingMemoryFunc(torch.autograd.Function):
         segment_idx: Optional[Tensor] = None,
         prev_segment_count: Optional[Tensor] = None,
         ortho: bool = False,
-        eps: float = 1e-6
+        eps: float = 1e-6,
+        health_layer_id: Optional[int] = None,
     ) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
         y, mask, mem, lnt = _adaptive_working_memory_fwd(
             q, qk, k, v, chunk_size, memory, log_norm_term, prev_qk, prev_k, prev_v,
-            segment_idx, prev_segment_count, ortho, eps
+            segment_idx, prev_segment_count, ortho, eps, health_layer_id
         )
         ctx.save_for_backward(
             q, qk, k, v, memory, log_norm_term, prev_qk, prev_k, prev_v, segment_idx, prev_segment_count
@@ -59,7 +61,7 @@ class AdaptiveWorkingMemoryFunc(torch.autograd.Function):
         lnt_grad: Tensor,
     ) -> Tuple[Tensor, Tensor, Tensor, Tensor, None, Tensor, Tensor,
                Optional[Tensor], Optional[Tensor], Optional[Tensor],
-               None, None, None, None]:
+               None, None, None, None, None]:
         (
             q, qk, k, v, memory, log_norm_term, prev_qk, prev_k, prev_v, segment_idx, prev_segment_count
          ) = ctx.saved_tensors
@@ -90,7 +92,7 @@ class AdaptiveWorkingMemoryFunc(torch.autograd.Function):
         )
 
         return (q_grad, qk_grad, k_grad, v_grad, None, mem_grad, lnt_grad,
-                prev_qk_grad, prev_k_grad, prev_v_grad, None, None, None, None)
+                prev_qk_grad, prev_k_grad, prev_v_grad, None, None, None, None, None)
 
 
 adaptive_working_memory = AdaptiveWorkingMemoryFunc.apply
@@ -110,8 +112,10 @@ def _adaptive_working_memory_fwd(
     segment_idx: Optional[Tensor] = None,  # B x L(+C)
     prev_segment_count: Optional[Tensor] = None,  # B
     ortho: bool = False,
-    eps: float = 1e-6
+    eps: float = 1e-6,
+    health_layer_id: Optional[int] = None,
 ):
+    health_collector = get_active_health_collector() if health_layer_id is not None else None
     bsz, n_heads, seq_len, qk_head_dim = query.shape
     _, n_kv_heads, _, v_head_dim = value.shape
     assert seq_len % chunk_size == 0
@@ -213,6 +217,8 @@ def _adaptive_working_memory_fwd(
             log_norm_term = torch.logaddexp(log_norm_term_curr, log_norm_term)
             # B x K x S x 1
             ratio = rearrange(torch.exp(log_norm_term_curr - log_norm_term).to(memory), 'b k d -> b k d 1')
+            if health_collector is not None:
+                health_collector.record_gekko_update_ratio(health_layer_id, ratio)
             # (B*K) x C x V
             prev_v = rearrange(prev_v, 'b k c v -> (b k) c v')
             prev_qk = rearrange(prev_qk, 'b k c s -> (b k) c s')
@@ -622,12 +628,13 @@ def adaptive_working_memory_fwd(
     segment_idx: Optional[Tensor] = None,
     prev_segment_count: Optional[Tensor] = None,
     ortho: bool = False,
-    eps: float = 1e-6
+    eps: float = 1e-6,
+    health_layer_id: Optional[int] = None,
 ) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
     return _adaptive_working_memory_fwd(
         query, qkey, key, value, chunk_size, memory, log_norm_term,
         prev_qkey, prev_key, prev_value,
-        segment_idx, prev_segment_count, ortho, eps
+        segment_idx, prev_segment_count, ortho, eps, health_layer_id
     )
 
 

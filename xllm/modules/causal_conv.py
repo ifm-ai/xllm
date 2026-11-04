@@ -108,9 +108,10 @@ class CausalConv1d(nn.Module):
         w = self.weight
         if self.normalize_weight:
             # Avoid rounding before softmax backward subtracts the common mode.
-            w = F.softmax(w, dim=-1, dtype=torch.float32)
-            if self.backend != 'triton':
+            w = F.softmax(w, dim=-1, dtype=torch.float32)  # fp32
+            if self.backend == 'fla':
                 w = w.to(x)
+
         return causal_conv1d(
             x, w, self.bias, initial_state, bos_mask,
             output_final_state, self.activation, self.backend, deterministic
