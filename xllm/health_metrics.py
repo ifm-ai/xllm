@@ -174,6 +174,7 @@ class HealthMetricCollector:
         enable_logits_stats: bool = False,
         enable_gekko_stats: bool = False,
         router_stats_layers: Optional[Dict[str, list[int]]] = None,
+        gekko_stats_layers: Optional[list[int]] = None,
     ):
         self.enabled = enabled
         self.freq = freq
@@ -183,6 +184,13 @@ class HealthMetricCollector:
         self.enable_gradient_norms = enable_gradient_norms
         self.enable_logits_stats = enable_logits_stats
         self.enable_gekko_stats = enable_gekko_stats
+        # Decoder layers that are GekkoBlocks; hybrid Gekko interleaves full-attention
+        # TransformerBlocks, which record query/key stats but no Gekko stats. Default: all layers.
+        self.gekko_stats_layers = (
+            list(range(num_layers)) if gekko_stats_layers is None else sorted(gekko_stats_layers)
+        )
+        if any(not 0 <= i < num_layers for i in self.gekko_stats_layers):
+            raise ValueError(f"Gekko statistics layers out of range: {self.gekko_stats_layers}")
         self.router_stats_layers = {
             family: sorted(layers) for family, layers in (router_stats_layers or {}).items()
         }
@@ -650,12 +658,15 @@ class HealthMetricCollector:
                 f"got {len(self.matrix_squared_l2_records)} records at step {step}"
             )
         if self.enable_gekko_stats:
-            if sorted(self.gekko_stats_records) != layers:
-                problems.append(f"Missing Gekko statistics at step {step}")
+            if sorted(self.gekko_stats_records) != self.gekko_stats_layers:
+                problems.append(
+                    f"Missing Gekko statistics at step {step}: expected layers {self.gekko_stats_layers}, "
+                    f"got layers {sorted(self.gekko_stats_records)}"
+                )
             else:
                 problems.extend(
                     f"Missing Gekko branch statistics for layer {layer_idx}"
-                    for layer_idx in layers
+                    for layer_idx in self.gekko_stats_layers
                     if "output_gate" not in self.gekko_stats_records[layer_idx]
                 )
 
@@ -710,7 +721,7 @@ class HealthMetricCollector:
                     ))
 
         if self.enable_gekko_stats:
-            for layer_idx in layers:
+            for layer_idx in self.gekko_stats_layers:
                 layer_stats = self.gekko_stats_records[layer_idx]
                 for name, stats in layer_stats.items():
                     entries.append((
@@ -783,7 +794,7 @@ class HealthMetricCollector:
                 (prefix for prefix, _, _ in entries),
                 reduced_counts[:num_stat_entries].cpu().tolist(),
             ))
-            for layer_idx in layers:
+            for layer_idx in self.gekko_stats_layers:
                 prefix = f"gekko_stats/layer_{layer_idx:03d}"
                 sca_squared = metrics[f"{prefix}/sca_squared/mean"]
                 awk_squared = metrics[f"{prefix}/awk_squared/mean"]

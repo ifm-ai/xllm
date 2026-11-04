@@ -206,6 +206,11 @@ class GekkoBlock(nn.Module):
         return out, None, cache
 
 
+def gekko_layer_ids(model: nn.Module) -> list[int]:
+    """Decoder layers that are GekkoBlocks (not hybrid full-attention), read from the built (possibly FSDP-wrapped) model."""
+    return sorted(module.layer_id for module in model.modules() if isinstance(module, GekkoBlock))
+
+
 class GekkoOutputLayer(nn.Module):
     def __init__(self, cfg: ModelConf):
         super().__init__()
