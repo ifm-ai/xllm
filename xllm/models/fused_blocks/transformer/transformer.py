@@ -371,17 +371,17 @@ class TransformerBlockFunction(torch.autograd.Function):
             mx = reshape_gathered_tensor_along_specific_dim(mx, gather_dim=2)
 
         attn_outs, q_outs, k_outs, v_outs, handle_kv, attn_gate_outs = multihead_attention_recompute(
-            attn_out, attn_lse, xq, xk, xv, end_seq, mx, freqs_cis, bos_mask, segments,
+            attn_out, attn_readers, attn_lse, xq, xk, xv, end_seq, mx, freqs_cis, bos_mask, segments,
             wq, wk, wv, wr, q_norm_w, k_norm_w, head_dim, rope_head_dim, local_heads, local_kv_heads,
             attn_scale, attn_act_func, apply_attn_gate, attn_gate_func, rmsnorm_eps,
             attention_dropout, attn_rng_state, causal_attn_backend, attn_stability_control
         )
-        attn_out, attn_lse = attn_outs
+        attn_out, attn_readers, attn_lse = attn_outs
         xq, xq_, xq_rstd = q_outs
         xk, xk_, xk_rstd = k_outs
         xv, xv_ = v_outs
         handle_xk, handle_xv = handle_kv
-        rmx, r = attn_gate_outs
+        rmx, r, g = attn_gate_outs
 
         # B x L x H x V -> B x L x H*V
         attn = rearrange(attn_out, 'b l h v -> b l (h v)')

@@ -25,7 +25,8 @@ from .utils import (
     fused_permute_y_bwd_scores_grad,
     flash_attention_fwd,
     flash_attention_bwd,
-    recompute_flash_attention_lse,
+    recompute_flash_attention,
+    recompute_softdelta_attn,
     softdelta_attn_fwd,
     apply_rope,
     apply_ropes
@@ -432,7 +433,7 @@ def mova_bwd(
 
 
 def mova_recompute(
-    attn_out, attn_lse, xq, xk, xv, end_seq, sx,
+    attn_out, attn_readers, attn_lse, xq, xk, xv, end_seq, sx,
     original_scores, routing_indices, org_topk_scores, group_sizes,
     router_w, routing_score_func, routing_scaling_factor,
     n_values, topk, value_backend, moe_permutation_backend,
@@ -442,6 +443,7 @@ def mova_recompute(
     attention_dropout, attn_rng_state, causal_attn_backend, stability_control
 ):
     bsz, seq_len, _ = mx.shape
+    nk = {"softmax": 1, "softdelta": 2}[attn_act_func]
     attn_gate_fn = {"silu": F.silu, "softplus": partial(F.softplus, beta=math.log(2))}[attn_gate_func]
 
     # recompute router
@@ -475,10 +477,11 @@ def mova_recompute(
     else:
         handle_xv = None
 
-    xk_, xk_rstd = rmsnorm_fwd(xk, k_norm_w, local_kv_heads, eps) if k_norm_w is not None else (xk, None)
+    xk_, xk_rstd = rmsnorm_fwd(xk, k_norm_w, local_kv_heads * nk, eps) if k_norm_w is not None else (xk, None)
     xk_ = rearrange(xk_, 'b l (k s) -> b l k s', k=local_kv_heads)
     if attn_act_func == 'softmax':
         xk_ = apply_rope(xk_, freqs_cis, head_dim, rope_head_dim, False)
+        kq_ = None
     else:
         assert attn_act_func == 'softdelta'
         kq_ = xk_[:, :, :, :head_dim]
@@ -535,7 +538,7 @@ def mova_recompute(
 
     # recompute attention output
     if attn_out is None:
-        assert attn_lse is None
+        assert attn_readers is None and attn_lse is None
 
         if handle_xk is not None:
             handle_xk.wait()
@@ -547,12 +550,21 @@ def mova_recompute(
             handle_xv = None
             xv_ = reshape_gathered_tensor_along_specific_dim(xv_, gather_dim=1)[:, :end_seq]
 
-        attn_out, attn_lse, _ = recompute_flash_attention_lse(
-            xq_, xk_, xv_, bos_mask, segments, attn_scale, attention_dropout,
-            attn_rng_state, stability_control, backend=causal_attn_backend
-        )
+        if attn_act_func == 'softmax':
+            attn_readers = None
+            attn_out, attn_lse, _ = recompute_flash_attention(
+                xq_, xk_, xv_, bos_mask, segments, attn_scale, attention_dropout,
+                attn_rng_state, stability_control, backend=causal_attn_backend
+            )
+        elif attn_act_func == 'softdelta':
+            attn_out, attn_readers, attn_lse, _ = recompute_softdelta_attn(
+                xq_, kq_, xk_, xv_, g, bos_mask, segments, attn_scale, attention_dropout,
+                attn_rng_state, stability_control, backend=causal_attn_backend
+            )
+        else:
+            raise NotImplementedError
 
     return (
-        (attn_out, attn_lse), (xq, xq_, xq_rstd), (xk, xk_, xk_rstd), (xv, xvv_, xv_),
-        (handle_xk, handle_xv), (rmx, r), (permuted_sx, original_scores, sorted_indices, inverse_indices)
+        (attn_out, attn_readers, attn_lse), (xq, xq_, xq_rstd), (xk, xk_, xk_rstd), (xv, xvv_, xv_),
+        (handle_xk, handle_xv), (rmx, r, g), (permuted_sx, original_scores, sorted_indices, inverse_indices)
     )

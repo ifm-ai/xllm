@@ -415,7 +415,7 @@ def normalize_bwd(
     return x_grad, grad_weight, grad_bias
 
 
-def recompute_flash_attention_lse(
+def recompute_flash_attention(
     xq: Tensor,
     xk: Tensor,
     xv: Tensor,
@@ -533,6 +533,39 @@ def flash_attention_bwd(
         )
     else:
         raise ValueError(f"Unknown causal attention backend: {backend}")
+
+
+def recompute_softdelta_attn(
+    xq: torch.Tensor,
+    kq: torch.Tensor,
+    xk: torch.Tensor,
+    xv: torch.Tensor,
+    g: torch.Tensor,
+    bos_mask: Optional[Tensor],
+    segments: Optional[Any],
+    scale: Optional[float],
+    dropout: float,
+    rng_state: Optional[Tensor],
+    stability_control: int,
+    backend: str,
+) -> Tuple[Tensor, Tensor, Tensor, Optional[Tensor]]:
+    if rng_state is not None:
+        assert dropout > 0, dropout
+        org_rng_state = torch.cuda.get_rng_state()
+        torch.cuda.set_rng_state(rng_state)
+    else:
+        org_rng_state = None
+
+    y, readers, lse, flash_rng_state, _ = softdelta_attn_fwd(
+        xq, kq, xk, xv, g, bos_mask, segments, scale, dropout, stability_control, backend, save_aux=True
+    )
+
+    if rng_state is not None:
+        # reset the original rng state
+        assert org_rng_state is not None
+        torch.cuda.set_rng_state(org_rng_state)
+
+    return y, readers, lse, flash_rng_state
 
 
 def softdelta_attn_fwd(
