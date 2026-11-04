@@ -11,6 +11,7 @@ import torch.distributed as dist
 from torch.distributed.tensor import DTensor
 
 from xllm.config import ModelConf
+from xllm.modules.residual import num_residual_streams
 from xllm.data.dataset_streamer.tokenizer import Tokenizer
 from xllm.distributed import (
     get_context_parallel_world_size,
@@ -45,6 +46,7 @@ class XLLModel(nn.Module):
 
         self.residual_func = cfg.residual_func
         self.residual_heads = cfg.residual_heads
+        self.residual_streams = num_residual_streams(cfg.residual_func)  # hyper-connections: N streams [B, L, N, D]
 
         # hidden dim
         self.ffn_hidden_dim = cfg.ffn_hidden_dim

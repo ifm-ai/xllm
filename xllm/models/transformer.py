@@ -16,7 +16,9 @@ from xllm.modules import (
     GroupLayerNorm,
     GroupRMSNorm,
 )
-from xllm.modules.residual import num_params_in_residual
+from xllm.modules.residual import (
+    num_params_in_residual, flops_in_residual, expand_streams, sum_streams,
+)
 from xllm.modules.fused_ops import memory_efficient_dropout
 from xllm.modules.model_parallel import (
     ParallelEmbedding,
@@ -689,6 +691,7 @@ class Transformer(XLLModel):
         # embeddings
         emb = self.embed(tokens)
         x = memory_efficient_dropout(emb, self.dropout, self.training)
+        x = expand_streams(x, self.residual_streams)  # hyper-connections: N copies of the embedding (N = 1: x itself)
         # rope frequencies
         freq_cis = None if self.rope is None else self.rope.get_freqs_cis(cache_len, cache_len + seq_len, x.device)
 
@@ -709,7 +712,7 @@ class Transformer(XLLModel):
                 )
 
             if health_collector is not None:
-                health_collector.record_activation(i, x)
+                health_collector.record_activation(i, sum_streams(x, self.residual_streams))  # the residual the output reads
 
             if aux_loss is not None:
                 aux_loss_sum = aux_loss if aux_loss_sum is None else aux_loss_sum + aux_loss
@@ -717,6 +720,7 @@ class Transformer(XLLModel):
             if cache is not None:
                 cache[i] = layer_cache
 
+        x = sum_streams(x, self.residual_streams)  # hyper-connections: the output reads the sum of the streams
         logits_or_loss = self.output(x, targets, token_mask)
         if targets is not None and self.context_parallel_size > 1:
             logits_or_loss = gather_from_context_parallel_region(logits_or_loss)
@@ -821,7 +825,7 @@ class Transformer(XLLModel):
             router_params = self.model_dim * self.num_experts
             residual_params = num_params_in_residual(self.residual_func, self.model_dim, self.residual_heads, self.model_dim)
             activated_params += (shared_expert_params + activated_expert_params + router_params + residual_params) * (self.num_layers - self.num_dense_layers)
-            total_params += (shared_expert_params + routed_expert_params + router_params) * (self.num_layers - self.num_dense_layers)
+            total_params += (shared_expert_params + routed_expert_params + router_params + residual_params) * (self.num_layers - self.num_dense_layers)
         # final norm
         activated_params += self.model_dim * (1 if self.apply_rmsnorm else 2)
         total_params += self.model_dim * (1 if self.apply_rmsnorm else 2)
@@ -839,9 +843,8 @@ class Transformer(XLLModel):
         # FFN
         ffn_flops = self.model_dim * self.ffn_hidden_dim * (3 if self.swiglu else 2)
 
-        # residual
-        # TODO
-        res_flops = 0.0
+        # residual: two per layer (0 but for hyper-connections)
+        res_flops = 2 * flops_in_residual(self.residual_func, self.model_dim)
 
         # MoVA
         mova_flops = self.model_dim * (self.num_heads * 2 + self.num_kv_heads) * self.head_dim

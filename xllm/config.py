@@ -113,6 +113,9 @@ class OptimConf(Config):
             assert self.wsd_decay_duration_steps is not None, 'decay duration steps is required for WSD.'
 
 
+HYPER_CONNECTION_FUNCS = ('ihc', 'mhc', 'ohc')  # residual_func values of xllm.modules.residual.HYPER_CONNECTIONS
+
+
 @dataclass
 class ModelConf(Config):
     arch: str = "transformer"  # Architecture: transformer or gekko
@@ -173,7 +176,7 @@ class ModelConf(Config):
     layernorm_eps: float = 1e-5
     rmsnorm_eps: float = 1e-6
     apply_rmsnorm: bool = False  # True = RMSNorm, False = LayerNorm
-    residual_func: str = "base"  # Residual connection type: base/add means standard addition, ortho for orthogonal residuals.
+    residual_func: str = "base"  # Residual connection type: base/add means standard addition, ortho for orthogonal residuals, ihc/mhc/ohc for hyper-connections (4 residual streams with identity / Sinkhorn / SO(4) transport, see xllm/modules/residual/README.md).
     residual_heads: Optional[int] = None  # Num of feature groups for orthogonal residuals. Required when using residual_func='ortho'.
     # Rope base
     rope_base: float = 100000  # RoPE frequency base
@@ -219,7 +222,9 @@ class ModelConf(Config):
 
         assert self.attn_act_func in ['softmax', 'softdelta']
         assert self.attn_gate_func in ['silu', 'softplus']
-        assert self.residual_func in ['base', 'add', 'ortho']
+        assert self.residual_func in ('base', 'add', 'ortho') + HYPER_CONNECTION_FUNCS
+        if self.residual_func in HYPER_CONNECTION_FUNCS:
+            assert not self.fused_block, "hyper-connections run on the module path (fused_block=false)"
 
         if self.num_values > 0:
             assert 0 < self.num_activated_values <= self.num_values

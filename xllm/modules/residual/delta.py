@@ -105,6 +105,9 @@ class DeltaResidual(nn.Module):
             memory_efficient=True,
         )
 
+    def read(self, x: Tensor):
+        return x, None  # the state itself, no write state (BaseResidual.read)
+
     def forward(
         self, h, residual, c, **kwargs
     ) -> Tensor:

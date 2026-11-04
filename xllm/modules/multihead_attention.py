@@ -220,6 +220,7 @@ class MultiheadAttention(nn.Module):
         cache: Optional[Tuple[Tensor, Tensor]] = None,
     ) -> Tuple[Tensor, Optional[Any]]:
         residual = x
+        x, rc = self.residual.read(residual)  # hyper-connections: h = sum_n a_n X_n and the write's (R, b); else x, None
         x = self.norm(x)
         if not self.norm.gather_input:
             x = gather_copy_model_parallel_region(x)
@@ -250,7 +251,7 @@ class MultiheadAttention(nn.Module):
         h = self.wo(attn)
         h = memory_efficient_dropout(h, self.dropout, self.training)
         # residual
-        out = self.residual(h, residual, c=attn)
+        out = self.residual(h, residual, c=attn, state=rc)
 
         return out, new_cache
 
