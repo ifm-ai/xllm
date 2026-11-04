@@ -316,7 +316,6 @@ class GekkoOutputLayer(nn.Module):
             return loss, cache
 
 
-
 class Gekko(XLLModel):
     """
     Gekko Architecture in
@@ -562,8 +561,9 @@ ConfStore["gekko-4B"] = ModelConf(arch='gekko', num_layers=36, model_dim=2560, n
                                   causal_conv_width=4, causal_conv_weight_normalization=True, ffn_hidden_dim=9216, swiglu=True,
                                   layernorm_num_groups=2, timenorm_num_groups=40, timenorm_eps=1e-5, layernorm_eps=1e-5, rmsnorm_eps=1e-6)
 
-ConfStore["gekko-7.1B"] = ModelConf(arch='gekko', num_layers=32, model_dim=4096, num_heads=4, num_kv_heads=4, head_dim=256, v_head_dim=2048,
-                                    causal_conv_width=4, chunk_size=4096, rope_base=500000, ffn_hidden_dim=8192, swiglu=True,
+ConfStore["gekko-7B"] = ModelConf(arch='gekko', num_layers=38, model_dim=4096, num_heads=48, num_kv_heads=8,
+                                    head_dim=128, v_head_dim=128, rope_head_dim=128, rope_base=500000, chunk_size=4096,
+                                    causal_conv_width=4, causal_conv_weight_normalization=True, ffn_hidden_dim=8192, swiglu=True,
                                     layernorm_num_groups=4, timenorm_num_groups=64, timenorm_eps=1e-5, layernorm_eps=1e-5, rmsnorm_eps=1e-6)
 
 # fmt: on
