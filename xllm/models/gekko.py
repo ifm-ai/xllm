@@ -446,7 +446,8 @@ class Gekko(XLLModel):
                 )
 
             if health_collector is not None:
-                health_collector.record_activation(i, sum_streams(x, self.residual_streams))  # the residual the output reads
+                with torch.no_grad():  # the residual the output reads; no graph for the stream sum
+                    health_collector.record_activation(i, sum_streams(x, self.residual_streams))
 
             if aux_loss is not None:
                 aux_loss_sum = aux_loss if aux_loss_sum is None else aux_loss_sum + aux_loss

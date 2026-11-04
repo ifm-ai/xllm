@@ -167,7 +167,7 @@ class TransformerBlock(nn.Module):
                     self.rmsnorm_eps,
                     self.apply_rmsnorm,
                     self.attention.norm.gather_input,
-                    self.residual_func,
+                    type(hc1),
                     hc1.eps,
                     hc1.weight,
                     hc1.bias,
@@ -698,7 +698,8 @@ class Transformer(XLLModel):
         self.apply_attn_gate = cfg.apply_attn_gate
 
         self.layers = nn.ModuleList()
-        self.stream_slot = StreamSlot()  # hyper-connection fused block: passes stream data between adjacent layers
+        # hyper-connection fused block: passes stream data between adjacent layers (None otherwise)
+        self.stream_slot = StreamSlot() if cfg.fused_block and cfg.residual_func in HYPER_CONNECTION_FUNCS else None
         for layer_id in range(self.num_layers):
             block_cls = TransformerBlock if layer_id < self.num_dense_layers else \
                 (TransformerMoVABlock if self.num_values > 0 else TransformerMoEBlock)
@@ -755,7 +756,8 @@ class Transformer(XLLModel):
         emb = self.embed(tokens)
         x = memory_efficient_dropout(emb, self.dropout, self.training)
         x = expand_streams(x, self.residual_streams)  # hyper-connections: N copies of the embedding (N = 1: x itself)
-        self.stream_slot.reset()  # the fused block's layer-to-layer hand-off starts empty, whatever the last pass left
+        if self.stream_slot is not None:
+            self.stream_slot.reset()  # the fused block's layer-to-layer hand-off starts empty, whatever the last pass left
         # rope frequencies
         freq_cis = None if self.rope is None else self.rope.get_freqs_cis(cache_len, cache_len + seq_len, x.device)
 
@@ -776,7 +778,8 @@ class Transformer(XLLModel):
                 )
 
             if health_collector is not None:
-                health_collector.record_activation(i, sum_streams(x, self.residual_streams))  # the residual the output reads
+                with torch.no_grad():  # the residual the output reads; no graph for the stream sum
+                    health_collector.record_activation(i, sum_streams(x, self.residual_streams))
 
             if aux_loss is not None:
                 aux_loss_sum = aux_loss if aux_loss_sum is None else aux_loss_sum + aux_loss

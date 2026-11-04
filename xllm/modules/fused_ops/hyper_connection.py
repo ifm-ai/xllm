@@ -25,12 +25,29 @@ import triton
 import triton.language as tl
 
 
-OHC_EPS = 1e-12
+MAX_STREAMS = 4  # the stream kernels tile four streams per program; fewer are masked, more are not supported
 
 
 def supported(x: torch.Tensor) -> bool:
-    """Fused path: CUDA BF16 / FP16 streams [..., N, D] with N <= 4."""
-    return x.is_cuda and x.dtype in (torch.bfloat16, torch.float16) and x.dim() >= 2 and x.shape[-2] <= 4
+    """Fused path: CUDA BF16 / FP16 streams [..., N, D]. The kernels have no path for N > MAX_STREAMS, so that is an
+    error rather than a silent fall-back to the (several times larger) torch reference path."""
+    if not (x.is_cuda and x.dtype in (torch.bfloat16, torch.float16)):
+        return False
+    assert x.dim() >= 2 and x.shape[-2] <= MAX_STREAMS, f"the stream kernels support at most {MAX_STREAMS} streams, got {tuple(x.shape)}"
+    return True
+
+
+def _check_streams(x: torch.Tensor):
+    """The raw launchers' contract: contiguous [T, N, D] with N <= MAX_STREAMS (the kernels mask n >= N)."""
+    assert x.dim() == 3 and x.is_contiguous() and x.shape[1] <= MAX_STREAMS, \
+        f"streams must be contiguous [T, N <= {MAX_STREAMS}, D], got {tuple(x.shape)}"
+
+
+def _check_coef(logits: torch.Tensor, n_logits: int, scale: torch.Tensor, bias: torch.Tensor):
+    """The coefficient kernels' contract: FP32 contiguous logits [T, n_logits], scale [2], bias [n_logits]."""
+    assert logits.dim() == 2 and logits.shape[1] == n_logits and logits.dtype == torch.float32 and logits.is_contiguous(), \
+        f"expected FP32 contiguous logits [T, {n_logits}], got {tuple(logits.shape)} {logits.dtype}"
+    assert scale.shape == (2,) and bias.shape == (n_logits,) and scale.is_contiguous() and bias.is_contiguous()
 
 
 def _tile(D: int, max_tile: int = 1024) -> int:
@@ -257,6 +274,7 @@ def _read_bwd_kernel(x_ptr, a_ptr, dh_ptr, dx_ptr, da_ptr, N, D, CH: tl.constexp
 
 
 def read_fwd(x, a):
+    _check_streams(x)
     """x [T, N, D], a [T, N] FP32, both contiguous -> h [T, D] in x's dtype."""
     T, N, D = x.shape
     h = torch.empty(T, D, device=x.device, dtype=x.dtype)
@@ -265,6 +283,7 @@ def read_fwd(x, a):
 
 
 def read_bwd(x, a, dh):
+    _check_streams(x)
     """-> dx [T, N, D], da [T, N]."""
     T, N, D = x.shape
     dx = torch.empty_like(x)
@@ -437,6 +456,7 @@ def write_fwd_split(hi, lo, R, b, y, split=True):
     """`write_fwd` on streams kept as hi + lo (lo None: hi alone), -> (hi', lo') of X': hi' = round(X'), the streams the
     next kernels read, and lo' = round(X' - hi'), so that hi' + lo' holds X' to ~2^-17 and the write can be inverted
     without the single-rounding drift. `split=False`: X' rounded once, (hi', None)."""
+    _check_streams(hi)
     T, N, D = hi.shape
     out = torch.empty_like(hi)
     outlo = torch.empty_like(hi) if split else None
@@ -447,8 +467,8 @@ def write_fwd_split(hi, lo, R, b, y, split=True):
 
 
 def write_bwd(x, R, b, y, go):
-    """-> dx (the contiguous go itself for the identity transport: do not modify it in place), dR or None,
-    db [T, N], dy [T, D]."""
+    """-> dx, dR, db [T, N], dy [T, D]. For the identity transport dX = dX' and dR does not exist: dx and dR are None."""
+    _check_streams(x)
     T, N, D = x.shape
     has_r = R is not None
     # the transport backward keeps 20 accumulator tiles live (H200 sweep, D = 1536): small tiles, 2 warps
@@ -460,8 +480,8 @@ def write_bwd(x, R, b, y, go):
         dx = torch.empty_like(x)
         dR = torch.empty_like(R)
     else:
-        dx, dR = go, None  # identity transport: dX = dX'
-    _write_bwd_kernel[(T,)](x, R if has_r else b, b, y, go, dx, dR if has_r else b, db, dy, N, D,
+        dx, dR = None, None  # identity transport: dX = dX', nothing to write
+    _write_bwd_kernel[(T,)](x, R if has_r else b, b, y, go, dx if has_r else go, dR if has_r else b, db, dy, N, D,
                             CH=_tile(D, tile), HAS_R=has_r, num_warps=warps)
     return dx, dR, db, dy
 
@@ -505,6 +525,7 @@ def unwrite(hi_next, lo_next, R, b, y, inplace=False):
     """Inverse of `write_fwd_split` for an orthogonal or identity transport: X' as (hi, lo) [T, N, D] (lo None: a
     singly rounded X'), R [T, N, N] FP32 or None, b [T, N] FP32, y [T, D] -> X as (hi, lo): hi for the kernels that
     consume the streams, hi + lo to chain further inversions. `inplace` overwrites hi_next and lo_next with the result."""
+    _check_streams(hi_next)
     T, N, D = hi_next.shape
     has_r = R is not None
     if inplace:
@@ -527,7 +548,8 @@ class _Write(torch.autograd.Function):
     @staticmethod
     def backward(ctx, go):
         x, R, b, y = ctx.saved_tensors
-        return write_bwd(x, R, b, y, go)
+        dx, dR, db, dy = write_bwd(x, R, b, y, go)
+        return go if dx is None else dx, dR, db, dy
 
 
 def hc_write(x: torch.Tensor, R, b: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
@@ -772,6 +794,7 @@ def _coef_bwd_buffers(T, NL, device, da, db):
 
 def ihc_coef_fwd(logits, scale, bias):
     """logits [T, 8], scale [2], bias [8], all FP32 contiguous -> a [T, 4], b [T, 4]."""
+    _check_coef(logits, 8, scale, bias)
     T = logits.shape[0]
     a = torch.empty(T, 4, device=logits.device, dtype=torch.float32)
     b = torch.empty(T, 4, device=logits.device, dtype=torch.float32)
@@ -781,75 +804,36 @@ def ihc_coef_fwd(logits, scale, bias):
 
 def ihc_coef_bwd(logits, scale, bias, da, db):
     """-> dlogits [T, 8], dscale [2], dbias [8] (FP32); a None gradient counts as zero."""
+    _check_coef(logits, 8, scale, bias)
     T = logits.shape[0]
     dl, ps, pb, da, db = _coef_bwd_buffers(T, 8, logits.device, da, db)
     _ihc_coef_bwd_kernel[(ps.shape[0],)](logits, scale, bias, da, db, dl, ps, pb, T, BT=COEF_BT, num_warps=4)
     return dl, ps.sum(0), pb.sum(0)
 
 
-def ohc_coef_fwd(logits, scale, bias, alpha):
-    """logits [T, 16], scale [2], bias [16], all FP32 contiguous -> a [T, 4], b [T, 4], R [T, 4, 4]."""
+def ohc_coef_fwd(logits, scale, bias, alpha, eps):
+    """logits [T, 16], scale [2], bias [16], all FP32 contiguous; alpha the rotation logits' scale, eps of the quaternion
+    normalization -> a [T, 4], R [T, 4, 4], b [T, 4]."""
+    _check_coef(logits, 16, scale, bias)
     T = logits.shape[0]
     dev = logits.device
     a = torch.empty(T, 4, device=dev, dtype=torch.float32)
     b = torch.empty(T, 4, device=dev, dtype=torch.float32)
     R = torch.empty(T, 4, 4, device=dev, dtype=torch.float32)
-    _ohc_coef_fwd_kernel[(triton.cdiv(T, COEF_BT),)](logits, scale, bias, a, b, R, T, alpha, OHC_EPS,
+    _ohc_coef_fwd_kernel[(triton.cdiv(T, COEF_BT),)](logits, scale, bias, a, b, R, T, alpha, eps,
                                                      BT=COEF_BT, num_warps=4)
-    return a, b, R
+    return a, R, b
 
 
-def ohc_coef_bwd(logits, scale, bias, da, db, dR, alpha):
+def ohc_coef_bwd(logits, scale, bias, da, dR, db, alpha, eps):
     """-> dlogits [T, 16], dscale [2], dbias [16] (FP32); a None gradient counts as zero."""
+    _check_coef(logits, 16, scale, bias)
     T = logits.shape[0]
     dl, ps, pb, da, db = _coef_bwd_buffers(T, 16, logits.device, da, db)
     dR = torch.zeros(T, 4, 4, device=logits.device) if dR is None else dR.contiguous()
-    _ohc_coef_bwd_kernel[(ps.shape[0],)](logits, scale, bias, da, db, dR, dl, ps, pb, T, alpha, OHC_EPS,
+    _ohc_coef_bwd_kernel[(ps.shape[0],)](logits, scale, bias, da, db, dR, dl, ps, pb, T, alpha, eps,
                                          BT=COEF_BT, num_warps=4)
     return dl, ps.sum(0), pb.sum(0)
-
-
-class _IhcCoefficients(torch.autograd.Function):
-
-    @staticmethod
-    def forward(ctx, logits, scale, bias):
-        ctx.save_for_backward(logits, scale, bias)
-        return ihc_coef_fwd(logits, scale, bias)
-
-    @staticmethod
-    def backward(ctx, da, db):
-        logits, scale, bias = ctx.saved_tensors
-        return ihc_coef_bwd(logits, scale, bias, da, db)
-
-
-def ihc_coefficients(logits, scale, bias):
-    """logits [B, L, 8], scale [2], bias [8] (FP32) -> a [B, L, 4], b [B, L, 4]."""
-    B, L, _ = logits.shape
-    a, b = _IhcCoefficients.apply(logits.reshape(B * L, 8).contiguous(), scale.contiguous(), bias.contiguous())
-    return a.view(B, L, 4), b.view(B, L, 4)
-
-
-class _OhcCoefficients(torch.autograd.Function):
-
-    @staticmethod
-    def forward(ctx, logits, scale, bias, alpha):
-        ctx.save_for_backward(logits, scale, bias)
-        ctx.alpha = alpha
-        return ohc_coef_fwd(logits, scale, bias, alpha)
-
-    @staticmethod
-    def backward(ctx, da, db, dR):
-        logits, scale, bias = ctx.saved_tensors
-        dlogits, dscale, dbias = ohc_coef_bwd(logits, scale, bias, da, db, dR, ctx.alpha)
-        return dlogits, dscale, dbias, None
-
-
-def ohc_coefficients(logits, scale, bias, alpha: float):
-    """logits [B, L, 16], scale [2], bias [16] (FP32), alpha -> a [B, L, 4], R [B, L, 4, 4], b [B, L, 4]."""
-    B, L, _ = logits.shape
-    a, b, R = _OhcCoefficients.apply(logits.reshape(B * L, 16).contiguous(), scale.contiguous(), bias.contiguous(),
-                                     float(alpha))
-    return a.view(B, L, 4), R.view(B, L, 4, 4), b.view(B, L, 4)
 
 
 # ---------------------------------------------------------------------------------------------

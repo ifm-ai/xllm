@@ -115,11 +115,21 @@ def test_model_conf_accepts_every_hyper_connection(residual_func):
     ModelConf(**MODEL_CONF, residual_func=residual_func)
 
 
-def test_model_conf_rejects_fused_block_for_mhc_and_unknown_names():
+def test_config_names_match_the_classes():
+    from xllm.config import HYPER_CONNECTION_FUNCS, FUSED_BLOCK_RESIDUALS
+    assert set(HYPER_CONNECTION_FUNCS) == set(HYPER_CONNECTIONS)
+    for name, hc in HYPER_CONNECTIONS.items():
+        assert hc.NAME == name
+        # a variant has a fused block exactly when it owns coefficient kernels (coef_fwd / coef_bwd overridden)
+        assert ('coef_fwd' in vars(hc)) == ('coef_bwd' in vars(hc)) == (name in FUSED_BLOCK_RESIDUALS), name
+
+
+def test_model_conf_fused_block_allowlist_and_unknown_names():
     from xllm.config import ModelConf
     ModelConf(**{**MODEL_CONF, 'residual_func': 'ohc', 'fused_block': True})  # ihc / ohc have a fused block
-    with pytest.raises(AssertionError, match="fused block only"):
-        ModelConf(**{**MODEL_CONF, 'residual_func': 'mhc', 'fused_block': True})
+    for residual_func in ('mhc', 'ortho'):  # not invertible / not implemented by the fused block
+        with pytest.raises(AssertionError, match="fused blocks implement"):
+            ModelConf(**{**MODEL_CONF, 'residual_func': residual_func, 'fused_block': True})
     with pytest.raises(AssertionError):
         ModelConf(**{**MODEL_CONF, 'residual_func': 'hc'})
 

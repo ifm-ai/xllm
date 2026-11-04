@@ -114,6 +114,7 @@ class OptimConf(Config):
 
 
 HYPER_CONNECTION_FUNCS = ('ihc', 'mhc', 'ohc')  # residual_func values of xllm.modules.residual.HYPER_CONNECTIONS
+FUSED_BLOCK_RESIDUALS = ('base', 'add', 'ihc', 'ohc')  # residuals the fused blocks implement (mhc's transport is not invertible)
 
 
 @dataclass
@@ -223,9 +224,12 @@ class ModelConf(Config):
         assert self.attn_act_func in ['softmax', 'softdelta']
         assert self.attn_gate_func in ['silu', 'softplus']
         assert self.residual_func in ('base', 'add', 'ortho') + HYPER_CONNECTION_FUNCS
-        if self.residual_func in HYPER_CONNECTION_FUNCS and self.fused_block:
-            assert self.arch == 'transformer' and self.num_experts == 0 and self.residual_func != 'mhc', \
-                "hyper-connections have a fused block only for dense transformer layers with ihc / ohc"
+        if self.fused_block:
+            assert self.residual_func in FUSED_BLOCK_RESIDUALS, \
+                f"the fused blocks implement the residuals {FUSED_BLOCK_RESIDUALS}, not {self.residual_func}"
+            if self.residual_func in HYPER_CONNECTION_FUNCS:
+                assert self.arch == 'transformer' and self.num_experts == 0, \
+                    "hyper-connections have a fused block only for dense transformer layers"
 
         if self.num_values > 0:
             assert 0 < self.num_activated_values <= self.num_values

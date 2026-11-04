@@ -1,7 +1,11 @@
 """Fused training block of a dense Transformer layer with hyper-connections (ihc / ohc).
 
 TransformerBlockFunction with the two residual adds replaced by the stream ops of
-xllm/modules/fused_ops/hyper_connection.py (xllm/modules/residual/hyper_connection.py is the module path):
+xllm/modules/fused_ops/hyper_connection.py (xllm/modules/residual/hyper_connection.py is the module path). A separate
+Function rather than a residual hook inside TransformerBlockFunction: the streams change the block's input shape, add a
+controller before each branch and a cross-layer stream recovery in the backward, none of which the plain block has. The
+controller's coefficient kernels come from the sublayer's HyperConnection class (`coef_fwd` / `coef_bwd`), the same ones
+the module path runs on CUDA, so the two paths compute the same model.
 
     X  [B, L, N, D] streams in
     (a1, R1, b1) = controller1(X);   h1 = read(X, a1);   y1 = attention(norm(h1));  X1 = write(X, R1, b1, y1)
@@ -49,7 +53,6 @@ from xllm.modules.fused_ops import (
     memory_efficient_dropout_bwd,
 )
 from xllm.modules.fused_ops import hyper_connection as fused
-from xllm.modules.residual.hyper_connection import OrthogonalHyperConnection
 from xllm.models.fused_blocks.utils import (
     layer_or_rmsnorm_fwd,
     swiglu_forward,
@@ -61,8 +64,6 @@ from xllm.models.fused_blocks.mha import (
     multihead_attention_recompute
 )
 
-
-ROTATION_SCALE = OrthogonalHyperConnection.ROTATION_SCALE
 
 
 class StreamSlot:
@@ -88,28 +89,20 @@ class StreamSlot:
         return streams
 
 
-def controller_fwd(residual_func: str, X: Tensor, weight: Tensor, bias: Tensor, scale: Tensor, eps: float):
-    """One sublayer's controller on contiguous streams X [T, N, D] -> (logits, rstd, a, R, b); R None for ihc."""
+def controller_fwd(hc_cls, X: Tensor, weight: Tensor, bias: Tensor, scale: Tensor, eps: float):
+    """One sublayer's controller on contiguous streams X [T, N, D] -> (logits, rstd, a, R, b); R None for the identity.
+    `hc_cls` is the sublayer's HyperConnection class: its `coef_fwd` owns the variant's coefficient kernels."""
     T, N, D = X.shape
     logits, rstd = fused.logits_fwd(X.view(T, N * D), weight.to(X.dtype).contiguous(), eps)
-    scale_f, bias_f = scale.float().contiguous(), bias.float().contiguous()
-    if residual_func == 'ohc':
-        a, b, R = fused.ohc_coef_fwd(logits, scale_f, bias_f, ROTATION_SCALE)
-    else:
-        a, b = fused.ihc_coef_fwd(logits, scale_f, bias_f)
-        R = None
+    a, R, b = hc_cls.coef_fwd(logits, scale.float().contiguous(), bias.float().contiguous())
     return logits, rstd, a, R, b
 
 
-def controller_bwd(residual_func: str, X: Tensor, weight: Tensor, bias: Tensor, scale: Tensor, eps: float,
-                   logits: Tensor, rstd: Tensor, da: Tensor, db: Tensor, dR: Optional[Tensor]):
+def controller_bwd(hc_cls, X: Tensor, weight: Tensor, bias: Tensor, scale: Tensor, eps: float,
+                   logits: Tensor, rstd: Tensor, da: Tensor, dR: Optional[Tensor], db: Tensor):
     """-> dX [T, N, D] (the controller's share), dweight, dbias, dscale in the parameters' dtypes."""
     T, N, D = X.shape
-    scale_f, bias_f = scale.float().contiguous(), bias.float().contiguous()
-    if residual_func == 'ohc':
-        dlogits, dscale, dbias = fused.ohc_coef_bwd(logits, scale_f, bias_f, da, db, dR, ROTATION_SCALE)
-    else:
-        dlogits, dscale, dbias = fused.ihc_coef_bwd(logits, scale_f, bias_f, da, db)
+    dlogits, dscale, dbias = hc_cls.coef_bwd(logits, scale.float().contiguous(), bias.float().contiguous(), da, dR, db)
     dX, dW = fused.logits_bwd(X.view(T, N * D), weight.to(X.dtype).contiguous(), rstd, logits, dlogits)
     return dX.view(T, N, D), dW.to(weight.dtype), dbias.to(bias.dtype), dscale.to(scale.dtype)
 
@@ -152,7 +145,7 @@ class HyperConnectionBlockFunction(torch.autograd.Function):
         rmsnorm_eps: float,
         apply_rmsnorm: bool,
         gather_before_norm: bool,
-        residual_func: str,
+        hc_cls: type,
         hc_eps: float,
         hc1_w: Tensor,
         hc1_b: Tensor,
@@ -171,7 +164,6 @@ class HyperConnectionBlockFunction(torch.autograd.Function):
         store_output: bool,
         slot: Optional[StreamSlot],
     ):
-        assert residual_func in ('ihc', 'ohc'), residual_func
         assert (store_output and layer_id == 0) or slot is not None, "the streams' lo parts pass through the StreamSlot"
         assert not store_input or layer_id == 0, "only the first layer saves its input (the embedding, no lo part)"
         bsz, seq_len, N, D = streams.shape
@@ -180,7 +172,7 @@ class HyperConnectionBlockFunction(torch.autograd.Function):
         X_lo = slot.take() if layer_id > 0 else None  # the lo part of the layer below's output streams
 
         # sublayer 1: controller, read, attention, write
-        l1, rstd1, a1, R1, b1 = controller_fwd(residual_func, X, hc1_w, hc1_b, hc1_s, hc_eps)
+        l1, rstd1, a1, R1, b1 = controller_fwd(hc_cls, X, hc1_w, hc1_b, hc1_s, hc_eps)
         h1 = fused.read_fwd(X, a1).view(bsz, seq_len, D)
         mx, _, _ = layer_or_rmsnorm_fwd(h1, attn_norm_w, attn_norm_b, norm_local_groups, layernorm_eps, rmsnorm_eps, apply_rmsnorm)
         del h1
@@ -212,7 +204,7 @@ class HyperConnectionBlockFunction(torch.autograd.Function):
         del X_lo
 
         # sublayer 2: controller, read, FFN, write
-        l2, rstd2, a2, R2, b2 = controller_fwd(residual_func, X1, hc2_w, hc2_b, hc2_s, hc_eps)
+        l2, rstd2, a2, R2, b2 = controller_fwd(hc_cls, X1, hc2_w, hc2_b, hc2_s, hc_eps)
         h2 = fused.read_fwd(X1, a2).view(bsz, seq_len, D)
         xf, _, _ = layer_or_rmsnorm_fwd(h2, ffn_norm_w, ffn_norm_b, norm_local_groups, layernorm_eps, rmsnorm_eps, apply_rmsnorm)
         del h2
@@ -297,7 +289,7 @@ class HyperConnectionBlockFunction(torch.autograd.Function):
         ctx.apply_rmsnorm = apply_rmsnorm
         ctx.gather_before_norm = gather_before_norm
         ctx.causal_attn_backend = causal_attn_backend
-        ctx.residual_func = residual_func
+        ctx.hc_cls = hc_cls
         ctx.hc_eps = hc_eps
         ctx.layer_id = layer_id
         ctx.slot = slot
@@ -347,7 +339,7 @@ class HyperConnectionBlockFunction(torch.autograd.Function):
         gather_before_norm = ctx.gather_before_norm
         causal_attn_backend = ctx.causal_attn_backend
         attn_gate_func = ctx.attn_gate_func
-        residual_func = ctx.residual_func
+        hc_cls = ctx.hc_cls
         hc_eps = ctx.hc_eps
         attn_stability_control = ctx.attn_stability_control
         deterministic = ctx.deterministic
@@ -384,7 +376,9 @@ class HyperConnectionBlockFunction(torch.autograd.Function):
             h3_ = F.linear(xf, fc3_w)
 
         # X2 = write(X1, R2, b2, y2): dX1 (transport share), dR2, db2, dy2
-        dX1_w, dR2, db2, dy2 = fused.write_bwd(X1, R2, b2, y2, G2)  # ihc: dX1_w is G2 itself
+        dX1_w, dR2, db2, dy2 = fused.write_bwd(X1, R2, b2, y2, G2)
+        if dX1_w is None:
+            dX1_w = G2  # identity transport: dX1 = dX2; G2 must not be modified in place
         del G2
         dy2 = memory_efficient_dropout_bwd(dy2, dropout, ctx.out_rng_state)
         h2_grad, fc1_w_grad, fc2_w_grad, fc3_w_grad, ffn_norm_w_grad, ffn_norm_b_grad = swiglu_backward(
@@ -396,7 +390,7 @@ class HyperConnectionBlockFunction(torch.autograd.Function):
         dX1, da2 = fused.read_bwd(X1, a2, h2_grad.reshape(T, D))
         del h2_grad
         dX1_c, hc2_w_grad, hc2_b_grad, hc2_s_grad = controller_bwd(
-            residual_func, X1, hc2_w, hc2_b, hc2_s, hc_eps, l2, rstd2, da2, db2, dR2
+            hc_cls, X1, hc2_w, hc2_b, hc2_s, hc_eps, l2, rstd2, da2, dR2, db2
         )
         del da2, db2, dR2
         dX1 = dX1.add_(dX1_w).add_(dX1_c)  # dX1_w may alias out_grad: accumulate into the fresh read gradient
@@ -418,6 +412,8 @@ class HyperConnectionBlockFunction(torch.autograd.Function):
         )
         # X1 = write(X, R1, b1, y1)
         dX0_w, dR1, db1, dy1 = fused.write_bwd(X, R1, b1, y1, dX1)
+        if dX0_w is None:
+            dX0_w = dX1  # identity transport: dX0 = dX1
         del dX1
         xh_grad = memory_efficient_dropout_bwd(dy1.view(bsz, seq_len, D), dropout, ctx.xh_rng_state)
         del dy1
@@ -481,7 +477,7 @@ class HyperConnectionBlockFunction(torch.autograd.Function):
         dX0, da1 = fused.read_bwd(X, a1, h1_grad.reshape(T, D))
         del h1_grad
         dX0_c, hc1_w_grad, hc1_b_grad, hc1_s_grad = controller_bwd(
-            residual_func, X, hc1_w, hc1_b, hc1_s, hc_eps, l1, rstd1, da1, db1, dR1
+            hc_cls, X, hc1_w, hc1_b, hc1_s, hc_eps, l1, rstd1, da1, dR1, db1
         )
         dX0 = dX0.add_(dX0_w).add_(dX0_c)
         del dX0_w, dX0_c
@@ -520,7 +516,7 @@ class HyperConnectionBlockFunction(torch.autograd.Function):
             None,  # rmsnorm_eps
             None,  # apply_rmsnorm
             None,  # gather_before_norm
-            None,  # residual_func
+            None,  # hc_cls
             None,  # hc_eps
             hc1_w_grad,
             hc1_b_grad,

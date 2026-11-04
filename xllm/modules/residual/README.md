@@ -79,9 +79,17 @@ Per sublayer the streams are read three times (write, controller statistics, rea
   transport, not invertible), MoE / MoVA and Gekko fused blocks are asserted off in `ModelConf`. k2-horizon-0.9B,
   8 x H200, bsz 32 x 8k: base fused block 116 GB 48.5k wps/GPU; `ohc` fused block 135.4 GB 40.1k (the stream
   path's working set in the backward, not saved streams, sets the peak); `ohc` with `layerwise_ckpt` 121-125 GB 37k.
+- A variant's coefficient kernels live on its class (`coef_fwd` / `coef_bwd`, raw FP32 ops on `[T, n_logits]`
+  logits); the module path on CUDA (`fused_coefficients`) and the fused block both call them, so adding a variant
+  with a fused block means one class with a torch reference (`coefficients_from_logits`) and those two methods, and
+  its name in `config.FUSED_BLOCK_RESIDUALS`. The stream kernels tile `fused.MAX_STREAMS = 4` streams per program
+  (fewer are masked); their launchers assert contiguous `[T, N <= 4, D]` and `supported()` raises for more.
 - No model parallelism, and so no MoE expert parallelism (it runs over the model-parallel group): the
-  controller normalizes over all `N * D` channels of a token. `layerwise_ckpt` works; context parallelism
-  should, as every hyper-connection op is per token, but has not been run.
+  controller normalizes over all `N * D` channels of a token. Supporting it would touch `logits` (reduce the
+  sum of squares for `rstd` across ranks, row-shard `W [N * D / tp, n_logits]` and all-reduce the logits),
+  `register_muon(..., tp_dim=0)`, `num_params_in_hyper_connection`, and the fused block's `controller_fwd/bwd`;
+  read / write / unwrite are per channel and shard along `D` as they are. `layerwise_ckpt` works; context
+  parallelism should, as every hyper-connection op is per token, but has not been run.
 - Memory: the streams cost `N` times the plain residual, and `layerwise_ckpt` keeps each layer's input
   streams, `N * D * 2` bytes per token per layer (k2-horizon-0.9B, bsz 32 x 8k: about 3.2 GB per layer,
   ~121-125 GB per GPU in total).
