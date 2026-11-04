@@ -223,8 +223,9 @@ class ModelConf(Config):
         assert self.attn_act_func in ['softmax', 'softdelta']
         assert self.attn_gate_func in ['silu', 'softplus']
         assert self.residual_func in ('base', 'add', 'ortho') + HYPER_CONNECTION_FUNCS
-        if self.residual_func in HYPER_CONNECTION_FUNCS:
-            assert not self.fused_block, "hyper-connections run on the module path (fused_block=false)"
+        if self.residual_func in HYPER_CONNECTION_FUNCS and self.fused_block:
+            assert self.arch == 'transformer' and self.num_experts == 0 and self.residual_func != 'mhc', \
+                "hyper-connections have a fused block only for dense transformer layers with ihc / ohc"
 
         if self.num_values > 0:
             assert 0 < self.num_activated_values <= self.num_values

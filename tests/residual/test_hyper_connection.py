@@ -115,10 +115,11 @@ def test_model_conf_accepts_every_hyper_connection(residual_func):
     ModelConf(**MODEL_CONF, residual_func=residual_func)
 
 
-def test_model_conf_rejects_fused_block_and_unknown_names():
+def test_model_conf_rejects_fused_block_for_mhc_and_unknown_names():
     from xllm.config import ModelConf
-    with pytest.raises(AssertionError, match="fused_block"):
-        ModelConf(**{**MODEL_CONF, 'residual_func': 'ohc', 'fused_block': True})
+    ModelConf(**{**MODEL_CONF, 'residual_func': 'ohc', 'fused_block': True})  # ihc / ohc have a fused block
+    with pytest.raises(AssertionError, match="fused block only"):
+        ModelConf(**{**MODEL_CONF, 'residual_func': 'mhc', 'fused_block': True})
     with pytest.raises(AssertionError):
         ModelConf(**{**MODEL_CONF, 'residual_func': 'hc'})
 
