@@ -8,7 +8,7 @@ from tests.health.helpers import stats
 from xllm.config import ModelConf
 from xllm.distributed import FullyShardedDataParallel
 from xllm.health_metrics import HealthMetricCollector
-from xllm.models.gekko import GekkoBlock
+from xllm.models.gekko import Gekko, GekkoBlock, gekko_layer_ids
 
 # The Gekko hooks run inside fused CUDA kernels, so the statistics tests feed the collector exactly the
 # tensors the hooks pass, shaped (batch, seq, heads, head_dim); the norm tests use a real GekkoBlock.
@@ -157,6 +157,52 @@ def test_an_incomplete_gekko_layer_skips_the_step(caplog, partial, message):
 
     assert _flush(collector) is None
     assert message in caplog.text
+
+
+# Hybrid Gekko: full-attention layers record query/key statistics but no Gekko statistics.
+
+def test_hybrid_logs_gekko_stats_only_for_gekko_layers():
+    collector = _collector(num_layers=3, gekko_stats_layers=[1, 2])
+    collector.record_query_key_stats(0, Q, K)  # full-attention TransformerBlock
+    _record_layer(collector, 1)
+    _record_layer(collector, 2, sca=SCA * 2)
+
+    metrics = _flush(collector)
+
+    assert metrics is not None
+    assert all(f"q_stats/layer_{i:03d}/mean" in metrics for i in range(3))
+    assert not any(name.startswith("gekko_stats/layer_000/") for name in metrics)
+    assert (metrics["gekko_stats/layer_001/sca_rms"], metrics["gekko_stats/layer_002/sca_rms"]) == pytest.approx((3.0, 6.0))
+    assert metrics["gekko_stats/layer_001/awk_energy_fraction"] == pytest.approx(16 / 25)
+
+
+def test_hybrid_still_skips_when_a_gekko_layer_is_missing(caplog):
+    collector = _collector(num_layers=3, gekko_stats_layers=[1, 2])
+    collector.record_query_key_stats(0, Q, K)
+    _record_layer(collector, 1)
+    collector.record_query_key_stats(2, Q, K)  # layer 2 should have recorded Gekko statistics
+
+    assert _flush(collector) is None
+    assert "Missing Gekko statistics" in caplog.text
+
+
+def test_gekko_stats_layers_must_be_in_range():
+    with pytest.raises(ValueError, match="out of range"):
+        HealthMetricCollector(True, 1, 2, enable_gekko_stats=True, gekko_stats_layers=[2])
+
+
+def test_gekko_layer_ids_excludes_hybrid_full_attention_layers():
+    cfg = dict(
+        arch="gekko", num_layers=5, model_dim=64, ffn_hidden_dim=128, vocab_size=32, num_heads=2,
+        num_kv_heads=1, head_dim=32, v_head_dim=32, rope_head_dim=16, chunk_size=16, swiglu=True,
+        qknorm=True, apply_rmsnorm=True, timenorm_num_groups=8,
+        causal_attn_backend="xattn", sca_backend="xattn",
+    )
+    tokenizer = SimpleNamespace(vocab_size=32, bos_id=1, eos_id=2, pad_id=0)
+    hybrid = Gekko(ModelConf(full_attention_interval=4, **cfg), tokenizer)
+    assert hybrid.full_attention_layers == (0, 4)
+    assert gekko_layer_ids(hybrid) == [1, 2, 3]
+    assert gekko_layer_ids(Gekko(ModelConf(**cfg), tokenizer)) == list(range(5))
 
 
 # Parameter norms, on a real GekkoBlock

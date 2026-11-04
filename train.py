@@ -64,6 +64,7 @@ from xllm.monitor import GPUMonitor, Timings
 from xllm.metrics import MetricLogger, build_mlogger
 from xllm.health_metrics import HealthMetricCollector
 from xllm.modules.moe.moe import moe_layer_ids
+from xllm.models.gekko import gekko_layer_ids
 from xllm.modules.moe.mova import mova_layer_ids
 from xllm.configuration import cfg_from_cli
 try:
@@ -297,6 +298,7 @@ def main(cfg: TrainerConf):
         enable_logits_stats=cfg.health_logits_stats,
         enable_gekko_stats=cfg.health_gekko_stats,
         router_stats_layers=router_stats_layers,
+        gekko_stats_layers=gekko_layer_ids(model) if cfg.health_gekko_stats else None,
     )
 
     model.train()
