@@ -25,6 +25,8 @@ Arguments below are added by this stack; defaults are defined in [config.py](../
 | `--optim.muon_orthogonalizer` | `newton_schulz5` | `newton_schulz5` or `polar_express`. |
 | `--optim.muon_use_gram_newton_schulz` | `false` | Select Dion's Gram Newton-Schulz backend; requires the optional GNS dependency. |
 | `--optim.muon_use_triton` | `false` | Enable accelerated orthogonalization kernels. With GNS, forwards to its `ns_use_kernels` setting. |
+| `--optim.disable_wd_emb` | `false` | No weight decay on the embedding weights (AdamW and Muon; put in a separate `adamw_no_wd` group under Muon). |
+| `--optim.disable_wd_out` | `false` | No weight decay on the readout projection weights (the final norm keeps its decay). |
 
 ## Use
 
