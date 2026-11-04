@@ -193,7 +193,10 @@ def test_legacy_muon_contract_defaults_kernel_flags_without_hiding_drift(gns, tr
     legacy = {'optimizer_contract': {'optimizer': 'dion_muon', 'recipe': {'lr': 0.001}}}
     saved = deepcopy(legacy)
     current = deepcopy(legacy['optimizer_contract'])
-    current['recipe'].update(muon_use_gram_newton_schulz=gns, muon_use_triton=triton)
+    current['recipe'].update(
+        muon_use_gram_newton_schulz=gns, muon_use_triton=triton,
+        disable_wd_emb=False, disable_wd_out=False,
+    )
     optimizer = SimpleNamespace(_xllm_optimizer_contract=current)
     validate_optimizer_contract(optimizer, {'optimizer_contract': current})
     if gns or triton:
