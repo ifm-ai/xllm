@@ -41,6 +41,7 @@ from torch import Tensor, nn
 
 from xllm.distributed import get_model_parallel_group
 from xllm.modules.fused_ops import hyper_connection as fused
+from xllm.optim.muon_spec import register_muon
 from .base import BaseResidual
 
 
@@ -154,6 +155,9 @@ class HyperConnection(BaseResidual):
         self.scale = nn.Parameter(torch.full((self.NUM_SCALES,), 0.01))
         with torch.no_grad():
             nn.init.normal_(self.weight, std=1.0 / math.sqrt(num_streams * model_dim))
+        # Under Muon the projection is a Muon matrix (an [in, out] weight: the logits are x @ W), the static bias and
+        # the gating scales stay on AdamW, as DeepSeek-V4 trains its mHC modules (arXiv 2606.19348, section 2.4).
+        register_muon(self, "weight", layout="i o")
 
     def logits(self, streams: Tensor) -> Tensor:
         """[B, L, n_logits] in FP32 from the RMS-normalized, flattened streams."""

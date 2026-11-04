@@ -47,7 +47,8 @@ The model expands the streams from the embedding (every stream = `x0`, `expand_s
 with FP32 accumulation, before the final norm (`sum_streams`); the health collector records that sum.
 Streams keep the model dtype; coefficient math and stream mixing run in FP32. Under FSDP2 mixed precision
 `W`, the biases and the scales arrive in the compute dtype (BF16). Parameters:
-`layers.*.{attention,nffn,...}.residual.{weight,bias,scale}`.
+`layers.*.{attention,nffn,...}.residual.{weight,bias,scale}`. Under Muon the projection `weight` is a Muon matrix
+(`register_muon(..., layout="i o")`), `bias` and `scale` stay on AdamW, the split DeepSeek-V4 uses for mHC.
 
 ```json
 {"residual_func": "ohc"}
@@ -68,6 +69,16 @@ of the `[B, L, N, D]` streams alive until backward, so on GPU it needs several t
 
 Per sublayer the streams are read three times (write, controller statistics, read) and written once.
 
+- `fused_block` works for dense transformer layers with `ihc` / `ohc`
+  (`xllm/models/fused_blocks/transformer/hyper_connection.py`: the base block with the residual adds replaced by
+  the stream ops). It saves the two branch outputs per layer but not the streams: a write is invertible
+  (`X = R^T (X' - b y)`), so the backward recovers each layer's streams from the layer above. Between layers the
+  streams travel as hi + lo (two BF16 tensors: hi is what the branches and controllers read, hi + lo holds the
+  FP32 write result to ~2^-17), so the inversion reproduces the forward's streams and the gradients match the
+  stored-streams path at the BF16 noise floor; the lo parts pass through a `StreamSlot`. `mhc` (Sinkhorn
+  transport, not invertible), MoE / MoVA and Gekko fused blocks are asserted off in `ModelConf`. k2-horizon-0.9B,
+  8 x H200, bsz 32 x 8k: base fused block 116 GB 48.5k wps/GPU; `ohc` fused block 135.4 GB 40.1k (the stream
+  path's working set in the backward, not saved streams, sets the peak); `ohc` with `layerwise_ckpt` 121-125 GB 37k.
 - No model parallelism, and so no MoE expert parallelism (it runs over the model-parallel group): the
   controller normalizes over all `N * D` channels of a token. `layerwise_ckpt` works; context parallelism
   should, as every hyper-connection op is per token, but has not been run.
