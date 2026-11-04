@@ -17,7 +17,7 @@ from xllm.modules import (
     GroupRMSNorm,
 )
 from xllm.modules.residual import (
-    num_params_in_residual, flops_in_residual, expand_streams, sum_streams,
+    num_params_in_residual, flops_in_residual, expand_streams, sum_streams, StreamSlot,
 )
 from xllm.modules.fused_ops import memory_efficient_dropout
 from xllm.modules.model_parallel import (
@@ -39,14 +39,17 @@ from xllm.distributed import (
     get_context_parallel_rank,
 )
 from xllm.models.fused_blocks import (
-    HyperConnectionBlockFunction,
-    StreamSlot,
     TransformerBlockFunction,
     TransformerMoEBlockFunction,
     TransformerMoVABlockFunction,
     TransformerOutputLayerFunction,
 )
 from xllm.utils import get_init_fn
+
+
+def _controller_tensors(residual) -> tuple:
+    """(weight, bias, scale) of a hyper-connection controller for the fused block; Nones for a plain residual."""
+    return (residual.weight, residual.bias, residual.scale) if residual is not None else (None, None, None)
 
 
 class TransformerBlock(nn.Module):
@@ -130,63 +133,9 @@ class TransformerBlock(nn.Module):
         cache: Optional[Tuple[Tensor, Tensor, int]] = None,
     ) -> Tuple[Tensor, Optional[Tensor], Optional[Any]]:
         if self.fused_block and self.training:
-            if self.stream_slot is not None:
-                # hyper-connections: streams x [B, L, N, D]; the controllers are the sublayers' residual modules
-                hc1, hc2 = self.attention.residual, self.nffn.residual
-                return HyperConnectionBlockFunction.apply(
-                    self.layer_id,
-                    x,
-                    freqs_cis,
-                    bos_mask,
-                    segments,
-                    self.attention.norm.weight,
-                    self.attention.norm.bias,
-                    self.attention.wq.weight,
-                    self.attention.wk.weight,
-                    self.attention.wv.weight,
-                    self.attention.wr.weight if self.attention.apply_attn_gate else None,
-                    self.attention.wo.weight,
-                    self.attention.query_norm.weight if self.attention.qknorm else None,
-                    self.attention.local_heads,
-                    self.attention.local_kv_heads,
-                    self.attention.head_dim,
-                    self.attention.rope_head_dim,
-                    self.attention.attn_gate_fn,
-                    self.attention.causal_attn_backend,
-                    self.nffn.norm.weight,
-                    self.nffn.norm.bias,
-                    self.nffn.norm.groups_per_partition,
-                    self.nffn.fc1.weight,
-                    self.nffn.fc2.weight,
-                    self.nffn.fc3.weight if self.nffn.swiglu else None,
-                    self.dropout,
-                    self.attention.attention_dropout,
-                    self.attention.hidden_dropout,
-                    self.nffn.swiglu,
-                    self.layernorm_eps,
-                    self.rmsnorm_eps,
-                    self.apply_rmsnorm,
-                    self.attention.norm.gather_input,
-                    type(hc1),
-                    hc1.eps,
-                    hc1.weight,
-                    hc1.bias,
-                    hc1.scale,
-                    hc2.weight,
-                    hc2.bias,
-                    hc2.scale,
-                    attn_stability_control,
-                    deterministic,
-                    self.recompute_q,
-                    self.recompute_kv,
-                    self.recompute_attention,
-                    self.recompute_fc1_out,
-                    self.recompute_fc3_out,
-                    self.is_last_layer,  # store_output
-                    self.stream_slot,
-                )
-            fn = TransformerBlockFunction
-            return fn.apply(
+            # hyper-connections: the sublayers' residual modules are the controllers (None for a plain residual)
+            hc1, hc2 = (self.attention.residual, self.nffn.residual) if self.stream_slot is not None else (None, None)
+            return TransformerBlockFunction.apply(
                 self.layer_id,
                 x,
                 freqs_cis,
@@ -207,14 +156,14 @@ class TransformerBlock(nn.Module):
                 self.attention.rope_head_dim,
                 self.attention.attn_gate_fn,
                 self.attention.causal_attn_backend,
-                None,
+                *_controller_tensors(hc1),
                 self.nffn.norm.weight,
                 self.nffn.norm.bias,
                 self.nffn.norm.groups_per_partition,
                 self.nffn.fc1.weight,
                 self.nffn.fc2.weight,
                 self.nffn.fc3.weight if self.nffn.swiglu else None,
-                None,
+                *_controller_tensors(hc2),
                 self.dropout,
                 self.attention.attention_dropout,
                 self.attention.hidden_dropout,
@@ -225,6 +174,10 @@ class TransformerBlock(nn.Module):
                 self.attention.norm.gather_input,
                 self.residual_func,
                 self.residual_heads,
+                type(hc1) if hc1 is not None else None,
+                hc1.eps if hc1 is not None else None,
+                self.stream_slot,
+                self.is_last_layer,
                 attn_stability_control,
                 deterministic,
                 self.recompute_q,

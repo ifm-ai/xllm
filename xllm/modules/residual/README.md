@@ -70,8 +70,8 @@ of the `[B, L, N, D]` streams alive until backward, so on GPU it needs several t
 Per sublayer the streams are read three times (write, controller statistics, read) and written once.
 
 - `fused_block` works for dense transformer layers with `ihc` / `ohc`
-  (`xllm/models/fused_blocks/transformer/hyper_connection.py`: the base block with the residual adds replaced by
-  the stream ops). It saves the two branch outputs per layer but not the streams: a write is invertible
+  (`TransformerBlockFunction` in `xllm/models/fused_blocks/transformer/transformer.py`: the base block, with the
+  residual adds replaced by the stream ops when the sublayers' residual is a hyper-connection). It saves the two branch outputs per layer but not the streams: a write is invertible
   (`X = R^T (X' - b y)`), so the backward recovers each layer's streams from the layer above. Between layers the
   streams travel as hi + lo (two BF16 tensors: hi is what the branches and controllers read, hi + lo holds the
   FP32 write result to ~2^-17), so the inversion reproduces the forward's streams and the gradients match the
@@ -88,7 +88,7 @@ Per sublayer the streams are read three times (write, controller statistics, rea
 - No model parallelism, and so no MoE expert parallelism (it runs over the model-parallel group): the
   controller normalizes over all `N * D` channels of a token. Supporting it would touch `logits` (reduce the
   sum of squares for `rstd` across ranks, row-shard `W [N * D / tp, n_logits]` and all-reduce the logits),
-  `register_muon(..., tp_dim=0)`, `num_params_in_hyper_connection`, and the fused block's `controller_fwd/bwd`;
+  `register_muon(..., tp_dim=0)`, `num_params_in_hyper_connection`, and the fused block's helpers `controller_fwd/bwd` (end of hyper_connection.py);
   read / write / unwrite are per channel and shard along `D` as they are. `layerwise_ckpt` works; context
   parallelism should, as every hyper-connection op is per token, but has not been run.
 - Memory: the streams cost `N` times the plain residual, and `layerwise_ckpt` keeps each layer's input

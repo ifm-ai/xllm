@@ -3,8 +3,6 @@ from .gekko import (
     GekkoOutputLayerFunction
 )
 from .transformer import (
-    HyperConnectionBlockFunction,
-    StreamSlot,
     TransformerBlockFunction,
     TransformerMoEBlockFunction,
     TransformerMoVABlockFunction,

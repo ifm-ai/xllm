@@ -17,7 +17,7 @@ the projection, which also keeps its FP32 rstd [T] and logits [T, n_logits].
 
 The kernel launches are plain functions on contiguous [T, ...] tensors (`logits_fwd` / `logits_bwd`,
 `read_fwd` / `read_bwd`, `write_fwd` / `write_fwd_split` / `write_bwd` / `unwrite`, `ihc_coef_fwd` / `ihc_coef_bwd`,
-`ohc_coef_fwd` / `ohc_coef_bwd`), so a fused transformer block (xllm/models/fused_blocks/transformer/hyper_connection.py)
+`ohc_coef_fwd` / `ohc_coef_bwd`), so the fused transformer block (xllm/models/fused_blocks/transformer/transformer.py)
 can call them from its own forward and backward; the autograd Functions here wrap them for the module path.
 
 The fused block's stream path, where the streams travel as hi + lo pairs and are recovered in the backward by
