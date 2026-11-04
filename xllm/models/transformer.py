@@ -31,7 +31,7 @@ from xllm.modules.utils import (
     get_bos_mask,
     get_segment_idx_from_bos_mask,
 )
-from xllm.config import ModelConf, HYPER_CONNECTION_FUNCS
+from xllm.config import ModelConf
 from xllm.health_metrics import get_active_health_collector
 from xllm.models.xllm import XLLModel
 from xllm.distributed import (
@@ -130,8 +130,8 @@ class TransformerBlock(nn.Module):
         cache: Optional[Tuple[Tensor, Tensor, int]] = None,
     ) -> Tuple[Tensor, Optional[Tensor], Optional[Any]]:
         if self.fused_block and self.training:
-            if self.residual_func in HYPER_CONNECTION_FUNCS:
-                # streams x [B, L, N, D]; the controllers are the sublayers' residual modules
+            if self.stream_slot is not None:
+                # hyper-connections: streams x [B, L, N, D]; the controllers are the sublayers' residual modules
                 hc1, hc2 = self.attention.residual, self.nffn.residual
                 return HyperConnectionBlockFunction.apply(
                     self.layer_id,
@@ -182,7 +182,6 @@ class TransformerBlock(nn.Module):
                     self.recompute_attention,
                     self.recompute_fc1_out,
                     self.recompute_fc3_out,
-                    self.layer_id == 0,  # store_input: the first layer's input is the embedding
                     self.is_last_layer,  # store_output
                     self.stream_slot,
                 )
@@ -698,14 +697,14 @@ class Transformer(XLLModel):
         self.apply_attn_gate = cfg.apply_attn_gate
 
         self.layers = nn.ModuleList()
-        # hyper-connection fused block: passes stream data between adjacent layers (None otherwise)
-        self.stream_slot = StreamSlot() if cfg.fused_block and cfg.residual_func in HYPER_CONNECTION_FUNCS else None
+        # hyper-connection fused block: passes stream data between adjacent layers (None otherwise; the config
+        # asserts the layers are all dense)
+        self.stream_slot = StreamSlot() if cfg.fused_block and self.residual_streams > 1 else None
         for layer_id in range(self.num_layers):
             block_cls = TransformerBlock if layer_id < self.num_dense_layers else \
                 (TransformerMoVABlock if self.num_values > 0 else TransformerMoEBlock)
             layer = block_cls(cfg, layer_id)
-            if isinstance(layer, TransformerBlock):
-                layer.stream_slot = self.stream_slot
+            layer.stream_slot = self.stream_slot
             self.layers.append(wrap(layer))
 
         self.output = wrap(TransformerOutputLayer(cfg))
@@ -756,8 +755,6 @@ class Transformer(XLLModel):
         emb = self.embed(tokens)
         x = memory_efficient_dropout(emb, self.dropout, self.training)
         x = expand_streams(x, self.residual_streams)  # hyper-connections: N copies of the embedding (N = 1: x itself)
-        if self.stream_slot is not None:
-            self.stream_slot.reset()  # the fused block's layer-to-layer hand-off starts empty, whatever the last pass left
         # rope frequencies
         freq_cis = None if self.rope is None else self.rope.get_freqs_cis(cache_len, cache_len + seq_len, x.device)
 

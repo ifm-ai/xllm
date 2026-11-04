@@ -6,7 +6,8 @@ contiguous: a, b [T, N], R [T, N, N] with destination rows.
     hc_logits(Xf, W, eps)     rstd(Xf) * (Xf @ W)        Xf = X.flatten(-2) [T, N * D], FP32 out
     hc_read(X, a)             h  = sum_n a_n X_n          [T, D]
     hc_write(X, R, b, y)      X' = R X + b y              [T, N, D], R None = identity
-    ohc_coefficients(...)     oHC gates and SO(4) transport from the logits
+    ihc_coef_fwd / bwd        iHC gates from the logits                  raw launchers, see below
+    ohc_coef_fwd / bwd        oHC gates and SO(4) transport from the logits
     sinkhorn(z, iterations)   mHC transport from logits [..., 4, 4]
 
 The projection is a Triton rstd kernel and a cuBLAS BF16 matmul with FP32 accumulate and
@@ -15,9 +16,9 @@ coefficients and Sinkhorn are one kernel each way. Every op saves only its input
 the projection, which also keeps its FP32 rstd [T] and logits [T, n_logits].
 
 The kernel launches are plain functions on contiguous [T, ...] tensors (`logits_fwd` / `logits_bwd`,
-`read_fwd` / `read_bwd`, `write_fwd` / `write_bwd`, `ohc_coef_fwd` / `ohc_coef_bwd`), so a fused
-transformer block (xllm/models/fused_blocks/transformer/hyper_connection.py) can call them from its own
-backward; the autograd Functions here wrap them for the module path.
+`read_fwd` / `read_bwd`, `write_fwd` / `write_fwd_split` / `write_bwd` / `unwrite`, `ihc_coef_fwd` / `ihc_coef_bwd`,
+`ohc_coef_fwd` / `ohc_coef_bwd`), so a fused transformer block (xllm/models/fused_blocks/transformer/hyper_connection.py)
+can call them from its own forward and backward; the autograd Functions here wrap them for the module path.
 """
 
 import torch
@@ -274,8 +275,8 @@ def _read_bwd_kernel(x_ptr, a_ptr, dh_ptr, dx_ptr, da_ptr, N, D, CH: tl.constexp
 
 
 def read_fwd(x, a):
-    _check_streams(x)
     """x [T, N, D], a [T, N] FP32, both contiguous -> h [T, D] in x's dtype."""
+    _check_streams(x)
     T, N, D = x.shape
     h = torch.empty(T, D, device=x.device, dtype=x.dtype)
     _read_fwd_kernel[(T,)](x, a, h, N, D, CH=_tile(D), num_warps=4)
@@ -283,8 +284,8 @@ def read_fwd(x, a):
 
 
 def read_bwd(x, a, dh):
-    _check_streams(x)
     """-> dx [T, N, D], da [T, N]."""
+    _check_streams(x)
     T, N, D = x.shape
     dx = torch.empty_like(x)
     da = torch.empty_like(a)
@@ -583,7 +584,8 @@ def _ohc_rotation(lp, bias_ptr, alpha, tm, eps):
     va = 1.0 + z4
     sq = tl.rsqrt(vw * vw + z1 * z1 + z2 * z2 + z3 * z3 + eps)
     sr = tl.rsqrt(va * va + z5 * z5 + z6 * z6 + z7 * z7 + eps)
-    return vw, z1, z2, z3, sq, va, z5, z6, z7, sr
+    # the raw quaternions v, their inverse norms s and the unit quaternions q = v s, r = v s (the backward needs all)
+    return vw, z1, z2, z3, sq, va, z5, z6, z7, sr, vw * sq, z1 * sq, z2 * sq, z3 * sq, va * sr, z5 * sr, z6 * sr, z7 * sr
 
 
 @triton.jit
@@ -642,15 +644,7 @@ def _ohc_coef_fwd_kernel(l_ptr, scale_ptr, bias_ptr, a_ptr, b_ptr, r_ptr, T, alp
     tm = ot < T
     lp = l_ptr + ot * 16
     _gates_fwd(lp, scale_ptr, bias_ptr, a_ptr, b_ptr, ot, tm)
-    vw, vx, vy, vz, sq, va, vb, vc, vd, sr = _ohc_rotation(lp, bias_ptr, alpha, tm, eps)
-    qw = vw * sq
-    qx = vx * sq
-    qy = vy * sq
-    qz = vz * sq
-    ra = va * sr
-    rb = vb * sr
-    rc = vc * sr
-    rd = vd * sr
+    _, _, _, _, _, _, _, _, _, _, qw, qx, qy, qz, ra, rb, rc, rd = _ohc_rotation(lp, bias_ptr, alpha, tm, eps)
     rp = r_ptr + ot * 16
     tl.store(rp + 0, qw * ra + qx * rb + qy * rc + qz * rd, mask=tm)
     tl.store(rp + 1, qw * rb - qx * ra - qy * rd + qz * rc, mask=tm)
@@ -682,15 +676,7 @@ def _ohc_coef_bwd_kernel(l_ptr, scale_ptr, bias_ptr, da_ptr, db_ptr, dr_ptr, dl_
     pbp = pb_ptr + pid * 16
     _gates_bwd(lp, scale_ptr, bias_ptr, da_ptr, db_ptr, dlp, ps_ptr + pid * 2, pbp, ot, tm)
 
-    vw, vx, vy, vz, sq, va, vb, vc, vd, sr = _ohc_rotation(lp, bias_ptr, alpha, tm, eps)
-    qw = vw * sq
-    qx = vx * sq
-    qy = vy * sq
-    qz = vz * sq
-    ra = va * sr
-    rb = vb * sr
-    rc = vc * sr
-    rd = vd * sr
+    vw, vx, vy, vz, sq, va, vb, vc, vd, sr, qw, qx, qy, qz, ra, rb, rc, rd = _ohc_rotation(lp, bias_ptr, alpha, tm, eps)
     drp = dr_ptr + ot * 16
     dr00 = tl.load(drp + 0, mask=tm, other=0.0)
     dr01 = tl.load(drp + 1, mask=tm, other=0.0)

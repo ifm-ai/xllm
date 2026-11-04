@@ -63,14 +63,11 @@ class _FusedCoefficients(torch.autograd.Function):
     def forward(ctx, hc_cls, logits, scale, bias):
         ctx.hc_cls = hc_cls
         ctx.save_for_backward(logits, scale, bias)
-        a, R, b = hc_cls.coef_fwd(logits, scale, bias)
-        ctx.has_r = R is not None
-        return (a, R, b) if ctx.has_r else (a, b)
+        return hc_cls.coef_fwd(logits, scale, bias)  # (a, R, b); R None for the identity, and so is its gradient
 
     @staticmethod
-    def backward(ctx, *grads):
+    def backward(ctx, da, dR, db):
         logits, scale, bias = ctx.saved_tensors
-        da, dR, db = grads if ctx.has_r else (grads[0], None, grads[1])
         dlogits, dscale, dbias = ctx.hc_cls.coef_bwd(logits, scale, bias, da, dR, db)
         return None, dlogits, dscale, dbias
 
@@ -78,8 +75,7 @@ class _FusedCoefficients(torch.autograd.Function):
 def fused_coefficients(hc_cls, logits: Tensor, scale: Tensor, bias: Tensor) -> Tuple[Tensor, Optional[Tensor], Tensor]:
     """(a, R, b) of `hc_cls` from logits [B, L, n_logits] (FP32), through its kernels; R None for the identity."""
     B, L, NL = logits.shape
-    out = _FusedCoefficients.apply(hc_cls, logits.reshape(B * L, NL).contiguous(), scale.contiguous(), bias.contiguous())
-    a, R, b = out if len(out) == 3 else (out[0], None, out[1])
+    a, R, b = _FusedCoefficients.apply(hc_cls, logits.reshape(B * L, NL).contiguous(), scale.contiguous(), bias.contiguous())
     return a.view(B, L, -1), None if R is None else R.view(B, L, R.shape[-2], R.shape[-1]), b.view(B, L, -1)
 
 
@@ -163,18 +159,15 @@ def hc_write(streams: Tensor, R: Optional[Tensor], b: Tensor, y: Tensor) -> Tens
 class HyperConnection(BaseResidual):
     """A sublayer's hyper-connection: `read` forms the branch input from the streams and returns the
     transport and write gates as the state `forward` writes the branch output back with. Subclasses set
-    the logit and scale counts, form the coefficients from the logits in torch (`coefficients_from_logits`, the
-    reference path) and, where kernels exist, through `coef_fwd` / `coef_bwd`, the one place the fused path
-    (module path on CUDA and the fused block alike) gets a variant's coefficient kernels from."""
+    the logit and scale counts and form the coefficients from the logits in torch (`reference_coefficients`);
+    a variant with kernels also overrides `coef_fwd` / `coef_bwd`, the one place the fused path (module path on
+    CUDA and the fused block alike) gets its coefficient kernels from."""
 
     NAME: str  # the residual_func value (xllm.config.HYPER_CONNECTION_FUNCS lists them for the config check)
+    NUM_LOGITS: int  # the controller's outputs per token
     NUM_SCALES = 2  # read (a), write (b)
 
-    @staticmethod
-    def num_logits_for(num_streams: int) -> int:
-        raise NotImplementedError
-
-    def __init__(self, rc_id: int, model_dim: int, eps: float = 1e-6, num_streams: int = NUM_STREAMS):
+    def __init__(self, rc_id: int, model_dim: int, eps: float = 1e-6):
         super().__init__(rc_id, model_dim)
         # the controller normalizes over all N * D channels of a token, which a model-parallel shard does
         # not hold. The group, not the cached world size: a model built before initialize_model_parallel
@@ -182,16 +175,13 @@ class HyperConnection(BaseResidual):
         group = get_model_parallel_group()
         assert group is None or dist.get_world_size(group) == 1, \
             "hyper-connections do not support model / expert parallelism yet"
-        assert 1 < num_streams <= fused.MAX_STREAMS, f"the stream kernels support 2..{fused.MAX_STREAMS} streams"
-        self.num_streams = num_streams
-        self.num_logits = self.num_logits_for(num_streams)
         self.eps = eps
 
-        self.weight = nn.Parameter(torch.empty(num_streams * model_dim, self.num_logits))
-        self.bias = nn.Parameter(torch.zeros(self.num_logits))
+        self.weight = nn.Parameter(torch.empty(NUM_STREAMS * model_dim, self.NUM_LOGITS))
+        self.bias = nn.Parameter(torch.zeros(self.NUM_LOGITS))
         self.scale = nn.Parameter(torch.full((self.NUM_SCALES,), 0.01))
         with torch.no_grad():
-            nn.init.normal_(self.weight, std=1.0 / math.sqrt(num_streams * model_dim))
+            nn.init.normal_(self.weight, std=1.0 / math.sqrt(NUM_STREAMS * model_dim))
         # Under Muon the projection is a Muon matrix (an [in, out] weight: the logits are x @ W), the static bias and
         # the gating scales stay on AdamW, as DeepSeek-V4 trains its mHC modules (arXiv 2606.19348, section 2.4).
         register_muon(self, "weight", layout="i o")
@@ -203,10 +193,11 @@ class HyperConnection(BaseResidual):
         flat = rms_normalize(streams.float().flatten(-2), self.eps)
         return flat @ self.weight.float()
 
-    def gates(self, l_a: Tensor, l_b: Tensor, bias_a: Tensor, bias_b: Tensor) -> Tuple[Tensor, Tensor]:
-        scale = self.scale.float()
-        a = torch.sigmoid(scale[0] * l_a + bias_a)
-        b = 2.0 * torch.sigmoid(scale[1] * l_b + bias_b)
+    def gates(self, logits: Tensor) -> Tuple[Tensor, Tensor]:
+        """The read and write gates (a, b) from the first 2 N logits of a token."""
+        n, scale, bias = NUM_STREAMS, self.scale.float(), self.bias.float()
+        a = torch.sigmoid(scale[0] * logits[..., :n] + bias[:n])
+        b = 2.0 * torch.sigmoid(scale[1] * logits[..., n:2 * n] + bias[n:2 * n])
         return a, b
 
     def coefficients(self, streams: Tensor) -> Tuple[Tensor, Optional[Tensor], Tensor]:
@@ -214,8 +205,19 @@ class HyperConnection(BaseResidual):
         return self.coefficients_from_logits(self.logits(streams))
 
     def coefficients_from_logits(self, logits: Tensor) -> Tuple[Tensor, Optional[Tensor], Tensor]:
-        """(a, R, b) from the FP32 logits [B, L, n_logits]: the torch reference, or the variant's kernels on CUDA."""
+        """(a, R, b) from the FP32 logits [B, L, n_logits]: the variant's kernels on CUDA, else the torch reference."""
+        if logits.is_cuda and self.has_kernels():
+            return fused_coefficients(type(self), logits, self.scale.float(), self.bias.float())
+        return self.reference_coefficients(logits)
+
+    def reference_coefficients(self, logits: Tensor) -> Tuple[Tensor, Optional[Tensor], Tensor]:
+        """(a, R, b) from the FP32 logits [B, L, n_logits] in torch."""
         raise NotImplementedError
+
+    @classmethod
+    def has_kernels(cls) -> bool:
+        """Whether the variant has coefficient kernels, and so a fused block."""
+        return cls.coef_fwd.__func__ is not HyperConnection.coef_fwd.__func__
 
     @classmethod
     def coef_fwd(cls, logits: Tensor, scale: Tensor, bias: Tensor) -> Tuple[Tensor, Optional[Tensor], Tensor]:
@@ -230,8 +232,8 @@ class HyperConnection(BaseResidual):
 
     def read(self, streams: Tensor) -> Tuple[Tensor, WriteState]:
         """-> (branch input h [B, L, D], the write's (R, b) for `forward`)."""
-        assert streams.shape[-2:] == (self.num_streams, self.num_features), \
-            f"expected [B, L, {self.num_streams}, {self.num_features}] streams, got {tuple(streams.shape)}"
+        assert streams.shape[-2:] == (NUM_STREAMS, self.num_features), \
+            f"expected [B, L, {NUM_STREAMS}, {self.num_features}] streams, got {tuple(streams.shape)}"
         a, R, b = self.coefficients(streams)
         return hc_read(streams, a), WriteState(R, b)
 
@@ -240,17 +242,14 @@ class HyperConnection(BaseResidual):
         return hc_write(residual, state.R, state.b, h)
 
     def extra_repr(self) -> str:
-        return 'dim={}, streams={}, logits={}'.format(self.num_features, self.num_streams, self.num_logits)
+        return 'dim={}, streams={}, logits={}'.format(self.num_features, NUM_STREAMS, self.NUM_LOGITS)
 
 
 class IdentityHyperConnection(HyperConnection):
     """Sigmoid read gates, 2 sigmoid write gates, R = I (returned as None)."""
 
     NAME = 'ihc'
-
-    @staticmethod
-    def num_logits_for(num_streams: int) -> int:
-        return 2 * num_streams
+    NUM_LOGITS = 2 * NUM_STREAMS
 
     @classmethod
     def coef_fwd(cls, logits, scale, bias):
@@ -261,12 +260,8 @@ class IdentityHyperConnection(HyperConnection):
     def coef_bwd(cls, logits, scale, bias, da, dR, db):
         return fused.ihc_coef_bwd(logits, scale, bias, da, db)
 
-    def coefficients_from_logits(self, logits: Tensor) -> Tuple[Tensor, None, Tensor]:
-        n = self.num_streams
-        bias = self.bias.float()
-        if logits.is_cuda and n == 4:
-            return fused_coefficients(type(self), logits, self.scale.float(), bias)
-        a, b = self.gates(logits[..., :n], logits[..., n:], bias[:n], bias[n:])
+    def reference_coefficients(self, logits: Tensor) -> Tuple[Tensor, None, Tensor]:
+        a, b = self.gates(logits)
         return a, None, b
 
 
@@ -276,45 +271,34 @@ class ManifoldHyperConnection(HyperConnection):
     pulling it to uniform mixing. Rows of R sum to one, columns up to the Sinkhorn convergence."""
 
     NAME = 'mhc'
+    NUM_LOGITS = 2 * NUM_STREAMS + NUM_STREAMS * NUM_STREAMS
     NUM_SCALES = 3  # read, write, transport
     IDENTITY_LOGIT = 4.0
     SINKHORN_ITERATIONS = 20
 
-    @staticmethod
-    def num_logits_for(num_streams: int) -> int:
-        return 2 * num_streams + num_streams * num_streams
+    def __init__(self, rc_id: int, model_dim: int, eps: float = 1e-6):
+        super().__init__(rc_id, model_dim, eps)
+        self.register_buffer('identity_logits', self.IDENTITY_LOGIT * torch.eye(NUM_STREAMS), persistent=False)
 
-    def __init__(self, rc_id: int, model_dim: int, eps: float = 1e-6, num_streams: int = NUM_STREAMS):
-        super().__init__(rc_id, model_dim, eps, num_streams)
-        self.register_buffer('identity_logits', self.IDENTITY_LOGIT * torch.eye(num_streams), persistent=False)
-
-    def coefficients_from_logits(self, logits: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
-        n = self.num_streams
-        bias = self.bias.float()
-        a, b = self.gates(logits[..., :n], logits[..., n:2 * n], bias[:n], bias[n:2 * n])
-        r_logits = self.scale.float()[2] * logits[..., 2 * n:] + bias[2 * n:]
+    def reference_coefficients(self, logits: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
+        n = NUM_STREAMS
+        a, b = self.gates(logits)
+        r_logits = self.scale.float()[2] * logits[..., 2 * n:] + self.bias.float()[2 * n:]
         r_logits = r_logits.view(*r_logits.shape[:-1], n, n) + self.identity_logits.float()
-        if logits.is_cuda and n == 4:  # the Sinkhorn kernel; the gates stay torch (no fused block for mhc)
+        if logits.is_cuda:  # the Sinkhorn kernel; the gates stay torch (no coefficient kernels, no fused block)
             return a, fused.sinkhorn(r_logits, self.SINKHORN_ITERATIONS), b
         return a, sinkhorn_knopp(r_logits, self.SINKHORN_ITERATIONS), b
 
 
 class OrthogonalHyperConnection(HyperConnection):
     """oHC: gates as IHC, transport R = SO(4)(alpha * l_r + bias_r) from eight logits; alpha is the constant
-    ROTATION_SCALE, as the paper freezes it for orthogonal variants. Four streams only."""
+    ROTATION_SCALE, as the paper freezes it for orthogonal variants."""
 
     NAME = 'ohc'
-    ROTATION_LOGITS = 8
+    ROTATION_LOGITS = 8  # two quaternions, SO(4) = four streams
+    NUM_LOGITS = 2 * NUM_STREAMS + ROTATION_LOGITS
     ROTATION_SCALE = 0.01
     ROTATION_EPS = OHC_EPS
-
-    @staticmethod
-    def num_logits_for(num_streams: int) -> int:
-        return 2 * num_streams + OrthogonalHyperConnection.ROTATION_LOGITS
-
-    def __init__(self, rc_id: int, model_dim: int, eps: float = 1e-6, num_streams: int = NUM_STREAMS):
-        assert num_streams == 4, "ohc parameterizes SO(4): four streams"
-        super().__init__(rc_id, model_dim, eps, num_streams)
 
     @classmethod
     def coef_fwd(cls, logits, scale, bias):
@@ -324,13 +308,10 @@ class OrthogonalHyperConnection(HyperConnection):
     def coef_bwd(cls, logits, scale, bias, da, dR, db):
         return fused.ohc_coef_bwd(logits, scale, bias, da, dR, db, cls.ROTATION_SCALE, cls.ROTATION_EPS)
 
-    def coefficients_from_logits(self, logits: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
-        n = self.num_streams
-        bias = self.bias.float()
-        if logits.is_cuda:
-            return fused_coefficients(type(self), logits, self.scale.float(), bias)
-        a, b = self.gates(logits[..., :n], logits[..., n:2 * n], bias[:n], bias[n:2 * n])
-        R = quaternion_transport(self.ROTATION_SCALE * logits[..., 2 * n:] + bias[2 * n:], self.ROTATION_EPS)
+    def reference_coefficients(self, logits: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
+        n = NUM_STREAMS
+        a, b = self.gates(logits)
+        R = quaternion_transport(self.ROTATION_SCALE * logits[..., 2 * n:] + self.bias.float()[2 * n:], self.ROTATION_EPS)
         return a, R, b
 
 
@@ -340,13 +321,12 @@ HYPER_CONNECTIONS = {hc.NAME: hc for hc in (IdentityHyperConnection, ManifoldHyp
 def num_params_in_hyper_connection(residual_func: str, model_dim: int) -> int:
     """Parameters of one sublayer's controller (projection + biases + scales)."""
     hc = HYPER_CONNECTIONS[residual_func]
-    num_logits = hc.num_logits_for(NUM_STREAMS)
-    return NUM_STREAMS * model_dim * num_logits + num_logits + hc.NUM_SCALES
+    return NUM_STREAMS * model_dim * hc.NUM_LOGITS + hc.NUM_LOGITS + hc.NUM_SCALES
 
 
 def flops_in_hyper_connection(residual_func: str, model_dim: int) -> int:
     """Multiply-adds of one sublayer per token: controller projection, read and write."""
-    projection = NUM_STREAMS * model_dim * HYPER_CONNECTIONS[residual_func].num_logits_for(NUM_STREAMS)
+    projection = NUM_STREAMS * model_dim * HYPER_CONNECTIONS[residual_func].NUM_LOGITS
     read = NUM_STREAMS * model_dim
     transport = 0 if residual_func == 'ihc' else NUM_STREAMS * NUM_STREAMS * model_dim
     write = transport + NUM_STREAMS * model_dim

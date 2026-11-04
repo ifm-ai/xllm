@@ -81,9 +81,10 @@ Per sublayer the streams are read three times (write, controller statistics, rea
   path's working set in the backward, not saved streams, sets the peak); `ohc` with `layerwise_ckpt` 121-125 GB 37k.
 - A variant's coefficient kernels live on its class (`coef_fwd` / `coef_bwd`, raw FP32 ops on `[T, n_logits]`
   logits); the module path on CUDA (`fused_coefficients`) and the fused block both call them, so adding a variant
-  with a fused block means one class with a torch reference (`coefficients_from_logits`) and those two methods, and
-  its name in `config.FUSED_BLOCK_RESIDUALS`. The stream kernels tile `fused.MAX_STREAMS = 4` streams per program
-  (fewer are masked); their launchers assert contiguous `[T, N <= 4, D]` and `supported()` raises for more.
+  with a fused block means one class with `NAME`, `NUM_LOGITS`, a torch reference (`reference_coefficients`) and
+  those two methods, and its name in `config.FUSED_BLOCK_RESIDUALS`. `N = 4` is a module constant (`NUM_STREAMS`);
+  the stream kernels tile `fused.MAX_STREAMS = 4` streams per program (fewer are masked), their launchers assert
+  contiguous `[T, N <= 4, D]` and `supported()` raises for more.
 - No model parallelism, and so no MoE expert parallelism (it runs over the model-parallel group): the
   controller normalizes over all `N * D` channels of a token. Supporting it would touch `logits` (reduce the
   sum of squares for `rstd` across ranks, row-shard `W [N * D / tp, n_logits]` and all-reduce the logits),

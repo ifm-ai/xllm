@@ -13,9 +13,9 @@ the module path runs on CUDA, so the two paths compute the same model.
 
 Saved per layer: the branch outputs y1 and y2 (D per token each: the write backward needs them for db and dR,
 where the plain residual needs nothing), the attention activations the base block saves, and the controllers'
-logits, rstd and coefficients (a few dozen FP32 numbers per token). The streams are NOT saved: the transport is
-orthogonal (ohc) or the identity (ihc), so a write is invertible, X = R^T (X' - b y), and the backward recovers
-the streams from the layer above:
+logits and rstd (a few dozen FP32 numbers per token; the coefficients are recomputed from the logits). The
+streams are NOT saved: the transport is orthogonal (ohc) or the identity (ihc), so a write is invertible,
+X = R^T (X' - b y), and the backward recovers the streams from the layer above:
 
     X2  from the top layer's output (kept on its context), or from the layer above's backward through a StreamSlot
     X1 = unwrite(X2, R2, b2, y2);  X0 = unwrite(X1, R1, b1, y1);  X0 goes into the slot for the layer below
@@ -70,8 +70,8 @@ class StreamSlot:
     """Hands one layer's stream data to the adjacent layer outside the autograd graph: in the forward the lo part of a
     layer's output streams to the next layer, in the backward the (hi, lo) streams one layer recovered (its input X0)
     to the layer below, whose output they are. The layers run strictly in order both ways, so one slot per model
-    suffices; it is empty between passes. The model resets it at the start of every forward, so a pass that was cut
-    short (an exception, a backward over part of the graph) cannot leave streams behind for the next step."""
+    suffices; it is empty between passes. The first layer resets it at the start of every forward, so a pass that was
+    cut short (an exception, a backward over part of the graph) cannot leave streams behind for the next step."""
 
     def __init__(self):
         self.streams = None
@@ -89,22 +89,30 @@ class StreamSlot:
         return streams
 
 
+def controller_params(weight: Tensor, bias: Tensor, scale: Tensor, dtype: torch.dtype):
+    """The controller's parameters as its kernels take them: the projection in the streams' dtype, the bias and the
+    gating scales in FP32, all contiguous. Cast once per forward and saved; the backward returns the gradients in the
+    parameters' own dtypes."""
+    return weight.to(dtype).contiguous(), bias.float().contiguous(), scale.float().contiguous()
+
+
 def controller_fwd(hc_cls, X: Tensor, weight: Tensor, bias: Tensor, scale: Tensor, eps: float):
     """One sublayer's controller on contiguous streams X [T, N, D] -> (logits, rstd, a, R, b); R None for the identity.
-    `hc_cls` is the sublayer's HyperConnection class: its `coef_fwd` owns the variant's coefficient kernels."""
+    `hc_cls` is the sublayer's HyperConnection class: its `coef_fwd` owns the variant's coefficient kernels. The
+    parameters as `controller_params` returns them."""
     T, N, D = X.shape
-    logits, rstd = fused.logits_fwd(X.view(T, N * D), weight.to(X.dtype).contiguous(), eps)
-    a, R, b = hc_cls.coef_fwd(logits, scale.float().contiguous(), bias.float().contiguous())
+    logits, rstd = fused.logits_fwd(X.view(T, N * D), weight, eps)
+    a, R, b = hc_cls.coef_fwd(logits, scale, bias)
     return logits, rstd, a, R, b
 
 
 def controller_bwd(hc_cls, X: Tensor, weight: Tensor, bias: Tensor, scale: Tensor, eps: float,
                    logits: Tensor, rstd: Tensor, da: Tensor, dR: Optional[Tensor], db: Tensor):
-    """-> dX [T, N, D] (the controller's share), dweight, dbias, dscale in the parameters' dtypes."""
+    """-> dX [T, N, D] (the controller's share), dweight, dbias, dscale (in the kernels' dtypes)."""
     T, N, D = X.shape
-    dlogits, dscale, dbias = hc_cls.coef_bwd(logits, scale.float().contiguous(), bias.float().contiguous(), da, dR, db)
-    dX, dW = fused.logits_bwd(X.view(T, N * D), weight.to(X.dtype).contiguous(), rstd, logits, dlogits)
-    return dX.view(T, N, D), dW.to(weight.dtype), dbias.to(bias.dtype), dscale.to(scale.dtype)
+    dlogits, dscale, dbias = hc_cls.coef_bwd(logits, scale, bias, da, dR, db)
+    dX, dW = fused.logits_bwd(X.view(T, N * D), weight, rstd, logits, dlogits)
+    return dX.view(T, N, D), dW, dbias, dscale
 
 
 class HyperConnectionBlockFunction(torch.autograd.Function):
@@ -160,16 +168,21 @@ class HyperConnectionBlockFunction(torch.autograd.Function):
         recompute_attention: bool,
         recompute_fc1_out: bool,
         recompute_fc3_out: bool,
-        store_input: bool,
         store_output: bool,
-        slot: Optional[StreamSlot],
+        slot: StreamSlot,
     ):
-        assert (store_output and layer_id == 0) or slot is not None, "the streams' lo parts pass through the StreamSlot"
-        assert not store_input or layer_id == 0, "only the first layer saves its input (the embedding, no lo part)"
+        first = layer_id == 0  # the first layer's input is the embedding: exact, no lo part, saved instead of recovered
         bsz, seq_len, N, D = streams.shape
         T = bsz * seq_len
         X = streams.contiguous().view(T, N, D)
-        X_lo = slot.take() if layer_id > 0 else None  # the lo part of the layer below's output streams
+        if first:
+            slot.reset()  # the layer-to-layer hand-off starts empty, whatever the last pass left
+            X_lo = None
+        else:
+            X_lo = slot.take()  # the lo part of the layer below's output streams
+        hc_dtypes = (hc1_w.dtype, hc1_b.dtype, hc1_s.dtype)  # the gradients go back in the parameters' dtypes
+        hc1_w, hc1_b, hc1_s = controller_params(hc1_w, hc1_b, hc1_s, X.dtype)
+        hc2_w, hc2_b, hc2_s = controller_params(hc2_w, hc2_b, hc2_s, X.dtype)
 
         # sublayer 1: controller, read, attention, write
         l1, rstd1, a1, R1, b1 = controller_fwd(hc_cls, X, hc1_w, hc1_b, hc1_s, hc_eps)
@@ -218,7 +231,7 @@ class HyperConnectionBlockFunction(torch.autograd.Function):
         if not store_output:
             slot.put(X2_lo)  # for the next layer's forward
 
-        X_saved = X[:, 0].contiguous() if store_input else None  # the first layer's streams: N copies of the embedding
+        X_saved = X[:, 0].contiguous() if first else None  # the first layer's streams: N copies of the embedding
         ctx.save_for_backward(
             X_saved,  # the first layer only: (T, D)
             freqs_cis,
@@ -244,16 +257,10 @@ class HyperConnectionBlockFunction(torch.autograd.Function):
             hc2_w,
             hc2_b,
             hc2_s,
-            l1,  # (T, n_logits) FP32
+            l1,  # (T, n_logits) FP32; the coefficients (a, R, b) are recomputed from the logits in the backward
             rstd1,  # (T,) FP32
-            a1,  # (T, N) FP32
-            R1,  # (T, N, N) FP32 or None
-            b1,  # (T, N) FP32
             l2,
             rstd2,
-            a2,
-            R2,
-            b2,
             y1,  # (T, D)
             y2,  # (T, D)
             xq if not recompute_q else None,  # (bsz, slen, n_heads, head_dim)
@@ -273,7 +280,6 @@ class HyperConnectionBlockFunction(torch.autograd.Function):
         # the forward is not followed by a backward.
         ctx.X_out = (X2.detach(), X2_lo) if store_output else None
         del X2_lo
-        ctx.shape = (bsz, seq_len, N, D)
         ctx.local_heads = local_heads
         ctx.local_kv_heads = local_kv_heads
         ctx.head_dim = head_dim
@@ -291,7 +297,7 @@ class HyperConnectionBlockFunction(torch.autograd.Function):
         ctx.causal_attn_backend = causal_attn_backend
         ctx.hc_cls = hc_cls
         ctx.hc_eps = hc_eps
-        ctx.layer_id = layer_id
+        ctx.hc_dtypes = hc_dtypes
         ctx.slot = slot
         ctx.deterministic = deterministic
         ctx.attn_stability_control = attn_stability_control
@@ -316,11 +322,11 @@ class HyperConnectionBlockFunction(torch.autograd.Function):
             attn_norm_w, attn_norm_b, wq, wk, wv, wr, wo, q_norm_w,
             ffn_norm_w, ffn_norm_b, fc1_w, fc2_w, fc3_w,
             hc1_w, hc1_b, hc1_s, hc2_w, hc2_b, hc2_s,
-            l1, rstd1, a1, R1, b1, l2, rstd2, a2, R2, b2, y1, y2,
+            l1, rstd1, l2, rstd2, y1, y2,
             xq, xk, xk_rstd, xv, attn_for_save, attn_lse, flash_rng_state, h1_, h3_,
         ) = ctx.saved_tensors
 
-        bsz, seq_len, N, D = ctx.shape
+        bsz, seq_len, N, D = out_grad.shape
         T = bsz * seq_len
         if X_in is not None:
             X_in = X_in.unsqueeze(1).expand(T, N, D).contiguous()  # the first layer: re-expand the embedding
@@ -341,12 +347,16 @@ class HyperConnectionBlockFunction(torch.autograd.Function):
         attn_gate_func = ctx.attn_gate_func
         hc_cls = ctx.hc_cls
         hc_eps = ctx.hc_eps
+        hc_dtypes = ctx.hc_dtypes
         attn_stability_control = ctx.attn_stability_control
         deterministic = ctx.deterministic
         end_seq = ctx.end_seq
         attn_scale = 1.0 / math.sqrt(head_dim)
 
         G2 = out_grad.contiguous().view(T, N, D)
+        # the coefficients, from the saved logits (one small kernel each, instead of 96 bytes per token saved)
+        a1, R1, b1 = hc_cls.coef_fwd(l1, hc1_s, hc1_b)
+        a2, R2, b2 = hc_cls.coef_fwd(l2, hc2_s, hc2_b)
 
         # --- recover the mid streams X1 = (hi, lo): from X2 (the layer above's backward, or the top layer's output)
         # by inverting the second write, or forward from the first layer's exact input. X0 follows after the FFN
@@ -481,6 +491,7 @@ class HyperConnectionBlockFunction(torch.autograd.Function):
         )
         dX0 = dX0.add_(dX0_w).add_(dX0_c)
         del dX0_w, dX0_c
+        w_dtype, b_dtype, s_dtype = hc_dtypes
 
         return (
             None,  # layer_id
@@ -518,12 +529,12 @@ class HyperConnectionBlockFunction(torch.autograd.Function):
             None,  # gather_before_norm
             None,  # hc_cls
             None,  # hc_eps
-            hc1_w_grad,
-            hc1_b_grad,
-            hc1_s_grad,
-            hc2_w_grad,
-            hc2_b_grad,
-            hc2_s_grad,
+            hc1_w_grad.to(w_dtype),
+            hc1_b_grad.to(b_dtype),
+            hc1_s_grad.to(s_dtype),
+            hc2_w_grad.to(w_dtype),
+            hc2_b_grad.to(b_dtype),
+            hc2_s_grad.to(s_dtype),
             None,  # attn_stability_control
             None,  # deterministic
             None,  # recompute_q
@@ -531,7 +542,6 @@ class HyperConnectionBlockFunction(torch.autograd.Function):
             None,  # recompute_attention
             None,  # recompute_fc1_out
             None,  # recompute_fc3_out
-            None,  # store_input
             None,  # store_output
             None,  # slot
         )
