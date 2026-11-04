@@ -30,8 +30,17 @@ layer's output reaches the next layer's forward through the same StreamSlot; the
 the embedding, `expand_streams`) has no lo and is saved as one copy, D per token, the only streams saved besides
 the top layer's (hi, lo).
 
-Recomputed in the backward: the branch inputs h1 = read(X0, a1), h2 = read(X1, a2) (one read pass each) and
-their norms; q, k / v and fc1 / fc3 follow the base block's recompute switches.
+Recomputed in the backward: the branch inputs h1 = read(X0, a1), h2 = read(X1, a2) and their norms; q, k / v and
+fc1 / fc3 follow the base block's recompute switches.
+
+Passes over the streams. The forward's split write also produces the rstd of its hi (the next controller's
+normalization: no pass over the new streams for it); the rstd of a layer's output goes to the next layer through
+the StreamSlot with the lo part, the first layer computes its input's. The backward of a sublayer is two passes
+(xllm/modules/fused_ops/hyper_connection.py): `unwrite_bwd` inverts the write, reads the recovered streams for the
+branch recompute and forms dy, db, dR from the output gradient G; after the branch backward `read_da` gives the read's
+coefficient gradient, the controller backward runs on da, db, dR, and `read_proj_bwd` writes the whole stream gradient
+dX = R^T G + a dh + dP W^T - c X at once (in place over G when G is this backward's own tensor). The first layer, whose
+input is exact, recomputes X1 forward instead of inverting and uses the single-op kernels for that pass.
 
 Only the identity (ihc) and SO(4) (ohc) transports: a Sinkhorn transport (mhc) is not invertible (a doubly
 stochastic matrix can be singular), it would need stored streams. Model parallelism: the hyper-connection module
@@ -68,10 +77,11 @@ from xllm.models.fused_blocks.mha import (
 
 class StreamSlot:
     """Hands one layer's stream data to the adjacent layer outside the autograd graph: in the forward the lo part of a
-    layer's output streams to the next layer, in the backward the (hi, lo) streams one layer recovered (its input X0)
-    to the layer below, whose output they are. The layers run strictly in order both ways, so one slot per model
-    suffices; it is empty between passes. The first layer resets it at the start of every forward, so a pass that was
-    cut short (an exception, a backward over part of the graph) cannot leave streams behind for the next step."""
+    layer's output streams and their rstd (the next controller's normalization) to the next layer, in the backward the
+    (hi, lo) streams one layer recovered (its input X0) to the layer below, whose output they are. The layers run
+    strictly in order both ways, so one slot per model suffices; it is empty between passes. The first layer resets it
+    at the start of every forward, so a pass that was cut short (an exception, a backward over part of the graph)
+    cannot leave streams behind for the next step."""
 
     def __init__(self):
         self.streams = None
@@ -96,23 +106,27 @@ def controller_params(weight: Tensor, bias: Tensor, scale: Tensor, dtype: torch.
     return weight.to(dtype).contiguous(), bias.float().contiguous(), scale.float().contiguous()
 
 
-def controller_fwd(hc_cls, X: Tensor, weight: Tensor, bias: Tensor, scale: Tensor, eps: float):
+def controller_fwd(hc_cls, X: Tensor, weight: Tensor, bias: Tensor, scale: Tensor, eps: float,
+                   rstd: Optional[Tensor] = None):
     """One sublayer's controller on contiguous streams X [T, N, D] -> (logits, rstd, a, R, b); R None for the identity.
     `hc_cls` is the sublayer's HyperConnection class: its `coef_fwd` owns the variant's coefficient kernels. The
-    parameters as `controller_params` returns them."""
+    parameters as `controller_params` returns them. `rstd` [T] of X from the write that produced it
+    (`write_fwd_split_rstd`) saves the pass that computes it."""
     T, N, D = X.shape
-    logits, rstd = fused.logits_fwd(X.view(T, N * D), weight, eps)
+    logits, rstd = fused.logits_fwd(X.view(T, N * D), weight, eps, rstd)
     a, R, b = hc_cls.coef_fwd(logits, scale, bias)
     return logits, rstd, a, R, b
 
 
 def controller_bwd(hc_cls, X: Tensor, weight: Tensor, bias: Tensor, scale: Tensor, eps: float,
                    logits: Tensor, rstd: Tensor, da: Tensor, dR: Optional[Tensor], db: Tensor):
-    """-> dX [T, N, D] (the controller's share), dweight, dbias, dscale (in the kernels' dtypes)."""
+    """-> (dP, W^T, c), the terms of the controller's share of dX, dP W^T - c X, which `fused.read_proj_bwd` adds to the
+    stream gradient; dweight, dbias, dscale (in the kernels' dtypes)."""
     T, N, D = X.shape
     dlogits, dscale, dbias = hc_cls.coef_bwd(logits, scale, bias, da, dR, db)
-    dX, dW = fused.logits_bwd(X.view(T, N * D), weight, rstd, logits, dlogits)
-    return dX.view(T, N, D), dW, dbias, dscale
+    dP, c = fused.proj_bwd_terms(rstd, logits, dlogits, N * D, X.dtype)
+    dW = torch.mm(X.view(T, N * D).t(), dP, out_dtype=torch.float32)
+    return (dP, weight.t().contiguous(), c), dW, dbias, dscale
 
 
 class HyperConnectionBlockFunction(torch.autograd.Function):
@@ -177,15 +191,15 @@ class HyperConnectionBlockFunction(torch.autograd.Function):
         X = streams.contiguous().view(T, N, D)
         if first:
             slot.reset()  # the layer-to-layer hand-off starts empty, whatever the last pass left
-            X_lo = None
+            X_lo, rstd_in = None, None  # the embedding has no lo part; its rstd is computed
         else:
-            X_lo = slot.take()  # the lo part of the layer below's output streams
+            X_lo, rstd_in = slot.take()  # the lo part of the layer below's output streams and their rstd
         hc_dtypes = (hc1_w.dtype, hc1_b.dtype, hc1_s.dtype)  # the gradients go back in the parameters' dtypes
         hc1_w, hc1_b, hc1_s = controller_params(hc1_w, hc1_b, hc1_s, X.dtype)
         hc2_w, hc2_b, hc2_s = controller_params(hc2_w, hc2_b, hc2_s, X.dtype)
 
         # sublayer 1: controller, read, attention, write
-        l1, rstd1, a1, R1, b1 = controller_fwd(hc_cls, X, hc1_w, hc1_b, hc1_s, hc_eps)
+        l1, rstd1, a1, R1, b1 = controller_fwd(hc_cls, X, hc1_w, hc1_b, hc1_s, hc_eps, rstd_in)
         h1 = fused.read_fwd(X, a1).view(bsz, seq_len, D)
         mx, _, _ = layer_or_rmsnorm_fwd(h1, attn_norm_w, attn_norm_b, norm_local_groups, layernorm_eps, rmsnorm_eps, apply_rmsnorm)
         del h1
@@ -213,11 +227,11 @@ class HyperConnectionBlockFunction(torch.autograd.Function):
             seg1, seg2, max_seqlen_q, max_seqlen_k, total_seqlen_k = None, None, None, None, None
 
         y1 = y1.contiguous().view(T, D)  # the attention branch output after its dropout
-        X1, X1_lo = fused.write_fwd_split(X, X_lo, R1, b1, y1)
+        X1, X1_lo, rstd_x1 = fused.write_fwd_split_rstd(X, X_lo, R1, b1, y1, hc_eps)
         del X_lo
 
         # sublayer 2: controller, read, FFN, write
-        l2, rstd2, a2, R2, b2 = controller_fwd(hc_cls, X1, hc2_w, hc2_b, hc2_s, hc_eps)
+        l2, rstd2, a2, R2, b2 = controller_fwd(hc_cls, X1, hc2_w, hc2_b, hc2_s, hc_eps, rstd_x1)
         h2 = fused.read_fwd(X1, a2).view(bsz, seq_len, D)
         xf, _, _ = layer_or_rmsnorm_fwd(h2, ffn_norm_w, ffn_norm_b, norm_local_groups, layernorm_eps, rmsnorm_eps, apply_rmsnorm)
         del h2
@@ -226,10 +240,10 @@ class HyperConnectionBlockFunction(torch.autograd.Function):
         del xf
         y2, out_rng_state = memory_efficient_dropout_fwd(out, dropout, True)
         y2 = y2.contiguous()
-        X2, X2_lo = fused.write_fwd_split(X1, X1_lo, R2, b2, y2)
+        X2, X2_lo, rstd_x2 = fused.write_fwd_split_rstd(X1, X1_lo, R2, b2, y2, hc_eps)
         del X1, X1_lo
         if not store_output:
-            slot.put(X2_lo)  # for the next layer's forward
+            slot.put((X2_lo, rstd_x2))  # for the next layer's forward: the lo part and the rstd of its input streams
 
         X_saved = X[:, 0].contiguous() if first else None  # the first layer's streams: N copies of the embedding
         ctx.save_for_backward(
@@ -353,14 +367,15 @@ class HyperConnectionBlockFunction(torch.autograd.Function):
         end_seq = ctx.end_seq
         attn_scale = 1.0 / math.sqrt(head_dim)
 
-        G2 = out_grad.contiguous().view(T, N, D)
+        G2 = out_grad.contiguous().view(T, N, D)  # autograd's tensor: read only
         # the coefficients, from the saved logits (one small kernel each, instead of 96 bytes per token saved)
         a1, R1, b1 = hc_cls.coef_fwd(l1, hc1_s, hc1_b)
         a2, R2, b2 = hc_cls.coef_fwd(l2, hc2_s, hc2_b)
 
         # --- recover the mid streams X1 = (hi, lo): from X2 (the layer above's backward, or the top layer's output)
-        # by inverting the second write, or forward from the first layer's exact input. X0 follows after the FFN
-        # backward, so that the FFN's transients do not overlap the stream chain. ---
+        # by inverting the second write, in the pass that also reads h2 = read(X1, a2) and runs the write's backward
+        # (dy2, db2, dR2); or forward from the first layer's exact input, with the single-op kernels. X0 follows after
+        # the FFN backward, so that the FFN's transients do not overlap the stream chain. ---
         X_out, ctx.X_out = ctx.X_out, None
         at_top = X_out is not None
         if at_top:
@@ -370,12 +385,15 @@ class HyperConnectionBlockFunction(torch.autograd.Function):
             X2, X2_lo = ctx.slot.take()  # always take: the slot must be emptied
         if X_in is not None:  # the first layer
             X1, X1_lo = fused.write_fwd_split(X_in, None, R1, b1, y1)
+            h2 = fused.read_fwd(X1, a2)
+            _, dR2, db2, dy2 = fused.write_bwd(X1, R2, b2, y2, G2, need_dx=False)
         else:
-            X1, X1_lo = fused.unwrite(X2, X2_lo, R2, b2, y2, inplace=not at_top)  # the chain's tensors are reused
+            # the chain's tensors are reused
+            X1, X1_lo, h2, dR2, db2, dy2 = fused.unwrite_bwd(X2, X2_lo, R2, b2, y2, a2, G2, inplace=not at_top)
         del X2, X2_lo
 
         # --- sublayer 2 (FFN) ---
-        h2 = fused.read_fwd(X1, a2).view(bsz, seq_len, D)
+        h2 = h2.view(bsz, seq_len, D)
         xf, h2_mean, h2_invvar = layer_or_rmsnorm_fwd(
             h2, ffn_norm_w, ffn_norm_b, norm_local_groups, layernorm_eps, rmsnorm_eps, apply_rmsnorm
         )
@@ -385,46 +403,40 @@ class HyperConnectionBlockFunction(torch.autograd.Function):
         if swiglu and h3_ is None:
             h3_ = F.linear(xf, fc3_w)
 
-        # X2 = write(X1, R2, b2, y2): dX1 (transport share), dR2, db2, dy2
-        dX1_w, dR2, db2, dy2 = fused.write_bwd(X1, R2, b2, y2, G2)
-        if dX1_w is None:
-            dX1_w = G2  # identity transport: dX1 = dX2; G2 must not be modified in place
-        del G2
         dy2 = memory_efficient_dropout_bwd(dy2, dropout, ctx.out_rng_state)
         h2_grad, fc1_w_grad, fc2_w_grad, fc3_w_grad, ffn_norm_w_grad, ffn_norm_b_grad = swiglu_backward(
             dy2, xf, fc1_w, fc2_w, fc3_w, h1_, h3_, hidden_dropout, ctx.hidden_rng_state,
             h2, h2_mean, h2_invvar, ffn_norm_w, ffn_norm_b, norm_local_groups, apply_rmsnorm, gather_before_norm
         )
         del dy2, xf, h1_, h3_, h2, h2_mean, h2_invvar
-        # h2 = read(X1, a2) and the controller on X1
-        dX1, da2 = fused.read_bwd(X1, a2, h2_grad.reshape(T, D))
-        del h2_grad
-        dX1_c, hc2_w_grad, hc2_b_grad, hc2_s_grad = controller_bwd(
+        # the controller on X1 (its dlogits need da2 from h2 = read(X1, a2)), then the whole dX1 in one pass
+        h2_grad = h2_grad.reshape(T, D)
+        da2 = fused.read_da(X1, h2_grad)
+        proj2, hc2_w_grad, hc2_b_grad, hc2_s_grad = controller_bwd(
             hc_cls, X1, hc2_w, hc2_b, hc2_s, hc_eps, l2, rstd2, da2, dR2, db2
         )
         del da2, db2, dR2
-        dX1 = dX1.add_(dX1_w).add_(dX1_c)  # dX1_w may alias out_grad: accumulate into the fresh read gradient
-        del dX1_w, dX1_c
+        dX1 = fused.read_proj_bwd(X1, R2, a2, G2, h2_grad, *proj2)
+        del G2, h2_grad, proj2
 
-        # --- recover the input streams X0 = (hi, lo) and hand them to the layer below ---
+        # --- recover the input streams X0 = (hi, lo), in the pass that reads h1 = read(X0, a1) and runs the first
+        # write's backward (dy1, db1, dR1), and hand them to the layer below ---
         if X_in is not None:
             X = X_in
+            h1 = fused.read_fwd(X, a1)
+            _, dR1, db1, dy1 = fused.write_bwd(X, R1, b1, y1, dX1, need_dx=False)
         else:
-            X, X_lo = fused.unwrite(X1, X1_lo, R1, b1, y1, inplace=True)  # X1's tensors are reused
+            # X1's tensors are reused for X
+            X, X_lo, h1, dR1, db1, dy1 = fused.unwrite_bwd(X1, X1_lo, R1, b1, y1, a1, dX1, inplace=True)
             ctx.slot.put((X, X_lo))
             del X_lo
         del X_in, X1, X1_lo
 
         # --- sublayer 1 (attention) ---
-        h1 = fused.read_fwd(X, a1).view(bsz, seq_len, D)
+        h1 = h1.view(bsz, seq_len, D)
         mx, h1_mean, h1_invvar = layer_or_rmsnorm_fwd(
             h1, attn_norm_w, attn_norm_b, norm_local_groups, layernorm_eps, rmsnorm_eps, apply_rmsnorm
         )
-        # X1 = write(X, R1, b1, y1)
-        dX0_w, dR1, db1, dy1 = fused.write_bwd(X, R1, b1, y1, dX1)
-        if dX0_w is None:
-            dX0_w = dX1  # identity transport: dX0 = dX1
-        del dX1
         xh_grad = memory_efficient_dropout_bwd(dy1.view(bsz, seq_len, D), dropout, ctx.xh_rng_state)
         del dy1
 
@@ -483,14 +495,15 @@ class HyperConnectionBlockFunction(torch.autograd.Function):
         )
         del mx, h1, h1_mean, h1_invvar
 
-        # h1 = read(X, a1) and the controller on X
-        dX0, da1 = fused.read_bwd(X, a1, h1_grad.reshape(T, D))
-        del h1_grad
-        dX0_c, hc1_w_grad, hc1_b_grad, hc1_s_grad = controller_bwd(
+        # the controller on X, then the whole dX0 in one pass, in place over dX1 (this backward's own tensor)
+        h1_grad = h1_grad.reshape(T, D)
+        da1 = fused.read_da(X, h1_grad)
+        proj1, hc1_w_grad, hc1_b_grad, hc1_s_grad = controller_bwd(
             hc_cls, X, hc1_w, hc1_b, hc1_s, hc_eps, l1, rstd1, da1, dR1, db1
         )
-        dX0 = dX0.add_(dX0_w).add_(dX0_c)
-        del dX0_w, dX0_c
+        del da1, db1, dR1
+        dX0 = fused.read_proj_bwd(X, R1, a1, dX1, h1_grad, *proj1, out=dX1)
+        del dX1, h1_grad, proj1
         w_dtype, b_dtype, s_dtype = hc_dtypes
 
         return (
