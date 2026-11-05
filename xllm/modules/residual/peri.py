@@ -2,17 +2,16 @@ from torch import Tensor
 from torch import nn
 
 from xllm.modules.rms_norm import GroupRMSNorm
+from .base import BaseResidual
 
 
-class PeriResidual(nn.Module):
+class PeriResidual(BaseResidual):
     """
     Peri-LN Residual: Y = Norm(H) + Residual
     Ref: https://arxiv.org/abs/2502.02732
     """
     def __init__(self, rc_id: int, num_features: int, num_groups: int, eps: float):
-        super().__init__()
-        self.rc_id = rc_id
-        self.num_features = num_features
+        super().__init__(rc_id, num_features)
         self.norm = GroupRMSNorm(
             num_features,
             num_groups=num_groups,

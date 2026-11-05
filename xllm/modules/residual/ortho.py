@@ -8,9 +8,10 @@ from xllm.distributed import (
 from xllm.distributed.utils import divide_and_check_no_remainder
 from xllm.modules.rms_norm import GroupRMSNorm
 from xllm.modules.fused_ops import rejection
+from .base import BaseResidual
 
 
-class OrthoResidual(nn.Module):
+class OrthoResidual(BaseResidual):
     """
     Orthogonal Residual in: https://arxiv.org/abs/2505.11881
     """
@@ -21,8 +22,7 @@ class OrthoResidual(nn.Module):
         num_heads: int,
         eps: float,
     ):
-        super().__init__()
-        self.rc_id = rc_id
+        super().__init__(rc_id, model_dim)
 
         model_parallel_world_size = get_model_parallel_world_size()
         self.model_dim = model_dim

@@ -232,8 +232,9 @@ class MOVAttention(nn.Module):
         cache: Optional[Tuple[Tensor, Tensor]] = None,
         load_balancing_type: Optional[str] = None
     ) -> Tuple[Tensor, Optional[Tensor], Optional[Any]]:
-        bsz, slen, _ = x.shape
         residual = x
+        x, rc = self.residual.read(residual)  # hyper-connections: h = sum_n a_n X_n and the write's (R, b); else x, None
+        bsz, slen, _ = x.shape
         x = self.norm(x)
         sx = scatter_to_model_parallel_region(x) if self.norm.gather_input else x
         # B x L x K
@@ -279,7 +280,7 @@ class MOVAttention(nn.Module):
         h = self.wo(attn)
         h = memory_efficient_dropout(h, self.dropout, self.training)
         # residual
-        out = self.residual(h, residual, c=attn)
+        out = self.residual(h, residual, c=attn, state=rc)
 
         return out, aux_loss, new_cache
 

@@ -150,9 +150,10 @@ class NormalizedMoE(nn.Module):
         x: Tensor,
         load_balancing_type: Optional[str] = None
     ) -> Tuple[Tensor, Optional[Tensor]]:
+        residual = x
+        x, rc = self.residual.read(residual)  # hyper-connections: h = sum_n a_n X_n and the write's (R, b); else x, None
         bsz, slen, _ = x.shape
         # B x L x D/TP
-        residual = x
         x = self.norm(x)
         if self.norm.gather_input:
             x = scatter_to_model_parallel_region(x)
@@ -202,7 +203,7 @@ class NormalizedMoE(nn.Module):
         y = y1 + y2 if y1 is not None else y2
         y = memory_efficient_dropout(y, self.dropout, self.training)
         # residual
-        out = self.residual(y, residual, c=y)
+        out = self.residual(y, residual, c=y, state=rc)
         return out, aux_loss
 
     def extra_repr(self) -> str:

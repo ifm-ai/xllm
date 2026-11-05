@@ -113,6 +113,10 @@ class OptimConf(Config):
             assert self.wsd_decay_duration_steps is not None, 'decay duration steps is required for WSD.'
 
 
+HYPER_CONNECTION_FUNCS = ('ihc', 'mhc', 'ohc')  # residual_func values of xllm.modules.residual.HYPER_CONNECTIONS
+FUSED_BLOCK_RESIDUALS = ('base', 'add', 'ihc', 'ohc')  # residuals the fused blocks implement (mhc's transport is not invertible)
+
+
 @dataclass
 class ModelConf(Config):
     arch: str = "transformer"  # Architecture: transformer or gekko
@@ -173,8 +177,15 @@ class ModelConf(Config):
     layernorm_eps: float = 1e-5
     rmsnorm_eps: float = 1e-6
     apply_rmsnorm: bool = False  # True = RMSNorm, False = LayerNorm
-    residual_func: str = "base"  # Residual connection type: base/add means standard addition, ortho for orthogonal residuals.
+    # Residual connection type: base/add means standard addition, ortho for orthogonal residuals, ihc/mhc/ohc for
+    # hyper-connections (4 residual streams with identity / Sinkhorn / SO(4) transport, xllm/modules/residual/README.md).
+    residual_func: str = "base"
     residual_heads: Optional[int] = None  # Num of feature groups for orthogonal residuals. Required when using residual_func='ortho'.
+    # Hyper-connection fused block: how the backward gets the streams back. 0: inverts the writes, keeps no streams.
+    # k > 0: keeps the input streams of every k-th layer and recomputes the streams of the layers in between from them
+    # (mHC's recomputation blocks, arXiv 2512.24880 sec. 4.3.2): N * D * 2 bytes per token per kept layer, plus one
+    # layer's streams per layer of a block transiently in the backward, for cheaper writes and no hi / lo carry.
+    residual_ckpt_interval: int = 0
     # Rope base
     rope_base: float = 100000  # RoPE frequency base
     rope_head_dim: Optional[int] = None  # RoPE dimensions per Q/K head. None means full head_dim, 0 disables RoPE.
@@ -219,7 +230,17 @@ class ModelConf(Config):
 
         assert self.attn_act_func in ['softmax', 'softdelta']
         assert self.attn_gate_func in ['silu', 'softplus']
-        assert self.residual_func in ['base', 'add', 'ortho']
+        assert self.residual_func in ('base', 'add', 'ortho') + HYPER_CONNECTION_FUNCS
+        if self.fused_block:
+            assert self.residual_func in FUSED_BLOCK_RESIDUALS, \
+                f"the fused blocks implement the residuals {FUSED_BLOCK_RESIDUALS}, not {self.residual_func}"
+            if self.residual_func in HYPER_CONNECTION_FUNCS:
+                assert self.arch in ('transformer', 'gekko') and self.num_experts == 0, \
+                    "hyper-connections have a fused block only for dense transformer and Gekko layers"
+        assert self.residual_ckpt_interval >= 0, "residual_ckpt_interval: 0 (invert the writes) or a layer interval"
+        if self.residual_ckpt_interval:
+            assert self.fused_block and self.residual_func in HYPER_CONNECTION_FUNCS, \
+                "residual_ckpt_interval is a setting of the hyper-connection fused block"
 
         if self.num_values > 0:
             assert 0 < self.num_activated_values <= self.num_values

@@ -350,8 +350,9 @@ class GatedDeltaAttention(nn.Module):
                               Tuple[Tensor, Tensor, Tensor],
                               Tuple[Tensor, Tensor, Tensor]]] = None,
     ) -> Tuple[Tensor, Optional[Any]]:
-        bsz, seq_len, _ = x.size()
         residual = x
+        x, rc = self.residual.read(residual)  # hyper-connections: h = sum_n a_n X_n and the write's (R, b); else x, None
+        bsz, seq_len, _ = x.size()
 
         if cache is not None:
             cache_sca, cache_awk, cache_norm, cache_conv = cache
@@ -472,7 +473,7 @@ class GatedDeltaAttention(nn.Module):
         h = self.wo(attn)
         h = memory_efficient_dropout(h, self.dropout, self.training)
         # residual
-        out = self.residual(h, residual, c=attn)
+        out = self.residual(h, residual, c=attn, state=rc)
 
         if cache is not None:
             cache = (cache_sca, cache_awk, cache_norm, cache_conv)
