@@ -183,6 +183,117 @@ __global__ void MultiSegAttentionSoftmaxFwdKernel(
   register_utils::SaveImpl<T_ACC, T, kElementsPerThread>(x_acc, inner_size, y + i * inner_size);
 }
 
+// Same contract as MultiSegAttentionSoftmaxFwdKernel for non-decreasing segment ids (cumulative bos counts, as xllm
+// builds them): the keys of the query's segment are one interval [lower_bound(k_idx, q_idx), upper_bound(k_idx, q_idx)),
+// found by one binary search per row, instead of comparing a 64-bit segment id per element (the per-row k_idx reads
+// were ~1 GB of L2 traffic per call at 8192 keys). With 8 elements per thread each thread owns 8 contiguous elements
+// (16-byte vector loads / stores for 2-byte types); other shapes use the original element mapping.
+template <typename T, typename T_ACC, int64_t kCapacity, int64_t kNumThreads>
+__global__ void MultiSegAttentionSoftmaxFwdKernelV2(
+    int64_t outer_size, int64_t inner_size, int64_t num_heads, bool use_causal_mask,
+    const T* x, T* y, const int64_t* q_idx, const int64_t* k_idx) {
+  constexpr int64_t kElementsPerThread = kCapacity / kNumThreads;
+  constexpr T_ACC kInf = std::numeric_limits<T_ACC>::infinity();
+  constexpr bool kVector = kElementsPerThread % 8 == 0 && sizeof(T) == 2;
+  constexpr int64_t kVecs = kElementsPerThread / 8;  // 16-byte vectors per thread (vector path)
+
+  __shared__ T_ACC shm[cuda_utils::kWarpSize];
+  __shared__ int64_t range_shm[2];
+  T_ACC x_acc[kElementsPerThread];
+
+  const int64_t i = blockIdx.y * outer_size + blockIdx.x;
+  const int64_t b = blockIdx.y / num_heads;
+  const int64_t q = b * outer_size + blockIdx.x;
+  const int64_t r = blockIdx.x;
+  const int64_t n = use_causal_mask ? inner_size - outer_size + r + 1 : inner_size;
+  if (threadIdx.x == 0) {
+    const int64_t* kr = k_idx + b * inner_size;
+    const int64_t seg = q_idx[q];
+    int64_t lo = 0, hi = inner_size;
+    while (lo < hi) {  // first key with k_idx >= seg
+      const int64_t mid = (lo + hi) >> 1;
+      if (kr[mid] < seg) lo = mid + 1; else hi = mid;
+    }
+    int64_t lo2 = lo, hi2 = inner_size;
+    while (lo2 < hi2) {  // first key with k_idx > seg
+      const int64_t mid = (lo2 + hi2) >> 1;
+      if (kr[mid] <= seg) lo2 = mid + 1; else hi2 = mid;
+    }
+    range_shm[0] = lo;
+    range_shm[1] = lo2 < n ? lo2 : n;
+  }
+  __syncthreads();
+  const int64_t kmin = range_shm[0];
+  const int64_t kmax = range_shm[1];
+  if (kmax <= kmin) {
+    BlockFill<T, kElementsPerThread>(inner_size, T(0), y + i * inner_size);
+    return;
+  }
+  const T* xr = x + i * inner_size;
+  // vector path only for 16-byte aligned rows
+  const bool vec = kVector && inner_size % 8 == 0 && reinterpret_cast<std::uintptr_t>(x) % 16 == 0 &&
+                   reinterpret_cast<std::uintptr_t>(y) % 16 == 0;
+  if (vec) {
+#pragma unroll
+    for (int64_t vi = 0; vi < kVecs; ++vi) {
+      const int64_t e0 = (vi * kNumThreads + threadIdx.x) * 8;
+      if (e0 < inner_size) {
+        const uint4 raw = *reinterpret_cast<const uint4*>(xr + e0);
+        const T* v = reinterpret_cast<const T*>(&raw);
+#pragma unroll
+        for (int64_t j = 0; j < 8; ++j) {
+          const int64_t e = e0 + j;
+          x_acc[vi * 8 + j] = (e >= kmin && e < kmax) ? static_cast<T_ACC>(v[j]) : -kInf;
+        }
+      } else {
+#pragma unroll
+        for (int64_t j = 0; j < 8; ++j) x_acc[vi * 8 + j] = -kInf;
+      }
+    }
+  } else {
+#pragma unroll
+    for (int64_t j = 0; j < kElementsPerThread; ++j) {
+      const int64_t e = j * kNumThreads + threadIdx.x;
+      x_acc[j] = (e >= kmin && e < kmax) ? static_cast<T_ACC>(xr[e]) : -kInf;
+    }
+  }
+  T_ACC m = -kInf;
+#pragma unroll
+  for (int64_t j = 0; j < kElementsPerThread; ++j) {
+    m = c10::cuda::compat::max(m, x_acc[j]);
+  }
+  m = reduce::BlockAllReduce(m, shm, reduce::MaxOp<T_ACC>());
+  T_ACC d = T_ACC(0);
+#pragma unroll
+  for (int64_t j = 0; j < kElementsPerThread; ++j) {
+    const T_ACC v = c10::cuda::compat::exp(x_acc[j] - m);
+    x_acc[j] = v;
+    d += v;
+  }
+  d = reduce::BlockAllReduce(d, shm, reduce::SumOp<T_ACC>());
+  const T_ACC c = d == T_ACC(0) ? T_ACC(0) : T_ACC(1) / d;
+  T* yr = y + i * inner_size;
+  if (vec) {
+#pragma unroll
+    for (int64_t vi = 0; vi < kVecs; ++vi) {
+      const int64_t e0 = (vi * kNumThreads + threadIdx.x) * 8;
+      if (e0 < inner_size) {
+        uint4 raw;
+        T* o = reinterpret_cast<T*>(&raw);
+#pragma unroll
+        for (int64_t j = 0; j < 8; ++j) o[j] = static_cast<T>(x_acc[vi * 8 + j] * c);
+        *reinterpret_cast<uint4*>(yr + e0) = raw;
+      }
+    }
+  } else {
+#pragma unroll
+    for (int64_t j = 0; j < kElementsPerThread; ++j) {
+      const int64_t e = j * kNumThreads + threadIdx.x;
+      if (e < inner_size) yr[e] = static_cast<T>(x_acc[j] * c);
+    }
+  }
+}
+
 // DropKey
 // https://openaccess.thecvf.com/content/CVPR2023/html/Li_DropKey_for_Vision_Transformer_CVPR_2023_paper.html
 template <typename T, typename T_ACC, int64_t kCapacity, int64_t kNumThreads>

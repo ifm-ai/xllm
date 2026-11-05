@@ -1,3 +1,4 @@
+import os
 from typing import Any, Tuple, Optional
 
 import torch
@@ -83,6 +84,36 @@ def causal_conv1d(
     )
 
 
+def _cute_conv_supported(x, weight, bias, initial_state, output_final_state, final_state_grad=None) -> bool:
+    """The CuTe DSL causal conv (Blackwell, bf16, width 4, no bias / state; env XLLM_CUTE_CONV=0 disables it)."""
+    try:
+        from xllm.modules.fused_ops.cute.causal_conv import conv_supported
+    except ImportError:
+        return False
+    return conv_supported(x, weight, bias, initial_state, output_final_state, final_state_grad)
+
+
+def _sm90_conv_supported(x, weight, bias, initial_state, output_final_state, final_state_grad=None) -> bool:
+    """The Hopper CuTe DSL causal conv (bf16, width 4, no bias / state, channels a multiple of 256; env XLLM_CONV_SM90=0
+    disables it)."""
+    try:
+        from xllm.modules.fused_ops.cute.causal_conv_sm90 import conv_act_supported
+    except ImportError:
+        return False
+    return conv_act_supported(x, weight, bias, initial_state, output_final_state, final_state_grad)
+
+
+def _cute_conv_bwd_preferred(x, weight, bias, initial_state, final_state_grad=None, out_grad=None) -> bool:
+    """Whether the CuTe DSL causal conv backward should replace the Triton one (Blackwell, small shapes)."""
+    if not x.is_cuda or x.dtype != torch.bfloat16:
+        return False
+    try:
+        from xllm.modules.fused_ops.cute.causal_conv import conv_bwd_preferred
+    except ImportError:
+        return False
+    return conv_bwd_preferred(x, weight, bias, initial_state, final_state_grad, out_grad)
+
+
 def _causal_conv1d_fwd(
     x: Tensor,
     weight: Tensor,
@@ -99,6 +130,12 @@ def _causal_conv1d_fwd(
             x, weight, bias, initial_state, bos_mask, output_final_state, activation
         )
     elif backend == 'triton':
+        if _cute_conv_supported(x, weight, bias, initial_state, output_final_state):
+            from xllm.modules.fused_ops.cute.causal_conv import conv_fwd
+            return conv_fwd(x, weight, bos_mask, activation), None, None
+        if _sm90_conv_supported(x, weight, bias, initial_state, output_final_state):
+            from xllm.modules.fused_ops.cute.causal_conv_sm90 import conv_act_fwd
+            return conv_act_fwd(x, weight, bos_mask, activation), None, None
         return _triton_causal_conv1d_fwd(
             x, weight, bias, initial_state, bos_mask, output_final_state, activation, deterministic
         )
@@ -123,6 +160,14 @@ def _causal_conv1d_bwd(
             out_grad, final_state_grad, x, weight, bias, initial_state, bos_mask, activation
         )
     elif backend == 'triton':
+        if _cute_conv_bwd_preferred(x, weight, bias, initial_state, final_state_grad, out_grad):
+            from xllm.modules.fused_ops.cute.causal_conv import conv_bwd
+            x_grad, w_grad = conv_bwd(out_grad, x, weight, bos_mask, activation)
+            return x_grad, None, w_grad, None
+        if _sm90_conv_supported(x, weight, bias, initial_state, False, final_state_grad):
+            from xllm.modules.fused_ops.cute.causal_conv_sm90 import conv_act_bwd
+            x_grad, w_grad = conv_act_bwd(out_grad, x, weight, bos_mask, activation)
+            return x_grad, None, w_grad, None
         return _triton_causal_conv1d_bwd(
             out_grad, final_state_grad, x, weight, bias, initial_state, bos_mask, activation, deterministic
         )

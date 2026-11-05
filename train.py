@@ -28,6 +28,7 @@ from xllm.checkpointing import (
 )
 from xllm.data.build import build_data_loader
 from xllm.data.dataloader import MultiSourceDataLoader
+from xllm.data.balance import balance_rows_across_ranks
 from xllm.data.dataset_streamer.tokenizer import build_tokenizer
 from xllm.distributed import (
     init_signal_handler,
@@ -411,6 +412,10 @@ def main(cfg: TrainerConf):
             logger.info("Checking batch randomness at step: {}, ...".format(state.step))
             check_batch_for_sync({"x": x, "y": y, "mask": mask})
             logger.info(f"Pass batch randomness checking.")
+
+        if cfg.balance_dp_rows and cfg.multi_segments and cfg.data_parallel_size > 1:
+            x, y, mask = balance_rows_across_ranks(x, y, mask, model.eos_id, cfg.model.chunk_size,
+                                                   group=get_data_parallel_group())
 
         # fwd-bwd
         s_fwd_bwd = timer()

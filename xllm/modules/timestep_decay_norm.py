@@ -37,7 +37,14 @@ class TimestepDecayNormFunc(torch.autograd.Function):
         memory_efficient: bool = False,
         backend: str = 'cub',
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        if backend == 'cub':
+        if backend == 'cute':
+            from xllm.modules.fused_ops.cute.timestep_decay_norm import timestep_decay_norm_fwd
+            y, count, mean, var, cummean, cumrstd, step_count = timestep_decay_norm_fwd(
+                x, bos_mask, prev_count, prev_mean, prev_var, gamma, beta, padding_mask, num_groups, beta1, beta2, eps,
+            )
+            # the backward pass needs the per-step counts instead of prev_count
+            ctx.save_for_backward(x, bos_mask, step_count, cummean, cumrstd, gamma, beta, padding_mask)
+        elif backend == 'cub':
             y, count, mean, var, cummean, cumrstd = group_timestep_decay_norm_cub_fwd(
                 x, bos_mask, prev_count, prev_mean, prev_var, gamma, beta, padding_mask, num_groups, beta1, beta2, eps,
             )
@@ -71,7 +78,14 @@ class TimestepDecayNormFunc(torch.autograd.Function):
         eps = ctx.eps
         memory_efficient = ctx.memory_efficient
         backend = ctx.backend
-        if backend == 'cub':
+        if backend == 'cute':
+            from xllm.modules.fused_ops.cute.timestep_decay_norm import timestep_decay_norm_bwd
+            step_count = prev_count
+            x_grad, prev_mean_grad, prev_var_grad, gamma_grad, beta_grad = timestep_decay_norm_bwd(
+                y_grad, mean_grad, var_grad, x_or_y, bos_mask, cummean, cumrstd, step_count, gamma,
+                padding_mask, num_groups, beta1, beta2
+            )
+        elif backend == 'cub':
             x_grad, prev_mean_grad, prev_var_grad, gamma_grad, beta_grad = group_timestep_decay_norm_cub_bwd(
                 y_grad, mean_grad, var_grad, x_or_y, prev_count, bos_mask, cummean, cumrstd, gamma,
                 padding_mask, num_groups, beta1, beta2
@@ -106,8 +120,9 @@ class TimestepDecayNorm(nn.Module):
         self.num_groups = num_groups
 
         assert num_groups < num_features and num_features % num_groups == 0
-        if backend == 'cub':
-            assert not memory_efficient, 'timestep decay norm cub backend does not support memory efficient backward'
+        assert backend in ('cub', 'chunkwise', 'cute'), backend
+        if backend in ('cub', 'cute'):
+            assert not memory_efficient, f'timestep decay norm {backend} backend does not support memory efficient backward'
 
         # Divide the weight matrix along the last dimension.
         world_size = get_model_parallel_world_size()

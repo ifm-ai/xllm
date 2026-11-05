@@ -6,7 +6,7 @@ import math
 
 import torch
 from torch import nn
-from torch.nn.utils import get_total_norm, clip_grads_with_norm_
+from torch.nn.utils import get_total_norm
 import torch.distributed as dist
 from torch.distributed.tensor import DTensor
 
@@ -18,7 +18,29 @@ from xllm.distributed import (
     get_model_parallel_group,
     get_model_parallel_world_size,
 )
+from xllm.distributed.fsdp_patches import _flat_grad_buffers
 
+
+def _dtensor_local_grads(grads):
+    """Local shards of FSDP2 DTensor grads when all grads share one mesh and placements, else None."""
+    if not grads or not all(isinstance(g, DTensor) for g in grads):
+        return None
+    mesh, placements = grads[0].device_mesh, grads[0].placements
+    if any(p.is_partial() for p in placements):
+        return None
+    if any(g.device_mesh is not mesh or g.placements != placements for g in grads[1:]):
+        return None
+    return [g._local_tensor for g in grads]
+
+
+def _sharded_l2_norm(grads, local_grads, flats=None):
+    # norms accumulated and returned in fp32 (a bf16 per-tensor norm would round each partial norm to 8 bits)
+    sq = torch.stack(torch._foreach_norm(flats if flats is not None else local_grads, 2, dtype=torch.float32)).square().sum()
+    mesh = grads[0].device_mesh
+    for dim, placement in enumerate(grads[0].placements):
+        if placement.is_shard():
+            dist.all_reduce(sq, group=mesh.get_group(mesh_dim=dim))
+    return sq.sqrt()
 
 class XLLModel(nn.Module):
     def __init__(self, cfg: ModelConf, tokenizer: Tokenizer):
@@ -119,9 +141,18 @@ class XLLModel(nn.Module):
         if len(grads) == 0:
             return 0.
 
-        total_norm = get_total_norm(grads, norm_type, False, None)
-        if isinstance(total_norm, DTensor):
-            total_norm = total_norm.full_tensor()
+        local_grads = _dtensor_local_grads(grads)
+        if local_grads is not None and norm_type == 2.0:
+            # FSDP2 sharded grads: norm the local shards as plain tensors and all-reduce the squared sum over the
+            # sharded mesh dims. Going through DTensor dispatch for every foreach op costs ~10 ms of CPU per step.
+            # (the grads of a parameter group are views of one flat reduce-scatter buffer: norm and scale those)
+            flats = _flat_grad_buffers(local_grads)
+            total_norm = _sharded_l2_norm(grads, local_grads, flats)
+            grads = flats if flats is not None else local_grads
+        else:
+            total_norm = get_total_norm(grads, norm_type, False, None)
+            if isinstance(total_norm, DTensor):
+                total_norm = total_norm.full_tensor()
 
         model_parallel_world_size = get_model_parallel_world_size()
         # Reconstruct the total gradient norm depending on the norm type
@@ -134,7 +165,8 @@ class XLLModel(nn.Module):
                 dist.all_reduce(total_norm, group=model_parallel_process_group)
                 total_norm = total_norm ** (1.0 / norm_type)
 
-        clip_grads_with_norm_(parameters, max_norm, total_norm, None)
+        clip_coef = (max_norm / (total_norm + 1e-6)).clamp(max=1.0)
+        torch._foreach_mul_(grads, clip_coef)
         total_norm_cpu = total_norm.item()
         return total_norm_cpu
 

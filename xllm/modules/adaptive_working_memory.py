@@ -24,6 +24,7 @@ class AdaptiveWorkingMemory(nn.Module):
         chunk_size: int,
         orthogonal_update: bool,
         rmsnorm_eps: float,
+        backend: str = 'torch',
     ):
         super().__init__()
         self.layer_id = layer_id
@@ -34,6 +35,7 @@ class AdaptiveWorkingMemory(nn.Module):
         self.chunk_size = chunk_size
         self.ortho = orthogonal_update
         self.eps = rmsnorm_eps
+        self.backend = backend
 
     def forward(
         self,
@@ -64,7 +66,7 @@ class AdaptiveWorkingMemory(nn.Module):
         if seq_len >= self.chunk_size:
             out, mask, memory, log_norm_term = adaptive_working_memory(
                 xq, xqk, xkk, xv, self.chunk_size, memory, log_norm_term, prev_qk, prev_kk, prev_v,
-                segment_idx, prev_segment_count, self.ortho, self.eps, self.layer_id,
+                segment_idx, prev_segment_count, self.ortho, self.eps, self.layer_id, self.backend
             )
             prev_qk = xqk[:, :, seq_len - self.chunk_size:]
             prev_kk = xkk[:, :, seq_len - self.chunk_size:]

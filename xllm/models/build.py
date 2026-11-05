@@ -117,6 +117,9 @@ def build_model_fsdp2(
 ) -> nn.Module:
     from torch.distributed.fsdp import MixedPrecisionPolicy
     from xllm.distributed.wrap import enable_wrap, wrap
+    from xllm.distributed.fsdp_patches import install_fsdp2_patches, apply_fsdp2_module_options
+
+    install_fsdp2_patches()
 
     if forward_prefetch:
         logger.warning("forward prefetch is not supported yet for FSDP2.")
@@ -146,6 +149,7 @@ def build_model_fsdp2(
             model = model_cls(model_cfg, tokenizer)
             model = wrap(model.cuda())
             model.train()
+        apply_fsdp2_module_options(model)
 
         return model
 

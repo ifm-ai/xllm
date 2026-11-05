@@ -88,12 +88,14 @@ class OptimConf(Config):
     beta1: float = 0.9
     beta2: float = 0.98
     clip: float = 1.0  # Global gradient L2 norm clipping threshold, before applying loss scale.
+    fused: bool = True  # Fused AdamW kernel (one pass over params / grads / moments; works with FSDP2 DTensors)
     scheduler: str = "cosine"  # LR scheduler: linear, cosine, constant, or wsd (warmup-stable-decay)
     lr_init_ratio: float = 1e-4  # The initial LR = lr_init_ratio * lr
     lr_end_ratio: float = 0.01  # The ending LR = lr_end_ratio * lr. Also the end value if using a cosine scheduler
     cycles: float = 1.0  # Cycles of half period of cosine scheduler. 1 means decaying from peak to lr_end_ratio
     wsd_decay_duration_steps: Optional[int] = None  # Number of steps in the WSD decay phase. Decay starts at total_steps - wsd_decay_duration_steps.
     wsd_decay_style: str = 'cosine'  # The curve type of decay phase in WSD scheduler: cosine or linear
+    fused: bool = True  # AdamW fused CUDA kernel (one pass per tensor) instead of the multi-tensor foreach path
 
     def __post_init__(self):
         assert self.scheduler in ['linear', 'cosine', 'constant', 'wsd']
@@ -106,6 +108,7 @@ class OptimConf(Config):
 class ModelConf(Config):
     arch: str = "transformer"  # Architecture: transformer or gekko
     ddp_backend: str = 'fsdp2'  # Distributed parameter sharding implementation: fsdp1 or fsdp2
+    fsdp_layers_per_group: int = 1  # FSDP2 + gekko only: consecutive layers sharing one FSDP parameter group (one all-gather / reduce-scatter and one set of hooks per group; layer 0 always stays alone). >1 cuts the per-step CPU overhead of the FSDP hooks (launch-bound models: gekko-4B 8 GPUs -4% at 4) at the cost of keeping that many layers unsharded at once.
     num_layers: int = 8
     model_dim: int = 1024  # Dimensions of token hidden state and residual stream
     # Attention
@@ -119,11 +122,12 @@ class ModelConf(Config):
     apply_attn_gate: bool = False  # Whether to apply gating to attention output in Transformer
     attn_gate_func: str = 'softplus'  # silu or softplus
     causal_attn_backend: Optional[str] = None  # Attention operator backend: None = regular implementation, or choose between swift/flash/xattn
-    sca_backend: str = 'swift'  # Sliding Chunk Attention (SCA) operator backend (swift/flash/xattn).
+    sca_backend: str = 'swift'  # Sliding Chunk Attention (SCA) operator backend (swift/flash/xattn/cute). cute: CuTe DSL kernels (Blackwell), no attention matrix materialized.
     apply_bias_term: bool = False  # Whether the Gekko attention output gating projection W_r includes a bias term.
     ffn_hidden_dim: int = 2048  # Hidden dimension in dense FFN. MoE expert dimensions is set by expert_inter_dim.
     # Adaptive Working Memory (AWM)
     awm_orthogonal_update: bool = False  # Whether to apply orthogonal update when updating the memory in AWM
+    awm_backend: str = 'torch'  # AWM forward operator: torch (reference) or cute (CuTe DSL kernels, falls back to torch when unsupported)
     # MoE & MoVA
     num_values: int = 0  # Num of value projections available for routing to in MoVA. 0 means MoVA off. Requires using MoE as well when using MoVA.
     num_activated_values: int = 0  # Num of activated value projections per token (top-k) in MoVA
@@ -154,7 +158,7 @@ class ModelConf(Config):
     timenorm_num_groups: int = 32  # Num of groups of features used in timestep decay normalization in Gekko.
     timenorm_beta1: float = 0.999  # Used in timestep decay normalization.
     timenorm_beta2: float = 0.9999  # Used in timestep decay normalization.
-    timenorm_backend: str = 'cub'  # cub or chunkwise
+    timenorm_backend: str = 'cub'  # cub, chunkwise or cute (CuTe DSL kernels)
     layernorm_num_groups: int = 1  # Num of groups of features in LayerNorm/RMSNorm.
     memory_efficient_norm: bool = False  # Whether to use norm output for backward to save activation memory. Unsupported by 'cub' timestep norm backend.
     norm_affine: bool = True  # Enable learnable scaling in attention/FFN input norms (plus bias for LayerNorm).
@@ -184,6 +188,11 @@ class ModelConf(Config):
     recompute_awk: bool = False  # Whether to recompute AWM outputs in fused block in Gekko.
     recompute_fc1_out: bool = False  # Whether to recompute fc1 outputs in dense FFNs or shared experts in fused block.
     recompute_fc3_out: bool = False  # Whether to recompute fc3 outputs in dense SwiGLU FFNs or shared experts in fused block.
+    recompute_conv_qk: bool = True  # Fused Gekko block: recompute the timestep norm output, the q/k/v conv outputs, the q/k prep (norm / rope / softmax) outputs, the gate projection and the FFN norm output in the backward (default). False keeps them from the forward (~9 [B, L, D]-sized activations per layer; with model parallelism mx / xf are the all-gathered full-width tensors): ~5% faster steps on 0.9B / 4B when memory allows.
+    cuda_graph_block: bool = False  # Fused Gekko block: capture each layer's forward and backward in CUDA graphs after cuda_graph_warmup eager steps and replay them (launch-bound presets; needs dropout 0, no context parallelism, and with FSDP2 reshard_after_forward=False so the unsharded parameters keep their storage within a step).
+    cuda_graph_warmup: int = 2  # Eager steps before the capture (the kernels compile during them).
+    fp8_gemm: bool = False  # Fused Gekko block: the projection and FFN GEMMs in MXFP8 (e4m3 elements, e8m0 scales per 32 elements along K, fp32 accumulation; Blackwell cuBLASLt). Activations, gradients and weights are quantised on the fly (one kernel per tensor, no amax history); the attention / AWM / norm / conv kernels stay bf16. Needs dropout 0, no model / context parallelism, SwiGLU, dimensions multiples of 128 (falls back to bf16 otherwise).
+    fp8_attn_dp: bool = False  # Fused Gekko block, cute sliding chunk attention with v_head_dim > 256 (gekko-7.1B): the backward's dP = dO V^T GEMMs in MXFP8 (dO and V quantised per call, fp32 accumulation and output) instead of bf16 cuBLAS. Puts the attention gradient path through e4m3 operands (dS = P (dP - delta) sees ~4% relative noise on dP): opt-in, ~1-3% faster 7.1B steps. Independent of fp8_gemm; no effect on presets with v_head_dim <= 256.
     recompute_router: bool = False  # Whether to recompute router scores for MoE/MoVA in fused block.
 
     recompute_logits: bool = False  # Whether to recompute logits in output layer. Independent of fused_block. True = recompute logits and compute grad_X/grad_W during backward, False = precompute grad_X/grad_W during forward.
@@ -193,11 +202,12 @@ class ModelConf(Config):
         assert self.ddp_backend in ['fsdp1', 'fsdp2']
 
         assert self.causal_attn_backend in [None, "swift", "flash", 'xattn']
-        assert self.sca_backend in ["swift", "flash", 'xattn']
+        assert self.sca_backend in ["swift", "flash", 'xattn', 'cute']
         assert self.mova_backend in ['sequential', 'nested', 'torch', 'te']
         assert self.moe_expert_backend in ['sequential', 'nested', 'torch', 'te']
         assert self.moe_permutation_backend in ['torch', 'triton']
-        assert self.timenorm_backend in ['cub', 'chunkwise']
+        assert self.timenorm_backend in ['cub', 'chunkwise', 'cute']
+        assert self.awm_backend in ['torch', 'cute']
         assert self.causal_conv_backend in ['fla', 'triton']
 
         if self.fused_block:
@@ -346,6 +356,7 @@ class TrainerConf(Config):
     seq_len: int = 8192  # Num of tokens in each sequence. Must be divisible by context_parallel_size * model.chunk_size.
     multi_segments: bool = True  # Whether to segment docs using BOS token. This will prevent attention across document boundaries.
     deterministic: bool = False  # Whether to request deterministic computations when supported.
+    balance_dp_rows: bool = False  # Whether to redistribute the rows of a step across DP ranks to even out the attention work of EOS-packed rows (all-gathers the token rows; gradients unchanged). Needs batch_size > 1.
     attn_stability_control: int = 0 # The high precision level for attention (only supported in xattn backend).
 
     steps: int = 100000  # Total number of training steps.

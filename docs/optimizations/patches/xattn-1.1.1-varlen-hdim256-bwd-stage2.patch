@@ -1,0 +1,14 @@
+diff --git a/csrc/attention/hopper/bwd_template.cuh b/csrc/attention/hopper/bwd_template.cuh
+index 131e546..37f7b37 100644
+--- a/csrc/attention/hopper/bwd_template.cuh
++++ b/csrc/attention/hopper/bwd_template.cuh
+@@ -499,7 +499,8 @@ void RunAttentionBwdSm90Kernel(
+   static constexpr size_t DenseStage2Limit =
+       kHeadDim == 128 && kHeadDimV == 256 && !kGQA ? 225 * 1024 : 224 * 1024;
+   static constexpr bool UseDenseStage2 =
+-      !kDeterministic && !kVarlen && !kHasSegment &&
++      !kDeterministic && !kHasSegment &&
++      (!kVarlen || (kHeadDim == 256 && kHeadDimV == 256)) &&
+       Stage2TensorStorageEstimate <= DenseStage2Limit;
+   static constexpr bool UseDenseDetStage2 =
+       kDeterministic && Visibility::kIsSlidingChunk && !kVarlen &&

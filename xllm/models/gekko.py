@@ -57,6 +57,12 @@ class GekkoBlock(nn.Module):
         self.recompute_awk = cfg.recompute_awk
         self.recompute_fc1_out = cfg.recompute_fc1_out
         self.recompute_fc3_out = cfg.recompute_fc3_out
+        self.recompute_conv_qk = cfg.recompute_conv_qk
+        self.cuda_graph_block = cfg.cuda_graph_block
+        self.cuda_graph_warmup = cfg.cuda_graph_warmup
+        self.fp8_gemm = cfg.fp8_gemm
+        self.fp8_attn_dp = cfg.fp8_attn_dp
+        self._graphed = None
         self.apply_rmsnorm = cfg.apply_rmsnorm
         self.timenorm_eps = cfg.timenorm_eps
         self.layernorm_eps = cfg.layernorm_eps
@@ -74,6 +80,7 @@ class GekkoBlock(nn.Module):
             attn_act_func=cfg.attn_act_func,
             attn_gate_func=cfg.attn_gate_func,
             awm_orthogonal_update=cfg.awm_orthogonal_update,
+            awm_backend=cfg.awm_backend,
             causal_conv_width=cfg.causal_conv_width,
             causal_conv_backend=cfg.causal_conv_backend,
             causal_conv_weight_normalization=cfg.causal_conv_weight_normalization,
@@ -130,8 +137,18 @@ class GekkoBlock(nn.Module):
                               Tensor]] = None,
     ) -> Tuple[Tensor, Optional[Tensor], Optional[Any]]:
         if self.fused_block and self.training:
-            fn = GekkoBlockFunction
-            return fn.apply(
+            if self.cuda_graph_block:
+                if self._graphed is None:
+                    from xllm.models.fused_blocks.gekko.graphed import GraphedGekkoBlock
+                    assert self.gda.dropout == 0 and self.gda.attention_dropout == 0 and self.gda.hidden_dropout == 0, \
+                        "cuda_graph_block needs dropout 0"
+                    self._graphed = GraphedGekkoBlock(self.layer_id, self.cuda_graph_warmup)
+                assert get_active_health_collector() is None, \
+                    "cuda_graph_block cannot record health metrics (a replayed graph skips the hooks)"
+                fn = self._graphed
+            else:
+                fn = GekkoBlockFunction.apply
+            return fn(
                 self.layer_id,
                 x,
                 freqs_cis,
@@ -170,6 +187,7 @@ class GekkoBlock(nn.Module):
                 self.gda.attn_gate_fn,
                 self.gda.sca_backend,
                 self.gda.awm_orthogonal_update,
+                self.gda.awm_backend,
                 None,
                 self.nffn.norm.weight,
                 self.nffn.norm.bias,
@@ -196,6 +214,9 @@ class GekkoBlock(nn.Module):
                 self.recompute_awk,
                 self.recompute_fc1_out,
                 self.recompute_fc3_out,
+                self.recompute_conv_qk,
+                self.fp8_gemm,
+                self.fp8_attn_dp,
             )
 
         y, cache = self.gda(
@@ -348,9 +369,24 @@ class Gekko(XLLModel):
             self.rope = None
 
         self.layers = nn.ModuleList()
+        group = cfg.fsdp_layers_per_group if cfg.ddp_backend == 'fsdp2' else 1
         for layer_id in range(self.num_layers):
             layer = GekkoBlock(cfg, layer_id)
-            self.layers.append(wrap(layer))
+            if cfg.fp8_gemm and cfg.ddp_backend == 'fsdp2':
+                # opt-in XLLM_FP8_AG=1 (Hopper): FSDP2 all-gathers the linear weights as fp8 (fp8_fsdp.py)
+                from xllm.modules.fused_ops import fp8_fsdp
+                if fp8_fsdp.enabled():
+                    import torch.distributed as dist
+                    fp8_fsdp.convert([layer.gda.wq, layer.gda.wk, layer.gda.wv, layer.gda.wr, layer.gda.wo,
+                                      layer.nffn.fc1, layer.nffn.fc2, layer.nffn.fc3 if layer.nffn.swiglu else None],
+                                     dist.get_world_size() if dist.is_initialized() else 1)
+            self.layers.append(wrap(layer) if group == 1 else layer)
+        if group > 1:
+            # one FSDP2 parameter group per `group` consecutive layers; layer 0 stays alone so that the two
+            # exposed collectives (first all-gather of the forward, last reduce-scatter of the backward) stay small
+            bounds = sorted({0, 1, *range(1 + group, self.num_layers, group), self.num_layers})
+            for a, b in zip(bounds[:-1], bounds[1:]):
+                wrap(list(self.layers[a:b]))
 
         self.output = wrap(GekkoOutputLayer(cfg))
 
