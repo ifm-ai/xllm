@@ -608,8 +608,8 @@ def softdelta_attn_fwd(
 def softdelta_attn_bwd(
     y_grad: Tensor,
     y: Tensor,
-    kq: Tensor,
     xq: Tensor,
+    kq: Tensor,
     xk: Tensor,
     xv: Tensor,
     g: Tensor,
