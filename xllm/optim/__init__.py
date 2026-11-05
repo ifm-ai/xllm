@@ -2,7 +2,8 @@
 from importlib import import_module
 
 
-__all__ = ["rescale_grads", "build_optimizer", "build_lr_scheduler", "restore_optimizer_config"]
+__all__ = ["rescale_grads", "build_optimizer", "build_lr_scheduler", "restore_optimizer_config",
+           "param_group_names", "check_param_groups"]
 
 
 def __getattr__(name):

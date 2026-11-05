@@ -77,3 +77,70 @@
 --optim.optimizer muon --optim.muon_lr 0.01 --optim.lr 2e-3 \
 --dcp_for_optimizer true
 ```
+
+## Parameter roles (`--roles.*`)
+
+A module declares the role of each parameter where it creates it, `register_role(module, name, role)`
+(`xllm/optim/roles.py`; the tag lives on the module, so it survives FSDP2). The Transformer's roles:
+`embed`, `hidden_matrix` (the Muon matrices in the blocks but `residual_out`), `residual_out`
+(attention `wo`, FFN `fc2`: the residual branches' outputs), `hidden_vector` (norm gains and biases
+in the blocks), `final_norm`, `readout`. A parameter no module tags is in `other` (gekko's, MoE's).
+
+Each role (`RolesConf` in `xllm/config.py`) has, unset by default (unset changes nothing):
+- `lr`, `eps`, `weight_decay`: factors on the configured values. AdamW steps one param group per
+  role; Muon scales each matrix's lr and weight decay (`lr_scales`, `wd_scales`), its decay
+  `lr * weight_decay` taking both factors, as AdamW's. `eps` is AdamW's only.
+- `init_std`: a truncated normal init (at 3 std; 0: zeros) as the model is built (`init_roles`).
+- `clip_scale`: a factor on the role's gradients in the clipping norm; every gradient is still
+  clipped by the same factor.
+
+Roles need `--optim.optimizer muon`, and `init_std` needs `--model_parallel_size 1` (a
+tensor-parallel shard would draw the same values on every rank); values are checked with the config.
+- **Param groups.** Only a role `lr`, `eps` or `weight_decay` other than 1 makes per-role groups;
+  `init_std` and `clip_scale` alone keep Muon's two. Checkpoints record their groups, and a resume
+  (or `--reload_base_optim_state`) into other groups fails before loading: resume with the roles a
+  checkpoint was saved with, or load its weights only.
+- **Logs.** `lr` is Muon's; then `adamw_lr`, or with role groups one `<role>_lr` per role (a Muon
+  role's: `lr` x its factor). `gnorm` / `g_norm` are the gradient norm; with clip scales,
+  `gnorm_clip` / `g_norm_clip` are the norm clipping compares.
+
+E.g. `--roles.readout.lr 0.5 --roles.readout.weight_decay 0`.
+
+## Complete(d)P with Muon (`--mup.*`, experimental)
+
+Width / depth transfer of the hyperparameters of a base model (arXiv:2512.22382; `MuPConf` in
+`xllm/config.py`), as a preset of the roles. Scale `num_heads`, `num_kv_heads` and `ffn_hidden_dim`
+with `model_dim` and keep `head_dim` fixed (`--mup.base_head_dim` checks it).
+m_N = model_dim / base_model_dim, m_L = num_layers / base_num_layers, c = m_L^-alpha,
+sigma_h = base_init_hidden_std m_N^-1/2:
+
+| role            | lr              | eps                | weight_decay | init_std                    | clip_scale |
+|-----------------|-----------------|--------------------|--------------|-----------------------------|------------|
+| `embed`         | 1               | m_N^-1             | 1            | base_init_embed_std         | 1          |
+| `hidden_matrix` | m_L^(alpha-1)   | 1                  | 1            | sigma_h                     | 1          |
+| `residual_out`  | m_L^(alpha-1) c | 1                  | 1/c          | sigma_h c                   | c          |
+| `hidden_vector` | m_L^(alpha-1)   | m_N^-1 m_L^-alpha  | 1            | -                           | 1          |
+| `final_norm`    | 1               | 1                  | 1            | -                           | 1          |
+| `readout`       | m_N^-1          | 1                  | m_N          | base_init_unembed_std / m_N | 1          |
+
+Every parameter needs one of these roles (none in `other`), and a `--roles` value set by hand must
+equal the table's. Where this departs from the paper, whose rules are for AdamW:
+- **Hidden matrices** get no width factor: the paper's lr x m_N^-1 and weight decay x m_N (their
+  product unchanged) are left to Muon's spectral-norm update scale, which already transfers across
+  widths. This is our choice for Muon, not the paper's.
+- **The depth scale c** is folded into `residual_out` instead of a residual multiplier: its init
+  and lr x c, weight decay x 1/c (lr * weight decay unchanged) and gradients x c in the clipping
+  norm (`clip_scale`; the paper does not discuss clipping). Training equals the multiplier version
+  exactly, and the forward is a plain Transformer, so checkpoints serve as they are.
+- **Batch size and training duration** (the paper's m_B, m_D) are not covered: the hyperparameters
+  transfer across width and depth only.
+
+Supported: dense Transformers (no MoE, value heads or `scale_emb`; a plain residual add),
+`init_mode gaussian` with the roles' init stds (no `model.init_std`, `init_embed_std`,
+`init_logits_std`), `muon_adjust_lr spectral_norm`, `muon_block_scale block`, `model_parallel_size 1`.
+
+```bash
+--optim.optimizer muon --dcp_for_optimizer true --model.init_mode gaussian \
+--mup.base_model_dim 1024 --mup.base_num_layers 8 --mup.alpha 1.0 \
+--mup.base_init_hidden_std 0.02 --mup.base_init_embed_std 0.02 --mup.base_init_unembed_std 0.02
+```
