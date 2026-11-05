@@ -174,7 +174,6 @@ class TransformerBlock(nn.Module):
                 self.attention.norm.gather_input,
                 self.residual_func,
                 self.residual_heads,
-                type(hc1) if hc1 is not None else None,
                 hc1.eps if hc1 is not None else None,
                 self.stream_slot,
                 self.is_last_layer,

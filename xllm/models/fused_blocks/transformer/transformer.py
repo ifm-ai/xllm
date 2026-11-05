@@ -3,7 +3,7 @@
 `TransformerBlockFunction` runs one layer (norm, attention, residual, norm, FFN, residual) as one autograd Function,
 saving the two sublayer inputs and a few attention tensors and recomputing the rest in the backward.
 
-With hyper-connections (`hc_cls` set; `residual_func` ihc / ohc) the layer's state is N = 4 streams X [B, L, N, D] and
+With hyper-connections (`residual_func` ihc / ohc) the layer's state is N = 4 streams X [B, L, N, D] and
 the residual adds become the stream ops of xllm/modules/fused_ops/hyper_connection.py, with the sublayers' residual
 modules as the controllers (xllm/modules/residual/hyper_connection.py is the module path):
 
@@ -36,10 +36,10 @@ from xllm.modules.fused_ops import (
 )
 from xllm.modules.fused_ops import hyper_connection as fused
 from xllm.modules.residual.hyper_connection import (
+    HYPER_CONNECTIONS,
     StreamSlot,
     controller_params,
-    controller_fwd,
-    controller_bwd,
+    expand_streams,
 )
 from xllm.models.fused_blocks.utils import (
     layer_or_rmsnorm_fwd,
@@ -109,8 +109,7 @@ class TransformerBlockFunction(torch.autograd.Function):
         gather_before_norm: bool,
         residual_func: str,
         residual_heads: Optional[int],
-        hc_cls: Optional[type],  # the HyperConnection class; None: plain residual
-        hc_eps: Optional[float],
+        hc_eps: Optional[float],  # hyper-connections: the controllers' normalization eps
         slot: Optional[StreamSlot],
         last_layer: bool,
         attn_stability_control: int,
@@ -122,6 +121,7 @@ class TransformerBlockFunction(torch.autograd.Function):
         recompute_fc3_out: bool,
     ) -> Tuple[torch.Tensor, None, None]:
 
+        hc_cls = HYPER_CONNECTIONS.get(residual_func)  # the HyperConnection class; None: plain residual
         hc = hc_cls is not None
         if hc:
             # hyper-connections: x is the streams; the attention branch reads them
@@ -134,10 +134,9 @@ class TransformerBlockFunction(torch.autograd.Function):
                 X_lo, rstd_in = None, None
             else:
                 X_lo, rstd_in = slot.take()  # from the layer below's write
-            hc_dtypes = (hc1_w.dtype, hc1_b.dtype, hc1_s.dtype)
             hc1_w, hc1_b, hc1_s = controller_params(hc1_w, hc1_b, hc1_s, X.dtype)
             hc2_w, hc2_b, hc2_s = controller_params(hc2_w, hc2_b, hc2_s, X.dtype)
-            l1, rstd1, a1, R1, b1 = controller_fwd(hc_cls, X, hc1_w, hc1_b, hc1_s, hc_eps, rstd_in)
+            l1, rstd1, a1, R1, b1 = hc_cls.controller_fwd(X, hc1_w, hc1_b, hc1_s, hc_eps, rstd_in)
             x = fused.read_fwd(X, a1).view(bsz, seq_len, D)
         else:
             bsz, seq_len, _ = x.size()
@@ -187,9 +186,9 @@ class TransformerBlockFunction(torch.autograd.Function):
         if hc:
             # write the attention output into the streams; the FFN branch reads the result
             y1 = xh.contiguous().view(T, D)
-            X1, X1_lo, rstd_x1 = fused.write_fwd_split_rstd(X, X_lo, R1, b1, y1, hc_eps)
+            X1, X1_lo, rstd_x1 = fused.write_fwd(X, R1, b1, y1, lo=X_lo, split=True, rstd_eps=hc_eps)
             del X_lo
-            l2, rstd2, a2, R2, b2 = controller_fwd(hc_cls, X1, hc2_w, hc2_b, hc2_s, hc_eps, rstd_x1)
+            l2, rstd2, a2, R2, b2 = hc_cls.controller_fwd(X1, hc2_w, hc2_b, hc2_s, hc_eps, rstd_x1)
             xo = fused.read_fwd(X1, a2).view(bsz, seq_len, D)
         else:
             xo = torch.add(xh, residual, out=xh)
@@ -218,8 +217,8 @@ class TransformerBlockFunction(torch.autograd.Function):
         # residual
         if hc:
             y2 = out.contiguous().view(T, D)
-            X2, X2_lo, rstd_x2 = fused.write_fwd_split_rstd(X1, X1_lo, R2, b2, y2, hc_eps)
-            del X1, X1_lo
+            # the second write overwrites X1 (read above, not saved): no third pair of streams live in the forward
+            X2, X2_lo, rstd_x2 = fused.write_fwd(X1, R2, b2, y2, lo=X1_lo, split=True, rstd_eps=hc_eps, inplace=True)
             if not last_layer:
                 slot.put((X2_lo, rstd_x2))  # to the next layer's forward
             out = X2.view(bsz, seq_len, N, D)
@@ -286,8 +285,6 @@ class TransformerBlockFunction(torch.autograd.Function):
         ctx.residual_func = residual_func
         ctx.residual_heads = residual_heads
         ctx.hc_cls = hc_cls
-        ctx.hc_eps = hc_eps
-        ctx.hc_dtypes = hc_dtypes if hc else None
         ctx.slot = slot
         ctx.deterministic = deterministic
         ctx.attn_stability_control = attn_stability_control
@@ -375,11 +372,11 @@ class TransformerBlockFunction(torch.autograd.Function):
             # hyper-connections: recover X1 from X2 by inverting the second write, read xo = read(X1, a2) and take the
             # write's backward (dy2, db2, dR2) in the same pass; the first layer recomputes X1 from its exact input
             (X_in, hc1_w, hc1_b, hc1_s, hc2_w, hc2_b, hc2_s, l1, rstd1, l2, rstd2, y1, y2) = rc
-            hc_cls, hc_eps = ctx.hc_cls, ctx.hc_eps
+            hc_cls = ctx.hc_cls
             bsz, seq_len, N, D = out_grad.shape
             T = bsz * seq_len
             if X_in is not None:
-                X_in = X_in.unsqueeze(1).expand(T, N, D).contiguous()  # the first layer: re-expand the embedding
+                X_in = expand_streams(X_in.view(bsz, seq_len, D), N).view(T, N, D)  # the first layer: the embedding again
             G2 = out_grad.contiguous().view(T, N, D)  # autograd's tensor: read only
             a1, R1, b1 = hc_cls.coef_fwd(l1, hc1_s, hc1_b)
             a2, R2, b2 = hc_cls.coef_fwd(l2, hc2_s, hc2_b)
@@ -391,7 +388,7 @@ class TransformerBlockFunction(torch.autograd.Function):
             else:
                 X2, X2_lo = ctx.slot.take()
             if X_in is not None:
-                X1, X1_lo = fused.write_fwd_split(X_in, None, R1, b1, y1)
+                X1, X1_lo, _ = fused.write_fwd(X_in, R1, b1, y1, split=True)
                 xo = fused.read_fwd(X1, a2)
                 _, dR2, db2, dy2 = fused.write_bwd(X1, R2, b2, y2, G2, need_dx=False)
             else:
@@ -471,8 +468,8 @@ class TransformerBlockFunction(torch.autograd.Function):
             # the controller on X1 (its dlogits need da2 from the read), then the whole dX1 in one pass
             xo_grad = xo_grad.reshape(T, D)
             da2 = fused.read_da(X1, xo_grad)
-            proj2, hc2_w_grad, hc2_b_grad, hc2_s_grad = controller_bwd(
-                hc_cls, X1, hc2_w, hc2_b, hc2_s, hc_eps, l2, rstd2, da2, dR2, db2
+            proj2, hc2_w_grad, hc2_b_grad, hc2_s_grad = hc_cls.controller_bwd(
+                X1, hc2_w, hc2_b, hc2_s, l2, rstd2, da2, dR2, db2
             )
             del da2, db2, dR2
             dX1 = fused.read_proj_bwd(X1, R2, a2, G2, xo_grad, *proj2)
@@ -569,15 +566,12 @@ class TransformerBlockFunction(torch.autograd.Function):
             # the controller on X0, then the whole dX0 in one pass, in place over dX1
             x_grad = x_grad.reshape(T, D)
             da1 = fused.read_da(X, x_grad)
-            proj1, hc1_w_grad, hc1_b_grad, hc1_s_grad = controller_bwd(
-                hc_cls, X, hc1_w, hc1_b, hc1_s, hc_eps, l1, rstd1, da1, dR1, db1
+            proj1, hc1_w_grad, hc1_b_grad, hc1_s_grad = hc_cls.controller_bwd(
+                X, hc1_w, hc1_b, hc1_s, l1, rstd1, da1, dR1, db1
             )
             del da1, db1, dR1
             x_grad = fused.read_proj_bwd(X, R1, a1, dX1, x_grad, *proj1, out=dX1).view(bsz, seq_len, N, D)
-            del dX1, proj1
-            w_dtype, b_dtype, s_dtype = ctx.hc_dtypes
-            hc1_w_grad, hc1_b_grad, hc1_s_grad = hc1_w_grad.to(w_dtype), hc1_b_grad.to(b_dtype), hc1_s_grad.to(s_dtype)
-            hc2_w_grad, hc2_b_grad, hc2_s_grad = hc2_w_grad.to(w_dtype), hc2_b_grad.to(b_dtype), hc2_s_grad.to(s_dtype)
+            del dX1, proj1  # the controller gradients are FP32; autograd casts them to the parameters' dtypes
         else:
             x_grad = torch.add(x_grad, residual_grad, out=x_grad)
             hc1_w_grad = hc1_b_grad = hc1_s_grad = hc2_w_grad = hc2_b_grad = hc2_s_grad = None
@@ -625,7 +619,6 @@ class TransformerBlockFunction(torch.autograd.Function):
             None,  # gather_before_norm
             None,  # residual_func
             None,  # residual_heads
-            None,  # hc_cls
             None,  # hc_eps
             None,  # slot
             None,  # last_layer

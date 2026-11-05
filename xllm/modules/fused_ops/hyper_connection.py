@@ -23,15 +23,14 @@ The raw launchers are plain functions on contiguous [T, ...] tensors, so the fus
     ihc_coef_fwd / ihc_coef_bwd                 the iHC gates from the logits
     ohc_coef_fwd / ohc_coef_bwd                 the oHC gates and SO(4) transport from the logits
     read_fwd / read_bwd / read_da               the read, and its coefficient gradient alone
-    write_fwd / write_fwd_split / write_bwd     the write; `split` stores X' as hi + lo (see below)
-    unwrite                                     X = R^T (X' - b y), the inverse of a write
+    write_fwd / write_bwd                       the write; `split` stores X' as hi + lo (see below)
 
 The fused block's stream path keeps the streams between layers as hi + lo pairs (hi = round(X'), the streams
 every other kernel reads; lo = round(X' - hi), so hi + lo holds the FP32 write to ~2^-17) and recovers them in
 the backward by inverting the writes. Its own passes, one kernel over the N * D channels of every token:
 
-    write_fwd_split_rstd      the split write and the rstd of its hi, the next controller's normalization
-    unwrite_bwd               unwrite + the recomputed read + the write backward (dy, db, dR) in one pass
+    write_fwd(split, rstd)    the split write and the rstd of its hi, the next controller's normalization
+    unwrite_bwd               the inverse write + the recomputed read + the write backward (dy, db, dR) in one pass
     read_proj_bwd             dX = R^T G + a dh + dP W^T - c X: the whole stream gradient of a sublayer in one pass
 """
 
@@ -136,7 +135,8 @@ def proj_bwd_terms(rstd, logits, grad, K, dtype):
 
 
 def logits_bwd(xf, w, rstd, logits, grad, need_dx=True, need_dw=True):
-    """-> dx [T, K] in xf's dtype, dw [K, NL] FP32 (None when not needed)."""
+    """-> dx [T, K] in xf's dtype, dw [K, NL] FP32 (None when not needed), and the terms (dP, c) of `proj_bwd_terms`
+    (the fused block adds its dP W^T - c X share of dX in `read_proj_bwd` instead of taking dx)."""
     T, K = xf.shape
     NL = w.shape[1]
     dp, c = proj_bwd_terms(rstd, logits, grad, K, xf.dtype)
@@ -148,7 +148,7 @@ def logits_bwd(xf, w, rstd, logits, grad, need_dx=True, need_dw=True):
         grid = (triton.cdiv(T, BT), triton.cdiv(K, BK))
         _proj_dx_kernel[grid](xf, dp, w.t().contiguous(), c, dx, T, K, NL, BT=BT, BK=BK,
                               LP=max(16, triton.next_power_of_2(NL)), num_warps=4)
-    return dx, dw
+    return dx, dw, dp, c
 
 
 class _Logits(torch.autograd.Function):
@@ -166,7 +166,7 @@ class _Logits(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad):
         xf, w, rstd, logits = ctx.saved_tensors
-        dx, dw = logits_bwd(xf, w, rstd, logits, grad, ctx.needs_input_grad[0], ctx.needs_input_grad[1])
+        dx, dw, _, _ = logits_bwd(xf, w, rstd, logits, grad, ctx.needs_input_grad[0], ctx.needs_input_grad[1])
         if dx is not None:
             dx = dx.view(ctx.x_shape)
         if dw is not None:
@@ -367,7 +367,8 @@ def _mix(r0, r1, r2, r3, x0, x1, x2, x3):
 @triton.jit
 def _write_fwd_kernel(x_ptr, xlo_ptr, r_ptr, b_ptr, y_ptr, out_ptr, outlo_ptr, rstd_ptr, N, D, eps, CH: tl.constexpr,
                       HAS_R: tl.constexpr, HAS_LO: tl.constexpr, SPLIT: tl.constexpr, RSTD: tl.constexpr):
-    # X' = R X + b y. HAS_LO: X is kept as hi + lo; SPLIT: X' is stored as hi + lo (else rounded once into out_ptr).
+    # X' = R X + b y. HAS_LO: X is kept as hi + lo; SPLIT: X' is stored as hi + lo (else rounded once into out_ptr), in
+    # place when out_ptr is x_ptr (each tile is loaded before it is stored).
     # RSTD (with SPLIT): rstd[t] = rsqrt(mean(hi'^2) + eps) over the token's N * D channels, what `_rstd_kernel` computes
     # for the next controller from the stored hi', here from the rounded values in registers.
     t = tl.program_id(0).to(tl.int64)
@@ -502,36 +503,27 @@ def _write_bwd_kernel(x_ptr, r_ptr, b_ptr, y_ptr, go_ptr, dx_ptr, dr_ptr, db_ptr
         _str(dr_ptr, t, 3, 3, N, p33)
 
 
-def write_fwd(x, R, b, y):
-    """x [T, N, D], R [T, N, N] FP32 or None (identity), b [T, N] FP32, y [T, D] in x's dtype, all contiguous
-    -> X' [T, N, D], rounded once to x's dtype."""
-    return write_fwd_split(x, None, R, b, y, split=False)[0]
-
-
-def _write_fwd(hi, lo, R, b, y, split, rstd_eps):
+def write_fwd(hi, R, b, y, lo=None, split=False, rstd_eps=None, inplace=False):
+    """X' = R X + b y: hi [T, N, D] (X, or its hi part when `lo` is given: X = hi + lo), R [T, N, N] FP32 or None
+    (identity), b [T, N] FP32, y [T, D] in hi's dtype, all contiguous -> (hi', lo', rstd).
+    `split=False`: X' rounded once into hi', lo' None. `split=True`: hi' = round(X'), the streams the next kernels read,
+    and lo' = round(X' - hi'), so that hi' + lo' holds X' to ~2^-17 and the write can be inverted without the
+    single-rounding drift. `rstd_eps` (with split): also rstd [T] FP32 of hi', rsqrt(mean(hi'^2) + eps) over the N * D
+    channels, the normalization of the controller that reads X' next (`logits_fwd(..., rstd=rstd)`), without a pass
+    over hi'; else None. `inplace` (with split and lo) overwrites hi and lo with X'."""
     _check_streams(hi)
     T, N, D = hi.shape
-    out = torch.empty_like(hi)
-    outlo = torch.empty_like(hi) if split else None
+    if inplace:
+        assert split and lo is not None, "write_fwd in place takes X as (hi, lo) and stores X' as (hi', lo')"
+        out, outlo = hi, lo
+    else:
+        out = torch.empty_like(hi)
+        outlo = torch.empty_like(hi) if split else None
     rstd = torch.empty(T, device=hi.device, dtype=torch.float32) if rstd_eps is not None else None
-    has_r = R is not None
     _write_fwd_kernel[(T,)](hi, _ptr(lo, hi), _ptr(R, b), b, y, out, _ptr(outlo, out), _ptr(rstd, out), N, D,
-                            0.0 if rstd_eps is None else rstd_eps, CH=_tile(D), HAS_R=has_r, HAS_LO=lo is not None,
-                            SPLIT=split, RSTD=rstd is not None, num_warps=4)
+                            0.0 if rstd_eps is None else rstd_eps, CH=_tile(D), HAS_R=R is not None,
+                            HAS_LO=lo is not None, SPLIT=split, RSTD=rstd is not None, num_warps=4)
     return out, outlo, rstd
-
-
-def write_fwd_split(hi, lo, R, b, y, split=True):
-    """`write_fwd` on streams kept as hi + lo (lo None: hi alone), -> (hi', lo') of X': hi' = round(X'), the streams the
-    next kernels read, and lo' = round(X' - hi'), so that hi' + lo' holds X' to ~2^-17 and the write can be inverted
-    without the single-rounding drift. `split=False`: X' rounded once, (hi', None)."""
-    return _write_fwd(hi, lo, R, b, y, split, None)[:2]
-
-
-def write_fwd_split_rstd(hi, lo, R, b, y, eps):
-    """`write_fwd_split` that also returns rstd [T] FP32 of hi', rsqrt(mean(hi'^2) + eps) over the N * D channels: the
-    normalization of the controller that reads X' next (`logits_fwd(..., rstd=rstd)`), without a pass over hi'."""
-    return _write_fwd(hi, lo, R, b, y, True, eps)
 
 
 def write_bwd(x, R, b, y, go, need_dx=True):
@@ -557,7 +549,7 @@ class _Write(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, R, b, y):
         ctx.save_for_backward(x, R, b, y)
-        return write_fwd(x, R, b, y)
+        return write_fwd(x, R, b, y)[0]
 
     @staticmethod
     def backward(ctx, go):
@@ -576,61 +568,9 @@ def hc_write(x: torch.Tensor, R, b: torch.Tensor, y: torch.Tensor) -> torch.Tens
     return out.view(B, L, N, D)
 
 
-@triton.jit
-def _unwrite_kernel(xn_ptr, xnlo_ptr, r_ptr, b_ptr, y_ptr, out_ptr, outlo_ptr, N, D, CH: tl.constexpr, HAS_R: tl.constexpr,
-                    HAS_LO: tl.constexpr):
-    # X = R^T (X' - b y) for an orthogonal (or identity) transport: the streams before a write, from the streams after it,
-    # X' read as hi + lo (HAS_LO) and X stored as hi + lo. In place when out_ptr is xn_ptr: one program per token, each
-    # tile loaded before it is stored.
-    t = tl.program_id(0).to(tl.int64)
-    (b0, b1, b2, b3, r00, r01, r02, r03, r10, r11, r12, r13, r20, r21, r22, r23,
-     r30, r31, r32, r33) = _coefs(r_ptr, b_ptr, t, N, HAS_R)
-    ci = tl.arange(0, CH)
-    for d0 in range(0, D, CH):
-        d = d0 + ci
-        m = d < D
-        y = tl.load(y_ptr + t * D + d, mask=m, other=0.0).to(tl.float32)
-        z0 = _ld2(xn_ptr, xnlo_ptr, t, 0, N, D, d, m, HAS_LO) - b0 * y
-        z1 = _ld2(xn_ptr, xnlo_ptr, t, 1, N, D, d, m, HAS_LO) - b1 * y
-        z2 = _ld2(xn_ptr, xnlo_ptr, t, 2, N, D, d, m, HAS_LO) - b2 * y
-        z3 = _ld2(xn_ptr, xnlo_ptr, t, 3, N, D, d, m, HAS_LO) - b3 * y
-        if HAS_R:
-            # X_m = sum_n R[n, m] z_n
-            x0 = _mix(r00, r10, r20, r30, z0, z1, z2, z3)
-            x1 = _mix(r01, r11, r21, r31, z0, z1, z2, z3)
-            x2 = _mix(r02, r12, r22, r32, z0, z1, z2, z3)
-            x3 = _mix(r03, r13, r23, r33, z0, z1, z2, z3)
-        else:
-            x0 = z0
-            x1 = z1
-            x2 = z2
-            x3 = z3
-        _st2(out_ptr, outlo_ptr, t, 0, N, D, d, m, x0)
-        _st2(out_ptr, outlo_ptr, t, 1, N, D, d, m, x1)
-        _st2(out_ptr, outlo_ptr, t, 2, N, D, d, m, x2)
-        _st2(out_ptr, outlo_ptr, t, 3, N, D, d, m, x3)
-
-
-def unwrite(hi_next, lo_next, R, b, y, inplace=False):
-    """Inverse of `write_fwd_split` for an orthogonal or identity transport: X' as (hi, lo) [T, N, D] (lo None: a
-    singly rounded X'), R [T, N, N] FP32 or None, b [T, N] FP32, y [T, D] -> X as (hi, lo): hi for the kernels that
-    consume the streams, hi + lo to chain further inversions. `inplace` overwrites hi_next and lo_next with the result."""
-    _check_streams(hi_next)
-    T, N, D = hi_next.shape
-    has_r = R is not None
-    if inplace:
-        assert lo_next is not None
-        hi, lo = hi_next, lo_next
-    else:
-        hi, lo = torch.empty_like(hi_next), torch.empty_like(hi_next)
-    _unwrite_kernel[(T,)](hi_next, _ptr(lo_next, hi_next), _ptr(R, b), b, y, hi, lo, N, D,
-                          CH=_tile(D, 512), HAS_R=has_r, HAS_LO=lo_next is not None, num_warps=4)
-    return hi, lo
-
-
 # ---------------------------------------------------------------------------------------------
 # the fused block's backward through one sublayer, X' = R X + b y with h = read(X, a) feeding the branch, in two passes
-# over the streams instead of unwrite + read + write_bwd + read_bwd + projection dx + two accumulations:
+# over the streams instead of the inverse write + read + write_bwd + read_bwd + projection dx + two accumulations:
 #   unwrite_bwd    X' (hi + lo), G = dL/dX'  ->  X (hi + lo, in place), h, dy, db, dR      (then the branch backward)
 #   read_da        X, dh = dL/dh             ->  da                                          (then the controller backward)
 #   read_proj_bwd  X, G, dh, dP, W^T, c      ->  dX = R^T G + a dh + dP W^T - c X              (in place over G when allowed)
@@ -641,13 +581,13 @@ def unwrite(hi_next, lo_next, R, b, y, inplace=False):
 
 
 @triton.jit
-def _unwrite_bwd_kernel(xn_ptr, xnlo_ptr, r_ptr, b_ptr, y_ptr, a_ptr, go_ptr, x_ptr, xlo_ptr, h_ptr, part_ptr, dy_ptr,
+def _unwrite_bwd_kernel(xn_ptr, xnlo_ptr, r_ptr, b_ptr, y_ptr, a_ptr, go_ptr, x_ptr, xlo_ptr, h_ptr, db_ptr, dr_ptr, dy_ptr,
                         N, D, NT, CH: tl.constexpr, HAS_R: tl.constexpr):
     # One token x one channel tile, every tile loaded before it is stored (in place when x_ptr is xn_ptr):
-    #   X_m = sum_n R[n, m] (X'_n - b_n y)   from X' = hi + lo, stored as hi + lo       (`_unwrite_kernel`)
+    #   X_m = sum_n R[n, m] (X'_n - b_n y)   from X' = hi + lo, stored as hi + lo       (the inverse write)
     #   h = sum_m a_m hi_m                    the branch input, from the recovered hi    (`_read_fwd_kernel`)
     #   dy = sum_n b_n G_n,  db_n = sum_d G_n y,  dR[n, m] = sum_d G_n hi_m              (`_write_bwd_kernel` without dX)
-    # db and dR are the tile's partial sums, part[t, j] = (db_0..3, dR_00..33), added over the tiles j by the host.
+    # db and dR are the tile's partial sums, db[t, j, 0..3] and dR[t, j, 0..15], added over the tiles j by the host.
     t = tl.program_id(0).to(tl.int64)
     j = tl.program_id(1)
     (b0, b1, b2, b3, r00, r01, r02, r03, r10, r11, r12, r13, r20, r21, r22, r23,
@@ -679,28 +619,29 @@ def _unwrite_bwd_kernel(xn_ptr, xnlo_ptr, r_ptr, b_ptr, y_ptr, a_ptr, go_ptr, x_
     g2 = _ld(go_ptr, t, 2, N, D, d, m)
     g3 = _ld(go_ptr, t, 3, N, D, d, m)
     tl.store(dy_ptr + t * D + d, (b0 * g0 + b1 * g1 + b2 * g2 + b3 * g3).to(dy_ptr.dtype.element_ty), mask=m)
-    pp = part_ptr + (t * NT + j) * 20
+    pp = db_ptr + (t * NT + j) * 4
     tl.store(pp + 0, tl.sum(g0 * y, axis=0))
     tl.store(pp + 1, tl.sum(g1 * y, axis=0))
     tl.store(pp + 2, tl.sum(g2 * y, axis=0))
     tl.store(pp + 3, tl.sum(g3 * y, axis=0))
     if HAS_R:
-        tl.store(pp + 4, tl.sum(g0 * x0, axis=0))
-        tl.store(pp + 5, tl.sum(g0 * x1, axis=0))
-        tl.store(pp + 6, tl.sum(g0 * x2, axis=0))
-        tl.store(pp + 7, tl.sum(g0 * x3, axis=0))
-        tl.store(pp + 8, tl.sum(g1 * x0, axis=0))
-        tl.store(pp + 9, tl.sum(g1 * x1, axis=0))
-        tl.store(pp + 10, tl.sum(g1 * x2, axis=0))
-        tl.store(pp + 11, tl.sum(g1 * x3, axis=0))
-        tl.store(pp + 12, tl.sum(g2 * x0, axis=0))
-        tl.store(pp + 13, tl.sum(g2 * x1, axis=0))
-        tl.store(pp + 14, tl.sum(g2 * x2, axis=0))
-        tl.store(pp + 15, tl.sum(g2 * x3, axis=0))
-        tl.store(pp + 16, tl.sum(g3 * x0, axis=0))
-        tl.store(pp + 17, tl.sum(g3 * x1, axis=0))
-        tl.store(pp + 18, tl.sum(g3 * x2, axis=0))
-        tl.store(pp + 19, tl.sum(g3 * x3, axis=0))
+        pp = dr_ptr + (t * NT + j) * 16
+        tl.store(pp + 0, tl.sum(g0 * x0, axis=0))
+        tl.store(pp + 1, tl.sum(g0 * x1, axis=0))
+        tl.store(pp + 2, tl.sum(g0 * x2, axis=0))
+        tl.store(pp + 3, tl.sum(g0 * x3, axis=0))
+        tl.store(pp + 4, tl.sum(g1 * x0, axis=0))
+        tl.store(pp + 5, tl.sum(g1 * x1, axis=0))
+        tl.store(pp + 6, tl.sum(g1 * x2, axis=0))
+        tl.store(pp + 7, tl.sum(g1 * x3, axis=0))
+        tl.store(pp + 8, tl.sum(g2 * x0, axis=0))
+        tl.store(pp + 9, tl.sum(g2 * x1, axis=0))
+        tl.store(pp + 10, tl.sum(g2 * x2, axis=0))
+        tl.store(pp + 11, tl.sum(g2 * x3, axis=0))
+        tl.store(pp + 12, tl.sum(g3 * x0, axis=0))
+        tl.store(pp + 13, tl.sum(g3 * x1, axis=0))
+        tl.store(pp + 14, tl.sum(g3 * x2, axis=0))
+        tl.store(pp + 15, tl.sum(g3 * x3, axis=0))
 
 
 def unwrite_bwd(hi_next, lo_next, R, b, y, a, go, inplace=False):
@@ -719,12 +660,12 @@ def unwrite_bwd(hi_next, lo_next, R, b, y, a, go, inplace=False):
     dy = torch.empty_like(y)
     CH = _tile(D, 512)
     NT = triton.cdiv(D, CH)
-    part = torch.empty(T, NT, 20, device=hi.device, dtype=torch.float32)
-    _unwrite_bwd_kernel[(T, NT)](hi_next, lo_next, _ptr(R, b), b, y, a, go.contiguous(), hi, lo, h, part, dy,
-                                 N, D, NT, CH=CH, HAS_R=has_r, num_warps=1)
-    sums = part.sum(1)  # over the channel tiles, in a fixed order
-    db = sums[:, :N].contiguous()
-    dR = sums[:, 4:].view(T, 4, 4)[:, :N, :N].contiguous() if has_r else None
+    part_db = torch.empty(T, NT, 4, device=hi.device, dtype=torch.float32)  # the tiles' partial sums
+    part_dR = torch.empty(T, NT, 16, device=hi.device, dtype=torch.float32) if has_r else None
+    _unwrite_bwd_kernel[(T, NT)](hi_next, lo_next, _ptr(R, b), b, y, a, go.contiguous(), hi, lo, h, part_db,
+                                 _ptr(part_dR, part_db), dy, N, D, NT, CH=CH, HAS_R=has_r, num_warps=1)
+    db = part_db.sum(1)[:, :N].contiguous()  # over the channel tiles, in a fixed order
+    dR = part_dR.sum(1).view(T, 4, 4)[:, :N, :N].contiguous() if has_r else None
     return hi, lo, h, dR, db, dy
 
 
@@ -899,11 +840,11 @@ def _ihc_coef_fwd_kernel(l_ptr, scale_ptr, bias_ptr, a_ptr, b_ptr, T, BT: tl.con
 
 
 @triton.jit
-def _ihc_coef_bwd_kernel(l_ptr, scale_ptr, bias_ptr, da_ptr, db_ptr, dl_ptr, ps_ptr, pb_ptr, T, BT: tl.constexpr):
+def _ihc_coef_bwd_kernel(l_ptr, scale_ptr, bias_ptr, da_ptr, db_ptr, dl_ptr, pp_ptr, T, BT: tl.constexpr):
     pid = tl.program_id(0).to(tl.int64)
     ot = pid * BT + tl.arange(0, BT)
-    _gates_bwd(l_ptr + ot * 8, scale_ptr, bias_ptr, da_ptr, db_ptr, dl_ptr + ot * 8, ps_ptr + pid * 2, pb_ptr + pid * 8,
-               ot, ot < T)
+    psp = pp_ptr + pid * 10  # this program's partial sums: dscale [2], dbias [8]
+    _gates_bwd(l_ptr + ot * 8, scale_ptr, bias_ptr, da_ptr, db_ptr, dl_ptr + ot * 8, psp, psp + 2, ot, ot < T)
 
 
 @triton.jit
@@ -933,7 +874,7 @@ def _ohc_coef_fwd_kernel(l_ptr, scale_ptr, bias_ptr, a_ptr, b_ptr, r_ptr, T, alp
 
 
 @triton.jit
-def _ohc_coef_bwd_kernel(l_ptr, scale_ptr, bias_ptr, da_ptr, db_ptr, dr_ptr, dl_ptr, ps_ptr, pb_ptr, T, alpha, eps,
+def _ohc_coef_bwd_kernel(l_ptr, scale_ptr, bias_ptr, da_ptr, db_ptr, dr_ptr, dl_ptr, pp_ptr, T, alpha, eps,
                          BT: tl.constexpr):
     # -> dlogits [T, 16]; per program the partial sums of dscale [2] and dbias [16] (the host adds the programs)
     pid = tl.program_id(0).to(tl.int64)
@@ -941,8 +882,9 @@ def _ohc_coef_bwd_kernel(l_ptr, scale_ptr, bias_ptr, da_ptr, db_ptr, dr_ptr, dl_
     tm = ot < T
     lp = l_ptr + ot * 16
     dlp = dl_ptr + ot * 16
-    pbp = pb_ptr + pid * 16
-    _gates_bwd(lp, scale_ptr, bias_ptr, da_ptr, db_ptr, dlp, ps_ptr + pid * 2, pbp, ot, tm)
+    psp = pp_ptr + pid * 18
+    pbp = psp + 2
+    _gates_bwd(lp, scale_ptr, bias_ptr, da_ptr, db_ptr, dlp, psp, pbp, ot, tm)
 
     vw, vx, vy, vz, sq, va, vb, vc, vd, sr, qw, qx, qy, qz, ra, rb, rc, rd = _ohc_rotation(lp, bias_ptr, alpha, tm, eps)
     drp = dr_ptr + ot * 16
@@ -1038,12 +980,12 @@ COEF_BT = 1024  # tokens per program of the coefficient kernels
 
 def _coef_bwd_buffers(T, NL, device, da, db):
     """The coefficient backward's outputs and zero stand-ins for None gradients: dlogits [T, NL], the per-program
-    partial sums ps [P, 2] (dscale) and pb [P, NL] (dbias), da and db [T, 4]."""
+    partial sums pp [P, 2 + NL] = (dscale, dbias), da and db [T, 4]."""
     P = triton.cdiv(T, COEF_BT)
     da = torch.zeros(T, 4, device=device) if da is None else da.contiguous()
     db = torch.zeros(T, 4, device=device) if db is None else db.contiguous()
-    return (torch.empty(T, NL, device=device, dtype=torch.float32), torch.empty(P, 2, device=device, dtype=torch.float32),
-            torch.empty(P, NL, device=device, dtype=torch.float32), da, db)
+    return (torch.empty(T, NL, device=device, dtype=torch.float32),
+            torch.empty(P, 2 + NL, device=device, dtype=torch.float32), da, db)
 
 
 def ihc_coef_fwd(logits, scale, bias):
@@ -1060,9 +1002,10 @@ def ihc_coef_bwd(logits, scale, bias, da, db):
     """-> dlogits [T, 8], dscale [2], dbias [8] (FP32); a None gradient counts as zero."""
     _check_coef(logits, 8, scale, bias)
     T = logits.shape[0]
-    dl, ps, pb, da, db = _coef_bwd_buffers(T, 8, logits.device, da, db)
-    _ihc_coef_bwd_kernel[(ps.shape[0],)](logits, scale, bias, da, db, dl, ps, pb, T, BT=COEF_BT, num_warps=4)
-    return dl, ps.sum(0), pb.sum(0)
+    dl, pp, da, db = _coef_bwd_buffers(T, 8, logits.device, da, db)
+    _ihc_coef_bwd_kernel[(pp.shape[0],)](logits, scale, bias, da, db, dl, pp, T, BT=COEF_BT, num_warps=4)
+    sums = pp.sum(0)
+    return dl, sums[:2], sums[2:]
 
 
 def ohc_coef_fwd(logits, scale, bias, alpha, eps):
@@ -1083,11 +1026,12 @@ def ohc_coef_bwd(logits, scale, bias, da, dR, db, alpha, eps):
     """-> dlogits [T, 16], dscale [2], dbias [16] (FP32); a None gradient counts as zero."""
     _check_coef(logits, 16, scale, bias)
     T = logits.shape[0]
-    dl, ps, pb, da, db = _coef_bwd_buffers(T, 16, logits.device, da, db)
+    dl, pp, da, db = _coef_bwd_buffers(T, 16, logits.device, da, db)
     dR = torch.zeros(T, 4, 4, device=logits.device) if dR is None else dR.contiguous()
-    _ohc_coef_bwd_kernel[(ps.shape[0],)](logits, scale, bias, da, db, dR, dl, ps, pb, T, alpha, eps,
+    _ohc_coef_bwd_kernel[(pp.shape[0],)](logits, scale, bias, da, db, dR, dl, pp, T, alpha, eps,
                                          BT=COEF_BT, num_warps=4)
-    return dl, ps.sum(0), pb.sum(0)
+    sums = pp.sum(0)
+    return dl, sums[:2], sums[2:]
 
 
 # ---------------------------------------------------------------------------------------------

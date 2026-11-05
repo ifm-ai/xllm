@@ -88,7 +88,7 @@ Per sublayer the streams are read three times (write, controller statistics, rea
 - No model parallelism, and so no MoE expert parallelism (it runs over the model-parallel group): the
   controller normalizes over all `N * D` channels of a token. Supporting it would touch `logits` (reduce the
   sum of squares for `rstd` across ranks, row-shard `W [N * D / tp, n_logits]` and all-reduce the logits),
-  `register_muon(..., tp_dim=0)`, `num_params_in_hyper_connection`, and the fused block's helpers `controller_fwd/bwd` (end of hyper_connection.py);
+  `register_muon(..., tp_dim=0)`, `num_params_in_hyper_connection`, and `HyperConnection.controller_fwd/bwd` (the fused block's controller);
   read / write / unwrite are per channel and shard along `D` as they are. `layerwise_ckpt` works; context
   parallelism should, as every hyper-connection op is per token, but has not been run.
 - Memory: the streams cost `N` times the plain residual, and `layerwise_ckpt` keeps each layer's input

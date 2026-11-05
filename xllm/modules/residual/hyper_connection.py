@@ -33,7 +33,8 @@ sums them before the final norm (`sum_streams`).
 
 The fused training block (`fused_block`, ihc / ohc; `TransformerBlockFunction` in
 xllm/models/fused_blocks/transformer/transformer.py) runs the same stream ops and recovers the streams in its backward
-by inverting the writes; `StreamSlot` and `controller_fwd` / `controller_bwd` below are its helpers.
+by inverting the writes; `HyperConnection.controller_fwd` / `controller_bwd`, `controller_params` and `StreamSlot`
+below are its helpers.
 """
 
 import math
@@ -219,6 +220,27 @@ class HyperConnection(BaseResidual):
         raise NotImplementedError
 
     @classmethod
+    def controller_fwd(cls, X: Tensor, weight: Tensor, bias: Tensor, scale: Tensor, eps: float,
+                       rstd: Optional[Tensor] = None):
+        """The fused block's controller on contiguous streams X [T, N, D] -> (logits, rstd, a, R, b); R None for the
+        identity. The parameters as `controller_params` returns them. `rstd` of X, when the write that produced X returned
+        it, saves the pass that computes it."""
+        T, N, D = X.shape
+        logits, rstd = fused.logits_fwd(X.view(T, N * D), weight, eps, rstd)
+        a, R, b = cls.coef_fwd(logits, scale, bias)
+        return logits, rstd, a, R, b
+
+    @classmethod
+    def controller_bwd(cls, X: Tensor, weight: Tensor, bias: Tensor, scale: Tensor, logits: Tensor, rstd: Tensor,
+                       da: Tensor, dR: Optional[Tensor], db: Tensor):
+        """-> (dP, W^T, c), the controller's share of dX as dP W^T - c X (added by `fused.read_proj_bwd`); dweight, dbias,
+        dscale."""
+        T, N, D = X.shape
+        dlogits, dscale, dbias = cls.coef_bwd(logits, scale, bias, da, dR, db)
+        _, dW, dP, c = fused.logits_bwd(X.view(T, N * D), weight, rstd, logits, dlogits, need_dx=False)
+        return (dP, weight.t().contiguous(), c), dW, dbias, dscale
+
+    @classmethod
     def has_kernels(cls) -> bool:
         """Whether the variant has coefficient kernels, and so a fused block."""
         return cls.coef_fwd.__func__ is not HyperConnection.coef_fwd.__func__
@@ -364,24 +386,3 @@ def controller_params(weight: Tensor, bias: Tensor, scale: Tensor, dtype: torch.
     """The controller's parameters as the kernels take them: the projection in the streams' dtype, bias and scales in
     FP32, contiguous."""
     return weight.to(dtype).contiguous(), bias.float().contiguous(), scale.float().contiguous()
-
-
-def controller_fwd(hc_cls, X: Tensor, weight: Tensor, bias: Tensor, scale: Tensor, eps: float,
-                   rstd: Optional[Tensor] = None):
-    """One sublayer's controller on streams X [T, N, D] -> (logits, rstd, a, R, b); R None for the identity. `rstd` of X,
-    when the write that produced X returned it, saves the pass that computes it."""
-    T, N, D = X.shape
-    logits, rstd = fused.logits_fwd(X.view(T, N * D), weight, eps, rstd)
-    a, R, b = hc_cls.coef_fwd(logits, scale, bias)
-    return logits, rstd, a, R, b
-
-
-def controller_bwd(hc_cls, X: Tensor, weight: Tensor, bias: Tensor, scale: Tensor, eps: float,
-                   logits: Tensor, rstd: Tensor, da: Tensor, dR: Optional[Tensor], db: Tensor):
-    """-> (dP, W^T, c), the controller's share of dX as dP W^T - c X (added by `fused.read_proj_bwd`); dweight, dbias,
-    dscale."""
-    T, N, D = X.shape
-    dlogits, dscale, dbias = hc_cls.coef_bwd(logits, scale, bias, da, dR, db)
-    dP, c = fused.proj_bwd_terms(rstd, logits, dlogits, N * D, X.dtype)
-    dW = torch.mm(X.view(T, N * D).t(), dP, out_dtype=torch.float32)
-    return (dP, weight.t().contiguous(), c), dW, dbias, dscale
