@@ -86,6 +86,30 @@ class _FixedTokenStreamer:
         pass
 
 
+class _AlternatingLengthStreamer:
+    """Even lines tokenize to 2 tokens, odd lines to 5 tokens."""
+
+    def iter_raw(self):
+        line_num = 0
+        while True:
+            yield Instance({}, "mixed.jsonl", line_num, line_num)
+            line_num += 1
+
+    def build_features(self, instance):
+        n = 2 if instance.line_num % 2 == 0 else 5
+        instance.tokens = list(range(10, 10 + n))
+        return instance
+
+    def close(self):
+        pass
+
+
+class _ShortTokenStreamer(_FixedTokenStreamer):
+    def build_features(self, instance):
+        instance.tokens = [10]
+        return instance
+
+
 class _CapturePacker:
     def __init__(self):
         self.prefilled = []
@@ -118,6 +142,46 @@ def test_refill_budget_counts_all_document_tokens():
         )
         assert len(instances) == 2
         assert tokens_pushed == 6
+    finally:
+        assembler.close()
+
+
+def test_refill_budget_excludes_docs_below_min_doc_tokens():
+    assembler = BufferAssembler(
+        dataset_streamers={"mixed": _AlternatingLengthStreamer()},
+        dataset_weights={"mixed": 1.0},
+        packer=SimpleConcatPacker(seq_len=4),
+        seq_len=4,
+        num_buffered_seq=1,
+        min_doc_tokens=3,
+    )
+    try:
+        instances, tokens_pushed = assembler._tokenize_source_to_budget(
+            "mixed", target_tokens=10
+        )
+        assert [inst.line_num for inst in instances] == [1, 3]
+        assert tokens_pushed == 10
+    finally:
+        assembler.close()
+
+
+def test_refill_fails_after_consecutive_short_docs():
+    assembler = BufferAssembler(
+        dataset_streamers={"short": _ShortTokenStreamer()},
+        dataset_weights={"short": 1.0},
+        packer=SimpleConcatPacker(seq_len=4),
+        seq_len=4,
+        num_buffered_seq=1,
+        max_consecutive_skips=3,
+        min_doc_tokens=2,
+    )
+    try:
+        error = _assert_raises(
+            RuntimeError,
+            lambda: assembler._tokenize_source_to_budget("short", target_tokens=4),
+        )
+        assert "3 consecutive records" in str(error)
+        assert "min_doc_tokens=2" in str(error)
     finally:
         assembler.close()
 

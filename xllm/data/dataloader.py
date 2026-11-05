@@ -50,6 +50,9 @@ class MultiSourceDataLoader:
     - num_workers: Number of tokenizer worker threads used during buffer refill.
     - max_consecutive_skips: Fail a source after this many consecutive records
       fail to produce tokenized features.
+    - min_doc_tokens: Skip records with fewer tokens (incl. BOS/EOS) while
+      filling the buffer; skipped records do not count toward source budgets
+      and count as consecutive skips. 0 keeps all.
     """
     def __init__(
         self,
@@ -65,6 +68,7 @@ class MultiSourceDataLoader:
         num_workers: int = 1,
         max_consecutive_skips: int = 10000,
         skip_long_docs: bool = False,
+        min_doc_tokens: int = 0,
     ):
         dataset_weights, dataset_json_keys, dataset_source_formats = self._parse_data_mix_str(data_mix_str)
 
@@ -126,6 +130,7 @@ class MultiSourceDataLoader:
             max_consecutive_skips=max_consecutive_skips,
             world_rank=world_rank,
             world_size=world_size,
+            min_doc_tokens=min_doc_tokens,
         )
         self._steps = 0
 

@@ -72,6 +72,7 @@ DATA_CFGS=(
   --dataloader.num_workers 2
   --dataloader.packing_type bestfit
   --dataloader.skip_long_docs false
+  --dataloader.min_doc_tokens 0
 )
 ```
 
@@ -83,6 +84,7 @@ DATA_CFGS=(
 | `num_workers` | Threads reading and tokenizing different sources; one source is not split across workers. |
 | `packing_type` | `simple` concatenates tokens; `bestfit` uses length-aware packing to reduce padding, keeping documents intact when they fit in one sequence. |
 | `skip_long_docs` | With `bestfit`, `true` skips overlong chat records; text records are still split. |
+| `min_doc_tokens` | Skips records with fewer tokens (including BOS/EOS) while filling the buffer; `0` keeps all. Skipped records do not count toward source token budgets, so mix ratios and refill size apply to kept documents, and they count toward `max_consecutive_skips`. Many tiny documents in one sequence inflate the segment count seen by varlen attention kernels. |
 
 Set either `batch_size` or `global_batch_size`, not both.
 

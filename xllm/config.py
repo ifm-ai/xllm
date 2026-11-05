@@ -45,6 +45,7 @@ class DataLoaderConfig(Config):
     num_workers: int = 1  # Tokenizer worker threads during buffer refill
     packing_type: str = "simple"  # Sequence packing strategy: simple = concatenation, bestfit = find best sequence to pack into to reduce truncations
     skip_long_docs: bool = False  # True skips overlong non-text docs; otherwise they are split into seq_len chunks
+    min_doc_tokens: int = 0  # Skip docs with fewer tokens (incl. BOS/EOS) while filling the buffer; 0 keeps all
     max_consecutive_skips: int = 10000  # Fail a source that repeatedly produces no tokenized sample
 
 

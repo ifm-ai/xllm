@@ -78,7 +78,7 @@ def test_invalid_packing_type_reports_supported_names(tmp_path, packing_type):
 @pytest.mark.parametrize("overrides", [
     {},
     dict(buffer_size=7, num_workers=2, packing_type="bestfit",
-         skip_long_docs=True, max_consecutive_skips=23),
+         skip_long_docs=True, max_consecutive_skips=23, min_doc_tokens=16),
 ])
 def test_build_data_loader_preserves_config_values(monkeypatch, overrides):
     import xllm.data.build as build_module
@@ -97,6 +97,7 @@ def test_build_data_loader_preserves_config_values(monkeypatch, overrides):
         packing_type=data_cfg.packing_type, num_workers=data_cfg.num_workers,
         max_consecutive_skips=data_cfg.max_consecutive_skips,
         skip_long_docs=data_cfg.skip_long_docs,
+        min_doc_tokens=data_cfg.min_doc_tokens,
     )
 
 
