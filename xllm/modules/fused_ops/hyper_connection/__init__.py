@@ -31,6 +31,8 @@ the backward by inverting the writes. Its own passes, one kernel over the N * D 
 
     write_fwd(split, rstd)    the split write and the rstd of its hi, the next controller's normalization
     unwrite_bwd               the inverse write + the recomputed read + the write backward (dy, db, dR) in one pass
+    rewrite_bwd               the write below again + the read + the write backward, from the layer's input
+    read_write_bwd            the read + the write backward, from the streams themselves
     read_proj_bwd             dX = R^T G + a dh + dP W^T - c X: the whole stream gradient of a sublayer in one pass
 
 Modules: `projection` (the controller projection), `streams` (read / write), `fused_block` (the two-pass backward),
@@ -40,7 +42,7 @@ Modules: `projection` (the controller projection), `streams` (read / write), `fu
 from .common import MAX_STREAMS, supported
 from .projection import logits_fwd, proj_bwd_terms, logits_bwd, hc_logits
 from .streams import read_fwd, read_bwd, read_da, hc_read, write_fwd, write_bwd, hc_write
-from .fused_block import unwrite_bwd, read_proj_bwd
+from .fused_block import unwrite_bwd, rewrite_bwd, read_write_bwd, read_proj_bwd
 from .coefficients import ihc_coef_fwd, ihc_coef_bwd, ohc_coef_fwd, ohc_coef_bwd
 from .sinkhorn import sinkhorn
 
@@ -48,7 +50,7 @@ __all__ = [
     "MAX_STREAMS", "supported",
     "logits_fwd", "proj_bwd_terms", "logits_bwd", "hc_logits",
     "read_fwd", "read_bwd", "read_da", "hc_read", "write_fwd", "write_bwd", "hc_write",
-    "unwrite_bwd", "read_proj_bwd",
+    "unwrite_bwd", "rewrite_bwd", "read_write_bwd", "read_proj_bwd",
     "ihc_coef_fwd", "ihc_coef_bwd", "ohc_coef_fwd", "ohc_coef_bwd",
     "sinkhorn",
 ]

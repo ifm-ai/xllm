@@ -2,7 +2,7 @@
 xllm/models/fused_blocks/transformer/transformer.py).
 
 The stream ops on hi + lo streams: a split write and its inverse, exact to the hi + lo precision; the two-pass backward
-ops (`write_fwd(split, rstd_eps)`, `unwrite_bwd`, `read_da`, `read_proj_bwd`) against the single-op kernels they
+ops (`write_fwd(split, rstd_eps)`, `unwrite_bwd`, `rewrite_bwd`, `read_write_bwd`, `read_da`, `read_proj_bwd`) against the single-op kernels they
 replace, the fused dX no further from the FP64 value than the single-op path's. Then whole tiny Transformers with
 ihc / ohc: the fused block (`fused_block=True`) against the module path (`fused_block=False`, same Triton stream ops,
 BF16 streams rounded at every write), loss and every parameter gradient, with and without the recompute switches, at
@@ -148,6 +148,21 @@ def test_two_pass_backward_ops(N, has_r, D=1536, T=4096, NL=16):
     hi_c, lo_c = hi.clone(), lo.clone()
     out = fused.unwrite_bwd(hi_c, lo_c, R, b, y, a, G, inplace=True)
     assert out[0].data_ptr() == hi_c.data_ptr() and torch.equal(out[0], xh2) and torch.equal(out[1], xl2), "in place"
+    # the same pass from the layer's input: the write below again (write_fwd on hi alone) + read + write_bwd
+    y0 = torch.randn(T, D, device='cuda').bfloat16()
+    b0 = 2 * torch.rand(T, N, device='cuda')
+    R0 = quaternion_transport(torch.randn(T, 8, device='cuda') * 0.3)[:, :N, :N].contiguous() if has_r else None
+    x1_ref = fused.write_fwd(X, R0, b0, y0)[0]
+    x1, h3, dR3, db3, dy3 = fused.rewrite_bwd(X, R0, b0, y0, a, R, b, y, G)
+    assert (x1 != x1_ref).float().mean().item() < 1e-4, "the write again (FMA contraction may differ)"
+    h_ref = fused.read_fwd(x1, a)
+    _, dR_ref, db_ref, dy_ref = fused.write_bwd(x1, R, b, y, G, need_dx=False)
+    for got, want in ((h3, h_ref), (dy3, dy_ref), (db3, db_ref)) + (((dR3, dR_ref),) if has_r else ()):
+        assert rel(got, want) < 1e-5
+    # and from the streams themselves: read + write_bwd
+    h4, dR4, db4, dy4 = fused.read_write_bwd(xh, a, R, b, y, G)
+    for got, want in ((h4, h), (dy4, dy), (db4, db)) + (((dR4, dR),) if has_r else ()):
+        assert rel(got, want) < 1e-5
     # da alone
     dx_r, da = fused.read_bwd(xh, a, dh)
     assert rel(fused.read_da(xh, dh), da) < 1e-6
