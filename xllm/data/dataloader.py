@@ -50,8 +50,9 @@ class MultiSourceDataLoader:
     - num_workers: Number of tokenizer worker threads used during buffer refill.
     - max_consecutive_skips: Fail a source after this many consecutive records
       fail to produce tokenized features.
-    - min_doc_tokens: Skip records with fewer tokens (incl. BOS/EOS) before
-      packing; 0 keeps all.
+    - min_doc_tokens: Skip records with fewer tokens (incl. BOS/EOS) while
+      filling the buffer; skipped records do not count toward source budgets
+      and count as consecutive skips. 0 keeps all.
     """
     def __init__(
         self,
@@ -102,10 +103,9 @@ class MultiSourceDataLoader:
                 pad_id=self.pad_id,
                 skip_long_docs=skip_long_docs,
                 source_formats=dataset_source_formats,
-                min_doc_tokens=min_doc_tokens,
             )
         elif _packing_type == "simple":
-            self.packer = SimpleConcatPacker(seq_len=seq_len, pad_id=self.pad_id, min_doc_tokens=min_doc_tokens)
+            self.packer = SimpleConcatPacker(seq_len=seq_len, pad_id=self.pad_id)
         else:
             raise ValueError(f"Unknown packing_type: {packing_type!r}. Supported: 'simple', 'bestfit'")
 
@@ -130,6 +130,7 @@ class MultiSourceDataLoader:
             max_consecutive_skips=max_consecutive_skips,
             world_rank=world_rank,
             world_size=world_size,
+            min_doc_tokens=min_doc_tokens,
         )
         self._steps = 0
 

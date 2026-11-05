@@ -46,6 +46,7 @@ class BufferAssembler:
         max_consecutive_skips: int = 10000,
         world_rank: int = 0,
         world_size: int = 1,
+        min_doc_tokens: int = 0,
     ):
         self.streamers = dataset_streamers
         self.streamer_iters = {ds: st.iter_raw() for ds, st in self.streamers.items()}
@@ -57,8 +58,11 @@ class BufferAssembler:
             raise ValueError(f"num_tokenizer_workers must be >= 1, got {num_tokenizer_workers}")
         if max_consecutive_skips < 1:
             raise ValueError(f"max_consecutive_skips must be >= 1, got {max_consecutive_skips}")
+        if min_doc_tokens < 0:
+            raise ValueError(f"min_doc_tokens must be >= 0, got {min_doc_tokens}")
         self.num_tokenizer_workers = int(num_tokenizer_workers)
         self.max_consecutive_skips = int(max_consecutive_skips)
+        self.min_doc_tokens = int(min_doc_tokens)
         self._tokenizer_executor: Optional[ThreadPoolExecutor] = None
         if self.num_tokenizer_workers > 1:
             self._tokenizer_executor = ThreadPoolExecutor(
@@ -145,18 +149,21 @@ class BufferAssembler:
             if self._close_event.is_set():
                 raise RuntimeError("Dataloader is closing")
             ex = streamer.build_features(raw)
-            if ex is None:
+            if ex is not None and ex.tokens is None:
+                raise RuntimeError(f"Dataset {ds!r} produced an instance without tokens")
+            # Short docs are skipped before they count toward the source budget,
+            # so mix ratios and refill size hold for the documents actually kept.
+            if ex is None or len(ex.tokens) < self.min_doc_tokens:
                 consecutive_skips += 1
                 if consecutive_skips >= self.max_consecutive_skips:
                     raise RuntimeError(
-                        f"Dataset {ds!r} produced no tokenized features for "
-                        f"{consecutive_skips} consecutive records; last record was "
+                        f"Dataset {ds!r} produced no usable tokenized features for "
+                        f"{consecutive_skips} consecutive records (failed or shorter than "
+                        f"min_doc_tokens={self.min_doc_tokens}); last record was "
                         f"{raw.filename}:{raw.line_num}"
                     )
                 continue
             consecutive_skips = 0
-            if ex.tokens is None:
-                raise RuntimeError(f"Dataset {ds!r} produced an instance without tokens")
             instances.append(ex)
             tokens_pushed += len(ex.tokens)
 
