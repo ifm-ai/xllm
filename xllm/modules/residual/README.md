@@ -102,5 +102,9 @@ Per sublayer the streams are read three times (write, controller statistics, rea
 ### Tests
 
 ```bash
+python -m pytest -q tests/residual                            # all of the below; the GPU tests skip without CUDA
 python -m pytest -q tests/residual/test_hyper_connection.py   # CPU: coefficients, read / write, the sublayer pairing, config checks
+python -m pytest -q tests/residual/test_hyper_connection_ops.py          # GPU: every Triton op vs the FP64 reference, fused vs reference models
+python -m pytest -q tests/residual/test_hyper_connection_fused_block.py  # GPU: the fused block's stream ops and its parity with the module path
+python -m pytest -q tests/residual/test_hyper_connection_model.py        # GPU: train / eval smoke of every residual in Transformer and Gekko
 ```
