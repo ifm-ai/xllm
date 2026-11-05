@@ -240,9 +240,9 @@ def mova_bwd(
             attn_scale, attention_dropout, flash_rng_state,
             stability_control, deterministic, causal_attn_backend
         )
-        kq_grad_ = g_grad = None
+        kq_grad = g_grad = None
     elif attn_act_func == 'softdelta':
-        xq_grad, kq_grad_, xk_grad_, xv_grad_, g_grad = softdelta_attn_bwd(
+        xq_grad, kq_grad, xk_grad_, xv_grad_, g_grad = softdelta_attn_bwd(
             attn_grad, attn_for_bwd, xq_, kq_, xk_, xv_, g, attn_readers, attn_lse,
             bos_mask, segments, attn_scale, attention_dropout, flash_rng_state,
             stability_control, deterministic, causal_attn_backend
@@ -290,24 +290,34 @@ def mova_bwd(
     xv_grad, handle_xv = all_gather(xv_grad, parallel_region='model', async_op=True)
 
     # compute rmx_grad
-    if r_grad is not None:
-        # B*L x D
-        rmx_grad = attn_gate_fn_bwd(r_grad, rmx).view(bsz * seq_len, local_heads * head_dim)
-        mx_grad = torch.addmm(mx_grad, rmx_grad, wr, out=mx_grad)
+    # B x L x H
+    if apply_attn_gate:
+        # B x L x H x S
+        r_grad = rearrange(r_grad, 'b l (h s) -> b l h s', h=local_heads)
+        r_grad = attn_gate_fn_bwd(r_grad, rmx)
+        rmx_grad = r_grad if g_grad is None else torch.cat([r_grad, g_grad[..., None]], dim=-1)
     else:
-        rmx_grad = None
+        rmx_grad = g_grad
+
+    if rmx_grad is not None:
+        rmx_grad = rmx_grad.view(bsz * seq_len, -1)
+        mx_grad = torch.addmm(mx_grad, rmx_grad, wr, out=mx_grad)
 
     # compute xk_grad
     if handle_xk is not None:
         handle_xk.wait()
     xk_grad = apply_rope(xk_grad, freqs_cis, head_dim, rope_head_dim, True)
+    if kq_ is not None:
+        kq_grad = apply_rope(kq_grad, freqs_cis, head_dim, rope_head_dim, True)
+        xk_grad = torch.cat([kq_grad, xk_grad], dim=-1)
+
     if k_norm_w is not None:
         xk_grad = rearrange(xk_grad, 'b l k s -> b l (k s)')
-        xk_grad, k_norm_w_grad = rmsnorm_bwd(xk_grad, xk, xk_rstd, k_norm_w, local_kv_heads)
+        xk_grad, k_norm_w_grad = rmsnorm_bwd(xk_grad, xk, xk_rstd, k_norm_w, local_kv_heads * nk)
     else:
         k_norm_w_grad = None
     # B*L x H*D/H
-    xk_grad = xk_grad.view(bsz * seq_len, local_kv_heads * head_dim)
+    xk_grad = xk_grad.view(bsz * seq_len, local_kv_heads * head_dim * nk)
     mx_grad = torch.addmm(mx_grad, xk_grad, wk, out=mx_grad)
 
     # router grad
@@ -537,7 +547,7 @@ def mova_recompute(
         if apply_attn_gate:
             # B x L x H x S
             rmx = rg[:, :, :, :head_dim]
-            r = attn_gate_fn(rearrange(rmx, 'b l h s -> b l (h s)'))
+            r = rearrange(attn_gate_fn(rmx), 'b l h s -> b l (h s)')
         else:
             r, rmx = None, None
         # B x L x H

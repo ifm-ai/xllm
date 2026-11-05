@@ -480,9 +480,9 @@ class TransformerMoEBlockFunction(torch.autograd.Function):
         attn_r_grad = attn_r_grad.view(bsz, seq_len, local_heads, head_dim)
         x_grad, wq_grad, wk_grad, wv_grad, wr_grad, \
             q_norm_w_grad, k_norm_w_grad, attn_norm_w_grad, attn_norm_b_grad = multihead_attention_bwd(
-            attn_r_grad, r_grad, attn_out, attn_lse, xq_, xk_, xv_, total_seqlen_k, end_seq,
-            freqs_cis, bos_mask, segments, local_kv_heads, rope_head_dim,
-            xq, xk, xq_rstd, xk_rstd, rmx, mx, q_norm_w, k_norm_w, wq, wk, wv, wr,
+            attn_r_grad, r_grad, attn_out, attn_readers, attn_lse, xq_, kq_, xk_, xv_,
+            total_seqlen_k, end_seq, freqs_cis, bos_mask, segments, local_kv_heads, rope_head_dim,
+            xq, xk, xq_rstd, xk_rstd, rmx, g, mx, q_norm_w, k_norm_w, wq, wk, wv, wr,
             attn_scale, attn_act_func, apply_attn_gate, attn_gate_func, attention_dropout, flash_rng_state,
             causal_attn_backend, attn_stability_control, deterministic,
             x_, x_mean, x_invvar, attn_norm_w, attn_norm_b, norm_local_groups,
