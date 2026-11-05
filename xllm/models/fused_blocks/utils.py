@@ -605,6 +605,42 @@ def softdelta_attn_fwd(
     return y, readers, lse, flash_rng_state, rng_state
 
 
+def softdelta_attn_bwd(
+    y_grad: Tensor,
+    y: Tensor,
+    kq: Tensor,
+    xq: Tensor,
+    xk: Tensor,
+    xv: Tensor,
+    g: Tensor,
+    readers: Tensor,
+    lse: Tensor,
+    bos_mask: Optional[Tensor],
+    segments: Optional[Any],
+    scale: float,
+    dropout: float,
+    rng_state: Optional[Tensor],
+    stability_control: int,
+    deterministic: bool,
+    backend: str,
+) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
+    if backend == 'xattn':
+        if segments is not None:
+            segidx, total_seqlen_k = segments
+            xk = xk[:, -total_seqlen_k:]
+            xv = xv[:, -total_seqlen_k:]
+            bos_mask = bos_mask[:, -total_seqlen_k:]
+            segidx = segidx[:, -total_seqlen_k:]
+        else:
+            segidx = None
+
+        return xattn_softdelta_attn_bwd(
+            y_grad, xq, kq, xk, xv, g, y, readers, lse, scale, bos_mask, segidx, stability_control, deterministic
+        )
+    else:
+        raise ValueError(f"Unknown softdelta attention backend: {backend}")
+
+
 def recompute_sliding_chunk_attention(
     xq: Tensor,
     xk: Tensor,

@@ -26,8 +26,9 @@ from .utils import (
     flash_attention_fwd,
     flash_attention_bwd,
     recompute_flash_attention,
-    recompute_softdelta_attn,
     softdelta_attn_fwd,
+    softdelta_attn_bwd,
+    recompute_softdelta_attn,
     apply_rope,
     apply_ropes
 )
@@ -214,9 +215,9 @@ def mova_fwd(
 
 
 def mova_bwd(
-    attn_grad, r_grad, aux_loss_grad, attn_for_bwd, attn_lse, xq_, xk_, xv_, total_seqlen_k, end_seq,
-    freqs_cis, bos_mask, segments, local_kv_heads, rope_head_dim,
-    xq, xk, xv, xvv_, xq_rstd, xk_rstd, rmx, mx, q_norm_w, k_norm_w, wq, wk, wv, wr,
+    attn_grad, r_grad, aux_loss_grad, attn_for_bwd, attn_readers, attn_lse, xq_, kq_, xk_, xv_,
+    total_seqlen_k, end_seq, freqs_cis, bos_mask, segments, local_kv_heads, rope_head_dim,
+    xq, xk, xv, xvv_, xq_rstd, xk_rstd, rmx, g, mx, q_norm_w, k_norm_w, wq, wk, wv, wr,
     attn_scale, attn_act_func, apply_attn_gate, attn_gate_func, attention_dropout, flash_rng_state,
     causal_attn_backend, stability_control, deterministic,
     sx, permuted_sx, original_scores, routing_indices, org_topk_scores, tokens_per_expert,
@@ -227,6 +228,7 @@ def mova_bwd(
 ):
     # B x L x D -> B x L x H x D/H
     bsz, seq_len, local_heads, head_dim = attn_grad.shape
+    nk = {"softmax": 1, "softdelta": 2}[attn_act_func]
     attn_gate_fn_bwd = {
         "silu": torch.ops.aten.silu_backward,
         "softplus": partial(torch.ops.aten.softplus_backward, beta=math.log(2), threshold=20)
@@ -236,6 +238,13 @@ def mova_bwd(
         xq_grad, xk_grad_, xv_grad_ = flash_attention_bwd(
             attn_grad, attn_for_bwd, xq_, xk_, xv_, attn_lse, bos_mask, segments,
             attn_scale, attention_dropout, flash_rng_state,
+            stability_control, deterministic, causal_attn_backend
+        )
+        kq_grad_ = g_grad = None
+    elif attn_act_func == 'softdelta':
+        xq_grad, kq_grad_, xk_grad_, xv_grad_, g_grad = softdelta_attn_bwd(
+            attn_grad, attn_for_bwd, xq_, kq_, xk_, xv_, g, attn_readers, attn_lse,
+            bos_mask, segments, attn_scale, attention_dropout, flash_rng_state,
             stability_control, deterministic, causal_attn_backend
         )
     else:
@@ -525,10 +534,10 @@ def mova_recompute(
 
     if wr is not None:
         rg = rearrange(F.linear(mx, wr, None), 'b l (h s) -> b l h s', h=local_heads)
-        # B x L x H*S
         if apply_attn_gate:
-            rmx = rearrange(rg[:, :, :, :head_dim], 'b l h s -> b l (h s)')
-            r = attn_gate_fn(rmx)
+            # B x L x H x S
+            rmx = rg[:, :, :, :head_dim]
+            r = attn_gate_fn(rearrange(rmx, 'b l h s -> b l (h s)'))
         else:
             r, rmx = None, None
         # B x L x H
@@ -565,6 +574,6 @@ def mova_recompute(
             raise NotImplementedError
 
     return (
-        (attn_out, attn_readers, attn_lse), (xq, xq_, xq_rstd), (xk, xk_, xk_rstd), (xv, xvv_, xv_),
+        (attn_out, attn_readers, attn_lse), (xq, xq_, xq_rstd), (xk, kq_, xk_, xk_rstd), (xv, xvv_, xv_),
         (handle_xk, handle_xv), (rmx, r, g), (permuted_sx, original_scores, sorted_indices, inverse_indices)
     )

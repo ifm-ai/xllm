@@ -490,7 +490,7 @@ class TransformerMoVABlockFunction(torch.autograd.Function):
         )
         attn_out, attn_readers, attn_lse = attn_outs
         xq, xq_, xq_rstd = q_outs
-        xk, xk_, xk_rstd = k_outs
+        xk, kq_, xk_, xk_rstd = k_outs
         xv, xvv_, xv_ = v_outs
         handle_xk, handle_xv = handle_kv
         rmx, r, g = attn_gate_outs
