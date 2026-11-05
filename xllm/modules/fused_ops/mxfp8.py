@@ -29,7 +29,7 @@ nearest even e4m3.
 
 Measured (B200, cuBLASLt 13.1; per layer, fwd + dX + dW of all linears, operands already quantised): gekko-4B
 M=8192 bf16 3457 -> 1973 us, gekko-7.1B M=16384 12888 -> 7009, gekko-0.9B M=32768 4042 -> 2334. The quantisation
-kernel: 16384 x 8192 both operands in ~100 us (one read, 32 x 128 tiles, 2 warps); numbers in handoff/HANDOFF.md.
+kernel: 16384 x 8192 both operands in ~100 us (one read, 32 x 128 tiles, 2 warps).
 """
 import functools
 from typing import List, Optional, Sequence, Tuple

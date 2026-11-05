@@ -117,7 +117,7 @@ _CUTE_FALLBACK_WARNED = set()
 @functools.lru_cache(maxsize=None)
 def _xattn_takes_dpsum() -> bool:
     """Whether the installed xattn's flash_sca_bwd takes a precomputed rowsum(dY * Y) (a local xattn patch, see
-    handoff h100_scripts/patches); XLLM_XATTN_DPSUM=0 turns it off."""
+    docs/optimizations/patches); XLLM_XATTN_DPSUM=0 turns it off."""
     if os.environ.get("XLLM_XATTN_DPSUM", "1") == "0":
         return False
     import inspect
