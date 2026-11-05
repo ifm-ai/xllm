@@ -19,7 +19,9 @@ the next layer through the slot, the first layer's input (the embedding) has no 
 backward of a sublayer is two passes over the streams, `unwrite_bwd` and `read_proj_bwd`.
 
 mhc (Sinkhorn transport, not invertible) has no fused block. The hyper-connection module asserts a model-parallel world
-size of one, so the block's model-parallel gathers and scatters are no-ops on that path.
+size of one, so the block's model-parallel gathers and scatters are no-ops on that path. One backward per forward: the
+stream hand-off between layers (the slot, the top layer's streams on its ctx) is consumed by the first backward, so a
+second one through the same graph (retain_graph, double backward) is rejected at the top layer.
 """
 
 from typing import Optional, Tuple, Any
@@ -286,6 +288,7 @@ class TransformerBlockFunction(torch.autograd.Function):
         ctx.residual_heads = residual_heads
         ctx.hc_cls = hc_cls
         ctx.slot = slot
+        ctx.last_layer = last_layer
         ctx.deterministic = deterministic
         ctx.attn_stability_control = attn_stability_control
         ctx.max_seqlen_q = max_seqlen_q
@@ -380,6 +383,9 @@ class TransformerBlockFunction(torch.autograd.Function):
             G2 = out_grad.contiguous().view(T, N, D)  # autograd's tensor: read only
             a1, R1, b1 = hc_cls.coef_fwd(l1, hc1_s, hc1_b)
             a2, R2, b2 = hc_cls.coef_fwd(l2, hc2_s, hc2_b)
+            # one backward per forward: the stream hand-off (ctx.X_out, the slot) is consumed by the first backward
+            assert not (ctx.last_layer and ctx.X_out is None), \
+                "the hyper-connection fused block runs one backward per forward (no retain_graph / double backward)"
             X_out, ctx.X_out = ctx.X_out, None
             at_top = X_out is not None
             if at_top:
@@ -388,7 +394,7 @@ class TransformerBlockFunction(torch.autograd.Function):
             else:
                 X2, X2_lo = ctx.slot.take()
             if X_in is not None:
-                X1, X1_lo, _ = fused.write_fwd(X_in, R1, b1, y1, split=True)
+                X1, X1_lo, _ = fused.write_fwd(X_in, R1, b1, y1)  # hi alone: the single-op kernels below read hi
                 xo = fused.read_fwd(X1, a2)
                 _, dR2, db2, dy2 = fused.write_bwd(X1, R2, b2, y2, G2, need_dx=False)
             else:

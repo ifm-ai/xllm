@@ -31,8 +31,9 @@ X' = write(X)  = R X + b y
 Controller: `logits = RMSNorm(X.flatten(-2)) @ W`, `W [N*D, n_logits]`, `W ~ N(0, 1/(N*D))`, eps
 `rmsnorm_eps`; read gates `a = sigmoid(s_a * l_a + bias_a)`, write gates `b = 2 sigmoid(s_b * l_b + bias_b)`.
 Scales start at 0.01 and every bias at 0, so training starts close to a plain residual (`a ~ 0.5`,
-`b ~ 1`, `R` near `I`), and weight decay, which the optimizer applies to every parameter, pulls the
-biases back to that start rather than to another transport.
+`b ~ 1`, `R` near `I`). Weight decay, which the optimizer applies to every parameter, pulls the biases
+back to that start rather than to another transport, and pulls the scales toward zero (input-independent
+gates); the scales are tiny and their gradient pressure decides.
 
 | variant | transport `R` | logits | reference |
 | --- | --- | --- | --- |

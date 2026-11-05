@@ -264,6 +264,7 @@ def write_fwd(hi, R, b, y, lo=None, split=False, rstd_eps=None, inplace=False):
     else:
         out = torch.empty_like(hi)
         outlo = torch.empty_like(hi) if split else None
+    assert split or rstd_eps is None, "write_fwd: the rstd is of the split write's hi'"
     rstd = torch.empty(T, device=hi.device, dtype=torch.float32) if rstd_eps is not None else None
     _write_fwd_kernel[(T,)](hi, _ptr(lo, hi), _ptr(R, b), b, y, out, _ptr(outlo, out), _ptr(rstd, out), N, D,
                             0.0 if rstd_eps is None else rstd_eps, CH=_tile(D), HAS_R=R is not None,

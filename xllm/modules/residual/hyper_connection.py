@@ -22,8 +22,9 @@ Variants (``residual_func``):
 Controller: logits = RMSNorm(X.flatten(-2)) @ W with W [N * D, n_logits];
 a = sigmoid(s_a * l_a + bias_a), b = 2 sigmoid(s_b * l_b + bias_b). W ~ N(0, 1 / (N * D)),
 scales start at 0.01 and every bias at 0 (mHC adds a constant 4 I to its transport logits),
-so the model starts close to a plain residual (a ~ 0.5, b ~ 1, R near I) and weight decay
-pulls the biases back to that start. Coefficient math and stream mixing run in FP32; the
+so the model starts close to a plain residual (a ~ 0.5, b ~ 1, R near I). Weight decay (applied to
+every parameter) pulls the biases back to that start and the scales toward zero, i.e. toward
+input-independent gates. Coefficient math and stream mixing run in FP32; the
 branch input and the streams keep the model dtype. On CUDA BF16 / FP16 streams every stream op
 runs as a fused Triton kernel (xllm/modules/fused_ops/hyper_connection/); the torch code here is
 the reference path.
@@ -175,8 +176,8 @@ class HyperConnection(BaseResidual):
     def __init__(self, rc_id: int, model_dim: int, eps: float = 1e-6):
         super().__init__(rc_id, model_dim)
         # the controller normalizes over all N * D channels of a token, which a model-parallel shard does
-        # not hold. The group, not the cached world size: a model built before initialize_model_parallel
-        # would pin that cache to 1.
+        # not hold. Checked on the group (None before initialize_model_parallel: single-process tests build
+        # residuals without one, and then nothing is sharded).
         group = get_model_parallel_group()
         assert group is None or dist.get_world_size(group) == 1, \
             "hyper-connections do not support model / expert parallelism yet"

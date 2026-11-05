@@ -135,6 +135,7 @@ class TransformerBlock(nn.Module):
         if self.fused_block and self.training:
             # hyper-connections: the sublayers' residual modules are the controllers (None for a plain residual)
             hc1, hc2 = (self.attention.residual, self.nffn.residual) if self.stream_slot is not None else (None, None)
+            assert hc1 is None or hc1.eps == hc2.eps, "the fused block normalizes both controllers with one eps"
             return TransformerBlockFunction.apply(
                 self.layer_id,
                 x,
