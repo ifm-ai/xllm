@@ -1,0 +1,110 @@
+diff --git a/csrc/attention/hopper/bwd_template.cuh b/csrc/attention/hopper/bwd_template.cuh
+index 131e546..4e3e202 100644
+--- a/csrc/attention/hopper/bwd_template.cuh
++++ b/csrc/attention/hopper/bwd_template.cuh
+@@ -395,8 +395,8 @@ void RunAttentionBwdSm90Kernel(
+           ? 64 : kRequestedBlockN;
+   static_assert(!(kVarlen && kHasSegment),
+                 "attention SM90 BWD cannot enable varlen and segment mask together");
+-  static_assert(!kReaderPairKVReuse || (!kVarlen && !kHasSegment),
+-                "reader-pair K/V reuse requires dense attention BWD");
++  static_assert(!kReaderPairKVReuse || !kHasSegment,
++                "reader-pair K/V reuse does not support segment masks");
+   static_assert(!kHeadPairParallel ||
+                     (!kVarlen && !kHasSegment && !kDeterministic && kGQA),
+                 "parallel head-pair execution requires dense, grouped-output, non-deterministic BWD");
+@@ -412,7 +412,8 @@ void RunAttentionBwdSm90Kernel(
+         "paired-reader execution requires an even Q-head count and logical "
+         "Q heads divisible by KV heads");
+     TORCH_CHECK(
+-        params.odd_head_window_right_delta == -1 &&
++        (params.odd_head_window_right_delta == -1 ||
++         params.odd_head_window_right_delta == 0) &&
+             params.window_size_right == 0,
+         "paired-reader execution requires inclusive/strict-past paired "
+         "boundaries");
+@@ -499,7 +500,8 @@ void RunAttentionBwdSm90Kernel(
+   static constexpr size_t DenseStage2Limit =
+       kHeadDim == 128 && kHeadDimV == 256 && !kGQA ? 225 * 1024 : 224 * 1024;
+   static constexpr bool UseDenseStage2 =
+-      !kDeterministic && !kVarlen && !kHasSegment &&
++      !kDeterministic && !kHasSegment &&
++      (!kVarlen || (kHeadDim == 256 && kHeadDimV == 256)) &&
+       Stage2TensorStorageEstimate <= DenseStage2Limit;
+   static constexpr bool UseDenseDetStage2 =
+       kDeterministic && Visibility::kIsSlidingChunk && !kVarlen &&
+diff --git a/csrc/attention/hopper/mainloop_bwd_sm90_tma_gmma_ws.hpp b/csrc/attention/hopper/mainloop_bwd_sm90_tma_gmma_ws.hpp
+index 36820c7..2f5c2df 100644
+--- a/csrc/attention/hopper/mainloop_bwd_sm90_tma_gmma_ws.hpp
++++ b/csrc/attention/hopper/mainloop_bwd_sm90_tma_gmma_ws.hpp
+@@ -141,8 +141,8 @@ struct CollectiveMainloopBwdSm90 {
+     static constexpr bool HeadPairPrivateKVGrad =
+         HeadPairPrivateKVGrad_;
+ 
+-    static_assert(!ReaderPairKVReuse || (!Varlen_ && !HasSegment_),
+-                  "reader-pair K/V reuse requires dense inputs");
++    static_assert(!ReaderPairKVReuse || !HasSegment_,
++                  "reader-pair K/V reuse does not support segment masks");
+     static_assert(!HeadPairParallel || (!Varlen_ && !HasSegment_),
+                   "parallel head-pair execution requires dense inputs");
+     static_assert(!HeadPairClusterKVReuse || HeadPairParallel,
+diff --git a/csrc/flash_sca/hopper/bwd_template.cuh b/csrc/flash_sca/hopper/bwd_template.cuh
+index 436053b..c6d751d 100644
+--- a/csrc/flash_sca/hopper/bwd_template.cuh
++++ b/csrc/flash_sca/hopper/bwd_template.cuh
+@@ -1,4 +1,5 @@
+ #pragma once
++#include <cstdlib>
+ 
+ #include "flash_sca/hopper/bwd.h"
+ 
+@@ -32,6 +33,20 @@ void RunFlashSCABwdSm90DenseGQA(
+       false, kDirectChunkRange, true>(params, stream);
+ }
+ 
++// Local H100 patch: GQA backward with every Q head of a KV head in one CTA
++// (reader-pair K/V reuse): K / V loaded once, dK / dV kept in registers and
++// stored once, so no fp32 dK / dV accumulators, zero fill or cast kernel.
++// XATTN_PAIR=0 restores the per-Q-head CTAs. D = V = 256 only: at D = 128
++// (4B, H 32 / KV 8, L 8192) the serialized readers leave too few CTAs (slower).
++inline bool FlashSCABwdSm90PairKVReuse(AttentionBwdParams const& params) {
++  static const bool enabled = [] {
++    char const* env = std::getenv("XATTN_PAIR");
++    return env == nullptr || env[0] != '0';
++  }();
++  return enabled && params.h != params.h_k && params.h % 2 == 0 &&
++      (params.h / 2) % params.h_k == 0;
++}
++
+ template <int kHeadDim, int kHeadDimV, int kBlockN, typename Element,
+           bool kDeterministic, bool kVarlen, bool kHasSegment,
+           int kBlockMOverride = 0>
+@@ -40,7 +55,9 @@ void RunFlashSCABwdSm90HeadDispatch(
+   TORCH_CHECK(params.h % params.h_k == 0,
+               "FlashSCA SM90 BWD requires Hq divisible by Hkv");
+   if constexpr (!kVarlen && !kHasSegment) {
+-    if (params.odd_head_window_right_delta != 0) {
++    if (params.odd_head_window_right_delta != 0 ||
++        (kHeadDim == 256 && kHeadDimV == 256 && !kDeterministic &&
++         FlashSCABwdSm90PairKVReuse(params))) {
+       if (params.h / 2 == params.h_k) {
+         RunAttentionBwdSm90Kernel<
+             kHeadDim, kHeadDimV, kBlockN, Element, kDeterministic,
+@@ -59,6 +76,17 @@ void RunFlashSCABwdSm90HeadDispatch(
+       return;
+     }
+   }
++  if constexpr (kVarlen && !kHasSegment && !kDeterministic && kHeadDim == 256 && kHeadDimV == 256) {
++    if (FlashSCABwdSm90PairKVReuse(params)) {
++      RunAttentionBwdSm90Kernel<
++          kHeadDim, kHeadDimV, kBlockN, Element, kDeterministic,
++          kVarlen, false, kBlockMOverride, false /*kGQA*/, false,
++          attention::semantics::SlidingChunkVisibility,
++          flash::AttentionBwdSm90, 0, 0, 0, false, true, true,
++          true /*kReaderPairKVReuse*/>(params, stream);
++      return;
++    }
++  }
+   if (params.h == params.h_k) {
+     RunAttentionBwdSm90Kernel<
+         kHeadDim, kHeadDimV, kBlockN, Element, kDeterministic, kVarlen,
