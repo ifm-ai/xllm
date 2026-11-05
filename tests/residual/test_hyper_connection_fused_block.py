@@ -6,7 +6,8 @@ ops (`write_fwd(split, rstd_eps)`, `unwrite_bwd`, `rewrite_bwd`, `read_write_bwd
 replace, the fused dX no further from the FP64 value than the single-op path's. Then whole tiny Transformers with
 ihc / ohc: the fused block (`fused_block=True`) against the module path (`fused_block=False`, same Triton stream ops,
 BF16 streams rounded at every write), loss and every parameter gradient, with and without the recompute switches, at
-a channel count that uses a single kernel tile and at the production D = 1536 (three 512 tiles). The two paths differ
+a channel count that uses a single kernel tile and at the production D = 1536 (three 512 tiles), and the Gekko block
+the same way. The two paths differ
 by BF16 rounding of the streams, so every gradient is checked against the module path's own sensitivity to BF16-level
 forward noise (`bf16_floor`). A depth sweep checks the controller gradients layer by layer: with the streams recovered
 from hi + lo they stay at that floor down to the first layer. The recomputing mode (`residual_ckpt_interval` k > 0:
@@ -27,6 +28,7 @@ import torch
 
 from xllm.config import ModelConf
 from xllm.distributed.initialize import initialize_model_parallel, model_parallel_is_initialized
+from xllm.models.gekko import Gekko
 from xllm.models.transformer import Transformer
 from xllm.modules.fused_ops import hyper_connection as fused
 from xllm.modules.residual.hyper_connection import quaternion_transport
@@ -186,15 +188,15 @@ def test_two_pass_backward_ops(N, has_r, D=1536, T=4096, NL=16):
 # whole models: the fused block against the module path
 
 
-def build(residual_func, fused_block, model_dim, num_layers, **kwargs):
-    heads = model_dim // 32
-    cfg = ModelConf(arch='transformer', num_layers=num_layers, model_dim=model_dim, num_heads=heads,
+def build(residual_func, fused_block, model_dim, num_layers, arch='transformer', **kwargs):
+    heads = model_dim // 32 if arch == 'transformer' else min(model_dim // 32, 32)  # Gekko's fused per-head norm: <= 32 heads
+    cfg = ModelConf(arch=arch, num_layers=num_layers, model_dim=model_dim, num_heads=heads,
                     num_kv_heads=max(1, heads // 2), head_dim=32, chunk_size=32, ffn_hidden_dim=2 * model_dim, swiglu=True,
-                    apply_rmsnorm=True, vocab_size=256, causal_attn_backend='flash', residual_func=residual_func,
-                    fused_block=fused_block, **kwargs)
+                    apply_rmsnorm=True, vocab_size=256, causal_attn_backend='flash' if arch == 'transformer' else None,
+                    residual_func=residual_func, fused_block=fused_block, **kwargs)
     torch.manual_seed(0)
     with create_on_gpu():
-        model = Transformer(cfg, types.SimpleNamespace(bos_id=1, eos_id=2, pad_id=0))
+        model = (Transformer if arch == 'transformer' else Gekko)(cfg, types.SimpleNamespace(bos_id=1, eos_id=2, pad_id=0))
     model = model.cuda().to(torch.bfloat16).train()
     with torch.no_grad():  # move the controllers off their near-identity init so every coefficient matters
         for name, p in model.named_parameters():
@@ -217,14 +219,14 @@ def loss_and_grads(model, B=2, L=64, noise=0.0):
     return loss.item(), {n: p.grad.float().clone() for n, p in model.named_parameters() if p.grad is not None}
 
 
-def bf16_floor(residual_func, model_dim, num_layers, grads_r):
+def bf16_floor(residual_func, model_dim, num_layers, grads_r, arch='transformer'):
     """How far every gradient of the module path moves under BF16-level forward noise: the module path rerun with the
     embedding perturbed by 2^-9 * sqrt(2 L) relatively (one BF16 rounding per write, 2 writes per layer). The fused block
     carries hi + lo instead of rounding at every write, so its gradients differ from the module path's by noise of this
     size; a gradient with heavy token cancellation (e.g. the first layer's FFN controller weight at 128 tokens) moves
     by 10% under it while the typical one moves by 1-2%. Both paths are deterministic here (rerunning either gives
     bitwise equal gradients), so this is the whole floor of the comparison."""
-    _, grads_n = loss_and_grads(build(residual_func, False, model_dim, num_layers), noise=2 ** -9 * (2 * num_layers) ** 0.5)
+    _, grads_n = loss_and_grads(build(residual_func, False, model_dim, num_layers, arch), noise=2 ** -9 * (2 * num_layers) ** 0.5)
     return {n: rel(grads_n[n], grads_r[n]) for n in grads_r}
 
 
@@ -268,6 +270,24 @@ def test_recomputing_mode_matches_module_path(single_process, residual_func, ckp
     assert abs(loss_f - loss_r) < 2e-3 * abs(loss_r), (loss_f, loss_r)
     errs = {n: rel(grads_f[n], grads_r[n]) for n in grads_f}
     floor = bf16_floor(residual_func, model_dim, num_layers, grads_r)
+    for n in errs:
+        if '.residual.' not in n or n.endswith('weight'):
+            assert errs[n] < bound(floor[n]), f"grad {n} relative error {errs[n]:.2e}, BF16 floor {floor[n]:.2e}"
+        else:
+            assert errs[n] < 2.5e-1, f"grad {n} relative error {errs[n]:.2e}"
+
+
+@pytest.mark.parametrize("model_dim,num_layers,ckpt,kwargs", [(128, 2, 0, {}), (1536, 3, 2, PRODUCTION)])
+@pytest.mark.parametrize("residual_func", ['ihc', 'ohc'])
+def test_gekko_fused_block_matches_module_path(single_process, residual_func, model_dim, num_layers, ckpt, kwargs):
+    """The Gekko block's stream path (the same `FusedStreams`, with the timestep norm recomputed after the FFN backward)
+    against Gekko's module path, inverting and recomputing, with the bounds of the transformer test."""
+    loss_f, grads_f = loss_and_grads(build(residual_func, True, model_dim, num_layers, 'gekko', residual_ckpt_interval=ckpt, **kwargs))
+    loss_r, grads_r = loss_and_grads(build(residual_func, False, model_dim, num_layers, 'gekko'))
+    assert abs(loss_f - loss_r) < 2e-3 * abs(loss_r), (loss_f, loss_r)
+    assert grads_f.keys() == grads_r.keys(), set(grads_f) ^ set(grads_r)
+    errs = {n: rel(grads_f[n], grads_r[n]) for n in grads_f}
+    floor = bf16_floor(residual_func, model_dim, num_layers, grads_r, 'gekko')
     for n in errs:
         if '.residual.' not in n or n.endswith('weight'):
             assert errs[n] < bound(floor[n]), f"grad {n} relative error {errs[n]:.2e}, BF16 floor {floor[n]:.2e}"

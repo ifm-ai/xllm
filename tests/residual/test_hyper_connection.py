@@ -127,6 +127,7 @@ def test_config_names_match_the_classes():
 def test_model_conf_fused_block_allowlist_and_unknown_names():
     from xllm.config import ModelConf
     ModelConf(**{**MODEL_CONF, 'residual_func': 'ohc', 'fused_block': True})  # ihc / ohc have a fused block
+    ModelConf(**{**MODEL_CONF, 'arch': 'gekko', 'causal_attn_backend': None, 'residual_func': 'ihc', 'fused_block': True})
     for residual_func in ('mhc', 'ortho'):  # not invertible / not implemented by the fused block
         with pytest.raises(AssertionError, match="fused blocks implement"):
             ModelConf(**{**MODEL_CONF, 'residual_func': residual_func, 'fused_block': True})

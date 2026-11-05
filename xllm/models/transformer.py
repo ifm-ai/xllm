@@ -17,7 +17,7 @@ from xllm.modules import (
     GroupRMSNorm,
 )
 from xllm.modules.residual import (
-    num_params_in_residual, flops_in_residual, expand_streams, sum_streams, StreamSlot,
+    num_params_in_residual, flops_in_residual, expand_streams, sum_streams, StreamSlot, controller_tensors,
 )
 from xllm.modules.fused_ops import memory_efficient_dropout
 from xllm.modules.model_parallel import (
@@ -45,11 +45,6 @@ from xllm.models.fused_blocks import (
     TransformerOutputLayerFunction,
 )
 from xllm.utils import get_init_fn
-
-
-def _controller_tensors(residual) -> tuple:
-    """(weight, bias, scale) of a hyper-connection controller for the fused block; Nones for a plain residual."""
-    return (residual.weight, residual.bias, residual.scale) if residual is not None else (None, None, None)
 
 
 class TransformerBlock(nn.Module):
@@ -158,14 +153,14 @@ class TransformerBlock(nn.Module):
                 self.attention.rope_head_dim,
                 self.attention.attn_gate_fn,
                 self.attention.causal_attn_backend,
-                *_controller_tensors(hc1),
+                *controller_tensors(hc1),
                 self.nffn.norm.weight,
                 self.nffn.norm.bias,
                 self.nffn.norm.groups_per_partition,
                 self.nffn.fc1.weight,
                 self.nffn.fc2.weight,
                 self.nffn.fc3.weight if self.nffn.swiglu else None,
-                *_controller_tensors(hc2),
+                *controller_tensors(hc2),
                 self.dropout,
                 self.attention.attention_dropout,
                 self.attention.hidden_dropout,

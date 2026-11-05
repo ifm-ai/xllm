@@ -235,8 +235,8 @@ class ModelConf(Config):
             assert self.residual_func in FUSED_BLOCK_RESIDUALS, \
                 f"the fused blocks implement the residuals {FUSED_BLOCK_RESIDUALS}, not {self.residual_func}"
             if self.residual_func in HYPER_CONNECTION_FUNCS:
-                assert self.arch == 'transformer' and self.num_experts == 0, \
-                    "hyper-connections have a fused block only for dense transformer layers"
+                assert self.arch in ('transformer', 'gekko') and self.num_experts == 0, \
+                    "hyper-connections have a fused block only for dense transformer and Gekko layers"
         assert self.residual_ckpt_interval >= 0, "residual_ckpt_interval: 0 (invert the writes) or a layer interval"
         if self.residual_ckpt_interval:
             assert self.fused_block and self.residual_func in HYPER_CONNECTION_FUNCS, \

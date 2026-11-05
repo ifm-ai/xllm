@@ -54,7 +54,7 @@ FUSED = dict(fused_block=True, recompute_q=True, recompute_fc1_out=True, recompu
     *[(arch, rf, {}) for arch in ('transformer', 'gekko') for rf in ('base', 'ihc', 'mhc', 'ohc')],
     *[('transformer', rf, MOE) for rf in ('ihc', 'mhc', 'ohc')],
     *[('transformer', rf, dict(num_values=4, num_activated_values=2, **MOE)) for rf in ('ihc', 'mhc', 'ohc')],
-    *[('transformer', rf, dict(residual_ckpt_interval=k, **FUSED)) for rf in ('ihc', 'ohc') for k in (0, 1)],
+    *[(arch, rf, dict(residual_ckpt_interval=k, **FUSED)) for arch in ('transformer', 'gekko') for rf in ('ihc', 'ohc') for k in (0, 1)],
 ])
 def test_train_and_eval_step(arch, residual_func, kwargs):
     torch.manual_seed(0)

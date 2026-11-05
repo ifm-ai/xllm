@@ -70,14 +70,15 @@ of the `[B, L, N, D]` streams alive until backward, so on GPU it needs several t
 
 Per sublayer the streams are read three times (write, controller statistics, read) and written once.
 
-- `fused_block` works for dense transformer layers with `ihc` / `ohc`
-  (`TransformerBlockFunction` in `xllm/models/fused_blocks/transformer/transformer.py`: the base block, with the
-  residual adds replaced by the stream ops when the sublayers' residual is a hyper-connection). It saves the two branch outputs per layer but not the streams: a write is invertible
+- `fused_block` works for dense transformer and Gekko layers with `ihc` / `ohc`
+  (`TransformerBlockFunction` and `GekkoBlockFunction`: the base blocks, with the residual adds replaced by the stream
+  path `FusedStreams` of `xllm/models/fused_blocks/hyper_connection.py` when the sublayers' residual is a
+  hyper-connection). It saves the two branch outputs per layer but not the streams: a write is invertible
   (`X = R^T (X' - b y)`), so the backward recovers each layer's streams from the layer above. Between layers the
   streams travel as hi + lo (two BF16 tensors: hi is what the branches and controllers read, hi + lo holds the
   FP32 write result to ~2^-17), so the inversion reproduces the forward's streams and the gradients match the
   stored-streams path at the BF16 noise floor; the lo parts pass through a `StreamSlot`. `mhc` (Sinkhorn
-  transport, not invertible), MoE / MoVA and Gekko fused blocks are asserted off in `ModelConf`. The backward of a
+  transport, not invertible) and the MoE / MoVA fused blocks are asserted off in `ModelConf`. The backward of a
   sublayer is two passes over the streams (`unwrite_bwd`, `read_proj_bwd`). `residual_ckpt_interval k > 0` trades
   memory for speed the way mHC does (arXiv 2512.24880, sec. 4.3.2): every k-th layer keeps its input streams, the
   forward writes round once (no hi / lo), and in the backward the top layer of each block of k layers recomputes

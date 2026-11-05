@@ -13,7 +13,7 @@ from xllm.modules import (
     TimestepDecayNorm,
 )
 from xllm.modules.residual import (
-    num_params_in_residual, flops_in_residual, expand_streams, sum_streams,
+    num_params_in_residual, flops_in_residual, expand_streams, sum_streams, StreamSlot, controller_tensors,
 )
 from xllm.modules.fused_ops import memory_efficient_dropout
 from xllm.modules.model_parallel import (
@@ -63,6 +63,9 @@ class GekkoBlock(nn.Module):
         self.timenorm_eps = cfg.timenorm_eps
         self.layernorm_eps = cfg.layernorm_eps
         self.rmsnorm_eps = cfg.rmsnorm_eps
+        self.is_last_layer = layer_id == cfg.num_layers - 1
+        self.stream_slot = None  # hyper-connection fused block: set by the model, shared by its layers
+        self.residual_ckpt_interval = cfg.residual_ckpt_interval
 
         self.gda = GatedDeltaAttention(
             layer_id=layer_id,
@@ -132,8 +135,10 @@ class GekkoBlock(nn.Module):
                               Tensor]] = None,
     ) -> Tuple[Tensor, Optional[Tensor], Optional[Any]]:
         if self.fused_block and self.training:
-            fn = GekkoBlockFunction
-            return fn.apply(
+            # hyper-connections: the sublayers' residual modules are the controllers (None for a plain residual)
+            hc1, hc2 = (self.gda.residual, self.nffn.residual) if self.stream_slot is not None else (None, None)
+            assert hc1 is None or hc1.eps == hc2.eps, "the fused block normalizes both controllers with one eps"
+            return GekkoBlockFunction.apply(
                 self.layer_id,
                 x,
                 freqs_cis,
@@ -172,14 +177,14 @@ class GekkoBlock(nn.Module):
                 self.gda.attn_gate_fn,
                 self.gda.sca_backend,
                 self.gda.awm_orthogonal_update,
-                None,
+                *controller_tensors(hc1),
                 self.nffn.norm.weight,
                 self.nffn.norm.bias,
                 self.nffn.norm.groups_per_partition,
                 self.nffn.fc1.weight,
                 self.nffn.fc2.weight,
                 self.nffn.fc3.weight if self.nffn.swiglu else None,
-                None,
+                *controller_tensors(hc2),
                 self.gda.dropout,
                 self.gda.attention_dropout,
                 self.gda.hidden_dropout,
@@ -190,6 +195,10 @@ class GekkoBlock(nn.Module):
                 self.apply_rmsnorm,
                 self.residual_func,
                 self.residual_heads,
+                hc1.eps if hc1 is not None else None,
+                self.stream_slot,
+                self.is_last_layer,
+                self.residual_ckpt_interval,
                 attn_stability_control,
                 deterministic,
                 self.recompute_q,
@@ -350,8 +359,10 @@ class Gekko(XLLModel):
             self.rope = None
 
         self.layers = nn.ModuleList()
+        self.stream_slot = StreamSlot() if cfg.fused_block and self.residual_streams > 1 else None
         for layer_id in range(self.num_layers):
             layer = GekkoBlock(cfg, layer_id)
+            layer.stream_slot = self.stream_slot
             self.layers.append(wrap(layer))
 
         self.output = wrap(GekkoOutputLayer(cfg))

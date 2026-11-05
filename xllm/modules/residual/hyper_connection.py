@@ -32,11 +32,11 @@ the reference path.
 The model expands the streams from the embedding (every stream = x0, `expand_streams`) and
 sums them before the final norm (`sum_streams`).
 
-The fused training block (`fused_block`, ihc / ohc; `TransformerBlockFunction` in
-xllm/models/fused_blocks/transformer/transformer.py) runs the same stream ops and does not keep the streams: its
+The fused training blocks (`fused_block`, ihc / ohc; `FusedStreams` in xllm/models/fused_blocks/hyper_connection.py,
+the stream path of the transformer and Gekko blocks) run the same stream ops and do not keep the streams: their
 backward recovers them by inverting the writes or, with `residual_ckpt_interval` k > 0, recomputes them from the input
-of every k-th layer; `HyperConnection.controller_fwd` / `controller_bwd`, `controller_params` and `StreamSlot` below
-are its helpers.
+of every k-th layer; `HyperConnection.controller_fwd` / `controller_bwd`, `controller_tensors`, `controller_params` and
+`StreamSlot` below are their helpers.
 """
 
 import math
@@ -384,6 +384,11 @@ class StreamSlot:
     def take(self, key):
         assert key in self.items, f"StreamSlot: nothing under {key}: the layers run in order, one backward per forward"
         return self.items.pop(key)
+
+
+def controller_tensors(residual) -> tuple:
+    """(weight, bias, scale) of a hyper-connection controller, the fused blocks' arguments; Nones for a plain residual."""
+    return (residual.weight, residual.bias, residual.scale) if residual is not None else (None, None, None)
 
 
 def controller_params(weight: Tensor, bias: Tensor, scale: Tensor, dtype: torch.dtype):
