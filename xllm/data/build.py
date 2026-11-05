@@ -19,6 +19,7 @@ def build_data_loader(tokenizer: Tokenizer, cfg: TrainerConf) -> MultiSourceData
     cfg.dataloader.num_workers   : source reader/tokenizer worker threads
     cfg.dataloader.max_consecutive_skips : invalid records allowed before a source fails
     cfg.dataloader.skip_long_docs : skip overlong non-text records with bestfit
+    cfg.dataloader.min_doc_tokens : skip records with fewer tokens before packing
 
     Defaults come from DataLoaderConfig; this builder does not override them.
     """
@@ -29,6 +30,7 @@ def build_data_loader(tokenizer: Tokenizer, cfg: TrainerConf) -> MultiSourceData
     num_workers: int = dataloader_cfg.num_workers
     max_consecutive_skips: int = dataloader_cfg.max_consecutive_skips
     skip_long_docs: bool = dataloader_cfg.skip_long_docs
+    min_doc_tokens: int = dataloader_cfg.min_doc_tokens
     return MultiSourceDataLoader(
         tokenizer=tokenizer,
         data_mix_str=cfg.data,
@@ -41,4 +43,5 @@ def build_data_loader(tokenizer: Tokenizer, cfg: TrainerConf) -> MultiSourceData
         num_workers=num_workers,
         max_consecutive_skips=max_consecutive_skips,
         skip_long_docs=skip_long_docs,
+        min_doc_tokens=min_doc_tokens,
     )

@@ -117,9 +117,10 @@ class Packer:
 
 
 class SimpleConcatPacker(Packer):
-    def __init__(self, seq_len: int, pad_id: int = 0):
+    def __init__(self, seq_len: int, pad_id: int = 0, min_doc_tokens: int = 0):
         self.seq_len = seq_len
         self.pad_id = pad_id
+        self.min_doc_tokens = min_doc_tokens
         self.prefill_buffer: List[Tuple[str, Instance]] = []
         self._leftover_chunks: List[_Chunk] = []
 
@@ -129,7 +130,10 @@ class SimpleConcatPacker(Packer):
     def pack(self) -> List[PackedSeq]:
         stream_chunks: List[_Chunk] = list(self._leftover_chunks)
         for ds, inst in self.prefill_buffer:
-            stream_chunks.append(_chunk_from_instance(ds, inst))
+            chunk = _chunk_from_instance(ds, inst)
+            if len(chunk[0]) < self.min_doc_tokens:
+                continue
+            stream_chunks.append(chunk)
 
         all_tokens, target_mask, has_mask, token_spans, _has_truncation = _flatten_chunks(stream_chunks)
 
@@ -199,6 +203,7 @@ class BestFitPacker(Packer):
         min_fill_ratio: float = 0.99,
         skip_long_docs: bool = False,
         source_formats: Optional[Dict[str, str]] = None,
+        min_doc_tokens: int = 0,
     ):
         self.seq_len = seq_len
         self.bin_capacity = seq_len + 1
@@ -206,6 +211,8 @@ class BestFitPacker(Packer):
         self.pad_id = pad_id
         self.min_fill_ratio = min_fill_ratio
         self.skip_long_docs = skip_long_docs
+        # docs with < 2 tokens have no next-token pair and are always skipped
+        self.min_doc_tokens = max(2, min_doc_tokens)
         self.source_formats = dict(source_formats or {})
 
         self.prefill_buffer: List[Tuple[str, Instance]] = []
@@ -259,7 +266,7 @@ class BestFitPacker(Packer):
         for ds, inst in self.prefill_buffer:
             full_chunk = _chunk_from_instance(ds, inst)
             n = len(full_chunk[0])
-            if n < 2:
+            if n < self.min_doc_tokens:
                 continue
             if n > self.bin_capacity:
                 source_format = self.source_formats.get(ds, "text")

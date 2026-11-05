@@ -73,6 +73,43 @@ def test_best_fit_sets_sft_masked_targets_to_ignore_index():
     assert np.array_equal(seqs[0].y, np.array([101, IGNORE_INDEX, 103, 104], dtype=np.int64))
 
 
+def test_best_fit_skips_docs_below_min_doc_tokens():
+    packer = BestFitPacker(seq_len=6, pad_id=0, min_fill_ratio=0.0, min_doc_tokens=3)
+    packer.prefill("ds", _instance([10, 11], line_num=1))
+    packer.prefill("ds", _instance([20, 21, 22], line_num=2))
+    packer.prefill("ds", _instance([30], line_num=3))
+
+    seqs = packer.pack()
+
+    assert len(seqs) == 1
+    assert np.array_equal(seqs[0].x, np.array([20, 21, 0, 0, 0, 0], dtype=np.int64))
+    assert [info.line_num for info in seqs[0].src_infos] == [2]
+
+
+def test_best_fit_keeps_two_token_docs_by_default():
+    packer = BestFitPacker(seq_len=4, pad_id=0, min_fill_ratio=0.0)
+    packer.prefill("ds", _instance([10, 11], line_num=1))
+    packer.prefill("ds", _instance([20], line_num=2))
+
+    seqs = packer.pack()
+
+    assert len(seqs) == 1
+    assert [info.line_num for info in seqs[0].src_infos] == [1]
+
+
+def test_simple_concat_skips_docs_below_min_doc_tokens():
+    packer = SimpleConcatPacker(seq_len=4, pad_id=0, min_doc_tokens=3)
+    packer.prefill("ds", _instance([10, 11], line_num=1))
+    packer.prefill("ds", _instance([20, 21, 22], line_num=2))
+    packer.prefill("ds", _instance([30, 31, 32], line_num=3))
+
+    seqs = packer.pack()
+
+    assert len(seqs) == 1
+    assert np.array_equal(seqs[0].x, np.array([20, 21, 22, 30], dtype=np.int64))
+    assert [info.line_num for info in seqs[0].src_infos] == [2, 3]
+
+
 def test_ignore_index_is_applied_in_place():
     y = np.array([10, 11, 12], dtype=np.int64)
     mask = np.array([True, False, True], dtype=np.bool_)
