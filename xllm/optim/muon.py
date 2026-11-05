@@ -60,6 +60,9 @@ def newton_schulz(X: Tensor, eps: float) -> Tensor:
 
     - The steps run on the smaller Gram matrix: A = X X^T and X <- a X + B X, or for a tall X, A = X^T X and
       X <- a X + X B (B = b A + c A^2 is symmetric), so a tall X is never transposed into a copy.
+    - X is first divided by the power of two at or below max|x| (U V^T does not change; exact in bf16):
+      ||A^2||_F squares X's entries eight times over, which underflows fp32 for ||X||_F below ~1e-5 (s = eps,
+      X / s far above 1, the steps overflow to NaN).
     - X is scaled by s = ||A^2||_F^(1/4) >= s_max, 5% more for rounding: within k^(1/8) of s_max where ||X||_F is
       within k^(1/2) (k = min(m, n)), so the small singular values start higher. s comes from the first step's A^2
       and folds into that step: p(X / s) = (a X + (b / s^2 A + c / s^4 A^2) X) / s.
@@ -75,6 +78,8 @@ def newton_schulz(X: Tensor, eps: float) -> Tensor:
         return torch.baddbmm(X, X, B, beta=a) if tall else torch.baddbmm(X, B, X, beta=a)
 
     X = X.to(torch.bfloat16)
+    n = X.abs().amax(dim=(-2, -1), keepdim=True).clamp_min(1e-30)  # max|x|: nothing is squared, cannot underflow
+    X = X / torch.exp2(torch.floor(torch.log2(n)))                  # a power of two: exact in bf16, no second rounding
     A = gram(X)
     AA = A @ A
     s = AA.float().norm(dim=(-2, -1), keepdim=True).pow(0.25) * 1.05 + eps
