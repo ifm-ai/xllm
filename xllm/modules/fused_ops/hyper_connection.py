@@ -1,31 +1,37 @@
 """Triton kernels for hyper-connection streams (xllm/modules/residual/hyper_connection.py).
 
 Streams X [T, N, D] stay in BF16 (or FP16); FP32 lives only in registers. Coefficients are FP32 and
-contiguous: a, b [T, N], R [T, N, N] with destination rows.
+contiguous: a, b [T, N], R [T, N, N] with destination rows. N <= 4: the kernels hold four streams per
+program and mask the ones beyond N.
+
+The module path's ops, each an autograd Function over the raw kernels:
 
     hc_logits(Xf, W, eps)     rstd(Xf) * (Xf @ W)        Xf = X.flatten(-2) [T, N * D], FP32 out
     hc_read(X, a)             h  = sum_n a_n X_n          [T, D]
     hc_write(X, R, b, y)      X' = R X + b y              [T, N, D], R None = identity
-    ihc_coef_fwd / bwd        iHC gates from the logits                  raw launchers, see below
-    ohc_coef_fwd / bwd        oHC gates and SO(4) transport from the logits
     sinkhorn(z, iterations)   mHC transport from logits [..., 4, 4]
 
-The projection is a Triton rstd kernel and a cuBLAS BF16 matmul with FP32 accumulate and
-output; its backward forms dX = dP W^T - c X in one kernel. Read, write, the oHC
-coefficients and Sinkhorn are one kernel each way. Every op saves only its inputs, except
-the projection, which also keeps its FP32 rstd [T] and logits [T, n_logits].
+The projection is an rstd kernel and a cuBLAS BF16 matmul with FP32 accumulate and output; its backward
+forms dX = dP W^T - c X in one kernel. Read and write are one kernel each way, Sinkhorn one each way.
+Every op saves only its inputs, except the projection, which also keeps its FP32 rstd [T] and logits
+[T, n_logits].
 
-The kernel launches are plain functions on contiguous [T, ...] tensors (`logits_fwd` / `logits_bwd`,
-`read_fwd` / `read_bwd`, `write_fwd` / `write_fwd_split` / `write_bwd` / `unwrite`, `ihc_coef_fwd` / `ihc_coef_bwd`,
-`ohc_coef_fwd` / `ohc_coef_bwd`), so the fused transformer block (xllm/models/fused_blocks/transformer/transformer.py)
-can call them from its own forward and backward; the autograd Functions here wrap them for the module path.
+The raw launchers are plain functions on contiguous [T, ...] tensors, so the fused transformer block
+(xllm/models/fused_blocks/transformer/transformer.py) calls them from its own forward and backward:
 
-The fused block's stream path, where the streams travel as hi + lo pairs and are recovered in the backward by
-inverting the writes, has its own passes, each one kernel over the N * D channels of every token:
+    logits_fwd / logits_bwd                     the projection
+    ihc_coef_fwd / ihc_coef_bwd                 the iHC gates from the logits
+    ohc_coef_fwd / ohc_coef_bwd                 the oHC gates and SO(4) transport from the logits
+    read_fwd / read_bwd / read_da               the read, and its coefficient gradient alone
+    write_fwd / write_fwd_split / write_bwd     the write; `split` stores X' as hi + lo (see below)
+    unwrite                                     X = R^T (X' - b y), the inverse of a write
+
+The fused block's stream path keeps the streams between layers as hi + lo pairs (hi = round(X'), the streams
+every other kernel reads; lo = round(X' - hi), so hi + lo holds the FP32 write to ~2^-17) and recovers them in
+the backward by inverting the writes. Its own passes, one kernel over the N * D channels of every token:
 
     write_fwd_split_rstd      the split write and the rstd of its hi, the next controller's normalization
     unwrite_bwd               unwrite + the recomputed read + the write backward (dy, db, dR) in one pass
-    read_da                   da of the read backward alone (the controller backward needs it before dX)
     read_proj_bwd             dX = R^T G + a dh + dP W^T - c X: the whole stream gradient of a sublayer in one pass
 """
 
@@ -57,6 +63,12 @@ def _check_coef(logits: torch.Tensor, n_logits: int, scale: torch.Tensor, bias: 
     assert logits.dim() == 2 and logits.shape[1] == n_logits and logits.dtype == torch.float32 and logits.is_contiguous(), \
         f"expected FP32 contiguous logits [T, {n_logits}], got {tuple(logits.shape)} {logits.dtype}"
     assert scale.shape == (2,) and bias.shape == (n_logits,) and scale.is_contiguous() and bias.is_contiguous()
+
+
+def _ptr(t, stand_in):
+    """A kernel pointer argument that may be absent: `stand_in` is passed in its place (a tensor the kernel does have),
+    never dereferenced since the matching constexpr flag is off."""
+    return stand_in if t is None else t
 
 
 def _tile(D: int, max_tile: int = 1024) -> int:
@@ -168,9 +180,9 @@ def hc_logits(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor
 
 
 # ---------------------------------------------------------------------------------------------
-# stream read and write. One program per token over channel tiles [CH]; the N <= 4 streams are
-# explicit (streams n >= N are masked off), the coefficient reductions accumulate elementwise
-# over the tiles and reduce once.
+# stream read and write: one program per token over channel tiles [CH]; the four streams are explicit (n >= N
+# masked off), the coefficient reductions accumulate elementwise over the tiles and reduce once. The raw launchers
+# and, for the module path, the autograd Functions `_Read` / `_Write`.
 
 
 @triton.jit
@@ -322,7 +334,7 @@ def read_da(x, dh):
     _check_streams(x)
     T, N, D = x.shape
     da = torch.empty(T, N, device=x.device, dtype=torch.float32)
-    _read_bwd_kernel[(T,)](x, x, dh.contiguous(), x, da, N, D, CH=_tile(D), HAS_DX=False, num_warps=4)
+    _read_bwd_kernel[(T,)](x, x, dh.contiguous(), x, da, N, D, CH=_tile(D), HAS_DX=False, num_warps=4)  # a, dx unused
     return da
 
 
@@ -503,10 +515,9 @@ def _write_fwd(hi, lo, R, b, y, split, rstd_eps):
     outlo = torch.empty_like(hi) if split else None
     rstd = torch.empty(T, device=hi.device, dtype=torch.float32) if rstd_eps is not None else None
     has_r = R is not None
-    _write_fwd_kernel[(T,)](hi, lo if lo is not None else hi, R if has_r else b, b, y, out, outlo if split else out,
-                            out if rstd is None else rstd, N, D, 0.0 if rstd_eps is None else rstd_eps,
-                            CH=_tile(D), HAS_R=has_r, HAS_LO=lo is not None, SPLIT=split, RSTD=rstd is not None,
-                            num_warps=4)
+    _write_fwd_kernel[(T,)](hi, _ptr(lo, hi), _ptr(R, b), b, y, out, _ptr(outlo, out), _ptr(rstd, out), N, D,
+                            0.0 if rstd_eps is None else rstd_eps, CH=_tile(D), HAS_R=has_r, HAS_LO=lo is not None,
+                            SPLIT=split, RSTD=rstd is not None, num_warps=4)
     return out, outlo, rstd
 
 
@@ -536,9 +547,33 @@ def write_bwd(x, R, b, y, go, need_dx=True):
     dy = torch.empty_like(y)
     dx = torch.empty_like(x) if has_r and need_dx else None
     dR = torch.empty_like(R) if has_r else None  # identity transport: dX = dX', nothing to write
-    _write_bwd_kernel[(T,)](x, R if has_r else b, b, y, go, go if dx is None else dx, dR if has_r else b, db, dy, N, D,
+    _write_bwd_kernel[(T,)](x, _ptr(R, b), b, y, go, _ptr(dx, go), _ptr(dR, b), db, dy, N, D,
                             CH=_tile(D, tile), HAS_R=has_r, HAS_DX=dx is not None, num_warps=warps)
     return dx, dR, db, dy
+
+
+class _Write(torch.autograd.Function):
+
+    @staticmethod
+    def forward(ctx, x, R, b, y):
+        ctx.save_for_backward(x, R, b, y)
+        return write_fwd(x, R, b, y)
+
+    @staticmethod
+    def backward(ctx, go):
+        x, R, b, y = ctx.saved_tensors
+        dx, dR, db, dy = write_bwd(x, R, b, y, go)
+        return go if dx is None else dx, dR, db, dy
+
+
+def hc_write(x: torch.Tensor, R, b: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    """x [B, L, N, D], R [B, L, N, N] FP32 or None, b [B, L, N] FP32, y [B, L, D] -> X' [B, L, N, D]."""
+    B, L, N, D = x.shape
+    T = B * L
+    R = None if R is None else R.float().reshape(T, N, N).contiguous()
+    out = _Write.apply(x.contiguous().view(T, N, D), R, b.float().reshape(T, N).contiguous(),
+                       y.to(x.dtype).contiguous().view(T, D))
+    return out.view(B, L, N, D)
 
 
 @triton.jit
@@ -588,7 +623,7 @@ def unwrite(hi_next, lo_next, R, b, y, inplace=False):
         hi, lo = hi_next, lo_next
     else:
         hi, lo = torch.empty_like(hi_next), torch.empty_like(hi_next)
-    _unwrite_kernel[(T,)](hi_next, lo_next if lo_next is not None else hi_next, R if has_r else b, b, y, hi, lo, N, D,
+    _unwrite_kernel[(T,)](hi_next, _ptr(lo_next, hi_next), _ptr(R, b), b, y, hi, lo, N, D,
                           CH=_tile(D, 512), HAS_R=has_r, HAS_LO=lo_next is not None, num_warps=4)
     return hi, lo
 
@@ -685,7 +720,7 @@ def unwrite_bwd(hi_next, lo_next, R, b, y, a, go, inplace=False):
     CH = _tile(D, 512)
     NT = triton.cdiv(D, CH)
     part = torch.empty(T, NT, 20, device=hi.device, dtype=torch.float32)
-    _unwrite_bwd_kernel[(T, NT)](hi_next, lo_next, R if has_r else b, b, y, a, go.contiguous(), hi, lo, h, part, dy,
+    _unwrite_bwd_kernel[(T, NT)](hi_next, lo_next, _ptr(R, b), b, y, a, go.contiguous(), hi, lo, h, part, dy,
                                  N, D, NT, CH=CH, HAS_R=has_r, num_warps=1)
     sums = part.sum(1)  # over the channel tiles, in a fixed order
     db = sums[:, :N].contiguous()
@@ -791,33 +826,9 @@ def read_proj_bwd(x, R, a, go, dh, dp, wt, c, out=None):
     has_r = R is not None
     BT, CH, warps = 16, min(256, triton.next_power_of_2(D)), 4  # H200 sweep, D = 1536: 4.15 ms (ohc), 3.13 ms (ihc)
     _read_proj_bwd_kernel[(triton.cdiv(T, BT), triton.cdiv(D, CH))](
-        x, R if has_r else a, a, go, dh.contiguous(), dp, wt, c, dx, T, N, D, NL,
+        x, _ptr(R, a), a, go, dh.contiguous(), dp, wt, c, dx, T, N, D, NL,
         BT=BT, CH=CH, LP=max(16, triton.next_power_of_2(NL)), HAS_R=has_r, num_warps=warps)
     return dx
-
-
-class _Write(torch.autograd.Function):
-
-    @staticmethod
-    def forward(ctx, x, R, b, y):
-        ctx.save_for_backward(x, R, b, y)
-        return write_fwd(x, R, b, y)
-
-    @staticmethod
-    def backward(ctx, go):
-        x, R, b, y = ctx.saved_tensors
-        dx, dR, db, dy = write_bwd(x, R, b, y, go)
-        return go if dx is None else dx, dR, db, dy
-
-
-def hc_write(x: torch.Tensor, R, b: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-    """x [B, L, N, D], R [B, L, N, N] FP32 or None, b [B, L, N] FP32, y [B, L, D] -> X' [B, L, N, D]."""
-    B, L, N, D = x.shape
-    T = B * L
-    R = None if R is None else R.float().reshape(T, N, N).contiguous()
-    out = _Write.apply(x.contiguous().view(T, N, D), R, b.float().reshape(T, N).contiguous(),
-                       y.to(x.dtype).contiguous().view(T, D))
-    return out.view(B, L, N, D)
 
 
 # ---------------------------------------------------------------------------------------------
