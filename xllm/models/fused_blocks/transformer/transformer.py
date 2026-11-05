@@ -10,18 +10,27 @@ modules as the controllers (xllm/modules/residual/hyper_connection.py is the mod
     (a1, R1, b1) = controller1(X);   x  = read(X, a1);   y1 = attention(norm(x));   X1 = write(X, R1, b1, y1)
     (a2, R2, b2) = controller2(X1);  xo = read(X1, a2);  y2 = ffn(norm(xo));        X2 = write(X1, R2, b2, y2)
 
-The streams are not saved: a write is invertible, X = R^T (X' - b y), so the backward recovers them from the layer
-above (X2 from the top layer's output or the layer above's backward through the `StreamSlot`; X1 before the FFN
-backward, X0 before the attention backward, X0 on to the layer below) and saves the branch outputs y1, y2 and the
-controllers' logits and rstd instead of x and xo. The streams travel as hi + lo BF16 pairs: hi is what the model reads,
-hi + lo holds the FP32 write to ~2^-17, so the inversion reproduces the forward's streams; lo and the rstd of hi reach
-the next layer through the slot, the first layer's input (the embedding) has no lo and is saved as one copy. The
-backward of a sublayer is two passes over the streams, `unwrite_bwd` and `read_proj_bwd`.
+The streams are not saved per layer; the block saves the branch outputs y1, y2 and the controllers' logits and rstd
+instead of x and xo, and the backward gets the streams back one of two ways (`residual_ckpt_interval`):
+
+- Inverting (0): a write is invertible, X = R^T (X' - b y), so the backward recovers the streams from the layer above
+  (X2 from the top layer's output or the layer above's backward through the `StreamSlot`; X1 before the FFN backward,
+  X0 before the attention backward, X0 on to the layer below). The streams travel as hi + lo BF16 pairs: hi is what the
+  model reads, hi + lo holds the FP32 write to ~2^-17, so the inversion reproduces the forward's streams; lo and the
+  rstd of hi reach the next layer through the slot, the first layer's input (the embedding) has no lo and is saved as
+  one copy. The backward of a sublayer is two passes over the streams, `unwrite_bwd` and `read_proj_bwd`.
+- Recomputing (k > 0; mHC's recomputation blocks, arXiv 2512.24880 sec. 4.3.2): every k-th layer keeps its input
+  streams (a saved tensor; layer 0 its embedding copy) and the forward leaves each layer's write coefficients and
+  branch outputs in the slot; in the backward the top layer of each block of k layers recomputes the inputs of the
+  layers below it from the kept one (`recompute_block_streams`) and leaves them in the slot, where each layer takes
+  its own. No lo parts: the streams are rounded once per write as on the module path, the writes cost two passes
+  instead of five, and a sublayer's backward is the forward write again, a read, `write_bwd` and `read_proj_bwd`.
+  Memory: one [T, N, D] tensor per kept layer, plus one per layer of the block being run, transiently.
 
 mhc (Sinkhorn transport, not invertible) has no fused block. The hyper-connection module asserts a model-parallel world
 size of one, so the block's model-parallel gathers and scatters are no-ops on that path. One backward per forward: the
 stream hand-off between layers (the slot, the top layer's streams on its ctx) is consumed by the first backward, so a
-second one through the same graph (retain_graph, double backward) is rejected at the top layer.
+second one through the same graph (retain_graph, double backward) is rejected.
 """
 
 from typing import Optional, Tuple, Any
@@ -41,7 +50,6 @@ from xllm.modules.residual.hyper_connection import (
     HYPER_CONNECTIONS,
     StreamSlot,
     controller_params,
-    expand_streams,
 )
 from xllm.models.fused_blocks.utils import (
     layer_or_rmsnorm_fwd,
@@ -62,6 +70,26 @@ from xllm.models.fused_blocks.distributed import (
     reduce_scatter,
     all_gather,
 )
+
+
+def _kept_streams(X_saved: torch.Tensor, N: int) -> torch.Tensor:
+    """A kept input as streams [T, N, D]; the first layer keeps one copy of the embedding [T, D] (every stream)."""
+    return X_saved if X_saved.dim() == 3 else X_saved.unsqueeze(1).expand(-1, N, -1).contiguous()
+
+
+def recompute_block_streams(slot: StreamSlot, hc_cls, first: int, top: int, N: int):
+    """Recomputing mode: the input streams of layers first + 1 .. top from the kept input of layer `first` and the writes
+    the forward left in the slot (coefficient logits and branch outputs: saved tensors, not copies), each left in the
+    slot for its layer's backward. The forward's writes again, rounded the same way, so the streams are the forward's
+    to the bit. One fresh [T, N, D] tensor per layer; the kept input is read, not written."""
+    X = _kept_streams(slot.take((first, 'in')), N)
+    for layer in range(first, top):
+        hc1_s, hc1_b, l1, y1, hc2_s, hc2_b, l2, y2 = slot.take((layer, 'writes'))
+        _, R1, b1 = hc_cls.coef_fwd(l1, hc1_s, hc1_b)
+        _, R2, b2 = hc_cls.coef_fwd(l2, hc2_s, hc2_b)
+        X1, _, _ = fused.write_fwd(X, R1, b1, y1)
+        X, _, _ = fused.write_fwd(X1, R2, b2, y2, inplace=True)
+        slot.put((layer + 1, 'in'), X)
 
 
 class TransformerBlockFunction(torch.autograd.Function):
@@ -114,6 +142,7 @@ class TransformerBlockFunction(torch.autograd.Function):
         hc_eps: Optional[float],  # hyper-connections: the controllers' normalization eps
         slot: Optional[StreamSlot],
         last_layer: bool,
+        ckpt_interval: int,  # hyper-connections: 0 inverts the writes in the backward, k keeps every k-th layer's input
         attn_stability_control: int,
         deterministic: bool,
         recompute_q: bool,
@@ -130,12 +159,15 @@ class TransformerBlockFunction(torch.autograd.Function):
             bsz, seq_len, N, D = x.shape
             T = bsz * seq_len
             X = x.contiguous().view(T, N, D)
-            first = layer_id == 0  # the embedding: no lo part, saved rather than recovered
+            first = layer_id == 0  # the embedding: saved as one copy, no lo part
+            split = ckpt_interval == 0  # inverting: the streams travel as hi + lo
+            kept = ckpt_interval > 0 and layer_id % ckpt_interval == 0  # recomputing: this layer's input is kept
+            top = ckpt_interval > 0 and (last_layer or (layer_id + 1) % ckpt_interval == 0)  # and this one recomputes
             if first:
                 slot.reset()
                 X_lo, rstd_in = None, None
             else:
-                X_lo, rstd_in = slot.take()  # from the layer below's write
+                X_lo, rstd_in = slot.take((layer_id, 'carry'))  # from the layer below's write: lo (inverting), rstd
             hc1_w, hc1_b, hc1_s = controller_params(hc1_w, hc1_b, hc1_s, X.dtype)
             hc2_w, hc2_b, hc2_s = controller_params(hc2_w, hc2_b, hc2_s, X.dtype)
             l1, rstd1, a1, R1, b1 = hc_cls.controller_fwd(X, hc1_w, hc1_b, hc1_s, hc_eps, rstd_in)
@@ -188,7 +220,7 @@ class TransformerBlockFunction(torch.autograd.Function):
         if hc:
             # write the attention output into the streams; the FFN branch reads the result
             y1 = xh.contiguous().view(T, D)
-            X1, X1_lo, rstd_x1 = fused.write_fwd(X, R1, b1, y1, lo=X_lo, split=True, rstd_eps=hc_eps)
+            X1, X1_lo, rstd_x1 = fused.write_fwd(X, R1, b1, y1, lo=X_lo, split=split, rstd_eps=hc_eps)
             del X_lo
             l2, rstd2, a2, R2, b2 = hc_cls.controller_fwd(X1, hc2_w, hc2_b, hc2_s, hc_eps, rstd_x1)
             xo = fused.read_fwd(X1, a2).view(bsz, seq_len, D)
@@ -220,21 +252,27 @@ class TransformerBlockFunction(torch.autograd.Function):
         if hc:
             y2 = out.contiguous().view(T, D)
             # the second write overwrites X1 (read above, not saved): no third pair of streams live in the forward
-            X2, X2_lo, rstd_x2 = fused.write_fwd(X1, R2, b2, y2, lo=X1_lo, split=True, rstd_eps=hc_eps, inplace=True)
+            X2, X2_lo, rstd_x2 = fused.write_fwd(X1, R2, b2, y2, lo=X1_lo, split=split,
+                                                 rstd_eps=None if last_layer else hc_eps, inplace=True)
             if not last_layer:
-                slot.put((X2_lo, rstd_x2))  # to the next layer's forward
+                slot.put((layer_id + 1, 'carry'), (X2_lo, rstd_x2))  # to the next layer's forward
             out = X2.view(bsz, seq_len, N, D)
         else:
             out = torch.add(out, residual)
 
         # the residual's tensors: x and xo for the plain residual; the controllers, their logits and rstd, the branch
-        # outputs and the first layer's input (one copy of the embedding) for hyper-connections
+        # outputs and the kept input streams (the first layer's: one copy of the embedding) for hyper-connections
         if hc:
-            X_saved = X[:, 0].contiguous() if first else None
+            X_saved = X[:, 0].contiguous() if first else (X if kept else None)
             rc_saved = (X_saved, hc1_w, hc1_b, hc1_s, hc2_w, hc2_b, hc2_s, l1, rstd1, l2, rstd2, y1, y2)
-            # the top layer's output streams go on the ctx, not into the saved tensors, so the backward can free them
-            # right after inverting them (this is the step's peak); detached, or ctx -> X2 -> grad_fn would be a cycle
-            ctx.X_out = (X2.detach(), X2_lo) if last_layer else None
+            if kept:
+                slot.put((layer_id, 'in'), X_saved)  # for the block's top layer's recompute (the same tensor)
+            if ckpt_interval > 0 and not top:
+                slot.put((layer_id, 'writes'), (hc1_s, hc1_b, l1, y1, hc2_s, hc2_b, l2, y2))  # for the recompute
+            # inverting: the top layer's output streams go on the ctx, not into the saved tensors, so the backward can
+            # free them right after inverting them (this is the step's peak); detached, or ctx -> X2 -> grad_fn would
+            # be a cycle
+            ctx.X_out = (X2.detach(), X2_lo) if last_layer and split else None
             del X2_lo
         else:
             rc_saved = (x, xo)
@@ -289,6 +327,8 @@ class TransformerBlockFunction(torch.autograd.Function):
         ctx.hc_cls = hc_cls
         ctx.slot = slot
         ctx.last_layer = last_layer
+        ctx.layer_id = layer_id
+        ctx.ckpt_interval = ckpt_interval
         ctx.deterministic = deterministic
         ctx.attn_stability_control = attn_stability_control
         ctx.max_seqlen_q = max_seqlen_q
@@ -372,34 +412,39 @@ class TransformerBlockFunction(torch.autograd.Function):
         attn_scale = 1.0 / math.sqrt(head_dim)
         hc = ctx.hc_cls is not None
         if hc:
-            # hyper-connections: recover X1 from X2 by inverting the second write, read xo = read(X1, a2) and take the
-            # write's backward (dy2, db2, dR2) in the same pass; the first layer recomputes X1 from its exact input
+            # hyper-connections: X1, xo = read(X1, a2) and the second write's backward (dy2, db2, dR2). With the layer's
+            # input at hand (kept, recomputed, or the first layer's embedding) X1 is the forward's write again; else X1
+            # is recovered from X2 by inverting the write, in the same pass as the rest
             (X_in, hc1_w, hc1_b, hc1_s, hc2_w, hc2_b, hc2_s, l1, rstd1, l2, rstd2, y1, y2) = rc
-            hc_cls = ctx.hc_cls
+            hc_cls, slot, layer_id, k = ctx.hc_cls, ctx.slot, ctx.layer_id, ctx.ckpt_interval
             bsz, seq_len, N, D = out_grad.shape
             T = bsz * seq_len
-            if X_in is not None:
-                X_in = expand_streams(X_in.view(bsz, seq_len, D), N).view(T, N, D)  # the first layer: the embedding again
             G2 = out_grad.contiguous().view(T, N, D)  # autograd's tensor: read only
             a1, R1, b1 = hc_cls.coef_fwd(l1, hc1_s, hc1_b)
             a2, R2, b2 = hc_cls.coef_fwd(l2, hc2_s, hc2_b)
-            # one backward per forward: the stream hand-off (ctx.X_out, the slot) is consumed by the first backward
-            assert not (ctx.last_layer and ctx.X_out is None), \
-                "the hyper-connection fused block runs one backward per forward (no retain_graph / double backward)"
-            X_out, ctx.X_out = ctx.X_out, None
-            at_top = X_out is not None
-            if at_top:
-                X2, X2_lo = X_out[0].view(T, N, D), X_out[1]  # the model's output: not ours to overwrite
-                del X_out
-            else:
-                X2, X2_lo = ctx.slot.take()
+            if k > 0:
+                if ctx.last_layer or (layer_id + 1) % k == 0:  # the block's top layer: the inputs of the layers below
+                    recompute_block_streams(slot, hc_cls, layer_id - layer_id % k, layer_id, N)
+                if X_in is None:
+                    X_in = slot.take((layer_id, 'in'))
             if X_in is not None:
+                X_in = _kept_streams(X_in, N)
                 X1, X1_lo, _ = fused.write_fwd(X_in, R1, b1, y1)  # hi alone: the single-op kernels below read hi
                 xo = fused.read_fwd(X1, a2)
                 _, dR2, db2, dy2 = fused.write_bwd(X1, R2, b2, y2, G2, need_dx=False)
             else:
+                # one backward per forward: the stream hand-off (ctx.X_out, the slot) is consumed by the first backward
+                assert not (ctx.last_layer and ctx.X_out is None), \
+                    "the hyper-connection fused block runs one backward per forward (no retain_graph / double backward)"
+                X_out, ctx.X_out = ctx.X_out, None
+                at_top = X_out is not None
+                if at_top:
+                    X2, X2_lo = X_out[0].view(T, N, D), X_out[1]  # the model's output: not ours to overwrite
+                    del X_out
+                else:
+                    X2, X2_lo = slot.take((layer_id, 'out'))
                 X1, X1_lo, xo, dR2, db2, dy2 = fused.unwrite_bwd(X2, X2_lo, R2, b2, y2, a2, G2, inplace=not at_top)
-            del X2, X2_lo
+                del X2, X2_lo
             xo = xo.view(bsz, seq_len, D)
             out_grad = dy2.view(bsz, seq_len, D)
             del dy2
@@ -480,14 +525,14 @@ class TransformerBlockFunction(torch.autograd.Function):
             del da2, db2, dR2
             dX1 = fused.read_proj_bwd(X1, R2, a2, G2, xo_grad, *proj2)
             del G2, xo_grad, proj2
-            # recover X0 from X1 the same way (x = read(X0, a1), dy1, db1, dR1) and hand it to the layer below
+            # X0 the same way (x = read(X0, a1), dy1, db1, dR1); inverting hands it on to the layer below
             if X_in is not None:
                 X = X_in
                 x = fused.read_fwd(X, a1)
                 _, dR1, db1, dy1 = fused.write_bwd(X, R1, b1, y1, dX1, need_dx=False)
             else:
                 X, X_lo, x, dR1, db1, dy1 = fused.unwrite_bwd(X1, X1_lo, R1, b1, y1, a1, dX1, inplace=True)
-                ctx.slot.put((X, X_lo))
+                slot.put((layer_id - 1, 'out'), (X, X_lo))
                 del X_lo
             del X_in, X1, X1_lo
             x_ = x = x.view(bsz, seq_len, D)
@@ -628,6 +673,7 @@ class TransformerBlockFunction(torch.autograd.Function):
             None,  # hc_eps
             None,  # slot
             None,  # last_layer
+            None,  # ckpt_interval
             None,  # attn_stability_control
             None,  # deterministic
             None,  # recompute_q

@@ -78,7 +78,15 @@ Per sublayer the streams are read three times (write, controller statistics, rea
   FP32 write result to ~2^-17), so the inversion reproduces the forward's streams and the gradients match the
   stored-streams path at the BF16 noise floor; the lo parts pass through a `StreamSlot`. `mhc` (Sinkhorn
   transport, not invertible), MoE / MoVA and Gekko fused blocks are asserted off in `ModelConf`. The backward of a
-  sublayer is two passes over the streams (`unwrite_bwd`, `read_proj_bwd`). k2-horizon-0.9B, 1 node x 8 H200,
+  sublayer is two passes over the streams (`unwrite_bwd`, `read_proj_bwd`). `residual_ckpt_interval k > 0` trades
+  memory for speed the way mHC does (arXiv 2512.24880, sec. 4.3.2): every k-th layer keeps its input streams, the
+  forward writes round once (no hi / lo), and in the backward the top layer of each block of k layers recomputes
+  the inputs of the layers below it from the kept one (the writes again, bitwise the forward's streams) before
+  they run; `N * D * 2` bytes per token per kept layer plus one layer's streams per layer of the block transiently
+  (mHC's memory-optimal block is `k ~ sqrt(N L / (N + 2))`, 4-5 for 28 layers). Measured on one H200 (k2-horizon-0.9B,
+  bsz 16 x 8k, fwd + bwd): base 3.42 s; `ohc` k = 0 3.83 s / 62.0 GiB, k = 5 3.83 s / 71.0 GiB, k = 1 3.78 s / 101.0
+  GiB; `ihc` k = 0 3.81 s / 61.8 GiB, k = 5 3.77 s / 70.8 GiB. The inversion runs within 1.3% of keeping every
+  layer's streams (k = 1, +39 GiB), so 0 is the default. k2-horizon-0.9B, 1 node x 8 H200,
   bsz 32 x 8k, Muon: base fused block 5.40 s/step, 48.5k wps/GPU, 119 GB; `ohc` 6.25 s (+15.7%), 41.9k, 137 GB;
   `ihc` 6.17 s (+14.3%), 42.4k, 132 GB (the stream path's working set at the top layer's FFN backward, not saved
   streams, sets the peak); `ohc` with `layerwise_ckpt` instead of the fused block 121-125 GB, 37k wps.

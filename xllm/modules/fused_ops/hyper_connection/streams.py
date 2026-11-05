@@ -114,8 +114,8 @@ def _write_fwd_kernel(x_ptr, xlo_ptr, r_ptr, b_ptr, y_ptr, out_ptr, outlo_ptr, r
                       HAS_R: tl.constexpr, HAS_LO: tl.constexpr, SPLIT: tl.constexpr, RSTD: tl.constexpr):
     # X' = R X + b y. HAS_LO: X is kept as hi + lo; SPLIT: X' is stored as hi + lo (else rounded once into out_ptr), in
     # place when out_ptr is x_ptr (each tile is loaded before it is stored).
-    # RSTD (with SPLIT): rstd[t] = rsqrt(mean(hi'^2) + eps) over the token's N * D channels, what `_rstd_kernel` computes
-    # for the next controller from the stored hi', here from the rounded values in registers.
+    # RSTD: rstd[t] = rsqrt(mean(hi'^2) + eps) over the token's N * D channels, what `_rstd_kernel` computes for the
+    # next controller from the stored hi', here from the rounded values in registers.
     t = tl.program_id(0).to(tl.int64)
     (b0, b1, b2, b3, r00, r01, r02, r03, r10, r11, r12, r13, r20, r21, r22, r23,
      r30, r31, r32, r33) = _coefs(r_ptr, b_ptr, t, N, HAS_R)
@@ -145,13 +145,13 @@ def _write_fwd_kernel(x_ptr, xlo_ptr, r_ptr, b_ptr, y_ptr, out_ptr, outlo_ptr, r
             h1 = _st2(out_ptr, outlo_ptr, t, 1, N, D, d, m, o1)
             h2 = _st2(out_ptr, outlo_ptr, t, 2, N, D, d, m, o2)
             h3 = _st2(out_ptr, outlo_ptr, t, 3, N, D, d, m, o3)
-            if RSTD:
-                ss += h0 * h0 + h1 * h1 + h2 * h2 + h3 * h3  # masked streams and channels are zero
         else:
-            _st(out_ptr, t, 0, N, D, d, m, o0)
-            _st(out_ptr, t, 1, N, D, d, m, o1)
-            _st(out_ptr, t, 2, N, D, d, m, o2)
-            _st(out_ptr, t, 3, N, D, d, m, o3)
+            h0 = _st(out_ptr, t, 0, N, D, d, m, o0)
+            h1 = _st(out_ptr, t, 1, N, D, d, m, o1)
+            h2 = _st(out_ptr, t, 2, N, D, d, m, o2)
+            h3 = _st(out_ptr, t, 3, N, D, d, m, o3)
+        if RSTD:
+            ss += h0 * h0 + h1 * h1 + h2 * h2 + h3 * h3  # masked streams and channels are zero
     if RSTD:
         tl.store(rstd_ptr + t, tl.rsqrt(tl.sum(ss, axis=0) / (N * D) + eps))
 
@@ -253,18 +253,17 @@ def write_fwd(hi, R, b, y, lo=None, split=False, rstd_eps=None, inplace=False):
     (identity), b [T, N] FP32, y [T, D] in hi's dtype, all contiguous -> (hi', lo', rstd).
     `split=False`: X' rounded once into hi', lo' None. `split=True`: hi' = round(X'), the streams the next kernels read,
     and lo' = round(X' - hi'), so that hi' + lo' holds X' to ~2^-17 and the write can be inverted without the
-    single-rounding drift. `rstd_eps` (with split): also rstd [T] FP32 of hi', rsqrt(mean(hi'^2) + eps) over the N * D
-    channels, the normalization of the controller that reads X' next (`logits_fwd(..., rstd=rstd)`), without a pass
-    over hi'; else None. `inplace` (with split and lo) overwrites hi and lo with X'."""
+    single-rounding drift. `rstd_eps`: also rstd [T] FP32 of hi', rsqrt(mean(hi'^2) + eps) over the N * D channels,
+    the normalization of the controller that reads X' next (`logits_fwd(..., rstd=rstd)`), without a pass over hi';
+    else None. `inplace` overwrites hi (and lo, for a split write) with X'."""
     _check_streams(hi)
     T, N, D = hi.shape
     if inplace:
-        assert split and lo is not None, "write_fwd in place takes X as (hi, lo) and stores X' as (hi', lo')"
+        assert split == (lo is not None), "write_fwd in place stores X' over X: (hi, lo) for a split write, hi alone otherwise"
         out, outlo = hi, lo
     else:
         out = torch.empty_like(hi)
         outlo = torch.empty_like(hi) if split else None
-    assert split or rstd_eps is None, "write_fwd: the rstd is of the split write's hi'"
     rstd = torch.empty(T, device=hi.device, dtype=torch.float32) if rstd_eps is not None else None
     _write_fwd_kernel[(T,)](hi, _ptr(lo, hi), _ptr(R, b), b, y, out, _ptr(outlo, out), _ptr(rstd, out), N, D,
                             0.0 if rstd_eps is None else rstd_eps, CH=_tile(D), HAS_R=R is not None,

@@ -33,9 +33,10 @@ The model expands the streams from the embedding (every stream = x0, `expand_str
 sums them before the final norm (`sum_streams`).
 
 The fused training block (`fused_block`, ihc / ohc; `TransformerBlockFunction` in
-xllm/models/fused_blocks/transformer/transformer.py) runs the same stream ops and recovers the streams in its backward
-by inverting the writes; `HyperConnection.controller_fwd` / `controller_bwd`, `controller_params` and `StreamSlot`
-below are its helpers.
+xllm/models/fused_blocks/transformer/transformer.py) runs the same stream ops and does not keep the streams: its
+backward recovers them by inverting the writes or, with `residual_ckpt_interval` k > 0, recomputes them from the input
+of every k-th layer; `HyperConnection.controller_fwd` / `controller_bwd`, `controller_params` and `StreamSlot` below
+are its helpers.
 """
 
 import math
@@ -363,24 +364,26 @@ def flops_in_hyper_connection(residual_func: str, model_dim: int) -> int:
 # --- the fused training block's stream path (xllm/models/fused_blocks/transformer/transformer.py) ---
 
 class StreamSlot:
-    """Hands stream data from one layer to the adjacent one outside the autograd graph: in the forward the lo part and
-    rstd of a layer's output to the next layer, in the backward the recovered input streams to the layer below. The
-    layers run in order both ways, so one slot per model suffices; the first layer resets it every forward."""
+    """The fused block's hand-off of stream data between layers outside the autograd graph: a mailbox keyed by
+    (layer, what). The forward passes a layer's output rstd (and lo part, when inverting) to the layer above; the
+    backward passes recovered streams to the layer below (inverting) or, when recomputing, the kept inputs and the
+    writes' coefficients and branch outputs from the forward to the block's top layer, and the recomputed inputs from
+    there to each layer. The layers run in order both ways, so one slot per model suffices; the first layer resets it
+    every forward, which also drops what a forward without a backward left behind."""
 
     def __init__(self):
-        self.streams = None
+        self.items = {}
 
     def reset(self):
-        self.streams = None
+        self.items.clear()
 
-    def put(self, streams):
-        assert self.streams is None, "StreamSlot: the adjacent layer did not take the previous streams"
-        self.streams = streams
+    def put(self, key, value):
+        assert key not in self.items, f"StreamSlot: {key} not taken yet"
+        self.items[key] = value
 
-    def take(self):
-        streams, self.streams = self.streams, None
-        assert streams is not None, "StreamSlot: no streams from the adjacent layer"
-        return streams
+    def take(self, key):
+        assert key in self.items, f"StreamSlot: nothing under {key}: the layers run in order, one backward per forward"
+        return self.items.pop(key)
 
 
 def controller_params(weight: Tensor, bias: Tensor, scale: Tensor, dtype: torch.dtype):

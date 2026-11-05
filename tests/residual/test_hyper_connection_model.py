@@ -1,7 +1,8 @@
 """Single-GPU smoke of hyper-connections inside the Transformer and Gekko models.
 
-Builds tiny models for every residual_func, runs a training forward / backward and an eval forward, and checks finite
-losses, gradients on every controller parameter and that num_parameters() matches the real parameter count.
+Builds tiny models for every residual_func (module path, and the fused block in both of its modes), runs a training
+forward / backward and an eval forward, and checks finite losses, gradients on every controller parameter and that
+num_parameters() matches the real parameter count.
 
     python -m pytest -q tests/residual/test_hyper_connection_model.py
 """
@@ -45,6 +46,7 @@ def make_cfg(arch: str, residual_func: str, **kwargs) -> ModelConf:
 
 
 MOE = dict(num_experts=4, num_activated_experts=2, expert_inter_dim=64, num_dense_layers=1)
+FUSED = dict(fused_block=True, recompute_q=True, recompute_fc1_out=True, recompute_fc3_out=True)
 
 
 # Gekko has no MoE block in this tree (GekkoBlock is dense; num_experts is ignored), so no gekko MoE case
@@ -52,6 +54,7 @@ MOE = dict(num_experts=4, num_activated_experts=2, expert_inter_dim=64, num_dens
     *[(arch, rf, {}) for arch in ('transformer', 'gekko') for rf in ('base', 'ihc', 'mhc', 'ohc')],
     *[('transformer', rf, MOE) for rf in ('ihc', 'mhc', 'ohc')],
     *[('transformer', rf, dict(num_values=4, num_activated_values=2, **MOE)) for rf in ('ihc', 'mhc', 'ohc')],
+    *[('transformer', rf, dict(residual_ckpt_interval=k, **FUSED)) for rf in ('ihc', 'ohc') for k in (0, 1)],
 ])
 def test_train_and_eval_step(arch, residual_func, kwargs):
     torch.manual_seed(0)

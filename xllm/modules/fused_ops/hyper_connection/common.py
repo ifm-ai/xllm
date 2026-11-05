@@ -59,7 +59,10 @@ def _ld(ptr, t, n, N, D, d, m):
 
 @triton.jit
 def _st(ptr, t, n, N, D, d, m, v):
-    tl.store(ptr + (t * N + n) * D + d, v.to(ptr.dtype.element_ty), mask=m & (n < N))
+    # store v rounded to the tensor's dtype; -> the rounded value as FP32
+    h = v.to(ptr.dtype.element_ty)
+    tl.store(ptr + (t * N + n) * D + d, h, mask=m & (n < N))
+    return h.to(tl.float32)
 
 
 @triton.jit
