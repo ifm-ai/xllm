@@ -169,7 +169,12 @@ def get_n_restarts(dump_dir: Path, rank: int) -> int:
 
 @contextlib.contextmanager
 def create_on_gpu():
-    original_device = torch.get_default_device()
+    # torch.get_default_device() reports "cpu" when no default device was ever set; restoring *that* with
+    # set_default_device installs a DeviceContext TorchFunctionMode (a python __torch_function__ hook on every
+    # torch op) for the rest of the process, which costs ~10% of the CPU time of a training step. Restore the
+    # raw setting instead (None = no mode).
+    import torch.utils._device
+    original_device = torch.utils._device.CURRENT_DEVICE
     original_dtype = torch.get_default_dtype()
     try:
         torch.set_default_device(torch.cuda.current_device())
