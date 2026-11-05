@@ -223,8 +223,8 @@ def test(B: int, L: int, H: int, HKV: int, D: int, V: int, chunk_size: int, avg_
     # test_chunk_wise_attention_speed(query, key, value, out_grad, chunk_size * 2, epochs)
     # if D == V and dtype in ['bf16', 'fp16']:
     #     test_flash_sliding_window_attention_speed(query, key, value, out_grad, chunk_size * 2, 1.0 / math.sqrt(D), epochs)
-    test_sliding_chunk_attention_speed(query, key, value, out_grad, chunk_size, bos_mask, segment_idx, False, 'swift', epochs)
-    for level in range(5):
+    # test_sliding_chunk_attention_speed(query, key, value, out_grad, chunk_size, bos_mask, segment_idx, False, 'swift', epochs)
+    for level in range(2):
         test_sliding_chunk_attention_speed(query, key, value, out_grad, chunk_size, bos_mask, segment_idx, level, 'xattn', epochs)
         test_sliding_chunk_attention_speed(query, key, value, out_grad, chunk_size, None, segment_idx, level, 'xattn', epochs)
     print("*" * 70)

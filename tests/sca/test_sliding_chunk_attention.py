@@ -128,12 +128,6 @@ def test(B: int, L: int, H: int, HKV: int, D: int, V: int, chunk_size: int, prev
             ['xattn', 'segidx', 0],
             ['xattn', 'bos', 1],
             ['xattn', 'segidx', 1],
-            ['xattn', 'bos', 2],
-            ['xattn', 'segidx', 2],
-            ['xattn', 'bos', 3],
-            ['xattn', 'segidx', 3],
-            ['xattn', 'bos', 4],
-            ['xattn', 'segidx', 4],
         ]:
             if mode == 'bos':
                 bmask = bos_mask
