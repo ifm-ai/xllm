@@ -4,7 +4,7 @@
 saving the two sublayer inputs and a few attention tensors and recomputing the rest in the backward.
 
 With hyper-connections (`residual_func` ihc / ohc) the layer's state is N = 4 streams X [B, L, N, D] and
-the residual adds become the stream ops of xllm/modules/fused_ops/hyper_connection.py, with the sublayers' residual
+the residual adds become the stream ops of xllm/modules/fused_ops/hyper_connection/, with the sublayers' residual
 modules as the controllers (xllm/modules/residual/hyper_connection.py is the module path):
 
     (a1, R1, b1) = controller1(X);   x  = read(X, a1);   y1 = attention(norm(x));   X1 = write(X, R1, b1, y1)

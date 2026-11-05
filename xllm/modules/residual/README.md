@@ -60,7 +60,7 @@ and FLOP counts (`num_parameters`, `tflops_per_token`) include the controllers.
 ### Kernels and limits
 
 On CUDA BF16 / FP16 streams every stream op is a fused Triton kernel
-(`xllm/modules/fused_ops/hyper_connection.py`) that reads and writes the streams directly and keeps FP32
+(`xllm/modules/fused_ops/hyper_connection/`) that reads and writes the streams directly and keeps FP32
 in registers: read, write (with or without a transport), the iHC / oHC gates and the SO(4) transport, and the mHC
 Sinkhorn iterations; each with its backward. The controller projection `rstd * (X @ W)` is a Triton rstd
 kernel and a cuBLAS BF16 matmul with FP32 accumulate and output; its backward is one Triton kernel. The
@@ -76,9 +76,11 @@ Per sublayer the streams are read three times (write, controller statistics, rea
   streams travel as hi + lo (two BF16 tensors: hi is what the branches and controllers read, hi + lo holds the
   FP32 write result to ~2^-17), so the inversion reproduces the forward's streams and the gradients match the
   stored-streams path at the BF16 noise floor; the lo parts pass through a `StreamSlot`. `mhc` (Sinkhorn
-  transport, not invertible), MoE / MoVA and Gekko fused blocks are asserted off in `ModelConf`. k2-horizon-0.9B,
-  8 x H200, bsz 32 x 8k: base fused block 116 GB 48.5k wps/GPU; `ohc` fused block 135.4 GB 40.1k (the stream
-  path's working set in the backward, not saved streams, sets the peak); `ohc` with `layerwise_ckpt` 121-125 GB 37k.
+  transport, not invertible), MoE / MoVA and Gekko fused blocks are asserted off in `ModelConf`. The backward of a
+  sublayer is two passes over the streams (`unwrite_bwd`, `read_proj_bwd`). k2-horizon-0.9B, 1 node x 8 H200,
+  bsz 32 x 8k, Muon: base fused block 5.40 s/step, 48.5k wps/GPU, 119 GB; `ohc` 6.25 s (+15.7%), 41.9k, 137 GB;
+  `ihc` 6.17 s (+14.3%), 42.4k, 132 GB (the stream path's working set at the top layer's FFN backward, not saved
+  streams, sets the peak); `ohc` with `layerwise_ckpt` instead of the fused block 121-125 GB, 37k wps.
 - A variant's coefficient kernels live on its class (`coef_fwd` / `coef_bwd`, raw FP32 ops on `[T, n_logits]`
   logits); the module path on CUDA (`fused_coefficients`) and the fused block both call them, so adding a variant
   with a fused block means one class with `NAME`, `NUM_LOGITS`, a torch reference (`reference_coefficients`) and

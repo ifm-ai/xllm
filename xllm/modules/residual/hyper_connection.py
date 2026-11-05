@@ -25,7 +25,7 @@ scales start at 0.01 and every bias at 0 (mHC adds a constant 4 I to its transpo
 so the model starts close to a plain residual (a ~ 0.5, b ~ 1, R near I) and weight decay
 pulls the biases back to that start. Coefficient math and stream mixing run in FP32; the
 branch input and the streams keep the model dtype. On CUDA BF16 / FP16 streams every stream op
-runs as a fused Triton kernel (xllm/modules/fused_ops/hyper_connection.py); the torch code here is
+runs as a fused Triton kernel (xllm/modules/fused_ops/hyper_connection/); the torch code here is
 the reference path.
 
 The model expands the streams from the embedding (every stream = x0, `expand_streams`) and

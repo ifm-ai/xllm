@@ -177,7 +177,9 @@ class ModelConf(Config):
     layernorm_eps: float = 1e-5
     rmsnorm_eps: float = 1e-6
     apply_rmsnorm: bool = False  # True = RMSNorm, False = LayerNorm
-    residual_func: str = "base"  # Residual connection type: base/add means standard addition, ortho for orthogonal residuals, ihc/mhc/ohc for hyper-connections (4 residual streams with identity / Sinkhorn / SO(4) transport, see xllm/modules/residual/README.md).
+    # Residual connection type: base/add means standard addition, ortho for orthogonal residuals, ihc/mhc/ohc for
+    # hyper-connections (4 residual streams with identity / Sinkhorn / SO(4) transport, xllm/modules/residual/README.md).
+    residual_func: str = "base"
     residual_heads: Optional[int] = None  # Num of feature groups for orthogonal residuals. Required when using residual_func='ortho'.
     # Rope base
     rope_base: float = 100000  # RoPE frequency base
