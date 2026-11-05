@@ -40,12 +40,12 @@ class SlidingChunkSoftmaxAttentionFunc(torch.autograd.Function):
         training: bool = True,
     ) -> Tensor:
         p = dropout if training else 0.0
-        y, y_for_save, aux = sliding_chunk_softmax_attention_fwd(
+        y, aux = sliding_chunk_softmax_attention_fwd(
             q, k, v, chunk_size, scale, prev_k, prev_v, bos_mask,
             segment_idx, p, high_precision_level, backend, training
         )
         ctx.save_for_backward(
-            q, k, v, y_for_save, aux,
+            q, k, v, y, aux,
             prev_k, prev_v, bos_mask, segment_idx,
         )
 
@@ -236,21 +236,20 @@ def sliding_chunk_softmax_attention_fwd(
     high_precision_level: int = 0,
     backend: str = 'xattn',
     requires_grad: bool = False
-) -> Tuple[Tensor, Optional[Tensor], Optional[Tensor]]:
+) -> Tuple[Tensor, Optional[Tensor]]:
     if backend in ['xattn', 'flash']:
         assert XATTN_SCA_ENABLED, "xattn was not installed."
         assert dropout == 0.0, f"xattn SCA does not support attention dropout: {dropout}"
         if bos_mask is not None:
             segment_idx = None
 
-        y, y_fp32, lse = flash_sca_fwd(
+        y, lse = flash_sca_fwd(
             q, k, v, chunk_size, scale, prev_k, prev_v,
             bos_mask=bos_mask, segment_idx=segment_idx,
             high_precision_level=high_precision_level
         )
         lse = lse if requires_grad else None
-        y_for_bwd = (y if high_precision_level == 0 else y_fp32) if requires_grad else None
-        return y, y_for_bwd, lse
+        return y, lse
     elif backend == 'swift':
         if segment_idx is not None and prev_k is not None:
             assert segment_idx.shape[1] == q.shape[1] + chunk_size
@@ -262,7 +261,7 @@ def sliding_chunk_softmax_attention_fwd(
         y, w = _sequential_sliding_chunk_attention_fwd(
             q, k, v, chunk_size, scale, prev_k, prev_v, segment_idx, prev_segment_idx, dropout, requires_grad
         )
-        return y, None, w
+        return y, w
     else:
         raise ValueError(f"Unknown backend: {backend}.")
 

@@ -79,19 +79,19 @@ def test_sliding_chunk_attention_speed(
         # warm up
         for i in range(100):
             deterministic = i % 2 == 0
-            _, y_bwd, aux = sliding_chunk_softmax_attention_fwd(
+            y, aux = sliding_chunk_softmax_attention_fwd(
                 query, key, value, chunk_size, 1.0, None, None,
                 bos_mask, segment_idx, 0.0, level, backend, True
             )
             sliding_chunk_softmax_attention_bwd(
-                out_grad, query, key, value, y_bwd, aux, chunk_size, 1.0, None, None,
+                out_grad, query, key, value, y, aux, chunk_size, 1.0, None, None,
                 bos_mask, segment_idx, level, deterministic, backend
             )
         torch.cuda.synchronize()
 
         start = timer()
         for _ in range(epochs):
-            _, y_bwd, aux = sliding_chunk_softmax_attention_fwd(
+            y, aux = sliding_chunk_softmax_attention_fwd(
                 query, key, value, chunk_size, 1.0, None, None,
                 bos_mask, segment_idx, 0.0, level, backend, True
             )
@@ -109,7 +109,7 @@ def test_sliding_chunk_attention_speed(
         start = timer()
         for _ in range(epochs):
             sliding_chunk_softmax_attention_bwd(
-                out_grad, query, key, value, y_bwd, aux, chunk_size, 1.0, None, None,
+                out_grad, query, key, value, y, aux, chunk_size, 1.0, None, None,
                 bos_mask, segment_idx, level, deterministic, backend
             )
         torch.cuda.synchronize()
@@ -122,7 +122,7 @@ def test_sliding_chunk_attention_speed(
             start = timer()
             for _ in range(epochs):
                 sliding_chunk_softmax_attention_bwd(
-                    out_grad, query, key, value, y_bwd, aux, chunk_size, 1.0, None, None,
+                    out_grad, query, key, value, y, aux, chunk_size, 1.0, None, None,
                     bos_mask, segment_idx, level, deterministic, backend
                 )
             torch.cuda.synchronize()

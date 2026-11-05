@@ -149,7 +149,7 @@ def test(B: int, L: int, H: int, HKV: int, D: int, V: int, chunk_size: int, prev
             atol = {"fp32": 1e-6, "bf16": 1e-3, "fp16": 2e-4}[dtype]
             rtol = {"fp32": 1e-5, "bf16": 1e-2, "fp16": 1e-3}[dtype]
 
-            y_sca, y_bwd, aux = sliding_chunk_softmax_attention_fwd(
+            y_sca, aux = sliding_chunk_softmax_attention_fwd(
                 q, k, v, chunk_size, 1.0, prev_k, prev_v, bmask, segidx,
                 0.0, level, backend, requires_grad=True
             )
@@ -162,7 +162,7 @@ def test(B: int, L: int, H: int, HKV: int, D: int, V: int, chunk_size: int, prev
 
             # non-deterministic
             q_grad_sca, k_grad_sca, v_grad_sca, prev_k_grad_sca, prev_v_grad_sca = sliding_chunk_softmax_attention_bwd(
-                y_grad, q, k, v, y_bwd, aux, chunk_size, 1.0,
+                y_grad, q, k, v, y_sca, aux, chunk_size, 1.0,
                 prev_k, prev_v, bmask, segidx, level, False, backend
             )
             torch.testing.assert_close(q_grad_sca, q_grad, rtol=rtol, atol=atol)
@@ -178,7 +178,7 @@ def test(B: int, L: int, H: int, HKV: int, D: int, V: int, chunk_size: int, prev
 
             # deterministic
             q_grad_sca, k_grad_sca, v_grad_sca, prev_k_grad_sca, prev_v_grad_sca = sliding_chunk_softmax_attention_bwd(
-                y_grad, q, k, v, y_bwd, aux, chunk_size, 1.0,
+                y_grad, q, k, v, y_sca, aux, chunk_size, 1.0,
                 prev_k, prev_v, bmask, segidx, level, True, backend
             )
             torch.testing.assert_close(q_grad_sca, q_grad, rtol=rtol, atol=atol)
