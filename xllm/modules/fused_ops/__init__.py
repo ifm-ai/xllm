@@ -36,7 +36,8 @@ from .adaptive_working_memory import (
     adaptive_working_memory,
     adaptive_working_memory_fwd,
     adaptive_working_memory_accum_fwd,
-    adaptive_working_memory_bwd
+    adaptive_working_memory_bwd,
+    _cute_bwd_supported as awm_cute_bwd_supported,
 )
 from .memory_efficient_dropout import (
     memory_efficient_dropout,

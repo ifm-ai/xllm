@@ -26,7 +26,9 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> AttentionBwd(
 
 void DefineAttentionOp(py::module& m) {
   m.def("attention_fwd", &AttentionFwd, "AttentionFwd")
-      .def("attention_bwd", &AttentionBwd, "AttentionBwd");
+      .def("attention_bwd", &AttentionBwd, "AttentionBwd")
+      .def("attention_bwd_out", &AttentionCUDABwdOut, "AttentionCUDABwdOut")
+      .def("attention_bwd_ds_out", &AttentionCUDABwdDsOut, "AttentionCUDABwdDsOut");
 }
 
 std::tuple<torch::Tensor, torch::Tensor> MultiSegAttentionFwd(
@@ -39,8 +41,20 @@ std::tuple<torch::Tensor, torch::Tensor> MultiSegAttentionFwd(
   return MultiSegAttentionCUDAFwd(q, k, v, q_segment_idx, k_segment_idx, scale, dropout, use_causal_mask);
 }
 
+void MultiSegAttentionFwdOut(
+    const torch::Tensor& q, const torch::Tensor& k, const torch::Tensor& v,
+    const torch::Tensor& q_segment_idx, const torch::Tensor& k_segment_idx,
+    double scale, double dropout, bool use_causal_mask, torch::Tensor w,
+    torch::Tensor y) {
+  TORCH_CHECK(q.device().type() == torch::kCUDA);
+  TORCH_CHECK(k.device().type() == torch::kCUDA);
+  TORCH_CHECK(v.device().type() == torch::kCUDA);
+  MultiSegAttentionCUDAFwdOut(q, k, v, q_segment_idx, k_segment_idx, scale, dropout, use_causal_mask, w, y);
+}
+
 void DefineMultiSegAttentionOp(py::module& m) {
-  m.def("multiseg_attention_fwd", &MultiSegAttentionFwd, "MultiSegAttentionFwd");
+  m.def("multiseg_attention_fwd", &MultiSegAttentionFwd, "MultiSegAttentionFwd")
+      .def("multiseg_attention_fwd_out", &MultiSegAttentionFwdOut, "MultiSegAttentionFwdOut");
 }
 
 

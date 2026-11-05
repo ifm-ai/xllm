@@ -45,6 +45,18 @@ def _triton_causal_conv1d_fwd(
     return out, None, None
 
 
+_ZEROS = {}
+
+
+def _zeros(shape, dtype, device):
+    """Cached zero tensors for the kernels' optional read-only inputs (the training path has no bias / state)."""
+    key = (shape, dtype, device)
+    z = _ZEROS.get(key)
+    if z is None:
+        z = _ZEROS[key] = torch.zeros(shape, dtype=dtype, device=device)
+    return z
+
+
 def _triton_causal_conv1d_bwd(
     out_grad: torch.Tensor,
     final_state_grad: torch.Tensor | None,
@@ -70,17 +82,11 @@ def _triton_causal_conv1d_bwd(
         if initial_state is not None
         else None
     )
-    effective_final_state_grad = (
-        final_state_grad
-        if final_state_grad is not None
-        else x.new_zeros((x.shape[0], weight.shape[1] - 1, x.shape[2]))
-    )
-    triton_final_state_grad = (
-        effective_final_state_grad.transpose(1, 2).contiguous()
-    )
-    effective_bias = (
-        bias.contiguous() if bias is not None else x.new_zeros(x.shape[2])
-    )
+    if final_state_grad is not None:
+        triton_final_state_grad = final_state_grad.transpose(1, 2).contiguous()
+    else:  # read-only zeros in the kernel layout [B, D, W - 1], reused across calls
+        triton_final_state_grad = _zeros((x.shape[0], x.shape[2], weight.shape[1] - 1), x.dtype, x.device)
+    effective_bias = bias.contiguous() if bias is not None else _zeros((x.shape[2],), x.dtype, x.device)
 
     x_grad, weight_grad, bias_grad, triton_initial_state_grad = kernel_bwd_fn(
         x.contiguous(),

@@ -62,6 +62,7 @@ class GatedDeltaAttention(nn.Module):
         timenorm_beta1: float = 0.999,
         timenorm_beta2: float = 0.9999,
         timenorm_backend: str = 'cub',
+        awm_backend: str = 'torch',
         timenorm_eps: float = 1e-5,
         rmsnorm_eps: float = 1e-6,
         apply_bias_term: bool = False,
@@ -104,6 +105,7 @@ class GatedDeltaAttention(nn.Module):
         self.sca_backend = sca_backend
         self.attn_gate_fn = attn_gate_func
         self.awm_orthogonal_update = awm_orthogonal_update
+        self.awm_backend = awm_backend
         self.dropout = dropout
         self.attention_dropout = attention_dropout
         self.hidden_dropout = hidden_dropout
@@ -224,6 +226,7 @@ class GatedDeltaAttention(nn.Module):
             self.chunk_size,
             awm_orthogonal_update,
             rmsnorm_eps,
+            awm_backend,
         )
 
         self.attn_norm = GroupRMSNorm(

@@ -946,7 +946,10 @@ def _direct_backward(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
     batch, seqlen, dim = x.shape
     width = weight.shape[1]
-    block_n = 256
+    # 64-row chunks give 4x the programs of the original 256 (the single-warp streaming kernel is latency bound on
+    # B200: [1, 8192, 4096] 138 -> 96 us, [1, 16384, 4096] 169 -> 161); the deterministic path keeps 256 so that its
+    # per-chunk partial buffer and reduction stay small
+    block_n = 256 if (deterministic or seqlen <= 512) else 64  # short sequences keep the 1-2 chunk tail reduce
     block_d = 64
     chunks_per_batch = triton.cdiv(seqlen, block_n)
     num_chunks = batch * chunks_per_batch
