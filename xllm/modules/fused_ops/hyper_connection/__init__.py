@@ -16,8 +16,8 @@ forms dX = dP W^T - c X in one kernel. Read and write are one kernel each way, S
 Every op saves only its inputs, except the projection, which also keeps its FP32 rstd [T] and logits
 [T, n_logits].
 
-The raw launchers are plain functions on contiguous [T, ...] tensors, so the fused transformer block
-(xllm/models/fused_blocks/transformer/transformer.py) calls them from its own forward and backward:
+The raw launchers are plain functions on contiguous [T, ...] tensors, so the fused blocks' stream path
+(xllm/models/fused_blocks/hyper_connection.py) calls them from its own forward and backward:
 
     logits_fwd / logits_bwd                     the projection
     ihc_coef_fwd / ihc_coef_bwd                 the iHC gates from the logits
@@ -45,12 +45,3 @@ from .streams import read_fwd, read_bwd, read_da, hc_read, write_fwd, write_bwd,
 from .fused_block import unwrite_bwd, rewrite_bwd, read_write_bwd, read_proj_bwd
 from .coefficients import ihc_coef_fwd, ihc_coef_bwd, ohc_coef_fwd, ohc_coef_bwd
 from .sinkhorn import sinkhorn
-
-__all__ = [
-    "MAX_STREAMS", "supported",
-    "logits_fwd", "proj_bwd_terms", "logits_bwd", "hc_logits",
-    "read_fwd", "read_bwd", "read_da", "hc_read", "write_fwd", "write_bwd", "hc_write",
-    "unwrite_bwd", "rewrite_bwd", "read_write_bwd", "read_proj_bwd",
-    "ihc_coef_fwd", "ihc_coef_bwd", "ohc_coef_fwd", "ohc_coef_bwd",
-    "sinkhorn",
-]

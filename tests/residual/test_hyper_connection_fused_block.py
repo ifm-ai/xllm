@@ -19,48 +19,15 @@ and the first layer's embedding copy, or, recomputing, the kept inputs; nothing 
     python -m pytest -q tests/residual/test_hyper_connection_fused_block.py
 """
 
-import datetime
-import os
-import types
-
 import pytest
 import torch
 
-from xllm.config import ModelConf
-from xllm.distributed.initialize import initialize_model_parallel, model_parallel_is_initialized
-from xllm.models.gekko import Gekko
-from xllm.models.transformer import Transformer
 from xllm.modules.fused_ops import hyper_connection as fused
 from xllm.modules.residual.hyper_connection import quaternion_transport
-from xllm.utils import create_on_gpu
+from .helpers import PRODUCTION, build, loss_and_grads, rel
 
-pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason='requires CUDA')
-
-
-@pytest.fixture(autouse=True)
-def _exact_matmul():
-    tf32 = torch.backends.cuda.matmul.allow_tf32
-    torch.backends.cuda.matmul.allow_tf32 = False
-    torch.manual_seed(0)
-    yield
-    torch.backends.cuda.matmul.allow_tf32 = tf32
-
-
-@pytest.fixture(scope="module")
-def single_process():
-    if not torch.distributed.is_initialized():
-        os.environ.setdefault("MASTER_ADDR", "localhost")
-        os.environ.setdefault("MASTER_PORT", "29523")
-        torch.cuda.set_device(0)
-        torch.distributed.init_process_group(backend="nccl", init_method="env://", world_size=1, rank=0,
-                                             timeout=datetime.timedelta(seconds=600))
-    if not model_parallel_is_initialized():
-        initialize_model_parallel(1, 1, 600)
-
-
-def rel(x, ref):
-    x, ref = x.double(), ref.double()
-    return ((x - ref).norm() / ref.norm().clamp_min(1e-30)).item()
+pytestmark = [pytest.mark.skipif(not torch.cuda.is_available(), reason='requires CUDA'),
+              pytest.mark.usefixtures('exact_matmul')]
 
 
 def unwrite(hi, lo, R, b, y, inplace=False):
@@ -109,7 +76,7 @@ def test_two_pass_backward_ops(N, has_r, D=1536, T=4096, NL=16):
     """The fused block's two-pass backward against the single-op kernels it replaces. `unwrite_bwd` = the inverse write
     + read_fwd + write_bwd (same FP32 expressions: hi, lo, h, dy to BF16 ties, db, dR to FP32 rounding); `read_da` =
     read_bwd's da; the split write's rstd = the rstd kernel's, and `logits_fwd` given it = `logits_fwd` alone;
-    `write_bwd(need_dx=False)` = write_bwd without dx; `read_proj_bwd` = the FP64 dX = R^T G + a dh + dP W^T - c X
+    `read_proj_bwd` = the FP64 dX = R^T G + a dh + dP W^T - c X
     rounded once, at least as close to the FP64 value as the single-op path (its three shares rounded to BF16 and added
     in BF16). Both in place and fresh."""
     X = torch.randn(T, N, D, device='cuda').bfloat16()
@@ -138,8 +105,6 @@ def test_two_pass_backward_ops(N, has_r, D=1536, T=4096, NL=16):
     dx_w, dR, db, dy = fused.write_bwd(xh, R, b, y, G)
     if dx_w is None:
         dx_w = G  # identity transport: dX = dX'
-    dx_n, dR_n, db_n, dy_n = fused.write_bwd(xh, R, b, y, G, need_dx=False)
-    assert dx_n is None and torch.equal(db_n, db) and torch.equal(dy_n, dy) and (dR is None or torch.equal(dR_n, dR))
     xh2, xl2, h2, dR2, db2, dy2 = fused.unwrite_bwd(hi, lo, R, b, y, a, G)
     # the FP32 X agrees to FP32 rounding; its FMA contraction differs between the two kernels, so a few elements in a
     # million round to the other BF16 neighbour in hi, which shows in h and dR (sums over hi) at ~1e-5
@@ -158,7 +123,7 @@ def test_two_pass_backward_ops(N, has_r, D=1536, T=4096, NL=16):
     x1, h3, dR3, db3, dy3 = fused.rewrite_bwd(X, R0, b0, y0, a, R, b, y, G)
     assert (x1 != x1_ref).float().mean().item() < 1e-4, "the write again (FMA contraction may differ)"
     h_ref = fused.read_fwd(x1, a)
-    _, dR_ref, db_ref, dy_ref = fused.write_bwd(x1, R, b, y, G, need_dx=False)
+    _, dR_ref, db_ref, dy_ref = fused.write_bwd(x1, R, b, y, G)
     for got, want in ((h3, h_ref), (dy3, dy_ref), (db3, db_ref)) + (((dR3, dR_ref),) if has_r else ()):
         assert rel(got, want) < 1e-5
     # and from the streams themselves: read + write_bwd
@@ -188,37 +153,6 @@ def test_two_pass_backward_ops(N, has_r, D=1536, T=4096, NL=16):
 # whole models: the fused block against the module path
 
 
-def build(residual_func, fused_block, model_dim, num_layers, arch='transformer', **kwargs):
-    heads = model_dim // 32 if arch == 'transformer' else min(model_dim // 32, 32)  # Gekko's fused per-head norm: <= 32 heads
-    cfg = ModelConf(arch=arch, num_layers=num_layers, model_dim=model_dim, num_heads=heads,
-                    num_kv_heads=max(1, heads // 2), head_dim=32, chunk_size=32, ffn_hidden_dim=2 * model_dim, swiglu=True,
-                    apply_rmsnorm=True, vocab_size=256, causal_attn_backend='flash' if arch == 'transformer' else None,
-                    residual_func=residual_func, fused_block=fused_block, **kwargs)
-    torch.manual_seed(0)
-    with create_on_gpu():
-        model = (Transformer if arch == 'transformer' else Gekko)(cfg, types.SimpleNamespace(bos_id=1, eos_id=2, pad_id=0))
-    model = model.cuda().to(torch.bfloat16).train()
-    with torch.no_grad():  # move the controllers off their near-identity init so every coefficient matters
-        for name, p in model.named_parameters():
-            if '.residual.' in name and not name.endswith('weight'):
-                p.add_(torch.randn_like(p) * 0.5)
-    return model
-
-
-def loss_and_grads(model, B=2, L=64, noise=0.0):
-    """`noise` > 0 perturbs the embedding by that relative amount (the module path's BF16 sensitivity, see `bf16_floor`)."""
-    g = torch.Generator(device='cuda').manual_seed(1)
-    tokens = torch.randint(3, 256, (B, L), device='cuda', generator=g)
-    if noise:
-        def hook(mod, inp, out):
-            return (out.float() * (1 + noise * torch.randn(out.shape, device=out.device, generator=g))).to(out.dtype)
-        model.embed.register_forward_hook(hook)
-    loss, _, _ = model(tokens, multi_segments=False, targets=torch.roll(tokens, -1, dims=1))
-    loss = loss.float().mean()
-    loss.backward()
-    return loss.item(), {n: p.grad.float().clone() for n, p in model.named_parameters() if p.grad is not None}
-
-
 def bf16_floor(residual_func, model_dim, num_layers, grads_r, arch='transformer'):
     """How far every gradient of the module path moves under BF16-level forward noise: the module path rerun with the
     embedding perturbed by 2^-9 * sqrt(2 L) relatively (one BF16 rounding per write, 2 writes per layer). The fused block
@@ -234,7 +168,21 @@ def bound(floor):
     return max(5e-2, 3 * floor)
 
 
-PRODUCTION = dict(recompute_q=True, recompute_fc1_out=True, recompute_fc3_out=True)
+def assert_grads_at_floor(grads_f, grads_r, floor, bound_scales=True):
+    for n in grads_f:
+        err = rel(grads_f[n], grads_r[n])
+        if '.residual.' not in n or n.endswith('weight'):
+            assert err < bound(floor[n]), f"grad {n} relative error {err:.2e}, BF16 floor {floor[n]:.2e}"
+        elif bound_scales:
+            assert err < 2.5e-1, f"grad {n} relative error {err:.2e}"
+
+
+def assert_matches_module_path(residual_func, model_dim, num_layers, arch='transformer', **kwargs):
+    loss_f, grads_f = loss_and_grads(build(residual_func, True, model_dim, num_layers, arch, **kwargs))
+    loss_r, grads_r = loss_and_grads(build(residual_func, False, model_dim, num_layers, arch))
+    assert abs(loss_f - loss_r) < 2e-3 * abs(loss_r), (loss_f, loss_r)
+    assert grads_f.keys() == grads_r.keys(), set(grads_f) ^ set(grads_r)
+    assert_grads_at_floor(grads_f, grads_r, bf16_floor(residual_func, model_dim, num_layers, grads_r, arch))
 
 
 @pytest.mark.parametrize("model_dim,num_layers,kwargs", [
@@ -247,17 +195,7 @@ def test_fused_block_matches_module_path(single_process, residual_func, model_di
     controller projections must be within 5e-2 or within 3x their BF16 floor (`bf16_floor`): the two paths differ in the
     streams' carry (hi + lo across layers vs BF16 rounding at every write), so they agree to the BF16 level, not
     bitwise. The controllers' scales / biases are token sums with cancellation and are bounded loosely."""
-    loss_f, grads_f = loss_and_grads(build(residual_func, True, model_dim, num_layers, **kwargs))
-    loss_r, grads_r = loss_and_grads(build(residual_func, False, model_dim, num_layers))
-    assert abs(loss_f - loss_r) < 2e-3 * abs(loss_r), (loss_f, loss_r)
-    assert grads_f.keys() == grads_r.keys(), set(grads_f) ^ set(grads_r)
-    errs = {n: rel(grads_f[n], grads_r[n]) for n in grads_f}
-    floor = bf16_floor(residual_func, model_dim, num_layers, grads_r)
-    for n in errs:
-        if '.residual.' not in n or n.endswith('weight'):
-            assert errs[n] < bound(floor[n]), f"grad {n} relative error {errs[n]:.2e}, BF16 floor {floor[n]:.2e}"
-        else:
-            assert errs[n] < 2.5e-1, f"grad {n} relative error {errs[n]:.2e}"
+    assert_matches_module_path(residual_func, model_dim, num_layers, **kwargs)
 
 
 @pytest.mark.parametrize("ckpt", [1, 2, 3])
@@ -265,16 +203,7 @@ def test_fused_block_matches_module_path(single_process, residual_func, model_di
 def test_recomputing_mode_matches_module_path(single_process, residual_func, ckpt, model_dim=1536, num_layers=3):
     """`residual_ckpt_interval` 1 (every layer kept), 2 (a block of two and a partial one), 3 (one block, the whole
     model recomputed from the embedding): the same bounds as the inverting mode."""
-    loss_f, grads_f = loss_and_grads(build(residual_func, True, model_dim, num_layers, residual_ckpt_interval=ckpt, **PRODUCTION))
-    loss_r, grads_r = loss_and_grads(build(residual_func, False, model_dim, num_layers))
-    assert abs(loss_f - loss_r) < 2e-3 * abs(loss_r), (loss_f, loss_r)
-    errs = {n: rel(grads_f[n], grads_r[n]) for n in grads_f}
-    floor = bf16_floor(residual_func, model_dim, num_layers, grads_r)
-    for n in errs:
-        if '.residual.' not in n or n.endswith('weight'):
-            assert errs[n] < bound(floor[n]), f"grad {n} relative error {errs[n]:.2e}, BF16 floor {floor[n]:.2e}"
-        else:
-            assert errs[n] < 2.5e-1, f"grad {n} relative error {errs[n]:.2e}"
+    assert_matches_module_path(residual_func, model_dim, num_layers, residual_ckpt_interval=ckpt, **PRODUCTION)
 
 
 @pytest.mark.parametrize("model_dim,num_layers,ckpt,kwargs", [(128, 2, 0, {}), (1536, 3, 2, PRODUCTION)])
@@ -282,17 +211,7 @@ def test_recomputing_mode_matches_module_path(single_process, residual_func, ckp
 def test_gekko_fused_block_matches_module_path(single_process, residual_func, model_dim, num_layers, ckpt, kwargs):
     """The Gekko block's stream path (the same `FusedStreams`, with the timestep norm recomputed after the FFN backward)
     against Gekko's module path, inverting and recomputing, with the bounds of the transformer test."""
-    loss_f, grads_f = loss_and_grads(build(residual_func, True, model_dim, num_layers, 'gekko', residual_ckpt_interval=ckpt, **kwargs))
-    loss_r, grads_r = loss_and_grads(build(residual_func, False, model_dim, num_layers, 'gekko'))
-    assert abs(loss_f - loss_r) < 2e-3 * abs(loss_r), (loss_f, loss_r)
-    assert grads_f.keys() == grads_r.keys(), set(grads_f) ^ set(grads_r)
-    errs = {n: rel(grads_f[n], grads_r[n]) for n in grads_f}
-    floor = bf16_floor(residual_func, model_dim, num_layers, grads_r, 'gekko')
-    for n in errs:
-        if '.residual.' not in n or n.endswith('weight'):
-            assert errs[n] < bound(floor[n]), f"grad {n} relative error {errs[n]:.2e}, BF16 floor {floor[n]:.2e}"
-        else:
-            assert errs[n] < 2.5e-1, f"grad {n} relative error {errs[n]:.2e}"
+    assert_matches_module_path(residual_func, model_dim, num_layers, 'gekko', residual_ckpt_interval=ckpt, **kwargs)
 
 
 @pytest.mark.parametrize("ckpt", [0, 5])
@@ -303,11 +222,7 @@ def test_depth_sweep(single_process, residual_func, ckpt, model_dim=256, num_lay
     recomputed in blocks of five layers (the last block of three)."""
     _, grads_r = loss_and_grads(build(residual_func, False, model_dim, num_layers))
     _, grads_f = loss_and_grads(build(residual_func, True, model_dim, num_layers, residual_ckpt_interval=ckpt))
-    errs = {n: rel(grads_f[n], grads_r[n]) for n in grads_f}
-    floor = bf16_floor(residual_func, model_dim, num_layers, grads_r)
-    for n in errs:
-        if '.residual.' not in n or n.endswith('weight'):
-            assert errs[n] < bound(floor[n]), f"grad {n} relative error {errs[n]:.2e}, BF16 floor {floor[n]:.2e}"
+    assert_grads_at_floor(grads_f, grads_r, bf16_floor(residual_func, model_dim, num_layers, grads_r), bound_scales=False)
 
 
 @pytest.mark.parametrize("ckpt", [0, 1, 2])
@@ -326,6 +241,8 @@ def test_held_activations(single_process, residual_func, ckpt, model_dim=1536, n
         torch.cuda.synchronize()
         after = torch.cuda.memory_allocated()
         loss.float().mean().backward()
+        slot = model.layers[0].stream_slot
+        assert slot is None or not slot.items, "the backward leaves nothing in the slot"
         del model, loss
         torch.cuda.empty_cache()
         return after - before

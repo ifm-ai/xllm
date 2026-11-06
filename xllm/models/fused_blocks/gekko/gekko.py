@@ -18,7 +18,6 @@ from xllm.modules.fused_ops import (
     adaptive_working_memory_accum_fwd,
     adaptive_working_memory_bwd,
 )
-from xllm.modules.residual.hyper_connection import HYPER_CONNECTIONS, StreamSlot
 from xllm.models.fused_blocks.hyper_connection import FusedStreams
 from xllm.models.fused_blocks.utils import (
     layer_or_rmsnorm_fwd,
@@ -139,10 +138,7 @@ class GekkoBlockFunction(torch.autograd.Function):
         apply_rmsnorm: bool,
         residual_func: str,
         residual_heads: Optional[int],
-        hc_eps: Optional[float],  # hyper-connections: the controllers' normalization eps
-        slot: Optional[StreamSlot],
-        last_layer: bool,
-        ckpt_interval: int,  # hyper-connections: 0 inverts the writes in the backward, k keeps every k-th layer's input
+        streams: Optional[FusedStreams],  # hyper-connections: the layer's stream path; None: plain residual
         attn_stability_control: int,
         deterministic: bool,
         recompute_q: bool,
@@ -157,8 +153,6 @@ class GekkoBlockFunction(torch.autograd.Function):
         attn_gate_fn = {"silu": F.silu, "softplus": partial(F.softplus, beta=math.log(2))}[attn_gate_func]
         assert attn_gate_fn is not None
 
-        hc_cls = HYPER_CONNECTIONS.get(residual_func)  # the HyperConnection class; None: plain residual
-        streams = FusedStreams(hc_cls, slot, layer_id, last_layer, ckpt_interval, hc_eps) if hc_cls is not None else None
         hc = streams is not None
         if hc:
             x = streams.read1(x, hc1_w, hc1_b, hc1_s, hc2_w, hc2_b, hc2_s)  # x is the streams; the attention branch reads them
@@ -1032,16 +1026,18 @@ class GekkoBlockFunction(torch.autograd.Function):
         else:
             handle1 = None
 
+        wr_grad = torch.mm(rmx_grad.t(), mx_flat)
+        br_grad = None if br is None else rmx_grad.sum(dim=0)
+        wq_grad = torch.mm(xq_grad.t(), mx_flat)
+
         # residual connection
         if hc:
+            del x, mx, mx_flat, rmx_grad, xq_grad
             # the attention controller's backward, then the whole dX0 in one pass
             x_grad, (hc1_w_grad, hc1_b_grad, hc1_s_grad, hc2_w_grad, hc2_b_grad, hc2_s_grad) = streams.after_branch(x_grad)
         else:
             x_grad = torch.add(x_grad, residual_grad, out=x_grad)
             hc1_w_grad = hc1_b_grad = hc1_s_grad = hc2_w_grad = hc2_b_grad = hc2_s_grad = None
-        wr_grad = torch.mm(rmx_grad.t(), mx_flat)
-        br_grad = None if br is None else rmx_grad.sum(dim=0)
-        wq_grad = torch.mm(xq_grad.t(), mx_flat)
 
         if recv_from_prev:
             handle8.wait()
@@ -1114,10 +1110,7 @@ class GekkoBlockFunction(torch.autograd.Function):
             None,  # apply_rmsnorm
             None,  # residual_func
             None,  # residual_heads
-            None,  # hc_eps
-            None,  # slot
-            None,  # last_layer
-            None,  # ckpt_interval
+            None,  # streams
             None,  # attn_stability_control
             None,  # deterministic
             None,  # recompute_q

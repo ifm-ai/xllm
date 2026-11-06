@@ -7,31 +7,15 @@ Transformer / Gekko models.
     python -m pytest -q tests/residual/test_hyper_connection_ops.py
 """
 
-import datetime
-import os
-import types
-
 import pytest
 import torch
 
 from xllm.modules.fused_ops import hyper_connection as fused
 from xllm.modules.residual import hyper_connection as hc
+from .helpers import MOE, build, loss_and_grads, rel
 
-pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason='requires CUDA')
-
-
-@pytest.fixture(autouse=True)
-def _exact_matmul():
-    tf32 = torch.backends.cuda.matmul.allow_tf32
-    torch.backends.cuda.matmul.allow_tf32 = False
-    torch.manual_seed(0)
-    yield
-    torch.backends.cuda.matmul.allow_tf32 = tf32
-
-
-def rel(x, ref):
-    x, ref = x.double(), ref.double()
-    return ((x - ref).norm() / ref.norm().clamp_min(1e-30)).item()
+pytestmark = [pytest.mark.skipif(not torch.cuda.is_available(), reason='requires CUDA'),
+              pytest.mark.usefixtures('exact_matmul')]
 
 
 def close(name, x, ref, tol):
@@ -178,52 +162,15 @@ def test_sinkhorn(iterations, B, L):  # B * L > 8 * SMs * 32 runs the multi-bloc
 # whole models: the fused stream ops against the torch reference path
 
 
-@pytest.fixture(scope="module")
-def single_process():
-    from xllm.distributed.initialize import initialize_model_parallel, model_parallel_is_initialized
-    if not torch.distributed.is_initialized():
-        os.environ.setdefault("MASTER_ADDR", "localhost")
-        os.environ.setdefault("MASTER_PORT", "29523")
-        torch.cuda.set_device(0)
-        torch.distributed.init_process_group(backend="nccl", init_method="env://", world_size=1, rank=0,
-                                             timeout=datetime.timedelta(seconds=600))
-    if not model_parallel_is_initialized():
-        initialize_model_parallel(1, 1, 600)
-
-
 def model_loss_and_grads(arch, residual_func, use_fused, **kwargs):
-    from xllm.config import ModelConf
-    from xllm.models.gekko import Gekko
-    from xllm.models.transformer import Transformer
-    from xllm.utils import create_on_gpu
-
-    cfg = ModelConf(arch=arch, num_layers=2, model_dim=128, num_heads=4, num_kv_heads=2, head_dim=32, chunk_size=32,
-                    ffn_hidden_dim=256, swiglu=True, apply_rmsnorm=True, vocab_size=256,
-                    causal_attn_backend='flash' if arch == 'transformer' else None, residual_func=residual_func,
-                    **kwargs)
-    torch.manual_seed(0)
-    with create_on_gpu():
-        model = (Transformer if arch == 'transformer' else Gekko)(cfg, types.SimpleNamespace(bos_id=1, eos_id=2, pad_id=0))
-    model = model.cuda().to(torch.bfloat16).train()
-    with torch.no_grad():  # move the controllers off their near-identity init so every coefficient matters
-        for name, p in model.named_parameters():
-            if '.residual.' in name and not name.endswith('weight'):
-                p.add_(torch.randn_like(p) * 0.5)
-    g = torch.Generator(device='cuda').manual_seed(1)
-    tokens = torch.randint(3, 256, (2, 64), device='cuda', generator=g)
+    model = build(residual_func, False, 128, 2, arch, **kwargs)
     supported = fused.supported
     if not use_fused:
         fused.supported = lambda x: False
     try:
-        loss, _, _ = model(tokens, multi_segments=False, targets=torch.roll(tokens, -1, dims=1))
-        loss = loss.float().mean()
-        loss.backward()
+        return loss_and_grads(model)
     finally:
         fused.supported = supported
-    return loss.item(), {n: p.grad.float().clone() for n, p in model.named_parameters() if p.grad is not None}
-
-
-MOE = dict(num_experts=4, num_activated_experts=2, expert_inter_dim=64, num_dense_layers=1)
 
 
 @pytest.mark.parametrize("arch,residual_func,kwargs", [

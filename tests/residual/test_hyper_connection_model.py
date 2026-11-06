@@ -7,33 +7,20 @@ num_parameters() matches the real parameter count.
     python -m pytest -q tests/residual/test_hyper_connection_model.py
 """
 
-import datetime
-import os
 import types
 
 import pytest
 import torch
 
 from xllm.config import ModelConf
-from xllm.distributed.initialize import initialize_model_parallel, model_parallel_is_initialized
 from xllm.models.build import init_cache
 from xllm.models.gekko import Gekko
 from xllm.models.transformer import Transformer
 from xllm.utils import create_on_gpu
+from .helpers import MOE, PRODUCTION
 
-pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason='requires CUDA')
-
-
-@pytest.fixture(scope="module", autouse=True)
-def single_process():
-    if not torch.distributed.is_initialized():
-        os.environ.setdefault("MASTER_ADDR", "localhost")
-        os.environ.setdefault("MASTER_PORT", "29523")
-        torch.cuda.set_device(0)
-        torch.distributed.init_process_group(backend="nccl", init_method="env://", world_size=1, rank=0,
-                                             timeout=datetime.timedelta(seconds=600))
-    if not model_parallel_is_initialized():
-        initialize_model_parallel(1, 1, 600)
+pytestmark = [pytest.mark.skipif(not torch.cuda.is_available(), reason='requires CUDA'),
+              pytest.mark.usefixtures('single_process')]
 
 
 def make_cfg(arch: str, residual_func: str, **kwargs) -> ModelConf:
@@ -45,8 +32,7 @@ def make_cfg(arch: str, residual_func: str, **kwargs) -> ModelConf:
     )
 
 
-MOE = dict(num_experts=4, num_activated_experts=2, expert_inter_dim=64, num_dense_layers=1)
-FUSED = dict(fused_block=True, recompute_q=True, recompute_fc1_out=True, recompute_fc3_out=True)
+FUSED = dict(fused_block=True, **PRODUCTION)
 
 
 # Gekko has no MoE block in this tree (GekkoBlock is dense; num_experts is ignored), so no gekko MoE case

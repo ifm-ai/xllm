@@ -158,9 +158,8 @@ def _write_fwd_kernel(x_ptr, xlo_ptr, r_ptr, b_ptr, y_ptr, out_ptr, outlo_ptr, r
 
 @triton.jit
 def _write_bwd_kernel(x_ptr, r_ptr, b_ptr, y_ptr, go_ptr, dx_ptr, dr_ptr, db_ptr, dy_ptr, N, D,
-                      CH: tl.constexpr, HAS_R: tl.constexpr, HAS_DX: tl.constexpr):
-    # dy = sum_n b_n g_n, db_n = sum_d g_n y and, with a transport, dR[n, m] = sum_d g_n x_m and, HAS_DX,
-    # dX_m = sum_n R[n, m] g_n
+                      CH: tl.constexpr, HAS_R: tl.constexpr):
+    # dy = sum_n b_n g_n, db_n = sum_d g_n y and, with a transport, dR[n, m] = sum_d g_n x_m and dX_m = sum_n R[n, m] g_n
     t = tl.program_id(0).to(tl.int64)
     (b0, b1, b2, b3, r00, r01, r02, r03, r10, r11, r12, r13, r20, r21, r22, r23,
      r30, r31, r32, r33) = _coefs(r_ptr, b_ptr, t, N, HAS_R)
@@ -204,11 +203,10 @@ def _write_bwd_kernel(x_ptr, r_ptr, b_ptr, y_ptr, go_ptr, dx_ptr, dr_ptr, db_ptr
             x1 = _ld(x_ptr, t, 1, N, D, d, m)
             x2 = _ld(x_ptr, t, 2, N, D, d, m)
             x3 = _ld(x_ptr, t, 3, N, D, d, m)
-            if HAS_DX:
-                _st(dx_ptr, t, 0, N, D, d, m, _mix(r00, r10, r20, r30, g0, g1, g2, g3))
-                _st(dx_ptr, t, 1, N, D, d, m, _mix(r01, r11, r21, r31, g0, g1, g2, g3))
-                _st(dx_ptr, t, 2, N, D, d, m, _mix(r02, r12, r22, r32, g0, g1, g2, g3))
-                _st(dx_ptr, t, 3, N, D, d, m, _mix(r03, r13, r23, r33, g0, g1, g2, g3))
+            _st(dx_ptr, t, 0, N, D, d, m, _mix(r00, r10, r20, r30, g0, g1, g2, g3))
+            _st(dx_ptr, t, 1, N, D, d, m, _mix(r01, r11, r21, r31, g0, g1, g2, g3))
+            _st(dx_ptr, t, 2, N, D, d, m, _mix(r02, r12, r22, r32, g0, g1, g2, g3))
+            _st(dx_ptr, t, 3, N, D, d, m, _mix(r03, r13, r23, r33, g0, g1, g2, g3))
             p00 += g0 * x0
             p01 += g0 * x1
             p02 += g0 * x2
@@ -271,9 +269,8 @@ def write_fwd(hi, R, b, y, lo=None, split=False, rstd_eps=None, inplace=False):
     return out, outlo, rstd
 
 
-def write_bwd(x, R, b, y, go, need_dx=True):
-    """-> dx, dR, db [T, N], dy [T, D]. For the identity transport dX = dX' and dR does not exist: dx and dR are None.
-    `need_dx=False` leaves dx out for a transport too (the fused block forms its R^T G in `read_proj_bwd`)."""
+def write_bwd(x, R, b, y, go):
+    """-> dx, dR, db [T, N], dy [T, D]. For the identity transport dX = dX' and dR does not exist: dx and dR are None."""
     _check_streams(x)
     T, N, D = x.shape
     has_r = R is not None
@@ -282,10 +279,10 @@ def write_bwd(x, R, b, y, go, need_dx=True):
     go = go.contiguous()
     db = torch.empty_like(b)
     dy = torch.empty_like(y)
-    dx = torch.empty_like(x) if has_r and need_dx else None
+    dx = torch.empty_like(x) if has_r else None
     dR = torch.empty_like(R) if has_r else None  # identity transport: dX = dX', nothing to write
     _write_bwd_kernel[(T,)](x, _ptr(R, b), b, y, go, _ptr(dx, go), _ptr(dR, b), db, dy, N, D,
-                            CH=_tile(D, tile), HAS_R=has_r, HAS_DX=dx is not None, num_warps=warps)
+                            CH=_tile(D, tile), HAS_R=has_r, num_warps=warps)
     return dx, dR, db, dy
 
 

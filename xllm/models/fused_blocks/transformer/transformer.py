@@ -21,7 +21,6 @@ from xllm.modules.fused_ops import (
     memory_efficient_dropout_fwd,
     memory_efficient_dropout_bwd,
 )
-from xllm.modules.residual.hyper_connection import HYPER_CONNECTIONS, StreamSlot
 from xllm.models.fused_blocks.hyper_connection import FusedStreams
 from xllm.models.fused_blocks.utils import (
     layer_or_rmsnorm_fwd,
@@ -91,10 +90,7 @@ class TransformerBlockFunction(torch.autograd.Function):
         gather_before_norm: bool,
         residual_func: str,
         residual_heads: Optional[int],
-        hc_eps: Optional[float],  # hyper-connections: the controllers' normalization eps
-        slot: Optional[StreamSlot],
-        last_layer: bool,
-        ckpt_interval: int,  # hyper-connections: 0 inverts the writes in the backward, k keeps every k-th layer's input
+        streams: Optional[FusedStreams],  # hyper-connections: the layer's stream path; None: plain residual
         attn_stability_control: int,
         deterministic: bool,
         recompute_q: bool,
@@ -104,8 +100,6 @@ class TransformerBlockFunction(torch.autograd.Function):
         recompute_fc3_out: bool,
     ) -> Tuple[torch.Tensor, None, None]:
 
-        hc_cls = HYPER_CONNECTIONS.get(residual_func)  # the HyperConnection class; None: plain residual
-        streams = FusedStreams(hc_cls, slot, layer_id, last_layer, ckpt_interval, hc_eps) if hc_cls is not None else None
         hc = streams is not None
         if hc:
             x = streams.read1(x, hc1_w, hc1_b, hc1_s, hc2_w, hc2_b, hc2_s)  # x is the streams; the attention branch reads them
@@ -519,10 +513,7 @@ class TransformerBlockFunction(torch.autograd.Function):
             None,  # gather_before_norm
             None,  # residual_func
             None,  # residual_heads
-            None,  # hc_eps
-            None,  # slot
-            None,  # last_layer
-            None,  # ckpt_interval
+            None,  # streams
             None,  # attn_stability_control
             None,  # deterministic
             None,  # recompute_q

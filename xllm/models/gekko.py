@@ -39,6 +39,7 @@ from xllm.modules.utils import (
     get_segment_idx_from_bos_mask
 )
 from xllm.models.xllm import XLLModel
+from xllm.models.fused_blocks.hyper_connection import FusedStreams
 from xllm.models.fused_blocks import (
     GekkoBlockFunction,
     GekkoOutputLayerFunction
@@ -137,7 +138,8 @@ class GekkoBlock(nn.Module):
         if self.fused_block and self.training:
             # hyper-connections: the sublayers' residual modules are the controllers (None for a plain residual)
             hc1, hc2 = (self.gda.residual, self.nffn.residual) if self.stream_slot is not None else (None, None)
-            assert hc1 is None or hc1.eps == hc2.eps, "the fused block normalizes both controllers with one eps"
+            streams = None if hc1 is None else FusedStreams(type(hc1), self.stream_slot, self.layer_id, self.is_last_layer,
+                                                            self.residual_ckpt_interval, hc1.eps)
             return GekkoBlockFunction.apply(
                 self.layer_id,
                 x,
@@ -195,10 +197,7 @@ class GekkoBlock(nn.Module):
                 self.apply_rmsnorm,
                 self.residual_func,
                 self.residual_heads,
-                hc1.eps if hc1 is not None else None,
-                self.stream_slot,
-                self.is_last_layer,
-                self.residual_ckpt_interval,
+                streams,
                 attn_stability_control,
                 deterministic,
                 self.recompute_q,
@@ -359,10 +358,10 @@ class Gekko(XLLModel):
             self.rope = None
 
         self.layers = nn.ModuleList()
-        self.stream_slot = StreamSlot() if cfg.fused_block and self.residual_streams > 1 else None
+        stream_slot = StreamSlot() if cfg.fused_block and self.residual_streams > 1 else None
         for layer_id in range(self.num_layers):
             layer = GekkoBlock(cfg, layer_id)
-            layer.stream_slot = self.stream_slot
+            layer.stream_slot = stream_slot
             self.layers.append(wrap(layer))
 
         self.output = wrap(GekkoOutputLayer(cfg))
@@ -522,9 +521,8 @@ class Gekko(XLLModel):
             routed_expert_params = self.model_dim * self.expert_inter_dim * self.num_experts * 3
             activated_expert_params = self.model_dim * self.expert_inter_dim * self.num_activated_experts * 3
             router_params = self.model_dim * self.num_experts
-            residual_params = num_params_in_residual(self.residual_func, self.model_dim, self.residual_heads, self.model_dim)
-            activated_params += (shared_expert_params + activated_expert_params + router_params + residual_params) * (self.num_layers - self.num_dense_layers)
-            total_params += (shared_expert_params + routed_expert_params + router_params + residual_params) * (self.num_layers - self.num_dense_layers)
+            activated_params += (shared_expert_params + activated_expert_params + router_params) * (self.num_layers - self.num_dense_layers)
+            total_params += (shared_expert_params + routed_expert_params + router_params) * (self.num_layers - self.num_dense_layers)
         # final norm
         activated_params += self.model_dim * 2
         total_params += self.model_dim * 2

@@ -43,10 +43,9 @@ import math
 from typing import NamedTuple, Optional, Tuple
 
 import torch
-import torch.distributed as dist
 from torch import Tensor, nn
 
-from xllm.distributed import get_model_parallel_group
+from xllm.distributed import get_model_parallel_world_size
 from xllm.modules.fused_ops import hyper_connection as fused
 from xllm.optim.muon_spec import register_muon
 from .base import BaseResidual
@@ -90,7 +89,7 @@ def rms_normalize(x: Tensor, eps: float) -> Tensor:
     return x * torch.rsqrt(x.square().mean(dim=-1, keepdim=True) + eps)
 
 
-def sinkhorn_knopp(logits: Tensor, iterations: int = 20) -> Tensor:
+def sinkhorn_knopp(logits: Tensor, iterations: int) -> Tensor:
     """Approximately doubly stochastic matrices from square logits [..., N, N].
 
     Column then row normalization in log space; rows sum to one up to roundoff,
@@ -135,8 +134,8 @@ def quaternion_transport(logits: Tensor, eps: float = OHC_EPS) -> Tensor:
 
 
 def expand_streams(x: Tensor, num_streams: int) -> Tensor:
-    """x [B, L, D] -> X [B, L, N, D], every stream a copy of x. N = 1 (no hyper-connections): x itself."""
-    return x if num_streams == 1 else x.unsqueeze(-2).expand(-1, -1, num_streams, -1).contiguous()
+    """x [..., D] -> X [..., N, D], every stream a copy of x. N = 1 (no hyper-connections): x itself."""
+    return x if num_streams == 1 else x.unsqueeze(-2).expand(*x.shape[:-1], num_streams, x.shape[-1]).contiguous()
 
 
 def sum_streams(x: Tensor, num_streams: int) -> Tensor:
@@ -167,21 +166,23 @@ class HyperConnection(BaseResidual):
     """A sublayer's hyper-connection: `read` forms the branch input from the streams and returns the
     transport and write gates as the state `forward` writes the branch output back with. Subclasses set
     the logit and scale counts and form the coefficients from the logits in torch (`reference_coefficients`);
-    a variant with kernels also overrides `coef_fwd` / `coef_bwd`, the one place the fused path (module path on
-    CUDA and the fused block alike) gets its coefficient kernels from."""
+    a variant with kernels (and so a fused block) also sets `coef_fwd` / `coef_bwd`, the one place the fused path
+    (module path on CUDA and the fused block alike) gets its coefficient kernels from:
+
+        coef_fwd(logits [T, n_logits], scale, bias) -> (a [T, N], R [T, N, N] or None, b [T, N]), FP32 and contiguous
+        coef_bwd(logits, scale, bias, da, dR, db) -> (dlogits, dscale, dbias); a None gradient counts as zero
+    """
 
     NAME: str  # the residual_func value (xllm.config.HYPER_CONNECTION_FUNCS lists them for the config check)
     NUM_LOGITS: int  # the controller's outputs per token
     NUM_SCALES = 2  # read (a), write (b)
+    coef_fwd = None  # classmethods of the variants with kernels
+    coef_bwd = None
 
     def __init__(self, rc_id: int, model_dim: int, eps: float = 1e-6):
         super().__init__(rc_id, model_dim)
-        # the controller normalizes over all N * D channels of a token, which a model-parallel shard does
-        # not hold. Checked on the group (None before initialize_model_parallel: single-process tests build
-        # residuals without one, and then nothing is sharded).
-        group = get_model_parallel_group()
-        assert group is None or dist.get_world_size(group) == 1, \
-            "hyper-connections do not support model / expert parallelism yet"
+        # the controller normalizes over all N * D channels of a token, which a model-parallel shard does not hold
+        assert get_model_parallel_world_size() == 1, "hyper-connections do not support model / expert parallelism yet"
         self.eps = eps
 
         self.weight = nn.Parameter(torch.empty(NUM_STREAMS * model_dim, self.NUM_LOGITS))
@@ -209,11 +210,8 @@ class HyperConnection(BaseResidual):
 
     def coefficients(self, streams: Tensor) -> Tuple[Tensor, Optional[Tensor], Tensor]:
         """(a, R, b) in FP32; R is None for the identity transport."""
-        return self.coefficients_from_logits(self.logits(streams))
-
-    def coefficients_from_logits(self, logits: Tensor) -> Tuple[Tensor, Optional[Tensor], Tensor]:
-        """(a, R, b) from the FP32 logits [B, L, n_logits]: the variant's kernels on CUDA, else the torch reference."""
-        if logits.is_cuda and self.has_kernels():
+        logits = self.logits(streams)
+        if logits.is_cuda and self.coef_fwd is not None:
             return fused_coefficients(type(self), logits, self.scale.float(), self.bias.float())
         return self.reference_coefficients(logits)
 
@@ -241,22 +239,6 @@ class HyperConnection(BaseResidual):
         dlogits, dscale, dbias = cls.coef_bwd(logits, scale, bias, da, dR, db)
         _, dW, dP, c = fused.logits_bwd(X.view(T, N * D), weight, rstd, logits, dlogits, need_dx=False)
         return (dP, weight.t().contiguous(), c), dW, dbias, dscale
-
-    @classmethod
-    def has_kernels(cls) -> bool:
-        """Whether the variant has coefficient kernels, and so a fused block."""
-        return cls.coef_fwd.__func__ is not HyperConnection.coef_fwd.__func__
-
-    @classmethod
-    def coef_fwd(cls, logits: Tensor, scale: Tensor, bias: Tensor) -> Tuple[Tensor, Optional[Tensor], Tensor]:
-        """Raw kernels: FP32 contiguous logits [T, n_logits], scale, bias -> (a [T, N], R [T, N, N] or None, b [T, N])."""
-        raise NotImplementedError(f"{cls.NAME} has no coefficient kernels (and so no fused block)")
-
-    @classmethod
-    def coef_bwd(cls, logits: Tensor, scale: Tensor, bias: Tensor, da: Tensor, dR: Optional[Tensor], db: Tensor
-                 ) -> Tuple[Tensor, Tensor, Tensor]:
-        """-> (dlogits, dscale, dbias); a None gradient counts as zero."""
-        raise NotImplementedError(f"{cls.NAME} has no coefficient kernels (and so no fused block)")
 
     def read(self, streams: Tensor) -> Tuple[Tensor, WriteState]:
         """-> (branch input h [B, L, D], the write's (R, b) for `forward`)."""
@@ -326,20 +308,19 @@ class OrthogonalHyperConnection(HyperConnection):
     ROTATION_LOGITS = 8  # two quaternions, SO(4) = four streams
     NUM_LOGITS = 2 * NUM_STREAMS + ROTATION_LOGITS
     ROTATION_SCALE = 0.01
-    ROTATION_EPS = OHC_EPS
 
     @classmethod
     def coef_fwd(cls, logits, scale, bias):
-        return fused.ohc_coef_fwd(logits, scale, bias, cls.ROTATION_SCALE, cls.ROTATION_EPS)
+        return fused.ohc_coef_fwd(logits, scale, bias, cls.ROTATION_SCALE, OHC_EPS)
 
     @classmethod
     def coef_bwd(cls, logits, scale, bias, da, dR, db):
-        return fused.ohc_coef_bwd(logits, scale, bias, da, dR, db, cls.ROTATION_SCALE, cls.ROTATION_EPS)
+        return fused.ohc_coef_bwd(logits, scale, bias, da, dR, db, cls.ROTATION_SCALE, OHC_EPS)
 
     def reference_coefficients(self, logits: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
         n = NUM_STREAMS
         a, b = self.gates(logits)
-        R = quaternion_transport(self.ROTATION_SCALE * logits[..., 2 * n:] + self.bias.float()[2 * n:], self.ROTATION_EPS)
+        R = quaternion_transport(self.ROTATION_SCALE * logits[..., 2 * n:] + self.bias.float()[2 * n:])
         return a, R, b
 
 
@@ -361,7 +342,7 @@ def flops_in_hyper_connection(residual_func: str, model_dim: int) -> int:
     return projection + read + write
 
 
-# --- the fused training block's stream path (xllm/models/fused_blocks/transformer/transformer.py) ---
+# --- helpers of the fused training blocks' stream path (xllm/models/fused_blocks/hyper_connection.py) ---
 
 class StreamSlot:
     """The fused block's hand-off of stream data between layers outside the autograd graph: a mailbox keyed by

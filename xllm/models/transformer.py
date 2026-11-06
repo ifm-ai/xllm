@@ -38,6 +38,7 @@ from xllm.distributed import (
     get_context_parallel_world_size,
     get_context_parallel_rank,
 )
+from xllm.models.fused_blocks.hyper_connection import FusedStreams
 from xllm.models.fused_blocks import (
     TransformerBlockFunction,
     TransformerMoEBlockFunction,
@@ -131,7 +132,8 @@ class TransformerBlock(nn.Module):
         if self.fused_block and self.training:
             # hyper-connections: the sublayers' residual modules are the controllers (None for a plain residual)
             hc1, hc2 = (self.attention.residual, self.nffn.residual) if self.stream_slot is not None else (None, None)
-            assert hc1 is None or hc1.eps == hc2.eps, "the fused block normalizes both controllers with one eps"
+            streams = None if hc1 is None else FusedStreams(type(hc1), self.stream_slot, self.layer_id, self.is_last_layer,
+                                                            self.residual_ckpt_interval, hc1.eps)
             return TransformerBlockFunction.apply(
                 self.layer_id,
                 x,
@@ -171,10 +173,7 @@ class TransformerBlock(nn.Module):
                 self.attention.norm.gather_input,
                 self.residual_func,
                 self.residual_heads,
-                hc1.eps if hc1 is not None else None,
-                self.stream_slot,
-                self.is_last_layer,
-                self.residual_ckpt_interval,
+                streams,
                 attn_stability_control,
                 deterministic,
                 self.recompute_q,
@@ -649,12 +648,13 @@ class Transformer(XLLModel):
         self.layers = nn.ModuleList()
         # hyper-connection fused block: passes stream data between adjacent layers (None otherwise; the config
         # asserts the layers are all dense)
-        self.stream_slot = StreamSlot() if cfg.fused_block and self.residual_streams > 1 else None
+        stream_slot = StreamSlot() if cfg.fused_block and self.residual_streams > 1 else None
         for layer_id in range(self.num_layers):
             block_cls = TransformerBlock if layer_id < self.num_dense_layers else \
                 (TransformerMoVABlock if self.num_values > 0 else TransformerMoEBlock)
             layer = block_cls(cfg, layer_id)
-            layer.stream_slot = self.stream_slot
+            if stream_slot is not None:
+                layer.stream_slot = stream_slot
             self.layers.append(wrap(layer))
 
         self.output = wrap(TransformerOutputLayer(cfg))

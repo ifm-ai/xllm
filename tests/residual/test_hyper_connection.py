@@ -121,7 +121,7 @@ def test_config_names_match_the_classes():
     for name, hc in HYPER_CONNECTIONS.items():
         assert hc.NAME == name
         # a variant has a fused block exactly when it owns coefficient kernels (coef_fwd / coef_bwd overridden)
-        assert hc.has_kernels() == ('coef_bwd' in vars(hc)) == (name in FUSED_BLOCK_RESIDUALS), name
+        assert (hc.coef_fwd is not None) == ('coef_bwd' in vars(hc)) == (name in FUSED_BLOCK_RESIDUALS), name
 
 
 def test_model_conf_fused_block_allowlist_and_unknown_names():

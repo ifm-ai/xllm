@@ -40,12 +40,12 @@ from typing import Optional, Tuple
 import torch
 
 from xllm.modules.fused_ops import hyper_connection as fused
-from xllm.modules.residual.hyper_connection import StreamSlot, controller_params
+from xllm.modules.residual.hyper_connection import StreamSlot, controller_params, expand_streams
 
 
 def kept_streams(X_saved: torch.Tensor, N: int) -> torch.Tensor:
     """A kept input as streams [T, N, D]; the first layer keeps one copy of the embedding [T, D] (every stream)."""
-    return X_saved if X_saved.dim() == 3 else X_saved.unsqueeze(1).expand(-1, N, -1).contiguous()
+    return X_saved if X_saved.dim() == 3 else expand_streams(X_saved, N)
 
 
 def recompute_block_streams(slot: StreamSlot, hc_cls, first: int, top: int, N: int):
@@ -112,7 +112,6 @@ class FusedStreams:
         self.y2 = y2.contiguous().view(bsz * seq_len, D)
         X2, X2_lo, rstd_x2 = fused.write_fwd(self.X1, self.R2, self.b2, self.y2, lo=self.X1_lo, split=self.split,
                                              rstd_eps=None if self.last_layer else self.eps, inplace=True)
-        self.X1 = self.X1_lo = None
         if not self.last_layer:
             self.slot.put((self.layer_id + 1, 'carry'), (X2_lo, rstd_x2))  # to the next layer's forward
         if self.kept:
@@ -121,8 +120,9 @@ class FusedStreams:
             self.slot.put((self.layer_id, 'writes'), (self.p1[2], self.p1[1], self.l1, self.y1, self.p2[2], self.p2[1],
                                                       self.l2, self.y2))  # for the recompute
         # inverting: the top layer's output streams stay here, not in the saved tensors, so the backward can free them
-        # right after inverting them (this is the step's peak); detached, or ctx -> X2 -> grad_fn would be a cycle
-        self.X_out = (X2.detach(), X2_lo) if self.last_layer and self.split else None
+        # right after inverting them; detached, or ctx -> X2 -> grad_fn would be a cycle
+        if self.last_layer and self.split:
+            self.X_out = (X2.detach(), X2_lo)
         return X2.view(bsz, seq_len, N, D)
 
     def saved(self) -> tuple:
@@ -161,21 +161,16 @@ class FusedStreams:
             self.X = kept_streams(X_in, N)
             self.X1, xo, self.dR2, self.db2, dy2 = fused.rewrite_bwd(self.X, self.R1, self.b1, self.y1, self.a2, self.R2,
                                                                      self.b2, self.y2, self.G2)
-            self.X1_lo = None
         else:
-            self.X = None
-            # one backward per forward: the stream hand-off (X_out, the slot) is consumed by the first backward
-            assert not (self.last_layer and self.X_out is None), \
-                "the hyper-connection fused block runs one backward per forward (no retain_graph / double backward)"
-            X_out, self.X_out = self.X_out, None
-            at_top = X_out is not None
-            if at_top:
-                X2, X2_lo = X_out[0].view(T, N, D), X_out[1]  # the model's output: not ours to overwrite
-                del X_out
+            if self.last_layer:
+                # one backward per forward: the stream hand-off (X_out, the slot) is consumed by the first backward
+                assert self.X_out is not None, \
+                    "the hyper-connection fused block runs one backward per forward (no retain_graph / double backward)"
+                (X2, X2_lo), self.X_out = self.X_out, None  # the model's output: not ours to overwrite
             else:
                 X2, X2_lo = slot.take((layer_id, 'out'))
             self.X1, self.X1_lo, xo, self.dR2, self.db2, dy2 = fused.unwrite_bwd(X2, X2_lo, self.R2, self.b2, self.y2,
-                                                                                  self.a2, self.G2, inplace=not at_top)
+                                                                                  self.a2, self.G2, inplace=not self.last_layer)
             del X2, X2_lo
         return xo.view(bsz, seq_len, D), dy2.view(bsz, seq_len, D)
 
@@ -197,7 +192,8 @@ class FusedStreams:
         else:
             self.X, X_lo, x, self.dR1, self.db1, dy1 = fused.unwrite_bwd(self.X1, self.X1_lo, self.R1, self.b1, self.y1,
                                                                          self.a1, self.dX1, inplace=True)
-            self.slot.put((self.layer_id - 1, 'out'), (self.X, X_lo))
+            if self.layer_id > 1:  # the first layer rewrites its X1 from the embedding copy, not from these
+                self.slot.put((self.layer_id - 1, 'out'), (self.X, X_lo))
             del X_lo
         self.X1 = self.X1_lo = None
         return x.view(bsz, seq_len, D), dy1.view(bsz, seq_len, D)

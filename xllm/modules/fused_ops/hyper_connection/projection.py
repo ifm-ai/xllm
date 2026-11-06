@@ -40,7 +40,7 @@ def _proj_dx_kernel(x_ptr, dp_ptr, wt_ptr, c_ptr, dx_ptr, T, K, NL,
 
 def logits_fwd(xf, w, eps, rstd=None):
     """xf [T, K] contiguous streams, w [K, NL] contiguous in xf's dtype -> FP32 logits [T, NL], rstd [T]. `rstd` given
-    (from the write that produced xf, `write_fwd_split_rstd`) skips its kernel."""
+    (from the write that produced xf, `write_fwd(rstd_eps=...)`) skips its kernel."""
     T, K = xf.shape
     if rstd is None:
         rstd = torch.empty(T, device=xf.device, dtype=torch.float32)

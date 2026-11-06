@@ -14,7 +14,6 @@ from xllm.distributed.utils import divide_and_check_no_remainder
 from xllm.utils import get_init_fn
 from xllm.modules.model_parallel import reduce_scatter_model_parallel_region
 from xllm.modules.rms_norm import GroupRMSNorm
-from .base import BaseResidual
 
 
 def _init_affine_weight(
@@ -67,7 +66,7 @@ def _init_alphabet(
         alphabet[:, 1] = b
 
 
-class DeltaResidual(BaseResidual):
+class DeltaResidual(nn.Module):
     """
     Delta Residual in:
     """
@@ -80,7 +79,8 @@ class DeltaResidual(BaseResidual):
         eps: float,
         init_std: Optional[float] = None
     ):
-        super().__init__(rc_id, num_features)
+        super().__init__()
+        self.rc_id = rc_id
 
         model_parallel_world_size = get_model_parallel_world_size()
         self.model_dim = model_dim
