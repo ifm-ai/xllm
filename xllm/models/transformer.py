@@ -91,6 +91,7 @@ class TransformerBlock(nn.Module):
             residual_heads=cfg.residual_heads,
             init_mode=cfg.init_mode,
             init_std=cfg.init_std,
+            residual_multiplier=cfg.residual_multiplier * cfg.branch_scale,
         )
 
         self.nffn = NormalizedFeedForwardNetwork(
@@ -110,6 +111,7 @@ class TransformerBlock(nn.Module):
             residual_heads=cfg.residual_heads,
             init_mode=cfg.init_mode,
             init_std=cfg.init_std,
+            residual_multiplier=cfg.residual_multiplier * cfg.branch_scale,
         )
 
     def forward(
@@ -688,6 +690,8 @@ class Transformer(XLLModel):
 
         # embeddings
         emb = self.embed(tokens)
+        if self.embed_multiplier != 1.0:
+            emb = emb * self.embed_multiplier
         x = memory_efficient_dropout(emb, self.dropout, self.training)
         # rope frequencies
         freq_cis = None if self.rope is None else self.rope.get_freqs_cis(cache_len, cache_len + seq_len, x.device)

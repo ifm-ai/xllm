@@ -1,4 +1,5 @@
-from dataclasses import dataclass
+import math
+from dataclasses import dataclass, field, fields
 from logging import getLogger
 from typing import Optional
 from pathlib import Path
@@ -80,6 +81,46 @@ class SlurmConf(Config):
             json.loads(self.additional_params)
 
 
+ROLES = ("embed", "hidden_matrix", "hidden_vector", "final_norm", "readout")
+
+
+@dataclass
+class RoleConf(Config):
+    """Factors on one role's optimizer hyperparameters (dion_muon). None = 1. mup.* multiplies its own on top."""
+    lr: Optional[float] = None  # x optim.lr (AdamW roles) or optim.muon_lr (hidden_matrix)
+    eps: Optional[float] = None  # x optim.epsilon; AdamW roles only
+    weight_decay: Optional[float] = None  # x optim.weight_decay (Dion decays by lr * weight_decay)
+
+    def factor(self, name: str) -> float:
+        value = getattr(self, name)
+        return 1.0 if value is None else value
+
+
+@dataclass
+class RolesConf(Config):
+    """Per-role factors for dion_muon. Roles, by parameter name: embed = embed.*; readout = output.output.*;
+    final_norm = the rest of output.*; hidden_matrix = the Muon matrices in layers.*; hidden_vector = every other
+    parameter in layers.* (norm gains, biases, Gekko conv kernels and gates). All unset: the default groups."""
+    embed: RoleConf = field(default_factory=RoleConf)
+    hidden_matrix: RoleConf = field(default_factory=RoleConf)
+    hidden_vector: RoleConf = field(default_factory=RoleConf)
+    final_norm: RoleConf = field(default_factory=RoleConf)
+    readout: RoleConf = field(default_factory=RoleConf)
+
+    def __post_init__(self):
+        for role in ROLES:
+            for name in ("lr", "eps", "weight_decay"):
+                value = getattr(getattr(self, role), name)
+                if value is not None and not (math.isfinite(value) and value >= 0 and (name != "eps" or value > 0)):
+                    raise ValueError(f"optim.roles.{role}.{name} must be finite and >= 0 (eps > 0), got {value}")
+        if self.hidden_matrix.eps is not None:
+            raise ValueError("optim.roles.hidden_matrix.eps: Muon has no eps")
+
+    def is_set(self) -> bool:
+        return any(getattr(getattr(self, role), name) is not None
+                   for role in ROLES for name in ("lr", "eps", "weight_decay"))
+
+
 @dataclass
 class OptimConf(Config):
     optimizer: str = 'adamw'  # adamw or dion_muon (requires FSDP2)
@@ -105,8 +146,20 @@ class OptimConf(Config):
     cycles: float = 1.0  # Cycles of half period of cosine scheduler. 1 means decaying from peak to lr_end_ratio
     wsd_decay_duration_steps: Optional[int] = None  # Number of steps in the WSD decay phase. Decay starts at total_steps - wsd_decay_duration_steps.
     wsd_decay_style: str = 'cosine'  # The curve type of decay phase in WSD scheduler: cosine or linear
+    roles: RolesConf = field(default_factory=RolesConf)  # Per-role lr / eps / weight decay factors (dion_muon)
+
+    def role_factor(self, role: str, name: str) -> float:
+        """optim.roles.<role>.<name> times the mup.* factor (set by TrainerConf, not serialized)."""
+        mup = getattr(self, "_mup_role_factors", {})
+        return getattr(self.roles, role).factor(name) * mup.get(role, {}).get(name, 1.0)
+
+    def role_groups(self) -> bool:
+        """Whether dion_muon steps one group per role: some role factor is set or mup.* is on."""
+        return self.roles.is_set() or bool(getattr(self, "_mup_role_factors", {}))
 
     def __post_init__(self):
+        if self.roles.is_set() and self.optimizer != 'dion_muon':
+            raise ValueError('optim.roles.* require optim.optimizer=dion_muon')
         if self.optimizer not in ['adamw', 'dion_muon']:
             raise ValueError(f'Unknown optimizer: {self.optimizer}')
         if self.optimizer == 'dion_muon':
@@ -193,6 +246,9 @@ class ModelConf(Config):
     apply_rmsnorm: bool = False  # True = RMSNorm, False = LayerNorm
     residual_func: str = "base"  # Residual connection type: base/add means standard addition, ortho for orthogonal residuals.
     residual_heads: Optional[int] = None  # Num of feature groups for orthogonal residuals. Required when using residual_func='ortho'.
+    residual_multiplier: float = 1.0  # Multiplier on every attention / FFN branch output before the residual add.
+    branch_scale: float = 1.0  # CompleteP depth factor on the branches, (base_num_layers / num_layers)^alpha; set by mup.*, leave at 1
+    embed_multiplier: float = 1.0  # Multiplier on the embedding output.
     # Rope base
     rope_base: float = 100000  # RoPE frequency base
     rope_head_dim: Optional[int] = None  # RoPE dimensions per Q/K head. None means full head_dim, 0 disables RoPE.
@@ -250,6 +306,17 @@ class ModelConf(Config):
         assert self.attn_act_func in ['softmax', 'softdelta']
         assert self.attn_gate_func in ['silu', 'softplus']
         assert self.residual_func in ['base', 'add', 'ortho']
+        for name in ('residual_multiplier', 'branch_scale', 'embed_multiplier'):
+            value = getattr(self, name)
+            if not (math.isfinite(value) and value > 0):
+                raise ValueError(f'model.{name} must be finite and positive, got {value}')
+        if self.residual_multiplier * self.branch_scale != 1.0:
+            if self.residual_func not in ['base', 'add']:
+                raise ValueError('A residual branch multiplier needs residual_func base or add')
+            if self.fused_block:
+                raise ValueError('A residual branch multiplier is not implemented in the fused blocks')
+            if self.num_experts or self.num_values:
+                raise ValueError('A residual branch multiplier is only wired into dense blocks')
 
         if self.num_values > 0:
             assert 0 < self.num_activated_values <= self.num_values
@@ -345,6 +412,80 @@ class ValidConf(Config):
 
 
 @dataclass
+class MuPConf(Config):
+    """muP (width) + CompleteP (depth) for dion_muon, relative to a base model (arXiv:2512.22382; Aditya's
+    ifm-ai/xllm#30 table, with a real branch multiplier instead of folding). m_N = model_dim / base_model_dim,
+    m_L = num_layers / base_num_layers, c = m_L^-alpha. Keep head_dim fixed; scale heads, kv heads and ffn with
+    model_dim. Factors, on top of optim.* and optim.roles.*:
+
+        role           lr              eps        weight_decay   init std
+        embed          1               1/m_N      1              base_init_embed_std (all widths)
+        hidden_matrix  m_L^(alpha-1)   -          1              he / gaussian: 1/sqrt(fan_in), already ~ m_N^-1/2
+        hidden_vector  m_L^(alpha-1)   c/m_N      1              -
+        final_norm     1               1          1              -
+        readout        1/m_N           1          m_N            base_init_unembed_std / m_N
+        branches: x c (model.branch_scale); Muon needs spectral_norm, which transfers across width by itself.
+
+    Unset stds default to 1/sqrt(base_model_dim), xLLM's gaussian default at the base width, so a run at the base
+    shape is the run without mup.
+    """
+    base_model_dim: int = 0  # model_dim the hyperparameters were tuned at
+    base_num_layers: int = 0  # num_layers the hyperparameters were tuned at
+    alpha: float = 1.0  # CompleteP depth exponent in [0.5, 1]; c = (base_num_layers / num_layers)^alpha
+    base_init_embed_std: Optional[float] = None  # embedding init std, all widths
+    base_init_unembed_std: Optional[float] = None  # readout init std at the base width; x 1/m_N
+
+    def multipliers(self, model: "ModelConf"):
+        m_n = model.model_dim / self.base_model_dim
+        m_l = model.num_layers / self.base_num_layers
+        return m_n, m_l, m_l ** -self.alpha
+
+    def role_factors(self, model: "ModelConf"):
+        m_n, m_l, c = self.multipliers(model)
+        depth_lr = m_l ** (self.alpha - 1)
+        return {
+            "embed": {"eps": 1 / m_n},
+            "hidden_matrix": {"lr": depth_lr},
+            "hidden_vector": {"lr": depth_lr, "eps": c / m_n},
+            "final_norm": {},
+            "readout": {"lr": 1 / m_n, "weight_decay": m_n},
+        }
+
+    def resolve(self, model: "ModelConf", optim: "OptimConf"):
+        """Check the run; set model.branch_scale and the embedding / readout init stds; hand optim the factors.
+        Assignments only, so a resumed config (holding the resolved values) resolves to the same run."""
+        if self.base_model_dim <= 0 or self.base_num_layers <= 0:
+            raise ValueError('mup.base_model_dim and mup.base_num_layers must be positive')
+        if not 0.5 <= self.alpha <= 1.0:
+            raise ValueError(f'mup.alpha must be in [0.5, 1], got {self.alpha}')
+        for name, actual, supported in (
+            ('optim.optimizer', optim.optimizer, ['dion_muon']),
+            ('optim.muon_adjust_lr', optim.muon_adjust_lr, ['spectral_norm']),
+            ('model.arch', model.arch, ['transformer', 'gekko']),
+            ('model.init_mode', model.init_mode, ['he', 'gaussian']),
+            ('model.init_std', model.init_std, [None]),  # hidden init must stay ~ 1/sqrt(fan_in)
+            ('model.scale_emb', model.scale_emb, [False]),
+            ('model.residual_func', model.residual_func, ['base', 'add']),
+            ('model.fused_block', model.fused_block, [False]),
+            ('model.num_experts', model.num_experts, [0]),
+            ('model.num_values', model.num_values, [0]),
+        ):
+            if actual not in supported:
+                raise ValueError(f'mup requires {name} in {supported}, got {actual!r}')
+        m_n, _, c = self.multipliers(model)
+        base_std = 1 / math.sqrt(self.base_model_dim)
+        embed_std = self.base_init_embed_std if self.base_init_embed_std is not None else base_std
+        unembed_std = (self.base_init_unembed_std if self.base_init_unembed_std is not None else base_std) / m_n
+        for name, value in (('branch_scale', c), ('init_embed_std', embed_std), ('init_logits_std', unembed_std)):
+            current = getattr(model, name)
+            default = 1.0 if name == 'branch_scale' else None
+            if current != default and not math.isclose(current, value, rel_tol=1e-12):
+                raise ValueError(f'model.{name}={current} conflicts with mup, which sets it to {value}')
+            setattr(model, name, value)
+        optim._mup_role_factors = self.role_factors(model)
+
+
+@dataclass
 class TrainerConf(Config):
     slurm: Optional[SlurmConf]
     model: ModelConf
@@ -352,6 +493,7 @@ class TrainerConf(Config):
     valid: ValidConf
     tokenizer: TokenizerConf
     dataloader: DataLoaderConfig  # Configs for multi-source data loading.
+    mup: Optional[MuPConf] = None  # muP width + CompleteP depth transfer (dion_muon), relative to a base model
 
     # Training data / iterator
     data: str = ""  # Comma seperated data mix. Each mix is formatted as path:weight:json_key:source_format. Weights need not sum to 1.
@@ -460,6 +602,8 @@ class TrainerConf(Config):
     def __post_init__(self):
         # sanity check
         assert self.dtype in ["bf16", "fp16", "fp32"]
+        if self.mup is not None:
+            self.mup.resolve(self.model, self.optim)
         if self.optim.optimizer == 'dion_muon':
             if self.model.ddp_backend != 'fsdp2':
                 raise ValueError('dion_muon requires model.ddp_backend=fsdp2')

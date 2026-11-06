@@ -45,6 +45,7 @@ class XLLModel(nn.Module):
 
         self.residual_func = cfg.residual_func
         self.residual_heads = cfg.residual_heads
+        self.embed_multiplier = cfg.embed_multiplier
 
         # hidden dim
         self.ffn_hidden_dim = cfg.ffn_hidden_dim

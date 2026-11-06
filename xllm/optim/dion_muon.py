@@ -26,10 +26,81 @@ def synchronize_replicas(optimizer, args, kwargs):
     dist._broadcast_coalesced(optimizer._xllm_replica_group, tensors, 64 * 1024**2, 0)
 
 
+def _is_muon(name, modules):
+    owner, _, leaf = name.rpartition('.')
+    projection = isinstance(modules[owner], (nn.Linear, ColumnParallelLinear, RowParallelLinear))
+    return name.startswith('layers.') and projection and leaf == 'weight'
+
+
+def param_role(name, muon):
+    """Role of a parameter by name (RolesConf in xllm/config.py)."""
+    if muon:
+        return 'hidden_matrix'
+    if name.startswith('embed.'):
+        return 'embed'
+    if name.startswith('output.output.'):
+        return 'readout'
+    if name.startswith('output.'):
+        return 'final_norm'
+    if name.startswith('layers.'):
+        return 'hidden_vector'
+    raise ValueError(f'No role for parameter {name}')
+
+
+def role_parameter_groups(model, cfg):
+    """One Muon group (hidden_matrix) and one AdamW group per (role, decayed): lr, epsilon and weight decay are the
+    configured values times cfg.role_factor (optim.roles.* x mup.*). disable_wd_{emb,out} still zero the decay."""
+    modules = dict(model.named_modules())
+    no_decay_ids = no_weight_decay_param_ids(model, cfg)
+    muon_group = {
+        'params': [], 'group_id': 'muon', 'algorithm': 'muon',
+        'lr': cfg.muon_lr * cfg.role_factor('hidden_matrix', 'lr'),
+        'weight_decay': cfg.weight_decay * cfg.role_factor('hidden_matrix', 'weight_decay'),
+    }
+    groups, membership = [muon_group], [[]]
+    index = {}
+    seen = set()
+    for name, parameter in model.named_parameters(remove_duplicate=False):
+        if not parameter.requires_grad:
+            continue
+        if id(parameter) in seen:
+            raise ValueError(f'dion_muon does not support tied parameter {name}')
+        seen.add(id(parameter))
+        if parameter.ndim > 2:
+            raise ValueError(f'Unsupported parameter {name}: shape {tuple(parameter.shape)}')
+        muon = _is_muon(name, modules)
+        if muon and id(parameter) in no_decay_ids:
+            raise ValueError(f'No-weight-decay parameter {name} was routed to Muon')
+        role = param_role(name, muon)
+        if muon:
+            key = 0
+        else:
+            decayed = id(parameter) not in no_decay_ids
+            key = index.get((role, decayed))
+            if key is None:
+                key = index[(role, decayed)] = len(groups)
+                groups.append({
+                    'params': [], 'group_id': f'adamw_{role}' + ('' if decayed else '_no_wd'),
+                    'algorithm': 'adamw',
+                    'lr': cfg.lr * cfg.role_factor(role, 'lr'),
+                    'epsilon': cfg.epsilon * cfg.role_factor(role, 'eps'),
+                    'weight_decay': cfg.weight_decay * cfg.role_factor(role, 'weight_decay') if decayed else 0.0,
+                })
+                membership.append([])
+        groups[key]['params'].append(parameter)
+        membership[key].append((name, list(parameter.shape)))
+    if not groups[0]['params']:
+        raise ValueError('No trainable hidden projection matrices for Muon')
+    return groups, membership
+
+
 def parameter_groups(model, cfg):
     """Use module semantics: Gekko's 2-D depthwise kernels stay in AdamW."""
     if model.arch not in ('transformer', 'gekko') or model.num_experts or model.num_values:
         raise ValueError('dion_muon requires a Transformer or Gekko with dense FFNs')
+    if cfg.role_groups():
+        groups, membership = role_parameter_groups(model, cfg)
+        return groups, _contract(groups, membership)
     modules = dict(model.named_modules())
     groups = [
         {'params': [], 'group_id': 'muon', 'algorithm': 'muon', 'lr': cfg.muon_lr},
@@ -71,6 +142,10 @@ def parameter_groups(model, cfg):
         membership[index].append((name, list(parameter.shape)))
     if not groups[0]['params']:
         raise ValueError('No trainable hidden projection matrices for Muon')
+    return groups, _contract(groups, membership)
+
+
+def _contract(groups, membership):
     contract = [
         {
             'algorithm': group['algorithm'],
@@ -80,7 +155,7 @@ def parameter_groups(model, cfg):
         }
         for group, names in zip(groups, membership)
     ]
-    return groups, contract
+    return contract
 
 
 def build_dion_muon(model, cfg):

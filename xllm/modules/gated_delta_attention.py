@@ -70,6 +70,7 @@ class GatedDeltaAttention(nn.Module):
         residual_heads: Optional[int] = None,
         init_mode: str = 'he',
         init_std: Optional[float] = None,
+        residual_multiplier: float = 1.0,
     ):
         super().__init__()
         self.layer_id = layer_id
@@ -246,7 +247,7 @@ class GatedDeltaAttention(nn.Module):
 
         self.residual = build_residual(
             residual_func, 2 * layer_id + 1, mdim, num_heads=residual_heads,
-            num_features=hdim, eps=rmsnorm_eps, init_std=init_std
+            num_features=hdim, eps=rmsnorm_eps, init_std=init_std, multiplier=residual_multiplier
         )
 
     def _receive_prev_count(self, x, bos_mask):

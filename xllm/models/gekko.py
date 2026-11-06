@@ -94,6 +94,7 @@ class GekkoBlock(nn.Module):
             residual_heads=cfg.residual_heads,
             init_mode=cfg.init_mode,
             init_std=cfg.init_std,
+            residual_multiplier=cfg.residual_multiplier * cfg.branch_scale,
         )
 
         self.nffn = NormalizedFeedForwardNetwork(
@@ -113,6 +114,7 @@ class GekkoBlock(nn.Module):
             residual_heads=cfg.residual_heads,
             init_mode=cfg.init_mode,
             init_std=cfg.init_std,
+            residual_multiplier=cfg.residual_multiplier * cfg.branch_scale,
         )
 
     def forward(
@@ -426,6 +428,12 @@ class Gekko(XLLModel):
                 token_mask = token_mask[:, start:end] if token_mask is not None else None
         else:
             assert self.context_parallel_size == 1, "inference mode does not support context parallel."
+        if not self.training and cache is None:
+            # Plain full-sequence forward without a cache: packed PPL eval of hybrid models goes here, since they
+            # do not support packed inference with a cache (support_multi_segments_with_cache).
+            cache_layers, cache_output, cache_segment = None, None, None
+            start, end = 0, seq_len
+        elif not self.training:
             cache_layers, cache_output, cache_segment = cache
             if self.full_attention_layers:
                 start = cache_layers[0][-1]
@@ -445,6 +453,8 @@ class Gekko(XLLModel):
 
         # embeddings
         emb = self.embed(tokens)
+        if self.embed_multiplier != 1.0:
+            emb = emb * self.embed_multiplier
         x = memory_efficient_dropout(emb, self.dropout, self.training)
         # rope frequencies
         freq_cis = None if self.rope is None else self.rope.get_freqs_cis(start, end, x.device)
