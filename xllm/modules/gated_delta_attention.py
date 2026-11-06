@@ -37,6 +37,34 @@ from xllm.modules.fused_ops import (
 from xllm.utils import get_init_fn
 
 
+class ForgetGate(nn.Module):
+    """
+    Forget gate in gated AWM
+    """
+
+    def __init__(
+        self,
+        layer_id: int,
+        in_features: int,
+        out_features: int,
+        init_std: Optional[float] = None
+    ):
+        super().__init__()
+        self.layer_id = layer_id
+        self.in_features = in_features
+        self.out_features = out_features
+        self.init_std = init_std
+
+        world_size = get_model_parallel_world_size()
+        self.input_size_per_partition = divide_and_check_no_remainder(in_features, world_size)
+        self.output_size_per_partition = divide_and_check_no_remainder(out_features, world_size)
+
+        init_fn = get_init_fn('gaussian', dim=in_features, std=init_std)
+        self.weight = nn.Parameter(torch.empty(self.input_size_per_partition, self.out_features))
+        self.alphabet = nn.Parameter(torch.empty(self.output_size_per_partition * 2))
+
+
+
 class GatedDeltaAttention(nn.Module):
     """Gated Delta Attention.
     See "" for more details.
@@ -54,6 +82,7 @@ class GatedDeltaAttention(nn.Module):
         chunk_size: int,
         attn_act_func: str,
         attn_gate_func: str,
+        awm_forget_gate: bool,
         awm_orthogonal_update: bool,
         dropout: float = 0.0,
         attention_dropout: float = 0.0,
