@@ -67,7 +67,6 @@ class TransformerBlock(nn.Module):
         self.rmsnorm_eps = cfg.rmsnorm_eps
         self.is_last_layer = layer_id == cfg.num_layers - 1
         self.stream_slot = None  # hyper-connection fused block: set by the model, shared by its layers
-        self.residual_ckpt_interval = cfg.residual_ckpt_interval
 
         if self.fused_block:
             assert cfg.causal_attn_backend in ['flash', 'xattn'], f"flash or xattn attention backend is required for fused block."
@@ -133,7 +132,7 @@ class TransformerBlock(nn.Module):
             # hyper-connections: the sublayers' residual modules are the controllers (None for a plain residual)
             hc1, hc2 = (self.attention.residual, self.nffn.residual) if self.stream_slot is not None else (None, None)
             streams = None if hc1 is None else FusedStreams(type(hc1), self.stream_slot, self.layer_id, self.is_last_layer,
-                                                            self.residual_ckpt_interval, hc1.eps)
+                                                            hc1.eps)
             return TransformerBlockFunction.apply(
                 self.layer_id,
                 x,

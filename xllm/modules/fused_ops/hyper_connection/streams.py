@@ -253,11 +253,11 @@ def write_fwd(hi, R, b, y, lo=None, split=False, rstd_eps=None, inplace=False):
     and lo' = round(X' - hi'), so that hi' + lo' holds X' to ~2^-17 and the write can be inverted without the
     single-rounding drift. `rstd_eps`: also rstd [T] FP32 of hi', rsqrt(mean(hi'^2) + eps) over the N * D channels,
     the normalization of the controller that reads X' next (`logits_fwd(..., rstd=rstd)`), without a pass over hi';
-    else None. `inplace` overwrites hi (and lo, for a split write) with X'."""
+    else None. `inplace` overwrites a split write's (hi, lo) with X'."""
     _check_streams(hi)
     T, N, D = hi.shape
     if inplace:
-        assert split == (lo is not None), "write_fwd in place stores X' over X: (hi, lo) for a split write, hi alone otherwise"
+        assert split and lo is not None, "write_fwd in place stores a split X' over (hi, lo)"
         out, outlo = hi, lo
     else:
         out = torch.empty_like(hi)

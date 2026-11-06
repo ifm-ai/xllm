@@ -5,8 +5,8 @@ saving the two sublayer inputs and a few attention tensors and recomputing the r
 
 With hyper-connections (`residual_func` ihc / ohc) the layer's state is N = 4 streams X [B, L, N, D] and the two
 residual adds are the stream path of xllm/models/fused_blocks/hyper_connection.py (`FusedStreams`), which also
-documents how the backward gets the streams back (inverting the writes, or recomputing them from kept inputs every
-`residual_ckpt_interval` layers) and the one-backward-per-forward contract of the stream hand-off.
+documents how the backward gets the streams back (inverting the writes) and the one-backward-per-forward contract of
+the stream hand-off.
 """
 
 from typing import Optional, Tuple, Any

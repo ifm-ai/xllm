@@ -2,7 +2,7 @@
 passes over the streams instead of the inverse write + read + write_bwd + read_bwd + projection dx + two accumulations:
 
     unwrite_bwd    X' (hi + lo), G = dL/dX'  ->  X (hi + lo, in place), h, dy, db, dR      (then the branch backward)
-    rewrite_bwd    the input below, G        ->  X (the write below again), h, dy, db, dR   (when that input is at hand)
+    rewrite_bwd    the input below, G        ->  X (the write below again), h, dy, db, dR   (the first layer)
     read_write_bwd X, G                      ->  h, dy, db, dR
     read_da        X, dh = dL/dh             ->  da                                          (then the controller backward)
     read_proj_bwd  X, G, dh, dP, W^T, c      ->  dX = R^T G + a dh + dP W^T - c X              (in place over G when allowed)
@@ -147,7 +147,7 @@ def unwrite_bwd(hi_next, lo_next, R, b, y, a, go, inplace=False):
 def rewrite_bwd(x, R0, b0, y0, a, R, b, y, go):
     """The write below again, X = R0 x + b0 y0 (`write_fwd` on hi alone), then the recomputed read h = read(X, a) and the
     `write_bwd` of X' = R X + b y without its dX, for G = go -> X, h, dR, db, dy: the backward's first pass over the
-    streams when the layer's input x is at hand (kept, recomputed, or the first layer's embedding)."""
+    streams of the first layer, whose input x (the embedding) is at hand."""
     x_next = torch.empty_like(x)
     h, dR, db, dy = _stream_bwd(REWRITE, x, None, R0, b0, y0, R, b, y, a, go, x_next, None)
     return x_next, h, dR, db, dy

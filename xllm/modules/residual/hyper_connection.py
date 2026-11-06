@@ -34,8 +34,7 @@ sums them before the final norm (`sum_streams`).
 
 The fused training blocks (`fused_block`, ihc / ohc; `FusedStreams` in xllm/models/fused_blocks/hyper_connection.py,
 the stream path of the transformer and Gekko blocks) run the same stream ops and do not keep the streams: their
-backward recovers them by inverting the writes or, with `residual_ckpt_interval` k > 0, recomputes them from the input
-of every k-th layer; `HyperConnection.controller_fwd` / `controller_bwd`, `controller_tensors`, `controller_params` and
+backward recovers them by inverting the writes; `HyperConnection.controller_fwd` / `controller_bwd`, `controller_tensors`, `controller_params` and
 `StreamSlot` below are their helpers.
 """
 
@@ -346,10 +345,8 @@ def flops_in_hyper_connection(residual_func: str, model_dim: int) -> int:
 
 class StreamSlot:
     """The fused block's hand-off of stream data between layers outside the autograd graph: a mailbox keyed by
-    (layer, what). The forward passes a layer's output rstd (and lo part, when inverting) to the layer above; the
-    backward passes recovered streams to the layer below (inverting) or, when recomputing, the kept inputs and the
-    writes' coefficients and branch outputs from the forward to the block's top layer, and the recomputed inputs from
-    there to each layer. The layers run in order both ways, so one slot per model suffices; the first layer resets it
+    (layer, what). The forward passes a layer's output rstd and lo part to the layer above; the backward passes
+    recovered streams to the layer below. The layers run in order both ways, so one slot per model suffices; the first layer resets it
     every forward, which also drops what a forward without a backward left behind."""
 
     def __init__(self):

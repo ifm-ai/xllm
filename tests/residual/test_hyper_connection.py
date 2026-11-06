@@ -133,13 +133,6 @@ def test_model_conf_fused_block_allowlist_and_unknown_names():
             ModelConf(**{**MODEL_CONF, 'residual_func': residual_func, 'fused_block': True})
     with pytest.raises(AssertionError):
         ModelConf(**{**MODEL_CONF, 'residual_func': 'hc'})
-    # residual_ckpt_interval: a setting of the hyper-connection fused block
-    ModelConf(**{**MODEL_CONF, 'residual_func': 'ohc', 'fused_block': True, 'residual_ckpt_interval': 4})
-    for bad in (dict(residual_func='ohc', residual_ckpt_interval=4),  # the module path keeps every layer's streams
-                dict(residual_func='base', fused_block=True, residual_ckpt_interval=4),
-                dict(residual_func='ohc', fused_block=True, residual_ckpt_interval=-1)):
-        with pytest.raises(AssertionError, match="residual_ckpt_interval"):
-            ModelConf(**{**MODEL_CONF, **bad})
 
 
 def test_read_write_match_reference():

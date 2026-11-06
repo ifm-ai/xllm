@@ -12,22 +12,13 @@ the block saves; `restore`, `after_ffn`, `after_branch` in the backward. The str
 the calls, and the block keeps the object on its ctx (it holds only the top layer's output streams across the step).
 
 The streams are not saved per layer; the block saves the branch outputs y1, y2 and the controllers' logits and rstd
-instead of x and xo, and the backward gets the streams back one of two ways (`residual_ckpt_interval`):
-
-- Inverting (0): a write is invertible, X = R^T (X' - b y), so the backward recovers the streams from the layer above
-  (X2 from the top layer's output or the layer above's backward through the `StreamSlot`; X1 before the FFN backward,
-  X0 before the branch backward, X0 on to the layer below). The streams travel as hi + lo BF16 pairs: hi is what the
-  model reads, hi + lo holds the FP32 write to ~2^-17, so the inversion reproduces the forward's streams; lo and the
-  rstd of hi reach the next layer through the slot, the first layer's input (the embedding) has no lo and is saved as
-  one copy. The backward of a sublayer is two passes over the streams, `unwrite_bwd` and `read_proj_bwd`.
-- Recomputing (k > 0; mHC's recomputation blocks, arXiv 2512.24880 sec. 4.3.2): every k-th layer keeps its input
-  streams (a saved tensor; layer 0 its embedding copy) and the forward leaves each layer's write coefficients and
-  branch outputs in the slot; in the backward the top layer of each block of k layers recomputes the inputs of the
-  layers below it from the kept one (`recompute_block_streams`) and leaves them in the slot, where each layer takes
-  its own. No lo parts: the streams are rounded once per write as on the module path, the writes cost two passes
-  instead of five, and a sublayer's backward is two passes again: `rewrite_bwd` (the forward write again, the read
-  and the write's backward in one pass) or `read_write_bwd`, then `read_proj_bwd`. The first layer takes this path
-  in both modes. Memory: one [T, N, D] tensor per kept layer, plus one per layer of the block being run, transiently.
+instead of x and xo. A write is invertible, X = R^T (X' - b y), so the backward recovers the streams from the layer above
+(X2 from the top layer's output or the layer above's backward through the `StreamSlot`; X1 before the FFN backward, X0
+before the branch backward, X0 on to the layer below). The streams travel as hi + lo BF16 pairs: hi is what the model
+reads, hi + lo holds the FP32 write to ~2^-17, so the inversion reproduces the forward's streams; lo and the rstd of hi
+reach the next layer through the slot. The backward of a sublayer is two passes over the streams, `unwrite_bwd` and
+`read_proj_bwd`. The first layer's input (the embedding) has no lo and is saved as one copy, so its backward runs the
+forward's write again instead (`rewrite_bwd`, then `read_write_bwd`).
 
 mhc (Sinkhorn transport, not invertible) has no fused block. The hyper-connection module asserts a model-parallel world
 size of one, so the blocks' model-parallel gathers and scatters are no-ops on that path. One backward per forward: the
@@ -43,37 +34,14 @@ from xllm.modules.fused_ops import hyper_connection as fused
 from xllm.modules.residual.hyper_connection import StreamSlot, controller_params, expand_streams
 
 
-def kept_streams(X_saved: torch.Tensor, N: int) -> torch.Tensor:
-    """A kept input as streams [T, N, D]; the first layer keeps one copy of the embedding [T, D] (every stream)."""
-    return X_saved if X_saved.dim() == 3 else expand_streams(X_saved, N)
-
-
-def recompute_block_streams(slot: StreamSlot, hc_cls, first: int, top: int, N: int):
-    """Recomputing mode: the input streams of layers first + 1 .. top from the kept input of layer `first` and the writes
-    the forward left in the slot (coefficient logits and branch outputs: saved tensors, not copies), each left in the
-    slot for its layer's backward. The forward's writes again, rounded the same way, so the streams are the forward's
-    to the bit. One fresh [T, N, D] tensor per layer; the kept input is read, not written."""
-    X = kept_streams(slot.take((first, 'in')), N)
-    for layer in range(first, top):
-        hc1_s, hc1_b, l1, y1, hc2_s, hc2_b, l2, y2 = slot.take((layer, 'writes'))
-        _, R1, b1 = hc_cls.coef_fwd(l1, hc1_s, hc1_b)
-        _, R2, b2 = hc_cls.coef_fwd(l2, hc2_s, hc2_b)
-        X1, _, _ = fused.write_fwd(X, R1, b1, y1)
-        X, _, _ = fused.write_fwd(X1, R2, b2, y2, inplace=True)
-        slot.put((layer + 1, 'in'), X)
-
-
 class FusedStreams:
     """One layer's stream path (see the module docstring). `hc_cls` is the layer's HyperConnection class, `slot` the
     model's StreamSlot, `eps` the controllers' normalization eps."""
 
-    def __init__(self, hc_cls, slot: StreamSlot, layer_id: int, last_layer: bool, ckpt_interval: int, eps: float):
-        self.hc_cls, self.slot, self.layer_id, self.last_layer, self.k, self.eps = hc_cls, slot, layer_id, last_layer, ckpt_interval, eps
+    def __init__(self, hc_cls, slot: StreamSlot, layer_id: int, last_layer: bool, eps: float):
+        self.hc_cls, self.slot, self.layer_id, self.last_layer, self.eps = hc_cls, slot, layer_id, last_layer, eps
         self.first = layer_id == 0  # the embedding: saved as one copy, no lo part
-        self.split = ckpt_interval == 0  # inverting: the streams travel as hi + lo
-        self.kept = ckpt_interval > 0 and layer_id % ckpt_interval == 0  # recomputing: this layer's input is kept
-        self.top = ckpt_interval > 0 and (last_layer or (layer_id + 1) % ckpt_interval == 0)  # and this one recomputes
-        self.X_out = None  # inverting, the top layer: its output streams (hi, lo) for the backward
+        self.X_out = None  # the top layer: its output streams (hi, lo) for the backward
 
     # ---- forward
 
@@ -86,7 +54,7 @@ class FusedStreams:
             self.slot.reset()
             X_lo, rstd_in = None, None
         else:
-            X_lo, rstd_in = self.slot.take((self.layer_id, 'carry'))  # from the layer below's write: lo (inverting), rstd
+            X_lo, rstd_in = self.slot.take((self.layer_id, 'carry'))  # from the layer below's write
         self.p1 = controller_params(w1, b1, s1, X.dtype)
         self.p2 = controller_params(w2, b2, s2, X.dtype)
         self.l1, self.rstd1, self.a1, self.R1, self.b1 = self.hc_cls.controller_fwd(X, *self.p1, self.eps, rstd_in)
@@ -97,10 +65,9 @@ class FusedStreams:
         """The branch output y1 [B, L, D] into the streams -> the FFN input xo [B, L, D]."""
         bsz, seq_len, N, D = self.shape
         self.y1 = y1.contiguous().view(bsz * seq_len, D)
-        self.X1, self.X1_lo, rstd_x1 = fused.write_fwd(self.X, self.R1, self.b1, self.y1, lo=self.X_lo, split=self.split,
+        self.X1, self.X1_lo, rstd_x1 = fused.write_fwd(self.X, self.R1, self.b1, self.y1, lo=self.X_lo, split=True,
                                                        rstd_eps=self.eps)
-        # the kept input streams: the first layer's as one copy of the embedding
-        self.X_saved = self.X[:, 0].contiguous() if self.first else (self.X if self.kept else None)
+        self.X_saved = self.X[:, 0].contiguous() if self.first else None  # one copy of the embedding
         self.X = self.X_lo = None
         self.l2, self.rstd2, self.a2, self.R2, self.b2 = self.hc_cls.controller_fwd(self.X1, *self.p2, self.eps, rstd_x1)
         return fused.read_fwd(self.X1, self.a2).view(bsz, seq_len, D)
@@ -110,23 +77,18 @@ class FusedStreams:
         streams [B, L, N, D]."""
         bsz, seq_len, N, D = self.shape
         self.y2 = y2.contiguous().view(bsz * seq_len, D)
-        X2, X2_lo, rstd_x2 = fused.write_fwd(self.X1, self.R2, self.b2, self.y2, lo=self.X1_lo, split=self.split,
+        X2, X2_lo, rstd_x2 = fused.write_fwd(self.X1, self.R2, self.b2, self.y2, lo=self.X1_lo, split=True,
                                              rstd_eps=None if self.last_layer else self.eps, inplace=True)
         if not self.last_layer:
             self.slot.put((self.layer_id + 1, 'carry'), (X2_lo, rstd_x2))  # to the next layer's forward
-        if self.kept:
-            self.slot.put((self.layer_id, 'in'), self.X_saved)  # for the block's top layer's recompute (the same tensor)
-        if self.k > 0 and not self.top:
-            self.slot.put((self.layer_id, 'writes'), (self.p1[2], self.p1[1], self.l1, self.y1, self.p2[2], self.p2[1],
-                                                      self.l2, self.y2))  # for the recompute
-        # inverting: the top layer's output streams stay here, not in the saved tensors, so the backward can free them
-        # right after inverting them; detached, or ctx -> X2 -> grad_fn would be a cycle
-        if self.last_layer and self.split:
+        else:
+            # the top layer's output streams stay here, not in the saved tensors, so the backward can free them right
+            # after inverting them; detached, or ctx -> X2 -> grad_fn would be a cycle
             self.X_out = (X2.detach(), X2_lo)
         return X2.view(bsz, seq_len, N, D)
 
     def saved(self) -> tuple:
-        """The tensors the block saves for the backward (`restore` takes them back): the kept input, the controllers,
+        """The tensors the block saves for the backward (`restore` takes them back): the embedding copy, the controllers,
         their logits and rstd, the branch outputs. Nothing else of the forward stays on the object."""
         out = (self.X_saved, *self.p1, *self.p2, self.l1, self.rstd1, self.l2, self.rstd2, self.y1, self.y2)
         self._clear()
@@ -141,8 +103,7 @@ class FusedStreams:
 
     def restore(self, rc: tuple, out_grad: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """The saved tensors and dL/dX2 [B, L, N, D] -> (xo [B, L, D], dL/dy2 [B, L, D]): X1 and xo = read(X1, a2) back,
-        with the layer's input at hand (kept, recomputed, or the first layer's embedding) as the forward's write again,
-        else by inverting the second write; the write's backward (dy2, db2, dR2) in the same pass."""
+        by inverting the second write (the first layer, from the embedding copy: the forward's write again); the write's backward (dy2, db2, dR2) in the same pass."""
         X_in, w1, b1, s1, w2, b2, s2, self.l1, self.rstd1, self.l2, self.rstd2, self.y1, self.y2 = rc
         self.p1, self.p2 = (w1, b1, s1), (w2, b2, s2)
         bsz, seq_len, N, D = out_grad.shape
@@ -152,13 +113,8 @@ class FusedStreams:
         self.a1, self.R1, self.b1 = self.hc_cls.coef_fwd(self.l1, s1, b1)
         self.a2, self.R2, self.b2 = self.hc_cls.coef_fwd(self.l2, s2, b2)
         slot, layer_id = self.slot, self.layer_id
-        if self.k > 0:
-            if self.top:  # the block's top layer: the inputs of the layers below it
-                recompute_block_streams(slot, self.hc_cls, layer_id - layer_id % self.k, layer_id, N)
-            if X_in is None:
-                X_in = slot.take((layer_id, 'in'))
-        if X_in is not None:
-            self.X = kept_streams(X_in, N)
+        if self.first:
+            self.X = expand_streams(X_in, N)
             self.X1, xo, self.dR2, self.db2, dy2 = fused.rewrite_bwd(self.X, self.R1, self.b1, self.y1, self.a2, self.R2,
                                                                      self.b2, self.y2, self.G2)
         else:
@@ -176,8 +132,8 @@ class FusedStreams:
 
     def after_ffn(self, xo_grad: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """dL/dxo [B, L, D] -> (the branch input x [B, L, D] again, dL/dy1 [B, L, D]). The FFN controller's backward (its
-        dlogits need da2 from the read), the whole dX1 in one pass, then X0 (x = read(X0, a1), dy1, db1, dR1), which the
-        inverting mode hands on to the layer below."""
+        dlogits need da2 from the read), the whole dX1 in one pass, then X0 (x = read(X0, a1), dy1, db1, dR1), which goes on
+        to the layer below."""
         bsz, seq_len, N, D = self.shape
         xo_grad = xo_grad.reshape(bsz * seq_len, D)
         da2 = fused.read_da(self.X1, xo_grad)
@@ -187,7 +143,7 @@ class FusedStreams:
         self.dX1 = fused.read_proj_bwd(self.X1, self.R2, self.a2, self.G2, xo_grad, *proj2)
         self.G2 = None
         del xo_grad, proj2
-        if self.X is not None:
+        if self.first:
             x, self.dR1, self.db1, dy1 = fused.read_write_bwd(self.X, self.a1, self.R1, self.b1, self.y1, self.dX1)
         else:
             self.X, X_lo, x, self.dR1, self.db1, dy1 = fused.unwrite_bwd(self.X1, self.X1_lo, self.R1, self.b1, self.y1,

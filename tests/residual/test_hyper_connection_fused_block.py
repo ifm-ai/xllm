@@ -10,11 +10,9 @@ a channel count that uses a single kernel tile and at the production D = 1536 (t
 the same way. The two paths differ
 by BF16 rounding of the streams, so every gradient is checked against the module path's own sensitivity to BF16-level
 forward noise (`bf16_floor`). A depth sweep checks the controller gradients layer by layer: with the streams recovered
-from hi + lo they stay at that floor down to the first layer. The recomputing mode (`residual_ckpt_interval` k > 0:
-every k-th layer keeps its input, the block's top layer recomputes the rest in the backward) is checked the same way
-at several intervals, blocks of one layer to the whole model, with a partial last block. Last, the activation memory
-held between forward and backward: the two branch outputs per layer plus, inverting, the top layer's (hi, lo) streams
-and the first layer's embedding copy, or, recomputing, the kept inputs; nothing else of the stream path.
+from hi + lo they stay at that floor down to the first layer. Last, the activation memory held between forward and
+backward: the two branch outputs per layer plus the top layer's (hi, lo) streams and the first layer's embedding copy;
+nothing else of the stream path.
 
     python -m pytest -q tests/residual/test_hyper_connection_fused_block.py
 """
@@ -57,10 +55,10 @@ def test_split_write_and_its_inverse(has_r, D=1536, T=4096):
     assert (hi != exact.bfloat16()).float().mean().item() < 1e-3, "hi is the rounded write"
     assert rel(hi.float() + lo.float(), exact) < 3e-5
     assert torch.equal(fused.write_fwd(X, R, b, y, split=True)[0], fused.write_fwd(X, R, b, y)[0]), "lo None = plain write"
-    X_c = X.clone()
-    out_ip, lo_ip, _ = fused.write_fwd(X_c, R, b, y, inplace=True)
-    assert out_ip.data_ptr() == X_c.data_ptr() and lo_ip is None and torch.equal(X_c, fused.write_fwd(X, R, b, y)[0]), \
-        "plain write in place"
+    X_c, X_lo_c = X.clone(), X_lo.clone()
+    out_ip, lo_ip, _ = fused.write_fwd(X_c, R, b, y, lo=X_lo_c, split=True, inplace=True)
+    assert out_ip.data_ptr() == X_c.data_ptr() and lo_ip.data_ptr() == X_lo_c.data_ptr(), "split write in place"
+    assert torch.equal(out_ip, hi) and torch.equal(lo_ip, lo), "split write in place"
     xh, xl = unwrite(hi, lo, R, b, y)
     assert rel(xh.float() + xl.float(), X32) < 3e-5
     xh1, xl1 = unwrite(hi, None, R, b, y)
@@ -97,8 +95,6 @@ def test_two_pass_backward_ops(N, has_r, D=1536, T=4096, NL=16):
     assert rel(rstd_w, rstd) < 1e-5
     logits_w, rstd_w2 = fused.logits_fwd(hi.view(T, N * D), W, 1e-6, rstd_w)
     assert rstd_w2 is rstd_w and rel(logits_w, logits) < 1e-5
-    hi_p, lo_p, rstd_p = fused.write_fwd(X, R, b, y, rstd_eps=1e-6)  # the plain write's rstd (the recomputing mode)
-    assert lo_p is None and rel(rstd_p, fused.logits_fwd(hi_p.view(T, N * D), W, 1e-6)[1]) < 1e-5
     # backward pass 1: inverse write + read + write backward
     xh, xl = unwrite(hi, lo, R, b, y)
     h = fused.read_fwd(xh, a)
@@ -198,42 +194,30 @@ def test_fused_block_matches_module_path(single_process, residual_func, model_di
     assert_matches_module_path(residual_func, model_dim, num_layers, **kwargs)
 
 
-@pytest.mark.parametrize("ckpt", [1, 2, 3])
+@pytest.mark.parametrize("model_dim,num_layers,kwargs", [(128, 2, {}), (1536, 3, PRODUCTION)])
 @pytest.mark.parametrize("residual_func", ['ihc', 'ohc'])
-def test_recomputing_mode_matches_module_path(single_process, residual_func, ckpt, model_dim=1536, num_layers=3):
-    """`residual_ckpt_interval` 1 (every layer kept), 2 (a block of two and a partial one), 3 (one block, the whole
-    model recomputed from the embedding): the same bounds as the inverting mode."""
-    assert_matches_module_path(residual_func, model_dim, num_layers, residual_ckpt_interval=ckpt, **PRODUCTION)
-
-
-@pytest.mark.parametrize("model_dim,num_layers,ckpt,kwargs", [(128, 2, 0, {}), (1536, 3, 2, PRODUCTION)])
-@pytest.mark.parametrize("residual_func", ['ihc', 'ohc'])
-def test_gekko_fused_block_matches_module_path(single_process, residual_func, model_dim, num_layers, ckpt, kwargs):
+def test_gekko_fused_block_matches_module_path(single_process, residual_func, model_dim, num_layers, kwargs):
     """The Gekko block's stream path (the same `FusedStreams`, with the timestep norm recomputed after the FFN backward)
-    against Gekko's module path, inverting and recomputing, with the bounds of the transformer test."""
-    assert_matches_module_path(residual_func, model_dim, num_layers, 'gekko', residual_ckpt_interval=ckpt, **kwargs)
+    against Gekko's module path, with the bounds of the transformer test."""
+    assert_matches_module_path(residual_func, model_dim, num_layers, 'gekko', **kwargs)
 
 
-@pytest.mark.parametrize("ckpt", [0, 5])
 @pytest.mark.parametrize("residual_func", ['ihc', 'ohc'])
-def test_depth_sweep(single_process, residual_func, ckpt, model_dim=256, num_layers=28):
+def test_depth_sweep(single_process, residual_func, model_dim=256, num_layers=28):
     """The main-weight and controller-weight gradients at every depth stay at the BF16 floor when the streams are
-    recovered from hi + lo (with singly rounded streams the first layers drifted to 10-20%), and when they are
-    recomputed in blocks of five layers (the last block of three)."""
+    recovered from hi + lo (with singly rounded streams the first layers drifted to 10-20%)."""
     _, grads_r = loss_and_grads(build(residual_func, False, model_dim, num_layers))
-    _, grads_f = loss_and_grads(build(residual_func, True, model_dim, num_layers, residual_ckpt_interval=ckpt))
+    _, grads_f = loss_and_grads(build(residual_func, True, model_dim, num_layers))
     assert_grads_at_floor(grads_f, grads_r, bf16_floor(residual_func, model_dim, num_layers, grads_r), bound_scales=False)
 
 
-@pytest.mark.parametrize("ckpt", [0, 1, 2])
 @pytest.mark.parametrize("residual_func", ['ihc', 'ohc'])
-def test_held_activations(single_process, residual_func, ckpt, model_dim=1536, num_layers=4, B=2, L=2048):
+def test_held_activations(single_process, residual_func, model_dim=1536, num_layers=4, B=2, L=2048):
     """Activation memory held between forward and backward: the base fused block holds x and xo (2 D per token per
-    layer), the hyper-connection block y1 and y2 (2 D) plus, inverting, the top layer's (hi, lo) streams (2 x 4 D) and
-    the first layer's embedding copy (D); recomputing every k-th layer, the embedding copy (D) and the other kept
-    layers' streams (4 D each)."""
-    def held(func, **kwargs):
-        model = build(func, True, model_dim, num_layers, **PRODUCTION, **kwargs)
+    layer), the hyper-connection block y1 and y2 (2 D) plus the top layer's (hi, lo) streams (2 x 4 D) and the first
+    layer's embedding copy (D)."""
+    def held(func):
+        model = build(func, True, model_dim, num_layers, **PRODUCTION)
         tokens = torch.randint(3, 256, (B, L), device='cuda')
         torch.cuda.synchronize()
         before = torch.cuda.memory_allocated()
@@ -246,7 +230,6 @@ def test_held_activations(single_process, residual_func, ckpt, model_dim=1536, n
         del model, loss
         torch.cuda.empty_cache()
         return after - before
-    extra = held(residual_func, residual_ckpt_interval=ckpt) - held('base')
-    streams = 2 * 4 + 1 if ckpt == 0 else 1 + 4 * (-(-num_layers // ckpt) - 1)
-    expected = B * L * streams * model_dim * 2
+    extra = held(residual_func) - held('base')
+    expected = B * L * (2 * 4 + 1) * model_dim * 2
     assert abs(extra - expected) < 0.15 * expected + 24 * 2**20, (extra, expected)
