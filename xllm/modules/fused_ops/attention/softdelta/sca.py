@@ -6,7 +6,7 @@ from torch.autograd.function import FunctionCtx
 from einops import rearrange, repeat
 try:
     from xattn.ops import (
-        sliding_chunk_group_softdelta_attention
+        sliding_chunk_softdelta_attention as xattn_softdelta
     )
     XATTN_SCA_SOFTDELTA_ENABLED = True
 except ImportError:
@@ -37,8 +37,8 @@ def sliding_chunk_softdelta_attention(
         if bos_mask is not None:
             segment_idx = None
 
-        return sliding_chunk_group_softdelta_attention(
-            q, kk, v, g, chunk_size, qk, scale, prev_k, prev_v,
+        return xattn_softdelta(
+            q, kk, qk, v, g, chunk_size, scale, prev_k, prev_v,
             bos_mask=bos_mask, segment_idx=segment_idx,
             high_precision_level=high_precision_level,
             deterministic=deterministic,
