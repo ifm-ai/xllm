@@ -7,7 +7,7 @@ from torch import nn
 
 from xllm.config import ModelConf, MuPConf, OptimConf, RolesConf, RoleConf
 from xllm.modules.residual.build import build_residual
-from xllm.optim.dion_muon import parameter_groups
+from xllm.optim.dion_muon import param_subrole, parameter_groups
 
 
 def gekko_model_conf(**kw):
@@ -138,3 +138,76 @@ def test_model_multiplier_checks():
     with pytest.raises(ValueError):
         gekko_model_conf(residual_multiplier=0.0)
     gekko_model_conf(residual_multiplier=0.5)
+
+
+class FakeBlock(nn.Module):
+    """Gekko-like names: attention.{wq,wk,wv(+bias),wo,q_conv,timenorm,query_norm}, feed_forward.{fc1,fc2,fc3,norm}."""
+    arch, num_experts, num_values = 'gekko', 0, 0
+
+    def __init__(self):
+        super().__init__()
+        self.embed = nn.Embedding(10, 4)
+        layer = nn.Module()
+        attn = nn.Module()
+        attn.wq, attn.wk, attn.wo = (nn.Linear(4, 4, bias=False) for _ in range(3))
+        attn.wv = nn.Linear(4, 4, bias=True)
+        attn.q_conv = nn.Module()
+        attn.q_conv.weight = nn.Parameter(torch.ones(4, 4))
+        for norm in ('timenorm', 'query_norm'):
+            setattr(attn, norm, nn.Module())
+            getattr(attn, norm).weight = nn.Parameter(torch.ones(4))
+        ffn = nn.Module()
+        ffn.fc1, ffn.fc3 = nn.Linear(4, 8, bias=False), nn.Linear(4, 8, bias=False)
+        ffn.fc2 = nn.Linear(8, 4, bias=False)
+        ffn.norm = nn.Module()
+        ffn.norm.weight = nn.Parameter(torch.ones(4))
+        layer.attention, layer.feed_forward = attn, ffn
+        self.layers = nn.ModuleList([layer])
+        self.output = nn.Module()
+        self.output.final_norm = nn.Module()
+        self.output.final_norm.weight = nn.Parameter(torch.ones(4))
+        self.output.output = nn.Linear(4, 10, bias=False)
+
+
+def test_param_subrole_names():
+    assert param_subrole('layers.0.attention.wr.weight', 'hidden_matrix') == 'attn_in'
+    assert param_subrole('layers.3.attention.wo.weight', 'hidden_matrix') == 'attn_out'
+    assert param_subrole('layers.0.feed_forward.fc3.weight', 'hidden_matrix') == 'ffn_in'
+    assert param_subrole('layers.0.feed_forward.fc2.weight', 'hidden_matrix') == 'ffn_out'
+    assert param_subrole('layers.0.attention.k_conv.weight', 'hidden_vector') == 'vec_conv'
+    assert param_subrole('layers.0.attention.timenorm.bias', 'hidden_vector') == 'vec_norm'
+    assert param_subrole('layers.0.attention.attn_norm.weight', 'hidden_vector') == 'vec_norm'
+    assert param_subrole('layers.0.attention.wv.bias', 'hidden_vector') == 'vec_bias'
+    with pytest.raises(ValueError):
+        param_subrole('layers.0.attention.mystery.weight', 'hidden_matrix')
+
+
+def test_unsplit_layout_unchanged():
+    roles = RolesConf(embed=RoleConf(lr=8.0), hidden_vector=RoleConf(weight_decay=0.0))
+    groups, _ = parameter_groups(FakeBlock(), dion_optim(roles=roles))
+    assert [g['group_id'] for g in groups] == ['muon', 'adamw_embed_no_wd', 'adamw_hidden_vector',
+                                               'adamw_final_norm', 'adamw_readout_no_wd']
+
+
+def test_subrole_groups():
+    roles = RolesConf(hidden_matrix=RoleConf(lr=2.0), ffn_out=RoleConf(lr=0.5), attn_out=RoleConf(weight_decay=0.0),
+                      hidden_vector=RoleConf(lr=8.0, weight_decay=0.0), vec_conv=RoleConf(lr=0.25))
+    optim = dion_optim(roles=roles)
+    groups, contract = parameter_groups(FakeBlock(), optim)
+    g = by_id(groups)
+    assert {k for k in g if k.startswith('muon')} == {'muon_attn_in', 'muon_attn_out', 'muon_ffn_in', 'muon_ffn_out'}
+    assert len(g['muon_attn_in']['params']) == 3 and len(g['muon_ffn_in']['params']) == 2
+    assert math.isclose(g['muon_ffn_out']['lr'], 1e-3 * 2.0 * 0.5)
+    assert math.isclose(g['muon_attn_in']['lr'], 1e-3 * 2.0) and math.isclose(g['muon_attn_in']['weight_decay'], 0.2)
+    assert g['muon_attn_out']['weight_decay'] == 0.0
+    assert math.isclose(g['adamw_vec_conv']['lr'], 2e-3 * 8.0 * 0.25)
+    assert math.isclose(g['adamw_vec_norm']['lr'], 2e-3 * 8.0) and math.isclose(g['adamw_vec_bias']['lr'], 2e-3 * 8.0)
+    assert g['adamw_vec_norm']['weight_decay'] == 0.0
+    assert len(g['adamw_vec_norm']['params']) == 3 and len(g['adamw_vec_bias']['params']) == 1
+    names = sum(len(grp['params']) for grp in groups)
+    assert names == len(list(FakeBlock().parameters())) and len(contract) == len(groups)
+
+
+def test_subrole_rejects_muon_eps():
+    with pytest.raises(ValueError):
+        RolesConf(ffn_out=RoleConf(eps=2.0))

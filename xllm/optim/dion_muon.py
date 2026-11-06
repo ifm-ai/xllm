@@ -47,18 +47,47 @@ def param_role(name, muon):
     raise ValueError(f'No role for parameter {name}')
 
 
+MATRIX_SUBROLES = {'wq': 'attn_in', 'wk': 'attn_in', 'wv': 'attn_in', 'wr': 'attn_in', 'wg': 'attn_in',
+                   'wo': 'attn_out', 'fc1': 'ffn_in', 'fc3': 'ffn_in', 'fc2': 'ffn_out'}
+
+
+def param_subrole(name, role):
+    """Sub-role of a hidden_matrix / hidden_vector parameter by name (RolesConf in xllm/config.py)."""
+    owner, _, leaf = name.rpartition('.')
+    module = owner.rpartition('.')[2]
+    if role == 'hidden_matrix':
+        if module not in MATRIX_SUBROLES:
+            raise ValueError(f'No hidden_matrix sub-role for {name}')
+        return MATRIX_SUBROLES[module]
+    if role == 'hidden_vector':
+        if module.endswith('_conv'):
+            return 'vec_conv'
+        if 'norm' in module:
+            return 'vec_norm'
+        if module in MATRIX_SUBROLES and leaf == 'bias':
+            return 'vec_bias'
+        raise ValueError(f'No hidden_vector sub-role for {name}')
+    return None
+
+
 def role_parameter_groups(model, cfg):
-    """One Muon group (hidden_matrix) and one AdamW group per (role, decayed): lr, epsilon and weight decay are the
-    configured values times cfg.role_factor (optim.roles.* x mup.*). disable_wd_{emb,out} still zero the decay."""
+    """Muon groups for hidden_matrix and AdamW groups per (role, decayed): lr, epsilon and weight decay are the
+    configured values times cfg.role_factor (optim.roles.* x mup.*). disable_wd_{emb,out} still zero the decay.
+    A parent with a sub-role set (optim.roles.attn_in etc.) gets one group per sub-role. Groups are created in
+    parameter order, the Muon group first when hidden_matrix is not split."""
     modules = dict(model.named_modules())
     no_decay_ids = no_weight_decay_param_ids(model, cfg)
-    muon_group = {
-        'params': [], 'group_id': 'muon', 'algorithm': 'muon',
-        'lr': cfg.muon_lr * cfg.role_factor('hidden_matrix', 'lr'),
-        'weight_decay': cfg.weight_decay * cfg.role_factor('hidden_matrix', 'weight_decay'),
-    }
-    groups, membership = [muon_group], [[]]
+    split = {parent: cfg.roles.split(parent) for parent in ('hidden_matrix', 'hidden_vector')}
+    groups, membership = [], []
     index = {}
+    if not split['hidden_matrix']:
+        index[('hidden_matrix', None, True)] = 0
+        groups.append({
+            'params': [], 'group_id': 'muon', 'algorithm': 'muon',
+            'lr': cfg.muon_lr * cfg.role_factor('hidden_matrix', 'lr'),
+            'weight_decay': cfg.weight_decay * cfg.role_factor('hidden_matrix', 'weight_decay'),
+        })
+        membership.append([])
     seen = set()
     for name, parameter in model.named_parameters(remove_duplicate=False):
         if not parameter.requires_grad:
@@ -72,24 +101,29 @@ def role_parameter_groups(model, cfg):
         if muon and id(parameter) in no_decay_ids:
             raise ValueError(f'No-weight-decay parameter {name} was routed to Muon')
         role = param_role(name, muon)
-        if muon:
-            key = 0
-        else:
-            decayed = id(parameter) not in no_decay_ids
-            key = index.get((role, decayed))
-            if key is None:
-                key = index[(role, decayed)] = len(groups)
+        sub = param_subrole(name, role) if split.get(role) else None
+        decayed = id(parameter) not in no_decay_ids
+        key = index.get((role, sub, decayed))
+        if key is None:
+            key = index[(role, sub, decayed)] = len(groups)
+            if muon:
                 groups.append({
-                    'params': [], 'group_id': f'adamw_{role}' + ('' if decayed else '_no_wd'),
-                    'algorithm': 'adamw',
-                    'lr': cfg.lr * cfg.role_factor(role, 'lr'),
-                    'epsilon': cfg.epsilon * cfg.role_factor(role, 'eps'),
-                    'weight_decay': cfg.weight_decay * cfg.role_factor(role, 'weight_decay') if decayed else 0.0,
+                    'params': [], 'group_id': f'muon_{sub}', 'algorithm': 'muon',
+                    'lr': cfg.muon_lr * cfg.role_factor(role, 'lr', sub),
+                    'weight_decay': cfg.weight_decay * cfg.role_factor(role, 'weight_decay', sub),
                 })
-                membership.append([])
+            else:
+                groups.append({
+                    'params': [], 'group_id': f'adamw_{sub or role}' + ('' if decayed else '_no_wd'),
+                    'algorithm': 'adamw',
+                    'lr': cfg.lr * cfg.role_factor(role, 'lr', sub),
+                    'epsilon': cfg.epsilon * cfg.role_factor(role, 'eps', sub),
+                    'weight_decay': cfg.weight_decay * cfg.role_factor(role, 'weight_decay', sub) if decayed else 0.0,
+                })
+            membership.append([])
         groups[key]['params'].append(parameter)
         membership[key].append((name, list(parameter.shape)))
-    if not groups[0]['params']:
+    if not any(g['params'] for g in groups if g['algorithm'] == 'muon'):
         raise ValueError('No trainable hidden projection matrices for Muon')
     return groups, membership
 
@@ -167,14 +201,19 @@ def build_dion_muon(model, cfg):
     if mesh is None:
         raise ValueError('dion_muon requires a model built with FSDP2')
     groups, membership = parameter_groups(model, cfg)
+    if not dist.is_initialized() or dist.get_rank() == 0:
+        for group in groups:
+            print(f"dion_muon group {group['group_id']}: {len(group['params'])} params, lr {group['lr']:.4g}, "
+                  f"wd {group.get('weight_decay', cfg.weight_decay):.4g}, eps {group.get('epsilon', cfg.epsilon):.3g}", flush=True)
+    muon_params = [p for g in groups if g['algorithm'] == 'muon' for p in g['params']]
     # Tensor operations may reuse an equivalent DeviceMesh when a second
     # FSDP2 model is built in-process. Use the parameters' actual shard group,
     # not a newly created group with the same rank layout.
-    parameter_mesh = groups[0]['params'][0].device_mesh['dp']
+    parameter_mesh = muon_params[0].device_mesh['dp']
     if parameter_mesh.mesh.tolist() != mesh.mesh.tolist():
         raise ValueError('Muon parameters do not match the native FSDP2 shard layout')
     mesh = parameter_mesh
-    if any(p.device_mesh['dp'].get_group() != mesh.get_group() for p in groups[0]['params']):
+    if any(p.device_mesh['dp'].get_group() != mesh.get_group() for p in muon_params):
         raise ValueError('Muon projection matrices must share one FSDP2 shard group')
     model._xllm_dion_mesh = mesh
     optimizer = Muon(
@@ -190,7 +229,7 @@ def build_dion_muon(model, cfg):
         use_gram_newton_schulz=cfg.muon_use_gram_newton_schulz,
         use_triton=cfg.muon_use_triton,
     )
-    full_mesh = groups[0]['params'][0].device_mesh
+    full_mesh = muon_params[0].device_mesh
     replicated = 'cp' in full_mesh.mesh_dim_names and full_mesh['cp'].size() > 1
     if replicated:
         optimizer._xllm_replica_group = full_mesh['cp'].get_group()

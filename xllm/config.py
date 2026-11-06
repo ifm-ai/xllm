@@ -82,6 +82,13 @@ class SlurmConf(Config):
 
 
 ROLES = ("embed", "hidden_matrix", "hidden_vector", "final_norm", "readout")
+# Sub-roles: factors on top of their parent role's. hidden_matrix (Muon) by projection, hidden_vector by kind.
+SUBROLES = {
+    "hidden_matrix": ("attn_in", "attn_out", "ffn_in", "ffn_out"),
+    "hidden_vector": ("vec_norm", "vec_conv", "vec_bias"),
+}
+SUBROLE_PARENT = {sub: parent for parent, subs in SUBROLES.items() for sub in subs}
+ALL_ROLES = ROLES + tuple(SUBROLE_PARENT)
 
 
 @dataclass
@@ -106,19 +113,36 @@ class RolesConf(Config):
     hidden_vector: RoleConf = field(default_factory=RoleConf)
     final_norm: RoleConf = field(default_factory=RoleConf)
     readout: RoleConf = field(default_factory=RoleConf)
+    # Sub-roles, multiplied onto the parent's factor. hidden_matrix: attn_in = wq / wk / wv / wr / wg (attention
+    # inputs and gates), attn_out = wo, ffn_in = fc1 / fc3, ffn_out = fc2. hidden_vector: vec_norm = norm gains and
+    # biases (timenorm, query / key / attn norms, FFN norm), vec_conv = Gekko depthwise conv kernels, vec_bias =
+    # projection biases. Setting any sub-role of a parent splits that parent into one group per sub-role.
+    attn_in: RoleConf = field(default_factory=RoleConf)
+    attn_out: RoleConf = field(default_factory=RoleConf)
+    ffn_in: RoleConf = field(default_factory=RoleConf)
+    ffn_out: RoleConf = field(default_factory=RoleConf)
+    vec_norm: RoleConf = field(default_factory=RoleConf)
+    vec_conv: RoleConf = field(default_factory=RoleConf)
+    vec_bias: RoleConf = field(default_factory=RoleConf)
 
     def __post_init__(self):
-        for role in ROLES:
+        for role in ALL_ROLES:
             for name in ("lr", "eps", "weight_decay"):
                 value = getattr(getattr(self, role), name)
                 if value is not None and not (math.isfinite(value) and value >= 0 and (name != "eps" or value > 0)):
                     raise ValueError(f"optim.roles.{role}.{name} must be finite and >= 0 (eps > 0), got {value}")
-        if self.hidden_matrix.eps is not None:
-            raise ValueError("optim.roles.hidden_matrix.eps: Muon has no eps")
+        for role in ("hidden_matrix",) + SUBROLES["hidden_matrix"]:
+            if getattr(self, role).eps is not None:
+                raise ValueError(f"optim.roles.{role}.eps: Muon has no eps")
 
     def is_set(self) -> bool:
         return any(getattr(getattr(self, role), name) is not None
-                   for role in ROLES for name in ("lr", "eps", "weight_decay"))
+                   for role in ALL_ROLES for name in ("lr", "eps", "weight_decay"))
+
+    def split(self, parent: str) -> bool:
+        """Whether any sub-role of parent is set (parent then gets one group per sub-role)."""
+        return any(getattr(getattr(self, sub), name) is not None
+                   for sub in SUBROLES[parent] for name in ("lr", "eps", "weight_decay"))
 
 
 @dataclass
@@ -148,10 +172,15 @@ class OptimConf(Config):
     wsd_decay_style: str = 'cosine'  # The curve type of decay phase in WSD scheduler: cosine or linear
     roles: RolesConf = field(default_factory=RolesConf)  # Per-role lr / eps / weight decay factors (dion_muon)
 
-    def role_factor(self, role: str, name: str) -> float:
-        """optim.roles.<role>.<name> times the mup.* factor (set by TrainerConf, not serialized)."""
+    def role_factor(self, role: str, name: str, subrole: Optional[str] = None) -> float:
+        """optim.roles.<role>.<name> (x optim.roles.<subrole>.<name>) times the mup.* factor of role (set by
+        TrainerConf, not serialized)."""
         mup = getattr(self, "_mup_role_factors", {})
-        return getattr(self.roles, role).factor(name) * mup.get(role, {}).get(name, 1.0)
+        factor = getattr(self.roles, role).factor(name) * mup.get(role, {}).get(name, 1.0)
+        if subrole is not None:
+            assert SUBROLE_PARENT[subrole] == role, (subrole, role)
+            factor *= getattr(self.roles, subrole).factor(name)
+        return factor
 
     def role_groups(self) -> bool:
         """Whether dion_muon steps one group per role: some role factor is set or mup.* is on."""
