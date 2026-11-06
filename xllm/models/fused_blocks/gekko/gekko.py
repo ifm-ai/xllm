@@ -328,14 +328,14 @@ class GekkoBlockFunction(torch.autograd.Function):
             _, handle8 = send_memory_to_next(new_memory)
             _, handle9 = send_log_norm_term_to_next(new_lnt)
 
-            sca_out, sca_for_save, sca_aux, attn_w_rng_state = sliding_chunk_attention_fwd(
+            sca_out, sca_aux, attn_w_rng_state = sliding_chunk_attention_fwd(
                 sq, sk, xv_, attention_chunk_size, sca_scale, prev_sk, prev_sv,
                 bos_mask, segment_idx, attention_dropout, attn_stability_control, sca_backend, not recompute_sca
             )
             # B x L x E
             r = attn_gate_fn(F.linear(mx, wr, br))
         else:
-            sca_out, sca_for_save, sca_aux, attn_w_rng_state = sliding_chunk_attention_fwd(
+            sca_out, sca_aux, attn_w_rng_state = sliding_chunk_attention_fwd(
                 sq, sk, xv_, attention_chunk_size, sca_scale, prev_sk, prev_sv,
                 bos_mask, segment_idx, attention_dropout, attn_stability_control, sca_backend, not recompute_sca
             )
@@ -361,9 +361,6 @@ class GekkoBlockFunction(torch.autograd.Function):
             handle8 = None
             handle9 = None
 
-        if not recompute_sca and sca_for_save is None:
-            assert sca_backend == 'swift'
-            sca_for_save = sca_out
         # B x L x E
         sca_out = rearrange(sca_out, 'b l h v -> b l (h v)')
         awk_out = rearrange(awk_out, 'b h l v -> b l (h v)')
@@ -442,7 +439,7 @@ class GekkoBlockFunction(torch.autograd.Function):
             conv_state_v,  # (bsz, width-1, v/MP)
             prev_k,  # (bsz, chunk, s/MP * 2)
             prev_v,  # (bsz, chunk, v/MP)
-            sca_for_save,  # (bsz, slen, h/MP, v/MP)
+            sca_out if not recompute_sca else None,  # (bsz, slen, h/MP, v/MP)
             sca_aux,  # (bsz, h/MP, slen, chunksize)
             awk_out if not recompute_awk else None,  # (bsz, slen, v/MP)
             memory,  # (bsz, h/MP, s/(h*MP), v/(h*MP))
@@ -531,7 +528,7 @@ class GekkoBlockFunction(torch.autograd.Function):
             conv_state_v,  # (bsz, width-1, v/MP)
             prev_k,  # (bsz, chunk, s/MP)
             prev_v,  # (bsz, chunk, v/MP)
-            sca_for_save,  # (bsz, slen, h/MP, v/MP)
+            sca_out,  # (bsz, slen, slen, v/MP)
             sca_aux,  # (bsz, h/MP, slen, chunksize)
             awk_out,  # (bsz, slen, v/MP)
             memory,  # (bsz, h/MP, s/(h*MP), v/(h*MP))
@@ -716,17 +713,15 @@ class GekkoBlockFunction(torch.autograd.Function):
             handle_prev_v = None
 
         # recompute attention output
-        if sca_for_save is None:
+        if sca_out is None:
             assert sca_aux is None
-            sca_out, sca_for_save, sca_aux = recompute_sliding_chunk_attention(
+            sca_out, sca_aux = recompute_sliding_chunk_attention(
                 sq, sk, xv_, attention_chunk_size, sca_scale, prev_sk, prev_sv, bos_mask, segment_idx,
                 attention_dropout, attn_stability_control, sca_backend, attn_w_rng_state
             )
-        else:
-            sca_out = sca_for_save.to(x.dtype)
+            # B x L x E
+            sca_out = rearrange(sca_out, 'b l h v -> b l (h v)')
 
-        # B x L x E
-        sca_out = rearrange(sca_out, 'b l h v -> b l (h v)')
         # B x L x H x S -> B x H x L x S
         aq = aq.transpose(1, 2)
         aqk = aqk.transpose(1, 2)
@@ -766,6 +761,7 @@ class GekkoBlockFunction(torch.autograd.Function):
         sca_out_grad = mem_effn_rmsnorm_bwd(attn_norm_grad, attn_norm, attn_rstd, local_heads)
         # B x L x E -> B x L x H x E
         sca_out_grad = rearrange(sca_out_grad, 'b l (h v) -> b l h v', h=local_heads)
+        sca_out = rearrange(sca_out, 'b l (h v) -> b l h v', h=local_heads)
         # B x L x H x E -> B x H x L x E
         awk_out_grad = sca_out_grad.transpose(1, 2)
 
@@ -800,7 +796,7 @@ class GekkoBlockFunction(torch.autograd.Function):
             _, handle7 = send_log_norm_term_grad_to_prev(log_norm_term_grad)
 
             sq_grad, sk_grad, xv_grad, prev_sk_grad, prev_sv_grad = sliding_chunk_attention_bwd(
-                sca_out_grad, sq, sk, xv_, sca_for_save, sca_aux, attention_chunk_size, sca_scale,
+                sca_out_grad, sq, sk, xv_, sca_out, sca_aux, attention_chunk_size, sca_scale,
                 prev_sk, prev_sv, bos_mask, segment_idx, attn_stability_control, deterministic, sca_backend
             )
             assert prev_aqk_grad is not None and prev_akk_grad is not None and prev_av_grad is not None
@@ -812,7 +808,7 @@ class GekkoBlockFunction(torch.autograd.Function):
             _, handle5 = send_prev_key_or_value_grad_to_prev(prev_v_grad)
         else:
             sq_grad, sk_grad, xv_grad, prev_sk_grad, prev_sv_grad = sliding_chunk_attention_bwd(
-                sca_out_grad, sq, sk, xv_, sca_for_save, sca_aux, attention_chunk_size, sca_scale,
+                sca_out_grad, sq, sk, xv_, sca_out, sca_aux, attention_chunk_size, sca_scale,
                 prev_sk, prev_sv, bos_mask, segment_idx, attn_stability_control, deterministic, sca_backend
             )
 

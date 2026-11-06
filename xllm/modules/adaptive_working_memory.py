@@ -59,9 +59,8 @@ class AdaptiveWorkingMemory(nn.Module):
             xqk = xkk = xk  # shared qk & kk
         else:
             assert xk.shape[3] == 2 * self.head_dim  # separate qk & kk
-            # xqk = xk[:, :, :, :self.head_dim]
+            xqk = xk[:, :, :, :self.head_dim]
             xkk = xk[:, :, :, self.head_dim:]
-            xqk = xkk  # v1
         # softmax to qk
         xqk = F.softmax(xqk, dim=-1, dtype=torch.float32).to(xqk)
         xv = rearrange(xv, 'b l (k v) -> b k l v', k=self.n_kv_heads)

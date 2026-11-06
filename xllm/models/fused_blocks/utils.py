@@ -655,7 +655,7 @@ def recompute_sliding_chunk_attention(
     stability_control: int,
     backend: str,
     rng_state: Optional[Tensor]
-) -> Tuple[Tensor, Optional[Tensor], Tensor]:
+) -> Tuple[Tensor, Tensor]:
     # set rng state to the state in fwd
     if rng_state is not None:
         assert dropout > 0, dropout
@@ -664,7 +664,7 @@ def recompute_sliding_chunk_attention(
     else:
         org_rng_state = None
 
-    y, y_for_bwd, aux = sca_fwd(
+    y, aux = sca_fwd(
         xq, xk, xv, chunk_size, scale, prev_k, prev_v, bos_mask, segment_idx,
         dropout, stability_control, backend, requires_grad=True
     )
@@ -673,7 +673,7 @@ def recompute_sliding_chunk_attention(
         assert org_rng_state is not None
         torch.cuda.set_rng_state(org_rng_state)
 
-    return y, y_for_bwd, aux
+    return y, aux
 
 
 def sliding_chunk_attention_fwd(
@@ -690,13 +690,13 @@ def sliding_chunk_attention_fwd(
     stability_control: int,
     backend: str,
     save_aux: bool
-) -> Tuple[Tensor, Optional[Tensor], Optional[Tensor], Optional[Tensor]]:
+) -> Tuple[Tensor, Optional[Tensor], Optional[Tensor]]:
     rng_state = None if dropout == 0 else torch.cuda.get_rng_state()
-    y, y_for_bwd, aux = sca_fwd(
+    y, aux = sca_fwd(
         xq, xk, xv, chunk_size, scale, prev_k, prev_v, bos_mask, segment_idx,
         dropout, stability_control, backend, requires_grad=save_aux
     )
-    return y, y_for_bwd, aux, rng_state
+    return y, aux, rng_state
 
 
 def sliding_chunk_attention_bwd(
