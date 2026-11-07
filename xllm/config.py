@@ -289,6 +289,7 @@ class ModelConf(Config):
     swiglu: bool = False  # Whether to use SwiGLU in dense FFN. Otherwise uses SiLU.
     scale_emb: bool = False  # Whether to scale embedding output by sqrt(model_dim).
     layerwise_ckpt: bool = False  # Whether to enable activation checkpointing for each layer to save memory by recomputing forward during backprop.
+    layerwise_ckpt_layers: Optional[int] = None  # With layerwise_ckpt, checkpoint only the first N layers (None = all). Trades memory for less recompute.
 
     fused_block: bool = False  # Whether to use custom fused forward/backward implementations for training blocks; incompatible with layerwise_ckpt.
     # Recomputation switches

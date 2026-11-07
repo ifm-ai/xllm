@@ -471,7 +471,7 @@ class Gekko(XLLModel):
                 args = (x, freq_cis, bos_mask, segment_idx, prev_segment_count,
                         moe_router_load_balancing_type, attn_stability_control,
                         deterministic, layer_cache)
-            if self.layerwise_ckpt:
+            if self.ckpt_layer(i):
                 x, aux_loss, layer_cache = checkpoint(
                     layer, *args, use_reentrant=False, preserve_rng_state=True
                 )

@@ -700,7 +700,7 @@ class Transformer(XLLModel):
         health_collector = get_active_health_collector()
         for i, layer in enumerate(self.layers):
             layer_cache = cache[i] if cache is not None else None
-            if self.layerwise_ckpt:
+            if self.ckpt_layer(i):
                 x, aux_loss, layer_cache = checkpoint(
                     layer, x, freq_cis, bos_mask, segments, moe_router_load_balancing_type,
                     attn_stability_control, deterministic, layer_cache,
