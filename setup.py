@@ -35,6 +35,7 @@ CSRCS = [
     os.path.join(PATH, "xllm/csrc/ops/cema_cub_scan_kernel.cu"),
     os.path.join(PATH, "xllm/csrc/ops/fftconv.cc"),
     os.path.join(PATH, "xllm/csrc/ops/fftconv_kernel.cu"),
+    os.path.join(PATH, "xllm/csrc/ops/fp8_blockwise_gemm.cc"),
     os.path.join(PATH, "xllm/csrc/ops/group_layer_norm.cc"),
     os.path.join(PATH, "xllm/csrc/ops/group_layer_norm_kernel.cu"),
     os.path.join(PATH, "xllm/csrc/ops/group_rms_norm.cc"),

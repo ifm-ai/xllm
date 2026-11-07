@@ -1,5 +1,6 @@
 from typing import Optional, Tuple, List, Any
 import math
+import os
 import torch
 from torch import Tensor
 from torch.nn import functional as F
@@ -46,12 +47,25 @@ def timenorm_fwd(
     beta2: float,
     eps: float,
     backend: str,
+    want_step_count: bool = False,
 ):
+    """With ``want_step_count`` the per-step counts [B, L] int32 are returned as a 7th value (None unless the cute
+    backend computed them); pass them to ``timenorm_bwd`` so the backward does not recompute them."""
     gamma = gamma + 1.0
+    if backend == 'cute':
+        from xllm.modules.fused_ops.cute.timestep_decay_norm import timestep_decay_norm_fwd
+        y, count, mean, var, cummean, cumrstd, step_count = timestep_decay_norm_fwd(
+            x, bos_mask, prev_count, prev_mean, prev_var, gamma, beta, None, num_groups, beta1, beta2, eps,
+        )
+        if want_step_count:
+            return y, count, mean, var, cummean, cumrstd, step_count
+        return y, count, mean, var, cummean, cumrstd
     timestep_norm_fwd = xllm_ops.group_timestep_decay_norm_cub_fwd if backend == 'cub' else xllm_ops.group_timestep_decay_norm_fwd
     y, count, mean, var, cummean, cumrstd = timestep_norm_fwd(
         x, bos_mask, prev_count, prev_mean, prev_var, gamma, beta, None, num_groups, beta1, beta2, eps,
     )
+    if want_step_count:
+        return y, count, mean, var, cummean, cumrstd, None
     return y, count, mean, var, cummean, cumrstd
 
 
@@ -73,9 +87,30 @@ def timenorm_bwd(
     eps: float,
     memory_efficient: bool,
     backend: str,
+    residual: Optional[Tensor] = None,
+    step_count: Optional[Tensor] = None,
+    addend: Optional[Tensor] = None,
 ):
+    """``residual``: a gradient added to x_grad. The cute kernel reduce-adds its dx into it (``residual`` is
+    overwritten and returned as x_grad); the other backends add afterwards. ``addend`` (B200 name): the same
+    without overwriting the given tensor."""
+    if addend is not None:
+        assert residual is None
+        residual = addend.clone()
     gamma = gamma + 1.0
-    if backend == 'cub':
+    if backend == 'cute':
+        assert not memory_efficient
+        from xllm.modules.fused_ops.cute.timestep_decay_norm import timestep_decay_norm_bwd
+        # per-step counts come from the forward (want_step_count) or are recomputed from prev_count and the bos mask
+        x_grad, prev_mean_grad, prev_var_grad, gamma_grad, beta_grad = timestep_decay_norm_bwd(
+            y_grad, mean_grad, var_grad, x_or_y, bos_mask, cummean, cumrstd, step_count,
+            gamma, None, num_groups, beta1, beta2, prev_count=prev_count,
+            residual=residual if residual is not None and residual.is_contiguous() and residual.dtype == x_or_y.dtype else None,
+        )
+        if residual is not None and x_grad is not residual:
+            x_grad = torch.add(x_grad, residual, out=x_grad)
+        return x_grad, prev_mean_grad, prev_var_grad, gamma_grad, beta_grad
+    elif backend == 'cub':
         assert not memory_efficient
         x_grad, prev_mean_grad, prev_var_grad, gamma_grad, beta_grad = xllm_ops.group_timestep_decay_norm_cub_bwd(
             y_grad, mean_grad, var_grad, x_or_y, prev_count, bos_mask, cummean, cumrstd,
@@ -86,6 +121,8 @@ def timenorm_bwd(
             y_grad, mean_grad, var_grad, x_or_y, prev_count, bos_mask, cummean, cumrstd,
             gamma, beta, None, num_groups, beta1, beta2, eps, memory_efficient
         )
+    if residual is not None:
+        x_grad = torch.add(x_grad, residual, out=x_grad)
     return x_grad, prev_mean_grad, prev_var_grad, gamma_grad, beta_grad
 
 
@@ -223,6 +260,11 @@ def causal_conv1d_fwd(
 ) -> Tuple[Tensor, Optional[Tensor], Any]:
     w = weight
     if apply_weight_normalization:
+        from xllm.modules.fused_ops.conv.causal_conv1d import _cute_conv_supported
+        if backend == 'triton' and _cute_conv_supported(x, weight, bias, initial_state, output_final_state):
+            # the CuTe conv normalizes the taps itself (saves the softmax / transpose / cast launches per call)
+            from xllm.modules.fused_ops.cute.causal_conv import conv_fwd as cute_conv_fwd
+            return cute_conv_fwd(x, weight, bos_mask, activation, softmax=True), None, None
         w = F.softmax(weight, dim=-1, dtype=torch.float32)  # fp32
         if backend == 'fla':
             w = w.to(x)
@@ -246,6 +288,12 @@ def causal_conv1d_bwd(
     deterministic: bool
 ) -> Tuple[Tensor, Optional[Tensor], Tensor, Optional[Tensor]]:
     if apply_weight_normalization:
+        from xllm.modules.fused_ops.conv.causal_conv1d import _cute_conv_bwd_preferred
+        if backend == 'triton' and _cute_conv_bwd_preferred(x, weight, bias, initial_state, final_state_grad, out_grad):
+            # the CuTe kernel normalizes the taps itself and returns the gradient w.r.t. the raw weight
+            from xllm.modules.fused_ops.cute.causal_conv import conv_bwd as cute_conv_bwd
+            x_grad, w_grad = cute_conv_bwd(out_grad, x, weight, bos_mask, activation, softmax=True)
+            return x_grad, None, w_grad, None
         w_fp32 = F.softmax(weight, dim=-1, dtype=torch.float32)  # fp32
         w = w_fp32.to(x) if backend == 'fla' else w_fp32
     else:
@@ -262,6 +310,18 @@ def causal_conv1d_bwd(
     return x_grad, initial_state_grad, w_grad, b_grad
 
 
+def _cute_ln(x: Tensor, weight: Optional[Tensor], bias: Optional[Tensor], num_groups: int) -> bool:
+    """Whether the CuTe DSL group layer norm (Blackwell, bf16, affine, >= 2048 tokens; env XLLM_CUTE_LN=0 disables it)
+    handles this input."""
+    if weight is None or bias is None or x.dim() != 3 or x.shape[0] * x.shape[1] < 2048:
+        return False
+    try:
+        from xllm.modules.fused_ops.cute.layer_norm import ln_supported
+    except ImportError:
+        return False
+    return ln_supported(x, num_groups)
+
+
 def layernorm_fwd(
     x: Tensor,
     weight: Optional[Tensor],
@@ -270,6 +330,9 @@ def layernorm_fwd(
     eps: float,
 ) -> Tuple[Tensor, Tensor, Tensor]:
     xdim = x.shape[-1]
+    if _cute_ln(x, weight, bias, num_groups):
+        from xllm.modules.fused_ops.cute.layer_norm import ln_fwd
+        return ln_fwd(x, weight, bias, num_groups, eps)
     if weight is not None:
         return xllm_ops.group_layer_norm_fwd_affine(x, xdim, num_groups, weight + 1.0, bias, eps)
     else:
@@ -284,12 +347,20 @@ def layernorm_bwd(
     weight: Optional[Tensor],
     bias: Optional[Tensor],
     num_groups: int,
+    addend: Optional[Tensor] = None,
 ) -> Tuple[Tensor, Optional[Tensor], Optional[Tensor]]:
+    """``addend`` (x's shape) is added to x_grad (fused into the CuTe kernel's store)."""
     xdim = x.shape[-1]
+    if _cute_ln(x, weight, bias, num_groups):
+        from xllm.modules.fused_ops.cute.layer_norm import ln_bwd
+        return ln_bwd(y_grad, x, mean, rstd, weight, num_groups, addend=addend)
     if weight is not None:
-        return xllm_ops.group_layer_norm_bwd_affine(y_grad, x, xdim, num_groups, mean, rstd, weight + 1.0, bias, False)
+        x_grad, w_grad, b_grad = xllm_ops.group_layer_norm_bwd_affine(y_grad, x, xdim, num_groups, mean, rstd, weight + 1.0, bias, False)
     else:
-        return xllm_ops.group_layer_norm_bwd(y_grad, x, xdim, num_groups, mean, rstd, False), None, None
+        x_grad, w_grad, b_grad = xllm_ops.group_layer_norm_bwd(y_grad, x, xdim, num_groups, mean, rstd, False), None, None
+    if addend is not None:
+        x_grad = torch.add(x_grad, addend, out=x_grad)
+    return x_grad, w_grad, b_grad
 
 
 def rmsnorm_fwd(
@@ -356,12 +427,15 @@ def layer_or_rmsnorm_bwd(
     bias: Optional[Tensor],
     num_groups: int,
     apply_rmsnorm: bool,
+    addend: Optional[Tensor] = None,
 ) -> Tuple[Tensor, Optional[Tensor], Optional[Tensor]]:
     if apply_rmsnorm:
         x_grad, w_grad = rmsnorm_bwd(y_grad, x, rstd, weight, num_groups)
         b_grad = None
+        if addend is not None:
+            x_grad = torch.add(x_grad, addend, out=x_grad)
     else:
-        x_grad, w_grad, b_grad = layernorm_bwd(y_grad, x, mean, rstd, weight, bias, num_groups)
+        x_grad, w_grad, b_grad = layernorm_bwd(y_grad, x, mean, rstd, weight, bias, num_groups, addend=addend)
 
     return x_grad, w_grad, b_grad
 
@@ -475,7 +549,7 @@ def flash_attention_fwd(
             segidx, total_seqlen_k = segments
             xk = xk[:, -total_seqlen_k:]
             xv = xv[:, -total_seqlen_k:]
-            bos_mask = bos_mask[:, -total_seqlen_k:]
+            bos_mask = bos_mask[:, -total_seqlen_k:] if bos_mask is not None else None
             segidx = segidx[:, -total_seqlen_k:]
         else:
             segidx = None
@@ -521,7 +595,7 @@ def flash_attention_bwd(
             segidx, total_seqlen_k = segments
             xk = xk[:, -total_seqlen_k:]
             xv = xv[:, -total_seqlen_k:]
-            bos_mask = bos_mask[:, -total_seqlen_k:]
+            bos_mask = bos_mask[:, -total_seqlen_k:] if bos_mask is not None else None
             segidx = segidx[:, -total_seqlen_k:]
         else:
             segidx = None
@@ -607,11 +681,62 @@ def sliding_chunk_attention_bwd(
     stability_control: int,
     deterministic: bool,
     backend: str,
+    delta: Optional[Tensor] = None,
+    fp8_dp: bool = False,
 ) -> Tuple[Tensor, Tensor, Tensor, Optional[Tensor], Optional[Tensor]]:
     return sca_bwd(
         y_grad, xq, xk, xv, y, aux, chunk_size, scale, prev_k, prev_v,
-        bos_mask, segment_idx, stability_control, deterministic, backend
+        bos_mask, segment_idx, stability_control, deterministic, backend, delta=delta, fp8_dp=fp8_dp
     )
+
+
+def _cute_swiglu(h1: Tensor, dropout: float) -> bool:
+    """Whether the fused CuTe DSL SwiGLU elementwise kernels (Blackwell, bf16, no hidden dropout; env
+    XLLM_CUTE_SWIGLU=0 disables them) handle this input."""
+    try:
+        from xllm.modules.fused_ops.cute.swiglu import swiglu_supported
+    except ImportError:
+        return False
+    return swiglu_supported(h1, dropout)
+
+
+_QUACK_GEMM = None
+
+
+def _quack_swiglu(x: Tensor, w1: Tensor, dropout: float) -> bool:
+    """Whether quack's fused SwiGLU GEMMs (``quack-kernels``, CuTe DSL, Hopper / Blackwell; optional, used when
+    installed; env XLLM_QUACK_FFN=0 disables them) handle this FFN: fc1 / fc3 as one GEMM over [w1; w3] with
+    silu(h1) * h3 in its epilogue, and the fc2 input-gradient GEMM with the SwiGLU backward in its epilogue."""
+    global _QUACK_GEMM
+    if os.environ.get("XLLM_QUACK_FFN", "1") == "0" or dropout > 0 or x.dtype != torch.bfloat16 or not x.is_cuda:
+        return False
+    if w1.dtype != torch.bfloat16 or x.dim() != 2 or x.shape[-1] % 8 or w1.shape[0] % 8:
+        return False
+    if _QUACK_GEMM is None:
+        try:
+            from quack.gemm_interface import gemm, gemm_dgated, gemm_gated
+            _QUACK_GEMM = (gemm_gated, gemm_dgated, gemm)
+        except Exception:
+            _QUACK_GEMM = False
+    return bool(_QUACK_GEMM) and torch.cuda.get_device_capability(x.device)[0] >= 9
+
+
+def _is_packed_swiglu(h3: Optional[Tensor]) -> bool:
+    """swiglu_forward's quack path returns the interleaved pre-activation [h1 | h3] as h1 and an empty h3."""
+    return h3 is not None and h3.numel() == 0
+
+
+def swiglu_recompute(x: Tensor, w1: Tensor, w3: Optional[Tensor], h1: Optional[Tensor], h3: Optional[Tensor],
+                     dropout: float, swiglu: bool) -> Tuple[Tensor, Optional[Tensor]]:
+    """The backward's recompute of the FFN pre-activations not saved by the forward: with both missing on the quack
+    path, the packed [h1 | h3] from one GEMM over [w1; w3] (and the empty h3 marker), else F.linear for each."""
+    if swiglu and h1 is None and h3 is None and _quack_swiglu(x, w1, dropout):
+        return _QUACK_GEMM[2](x, torch.cat([w1, w3]).t(), concat_layout=("B",)), x.new_empty(0)
+    if h1 is None:
+        h1 = F.linear(x, w1)
+    if swiglu and h3 is None:
+        h3 = F.linear(x, w3)
+    return h1, h3
 
 
 def swiglu_forward(
@@ -621,20 +746,48 @@ def swiglu_forward(
     w3: Optional[Tensor],
     dropout: float,
     swiglu: bool,
+    residual: Optional[Tensor] = None,
+    fp8_state: Optional[dict] = None,
 ):
+    """With ``residual`` ([tokens, D]), returns residual + fc2(hidden) from one GEMM (the add in its epilogue).
+    On the quack path h1 is the interleaved pre-activation [h1 | h3] ([tokens, 2 E]) and h3 an empty marker
+    (swiglu_backward handles both forms; a recomputed h1 / h3 pair takes the unfused backward).
+    ``fp8_state`` (a dict): MXFP8 GEMMs (xllm/modules/fused_ops/mxfp8.py; SwiGLU, no dropout); the dict receives the
+    operands the backward needs (the quantised weights and hidden^T)."""
+    if fp8_state is not None:
+        from xllm.modules.fused_ops.mxfp8 import mx_quantize, swiglu_fwd_mx, MxLinearSet
+        assert swiglu and dropout == 0.0
+        w13 = MxLinearSet([w1, w3])
+        w2m = MxLinearSet([w2])
+        x_row, x_col = mx_quantize(x, colwise=fp8_state.get('keep_xf', False))  # colwise kept for the backward's w1 / w3 gradients
+        h1, h3 = w13.forward_all(x_row)  # one GEMM: x [w1; w3]^T, h1 / h3 its column halves (the SwiGLU kernel reads strided rows)
+        hid_row, hid_col = swiglu_fwd_mx(h1, h3)  # silu(h1) * h3 straight into both fp8 operands (no bf16 hidden)
+        out = w2m.forward(0, hid_row, residual=residual)
+        fp8_state.update(w13=w13, w2=w2m, hid_col=hid_col)
+        if x_col is not None:
+            fp8_state.update(xf_row=x_row, xf_col=x_col)
+        return h1, h3, out, None
     # fc1 & fc3
-    if swiglu:
+    if swiglu and _quack_swiglu(x, w1, dropout):
+        gemm_gated = _QUACK_GEMM[0]
+        h1, hidden = gemm_gated(x, torch.cat([w1, w3]).t(), activation="swiglu", concat_layout=("B",))
+        h3 = h1.new_empty(0)
+    elif swiglu:
         h1 = F.linear(x, w1)
         h3 = F.linear(x, w3)
-        hidden = F.silu(h1)
-        hidden = torch.mul(hidden, h3, out=hidden)
+        if _cute_swiglu(h1, dropout):
+            from xllm.modules.fused_ops.cute.swiglu import swiglu_fwd
+            hidden = swiglu_fwd(h1, h3)
+        else:
+            hidden = F.silu(h1)
+            hidden = torch.mul(hidden, h3, out=hidden)
     else:
         h1 = F.linear(x, w1)
         h3 = None
         hidden = F.silu(h1)
 
     hidden, hidden_rng_state = memory_efficient_dropout_fwd(hidden, dropout, True)
-    out = F.linear(hidden, w2)
+    out = F.linear(hidden, w2) if residual is None else torch.addmm(residual, hidden, w2.t())
     return h1, h3, out, hidden_rng_state
 
 
@@ -656,28 +809,59 @@ def swiglu_backward(
     norm_groups: int,
     apply_rmsnorm: bool,
     gather_before_norm: bool,
+    addend: Optional[Tensor] = None,
+    fp8_state: Optional[dict] = None,
 ):
-    assert xf.shape == y_grad.shape, (xf.shape, y_grad.shape)
+    """``addend`` (x's shape, e.g. the residual-branch gradient) is added to the returned x_grad. ``fp8_state``: the
+    dict filled by ``swiglu_forward`` plus ``xf_col`` (the colwise operand of xf) -> MXFP8 GEMMs."""
+    assert xf is None or xf.shape == y_grad.shape, (xf.shape, y_grad.shape)  # None: fp8 operands kept instead
     bsz, seq_len, _ = x.shape
 
-    # B*L x E
-    h1s = F.silu(h1)
-    h, h_noise = memory_efficient_dropout_fwd(h1s if h3 is None else h1s * h3, dropout, True, rng_state)
-    # B*L x D, D x E -> B*L x E
-    h_grad = torch.mm(y_grad, w2)
-    h_grad = memory_efficient_dropout_bwd(h_grad, dropout, rng_state, h_noise)
-
-    if h3 is not None:
-        h1s_grad = h_grad * h3
-        h3_grad = h_grad * h1s
+    packed = False
+    if fp8_state is not None:
+        from xllm.modules.fused_ops.mxfp8 import mx_quantize, mx_mm, swiglu_bwd_mx
+        dy_row, dy_col = mx_quantize(y_grad, kind="grad")
+        h_grad = mx_mm(dy_row, fp8_state['w2'].col)
+        # the SwiGLU backward straight into the operands of the gradient GEMMs (no bf16 h1_grad / h3_grad; hidden^T
+        # is kept from the forward), then one GEMM: [h1_grad | h3_grad] [w1; w3]
+        d13_row, d13_col = swiglu_bwd_mx(h1, h3, h_grad)
+        xf_grad = mx_mm(d13_row, fp8_state['w13'].col)
     else:
-        h1s_grad = h_grad
-        h3_grad = None
+        # quack forward: h1 is the packed [h1 | h3] (2 E wide); a caller that recomputed only one of them hands over
+        # an unpacked h1 with the empty marker (repacked here) or the packed h1 with a recomputed h3 (ignored)
+        packed = _is_packed_swiglu(h3) or (w3 is not None and h1.shape[-1] == 2 * w1.shape[0])
+        if packed and h1.shape[-1] != 2 * w1.shape[0]:
+            h1 = _QUACK_GEMM[2](xf, torch.cat([w1, w3]).t(), concat_layout=("B",))
+    if packed:
+        # fc2 input gradient with the SwiGLU backward in its epilogue: interleaved d[h1 | h3] and the recomputed hidden
+        _, gemm_dgated, gemm = _QUACK_GEMM
+        w13 = torch.cat([w1, w3])
+        h13_grad, h = gemm_dgated(y_grad.contiguous(), w2, h1, activation="swiglu", dynamic_scheduler=True)
+        xf_grad = gemm(h13_grad, w13, dynamic_scheduler=True, concat_layout=("B",))
+    elif fp8_state is None:
+        # B*L x D, D x E -> B*L x E
+        h_grad = torch.mm(y_grad, w2)
+        if h3 is not None and _cute_swiglu(h1, dropout):
+            # the recompute of hidden and both gradients in one pass
+            from xllm.modules.fused_ops.cute.swiglu import swiglu_bwd
+            h, h1_grad, h3_grad = swiglu_bwd(h1, h3, h_grad)
+        else:
+            # B*L x E
+            h1s = F.silu(h1)
+            h, h_noise = memory_efficient_dropout_fwd(h1s if h3 is None else h1s * h3, dropout, True, rng_state)
+            h_grad = memory_efficient_dropout_bwd(h_grad, dropout, rng_state, h_noise)
 
-    h1_grad = torch.ops.aten.silu_backward(h1s_grad, h1)
-    xf_grad = h1_grad.matmul(w1)
-    if h3_grad is not None:
-        xf_grad = torch.addmm(xf_grad, h3_grad, w3, out=xf_grad)
+            if h3 is not None:
+                h1s_grad = h_grad * h3
+                h3_grad = h_grad * h1s
+            else:
+                h1s_grad = h_grad
+                h3_grad = None
+
+            h1_grad = torch.ops.aten.silu_backward(h1s_grad, h1)
+        xf_grad = h1_grad.matmul(w1)
+        if h3_grad is not None:
+            xf_grad = torch.addmm(xf_grad, h3_grad, w3, out=xf_grad)
 
     handle_norm_w = None
     handle_norm_b = None
@@ -687,6 +871,8 @@ def swiglu_backward(
             xf_grad, x, x_mean, x_invvar, norm_w, norm_b, norm_groups, apply_rmsnorm
         )
         x_grad, handle = reduce_scatter(x_grad, parallel_region='model', async_op=True)
+        if addend is not None and handle is None:
+            x_grad = torch.add(x_grad, addend, out=x_grad)
         if norm_w_grad is not None:
             norm_w_grad, handle_norm_w = reduce_scatter(norm_w_grad, parallel_region='model', async_op=True)
         if norm_b_grad is not None:
@@ -695,13 +881,23 @@ def swiglu_backward(
         xf_grad, handle = reduce_scatter(xf_grad, parallel_region='model', async_op=True)
 
     # E x B*L, B*L x D -> E x D
-    w1_grad = torch.mm(h1_grad.t(), xf)
-    w3_grad = None if h3_grad is None else torch.mm(h3_grad.t(), xf)
-    w2_grad = torch.mm(y_grad.t(), h)
+    if fp8_state is not None:
+        w1_grad, w3_grad = fp8_state['w13'].wgrad(d13_col, fp8_state['xf_col'])  # one GEMM for both
+        w2_grad, = fp8_state['w2'].wgrad(dy_col, fp8_state['hid_col'])
+    elif packed:
+        # [w1; w3] gradient in one GEMM from the interleaved d[h1 | h3] (concat output: two contiguous halves)
+        w1_grad, w3_grad = _QUACK_GEMM[2](h13_grad.t(), xf, dynamic_scheduler=True, concat_layout=("out",)).chunk(2)
+        w2_grad = torch.mm(y_grad.t(), h)
+    else:
+        w1_grad = torch.mm(h1_grad.t(), xf)
+        w3_grad = None if h3_grad is None else torch.mm(h3_grad.t(), xf)
+        w2_grad = torch.mm(y_grad.t(), h)
 
     # wait for x_grad
     if handle is not None:
         handle.wait()
+        if gather_before_norm and addend is not None:
+            x_grad = torch.add(x_grad, addend, out=x_grad)
     if handle_norm_w is not None:
         handle_norm_w.wait()
     if handle_norm_b is not None:
@@ -709,8 +905,10 @@ def swiglu_backward(
 
     if not gather_before_norm:
         x_grad, norm_w_grad, norm_b_grad = layer_or_rmsnorm_bwd(
-            xf_grad, x, x_mean, x_invvar, norm_w, norm_b, norm_groups, apply_rmsnorm
+            xf_grad, x, x_mean, x_invvar, norm_w, norm_b, norm_groups, apply_rmsnorm, addend=addend
         )
+    elif handle is None and addend is not None:
+        x_grad = torch.add(x_grad, addend, out=x_grad)
 
     return x_grad, w1_grad, w2_grad, w3_grad, norm_w_grad, norm_b_grad
 
@@ -851,7 +1049,20 @@ def grouped_experts_bwd(
     return x_grad, w1_grad, w2_grad, w3_grad
 
 
+def _cute_rope(x: Tensor, freqs_cis: Tensor, rope_head_dim: int, backward: bool) -> Optional[Tensor]:
+    """The single-pass CuTe DSL rotary embedding (Blackwell, bf16; env XLLM_CUTE_ROPE=0 disables), else None."""
+    try:
+        from xllm.modules.fused_ops.cute.rope import rope, rope_supported
+    except ImportError:
+        return None
+    if not rope_supported(x, rope_head_dim) or freqs_cis.dtype != torch.complex64 or freqs_cis.shape != (x.shape[1], rope_head_dim // 2):
+        return None
+    return rope(x, freqs_cis, rope_head_dim, backward)
+
+
 def apply_rope(x: Tensor, freqs_cis: Tensor, head_dim: int, rope_head_dim: int, backward: bool):
+    if rope_head_dim > 0 and (y := _cute_rope(x, freqs_cis, rope_head_dim, backward)) is not None:
+        return y
     if rope_head_dim == head_dim:
         x = apply_rotary_embedding(x, freqs_cis=freqs_cis, backward=backward)
     elif rope_head_dim > 0:
@@ -862,6 +1073,8 @@ def apply_rope(x: Tensor, freqs_cis: Tensor, head_dim: int, rope_head_dim: int, 
 
 
 def apply_ropes(xq: Tensor, xk: Tensor, freqs_cis: Tensor, head_dim: int, rope_head_dim: int, backward: bool):
+    if rope_head_dim > 0 and (yq := _cute_rope(xq, freqs_cis, rope_head_dim, backward)) is not None:
+        return yq, _cute_rope(xk, freqs_cis, rope_head_dim, backward)
     if rope_head_dim == head_dim:
         xq, xk = apply_rotary_embeddings(xq, xk, freqs_cis=freqs_cis, backward=backward)
     elif rope_head_dim > 0:

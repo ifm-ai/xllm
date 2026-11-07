@@ -4,6 +4,8 @@ import importlib
 
 import pytest
 import torch
+
+pytest.importorskip("flash_attn_2_cuda", reason="xllm.modules.fused_ops imports flash-attn 2")
 import torch.nn.functional as F
 
 from xllm.models.fused_blocks import utils
@@ -104,3 +106,30 @@ def test_normalized_conv_keeps_small_gradients_in_fp32(monkeypatch, deterministi
         delta = actual - expected
         assert delta.norm() <= 0.01 * expected.norm() + 1e-8 * expected.numel() ** 0.5
         assert delta.abs().max() <= 0.03 * expected.abs().max() + 1e-8
+
+
+@pytest.mark.parametrize('batch,heads,kv_heads,dim,bos_every', [
+    (1, 8, 2, 128, 0), (1, 8, 2, 128, 700), (2, 8, 2, 128, 700), (2, 4, 2, 256, 700), (1, 4, 4, 64, 0)])
+def test_xattn_sca_bwd_takes_precomputed_delta(batch, heads, kv_heads, dim, bos_every):
+    from xllm.modules.fused_ops.attention import sca
+    if not sca.XATTN_SCA_ENABLED or not sca._xattn_takes_dpsum():
+        pytest.skip('xattn without the dpsum patch')
+    torch.manual_seed(5)
+    L, chunk = 2048, 512
+    q = torch.randn(batch, L, heads, dim, device='cuda', dtype=torch.bfloat16)
+    k = torch.randn(batch, L, kv_heads, dim, device='cuda', dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+    dy = torch.randn_like(q)
+    bos = None
+    if bos_every:
+        bos = torch.zeros(batch, L, device='cuda', dtype=torch.bool)
+        bos[:, ::bos_every] = True
+        bos[-1, 333] = True
+    scale = dim ** -0.5
+    y, lse = sca.flash_sca_fwd(q, k, v, chunk, scale, None, None, bos_mask=bos)[::2]
+    delta = (dy.float() * y.float()).sum(-1).transpose(1, 2).contiguous()
+    run = lambda d: sca.sliding_chunk_attention_bwd(dy, q, k, v, y, lse, chunk, scale, bos_mask=bos, delta=d)[:3]
+    for a, b in zip(run(None), run(delta)):
+        torch.testing.assert_close(a, b, rtol=1e-2, atol=1e-2)
+    # a wrong delta must change the gradients (the kernel really reads it)
+    assert not torch.allclose(run(delta + 1.0)[0].float(), run(delta)[0].float())

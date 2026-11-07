@@ -6,6 +6,7 @@
 #include "ops/cema_blelloch_scan.h"
 #include "ops/cema_cub_scan.h"
 #include "ops/fftconv.h"
+#include "ops/fp8_blockwise_gemm.h"
 #include "ops/group_rms_norm.h"
 #include "ops/group_layer_norm.h"
 #include "ops/sequence_norm.h"
@@ -38,6 +39,7 @@ PYBIND11_MODULE(xllm_extension, m) {
   ops::DefineFFTConvOp(m_ops);
   ops::DefineGroupLayerNormOp(m_ops);
   ops::DefineGroupRMSNormOp(m_ops);
+  ops::DefineFp8BlockwiseGemmOp(m_ops);
   ops::DefineSequenceNormOp(m_ops);
   ops::DefineTimestepNormOp(m_ops);
   ops::DefineTimestepDecayNormCubOp(m_ops);

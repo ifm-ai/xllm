@@ -1,5 +1,6 @@
 from typing import NamedTuple, Optional, Tuple
 import math
+import os
 
 import torch
 from torch import Tensor
@@ -39,6 +40,51 @@ def next_power_of_2(n):
         return 1  # Handle non-positive numbers
     exponent = math.ceil(math.log2(n))
     return 2 ** exponent
+
+
+def _cute_ce_supported(x_2d: Tensor, vocab: int) -> bool:
+    """Whether the fused CuTe DSL loss / scores kernel (Blackwell, bf16 logits; env XLLM_CUTE_CE=0 disables it)
+    handles this chunked cross entropy (single model-parallel rank only)."""
+    if x_2d.dtype != torch.bfloat16 or not x_2d.is_cuda:
+        return False
+    try:
+        from xllm.modules.fused_ops.cute.cross_entropy import ce_logits_supported
+    except ImportError:
+        return False
+    return ce_logits_supported(x_2d.new_empty((0, vocab)))
+
+
+_QUACK_LCE = None
+_QUACK_LCE_CHUNK = 8192
+
+
+def _quack_lce_fwd(x_2d: Tensor, weight: Tensor, target_1d: Tensor, ignore_index: int, compute_grad: bool):
+    """(loss fp32 [M], grad_input [M, D], grad_weight) of sum(loss) through quack's fused linear cross entropy
+    (``quack-kernels``, Hopper: logits GEMM with an lse epilogue, the softmax recomputed in the operand transform of
+    the dx / dw GEMMs, so the [chunk, V] scores are never written; dw accumulated in fp32), or None when it does not
+    apply (not installed, not sm_90, shapes; env XLLM_QUACK_CE=0 disables it). target_1d holds ignore_index for the
+    ignored rows."""
+    global _QUACK_LCE
+    if os.environ.get("XLLM_QUACK_CE", "1") == "0" or x_2d.dtype != torch.bfloat16 or weight.dtype != torch.bfloat16:
+        return None
+    if _QUACK_LCE is None:
+        try:
+            from quack.linear_cross_entropy import scaled_exp_lce_supported, scaled_exp_linear_cross_entropy_fwd
+            _QUACK_LCE = (scaled_exp_lce_supported, scaled_exp_linear_cross_entropy_fwd)
+        except Exception:
+            _QUACK_LCE = False
+    if not _QUACK_LCE or not x_2d.is_contiguous() or not weight.is_contiguous():
+        return None
+    supported, lce_fwd = _QUACK_LCE
+    M = x_2d.shape[0]
+    chunk = min(_QUACK_LCE_CHUNK, -(-M // 128) * 128)
+    if not supported(x_2d, weight, chunk, "sum"):
+        return None
+    try:
+        loss, dx, dw = lce_fwd(x_2d, weight, target_1d, chunk, ignore_index, need_dx=compute_grad, need_dw=compute_grad)
+    except ValueError:  # shape combinations quack's epilogue inference rejects (raised before any launch)
+        return None
+    return loss[:M], (dx[:M] if compute_grad else None), (dw.to(weight.dtype) if compute_grad else None)
 
 
 def _fused_linear_cross_entropy(
@@ -109,20 +155,31 @@ def _fused_linear_cross_entropy(
         loss_flat = loss.view(bsz * seq_len)
     else:
         loss = loss_flat = None
-    if compute_grad:
-        grad_input = torch.empty(bsz * seq_len, input_.shape[-1], dtype=input_.dtype, device=input_.device)
-        grad_weight = torch.zeros_like(weight)
-        weight_fp32 = weight.float()
-    else:
-        grad_input = None
-        grad_weight = None
-        weight_fp32 = None
-
     if handle_x is not None:
         handle_x.wait()
         x = reshape_gathered_tensor_along_specific_dim(x, gather_dim=2)
 
     x_2d = x.view(-1, mdim)
+    if model_parallel_size == 1 and not collect_logits_stats:
+        res = _quack_lce_fwd(x_2d, weight, target_1d.masked_fill(ignore_index_mask, ignore_index), ignore_index,
+                             compute_grad)
+        if res is not None:
+            loss_q, dx_q, dw_q = res
+            if compute_loss:
+                loss_flat.copy_(loss_q.masked_fill(ignore_index_mask, 0.0))
+            return loss, (dx_q.view(bsz, seq_len, -1) if compute_grad else None), (dw_q if compute_grad else None), None
+    if compute_grad:
+        grad_input = torch.empty(bsz * seq_len, input_.shape[-1], dtype=input_.dtype, device=input_.device)
+        grad_weight = torch.zeros_like(weight)
+    else:
+        grad_input = None
+        grad_weight = None
+    # the fused kernels (quack, cute) expose no logits statistics: a health-logging step takes the reference path
+    use_cute = model_parallel_size == 1 and not collect_logits_stats and _cute_ce_supported(x_2d, partial_voc_size)
+    # cute path: grad_input from the bf16 scores (fp32 accumulation; grad_input is bf16, so the result matches the
+    # fp32-scores GEMM to its rounding) and the kernel skips the fp32 scores. XLLM_CE_DGRAD_FP32=1 keeps them.
+    dgrad_lowp = use_cute and os.environ.get("XLLM_CE_DGRAD_FP32", "0") != "1"
+    weight_fp32 = weight.float() if compute_grad and not dgrad_lowp else None
     prev_handle = None
     prev_grad = None
     prev_start_index = None
@@ -153,60 +210,72 @@ def _fused_linear_cross_entropy(
         target_mask_chunk = target_mask[start_idx:end_idx]
         ignore_index_mask_chunk = ignore_index_mask[start_idx:end_idx]
         # C x V
-        partial_logits = F.linear(inp_chunk, weight).float()
-        if logits_sum is not None:
-            assert logits_minimum is not None and logits_maximum is not None
-            token_sums = partial_logits.sum(dim=-1)
-            token_sums.masked_fill_(ignore_index_mask_chunk, 0.0)
-            logits_sum = logits_sum + token_sums.sum()
-            token_logit_minimums, logits_max = torch.aminmax(partial_logits, dim=-1)
-            token_logit_minimums.masked_fill_(ignore_index_mask_chunk, float("inf"))
-            token_logit_maximums = logits_max.masked_fill(
-                ignore_index_mask_chunk, -float("inf")
-            )
-            logits_minimum = torch.minimum(logits_minimum, token_logit_minimums.min())
-            logits_maximum = torch.maximum(logits_maximum, token_logit_maximums.max())
+        logits = F.linear(inp_chunk, weight)
+        if use_cute:
+            # loss and softmax scores (fp32 and bf16) from the bf16 logits in one kernel
+            from xllm.modules.fused_ops.cute.cross_entropy import ce_logits
+            loss_chunk, scores, scores_lowp = ce_logits(logits, target_1d_chunk, ignore_index_mask_chunk, compute_loss,
+                                                        compute_grad, want_fp32=not dgrad_lowp)
+            if compute_loss:
+                loss_flat[start_idx:end_idx] = loss_chunk
         else:
+            partial_logits = logits.float()
+            if logits_sum is not None:
+                assert logits_minimum is not None and logits_maximum is not None
+                token_sums = partial_logits.sum(dim=-1)
+                token_sums.masked_fill_(ignore_index_mask_chunk, 0.0)
+                logits_sum = logits_sum + token_sums.sum()
+                token_logit_minimums, logits_max = torch.aminmax(partial_logits, dim=-1)
+                token_logit_minimums.masked_fill_(ignore_index_mask_chunk, float("inf"))
+                token_logit_maximums = logits_max.masked_fill(
+                    ignore_index_mask_chunk, -float("inf")
+                )
+                logits_minimum = torch.minimum(logits_minimum, token_logit_minimums.min())
+                logits_maximum = torch.maximum(logits_maximum, token_logit_maximums.max())
+            else:
+                # C
+                logits_max = torch.max(partial_logits, dim=-1)[0]
+            if model_parallel_size > 1:
+                torch.distributed.all_reduce(
+                    logits_max,
+                    op=torch.distributed.ReduceOp.MAX,
+                    group=get_model_parallel_group(),
+                )
+            partial_logits = partial_logits - logits_max.unsqueeze(1)
             # C
-            logits_max = torch.max(partial_logits, dim=-1)[0]
-        if model_parallel_size > 1:
-            torch.distributed.all_reduce(
-                logits_max,
-                op=torch.distributed.ReduceOp.MAX,
-                group=get_model_parallel_group(),
-            )
-        partial_logits = partial_logits - logits_max.unsqueeze(1)
-        # C
-        arange_1d = torch.arange(partial_logits.shape[0], device=partial_logits.device)
-        if compute_loss:
-            predicted_logits = partial_logits[arange_1d, target_1d_chunk]
-            predicted_logits = predicted_logits.clone().contiguous()
-            predicted_logits[target_mask_chunk] = 0.0
-            predicted_logits, handle_pred = all_reduce(predicted_logits, parallel_region='model', async_op=True)
-        else:
-            predicted_logits, handle_pred = None, None
+            arange_1d = torch.arange(partial_logits.shape[0], device=partial_logits.device)
+            if compute_loss:
+                predicted_logits = partial_logits[arange_1d, target_1d_chunk]
+                predicted_logits = predicted_logits.clone().contiguous()
+                predicted_logits[target_mask_chunk] = 0.0
+                predicted_logits, handle_pred = all_reduce(predicted_logits, parallel_region='model', async_op=True)
+            else:
+                predicted_logits, handle_pred = None, None
 
-        # C x V
-        exp_logits = torch.exp(partial_logits, out=partial_logits)
-        sum_exp_logits = exp_logits.sum(dim=-1)
+            # C x V
+            exp_logits = torch.exp(partial_logits, out=partial_logits)
+            sum_exp_logits = exp_logits.sum(dim=-1)
 
-        if handle_pred is not None:
-            handle_pred.wait()
+            if handle_pred is not None:
+                handle_pred.wait()
 
-        sum_exp_logits, _ = all_reduce(sum_exp_logits, parallel_region='model', async_op=False)
+            sum_exp_logits, _ = all_reduce(sum_exp_logits, parallel_region='model', async_op=False)
 
-        if compute_loss:
-            loss_flat[start_idx:end_idx] = torch.log(sum_exp_logits) - predicted_logits
+            if compute_loss:
+                loss_flat[start_idx:end_idx] = torch.log(sum_exp_logits) - predicted_logits
+
+            if compute_grad:
+                # softmax scores C x V
+                scores = torch.div(exp_logits, sum_exp_logits.unsqueeze(dim=-1), out=exp_logits)
+                score_update = 1.0 - target_mask_chunk.float()
+                scores[arange_1d, target_1d_chunk] -= score_update
+                # zero out ignored index
+                scores.masked_fill_(ignore_index_mask_chunk.unsqueeze(1), value=0.0)
+                scores_lowp = None
 
         if compute_grad:
-            # softmax scores C x V
-            scores = torch.div(exp_logits, sum_exp_logits.unsqueeze(dim=-1), out=exp_logits)
-            score_update = 1.0 - target_mask_chunk.float()
-            scores[arange_1d, target_1d_chunk] -= score_update
-            # zero out ignored index
-            scores.masked_fill_(ignore_index_mask_chunk.unsqueeze(1), value=0.0)
             # (C x V) x (V x D) -> C x D
-            curr_grad = torch.mm(scores, weight_fp32)
+            curr_grad = torch.mm(scores_lowp, weight) if dgrad_lowp else torch.mm(scores, weight_fp32)
 
             if prev_grad is not None:
                 if prev_handle is not None:
@@ -223,7 +292,7 @@ def _fused_linear_cross_entropy(
 
             grad_weight = torch.addmm(
                 input=grad_weight,
-                mat1=scores.t().to(dtype=x.dtype),
+                mat1=(scores_lowp if scores_lowp is not None else scores.to(dtype=x.dtype)).t(),
                 mat2=inp_chunk,
                 out=grad_weight,
             )
