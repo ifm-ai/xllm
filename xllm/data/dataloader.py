@@ -90,7 +90,7 @@ class MultiSourceDataLoader:
             }
         self.src_names = list(self._dataset_display_names.values())
 
-        bos_id = int(self.tokenizer.eos_id)
+        bos_id = int(self.tokenizer.bos_id)
         if bos_id < 0:
             raise ValueError(f"Tokenizer must provide a non-negative bos_id ({bos_id})")
         self.pad_id = bos_id

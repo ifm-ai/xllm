@@ -17,20 +17,20 @@ from xllm.modules.model_parallel import reduce_scatter_model_parallel_region
 
 def _init_affine_weight(
     weight,
-    n_heads: int,
-    num_features: int,
+    in_features: int,
+    out_features: int,
     init_method: Callable[[Tensor], Tensor],
 ):
     assert weight.dim() == 2, f"weight dim is not 2, {weight.dim()}"
     rank = get_model_parallel_rank()
     world_size = get_model_parallel_world_size()
-    features_per_partition = divide_and_check_no_remainder(num_features, world_size)
+    input_size_per_partition = divide_and_check_no_remainder(in_features, world_size)
 
     # Initialize master weight
-    master_weight = torch.empty(num_features, n_heads, dtype=weight.dtype, requires_grad=False)
+    master_weight = torch.empty(in_features, out_features, dtype=weight.dtype, requires_grad=False)
     init_method(master_weight)
 
-    weight_list = torch.split(master_weight, features_per_partition, dim=0)
+    weight_list = torch.split(master_weight, input_size_per_partition, dim=0)
     my_weight_list = weight_list[rank::world_size]
 
     with torch.no_grad():
@@ -42,24 +42,24 @@ def _init_affine_weight(
 
 def _init_alphabet(
     alphabet,
-    n_heads: int
+    out_features: int
 ):
     world_size = get_model_parallel_world_size()
     rank = get_model_parallel_rank()
-    n_local_heads = divide_and_check_no_remainder(n_heads, world_size)
-    alphabet = alphabet.view(n_local_heads, 2)
+    output_size_per_partition = divide_and_check_no_remainder(out_features, world_size)
+    alphabet = alphabet.view(output_size_per_partition, 2)
 
-    a = torch.log(torch.rand(n_heads))
+    a = torch.log(torch.rand(out_features))
 
     dt_min = 0.001
     dt_max = 0.1
     dt_init_floor = 1e-4
-    dt = torch.exp(torch.rand(n_heads) * (math.log(dt_max) - math.log(dt_min)) + math.log(dt_min))
+    dt = torch.exp(torch.rand(out_features) * (math.log(dt_max) - math.log(dt_min)) + math.log(dt_min))
     dt = torch.clamp(dt, min=dt_init_floor)
     inv_dt = dt + torch.log(-torch.expm1(-dt))
 
-    a = torch.split(a, n_local_heads)[rank]
-    b = torch.split(inv_dt, n_local_heads)[rank]
+    a = torch.split(a, output_size_per_partition)[rank]
+    b = torch.split(inv_dt, output_size_per_partition)[rank]
     with torch.no_grad():
         alphabet[:, 0] = a
         alphabet[:, 1] = b
@@ -90,4 +90,6 @@ class ForgetGate(nn.Module):
         init_fn = get_init_fn('gaussian', dim=in_features, std=init_std)
         self.weight = nn.Parameter(torch.empty(self.input_size_per_partition, self.out_features))
         self.alphabet = nn.Parameter(torch.empty(self.output_size_per_partition * 2))
+        _init_affine_weight(self.weight, in_features, out_features, init_fn)
+        _init_alphabet(self.alphabet, out_features)
 
