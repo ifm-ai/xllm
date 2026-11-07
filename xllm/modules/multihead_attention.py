@@ -24,6 +24,7 @@ from xllm.modules.fused_ops import (
     memory_efficient_dropout,
 )
 from xllm.utils import get_init_fn
+from xllm.optim.muon_spec import register_muon
 
 
 class MultiheadAttention(nn.Module):
@@ -197,6 +198,16 @@ class MultiheadAttention(nn.Module):
             residual_func, 2 * layer_id + 1, mdim, num_heads=residual_heads,
             num_features=self.n_heads * self.head_dim, eps=rmsnorm_eps, init_std=init_std
         )
+
+        # Muon (xllm/optim/muon.py): one Newton-Schulz block per head (a q head holds both softdelta
+        # queries); wo and wg are whole matrices
+        register_muon(self.wq, layout="(h k d) m", fan_out="k d", fan_in="m", k=nq, d=self.head_dim, tp_dim=0)
+        for w in (self.wk, self.wv, self.wr):
+            if w is not None:
+                register_muon(w, layout="(h d) m", fan_out="d", fan_in="m", d=self.head_dim, tp_dim=0)
+        register_muon(self.wo, tp_dim=1)
+        if self.wg is not None:
+            register_muon(self.wg, tp_dim=1)
 
     def forward(
         self,
