@@ -73,6 +73,7 @@ class GekkoBlock(nn.Module):
             chunk_size=cfg.chunk_size,
             attn_act_func=cfg.attn_act_func,
             attn_gate_func=cfg.attn_gate_func,
+            awm_forget_gate=cfg.apply_awm_gate,
             awm_orthogonal_update=cfg.awm_orthogonal_update,
             causal_conv_width=cfg.causal_conv_width,
             causal_conv_backend=cfg.causal_conv_backend,
