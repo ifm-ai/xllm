@@ -6,6 +6,7 @@ import pytest
 import torch
 
 from xllm.config import ModelConf
+from xllm.inference import inference
 from xllm.models import init_cache
 from xllm.models.gekko import Gekko, GekkoBlock, GekkoOutputLayer
 from xllm.models.transformer import TransformerBlock, TransformerOutputLayer
@@ -66,6 +67,12 @@ def test_hybrid_train_and_cache(fused):
     assert all(cache[0][i][-1] == 129 for i in (0, 4))
     with pytest.raises(ValueError, match='packed inference'):
         model(tokens[:, :128], True, cache=cache)
+
+    # Packed PPL eval: hybrid models report no multi-segment cache support, so
+    # inference() takes the cache-free path, which must work in eval mode.
+    assert not model.support_multi_segments_with_cache()
+    tok_loss = inference(model, tokens, tokens.roll(-1, 1), True)
+    assert tok_loss.shape == tokens.shape and torch.isfinite(tok_loss).all()
 
     cfg.full_attention_interval = 0
     pure = Gekko(cfg, tokenizer)

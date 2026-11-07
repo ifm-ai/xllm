@@ -426,22 +426,28 @@ class Gekko(XLLModel):
                 token_mask = token_mask[:, start:end] if token_mask is not None else None
         else:
             assert self.context_parallel_size == 1, "inference mode does not support context parallel."
-            cache_layers, cache_output, cache_segment = cache
-            if self.full_attention_layers:
-                start = cache_layers[0][-1]
+            if cache is None:
+                # Cache-free full-window pass, e.g. packed PPL eval with hybrid full-attention
+                # layers (support_multi_segments_with_cache() is False, so inference() passes no cache).
+                cache_layers = cache_output = cache_segment = None
+                start, end = 0, seq_len
             else:
-                start = 0 if cache_layers[0][0] is None else cache_layers[0][0][-1]
-            end = start + seq_len
-            if seq_len >= self.chunk_size:
-                assert start % self.chunk_size == 0 and end % self.chunk_size == 0
-            elif seq_len > 1:
-                assert start % self.chunk_size == 0
+                cache_layers, cache_output, cache_segment = cache
+                if self.full_attention_layers:
+                    start = cache_layers[0][-1]
+                else:
+                    start = 0 if cache_layers[0][0] is None else cache_layers[0][0][-1]
+                end = start + seq_len
+                if seq_len >= self.chunk_size:
+                    assert start % self.chunk_size == 0 and end % self.chunk_size == 0
+                elif seq_len > 1:
+                    assert start % self.chunk_size == 0
 
-            if bos_mask is not None:
-                prev_bos_mask, prev_segment_idx, prev_segment_count = cache_segment
-                if prev_bos_mask is not None:
-                    bos_mask = torch.cat([prev_bos_mask, bos_mask], dim=1)
-                    segment_idx = torch.cat([prev_segment_idx, segment_idx + prev_segment_idx[:, -1:]], dim=1)
+                if bos_mask is not None:
+                    prev_bos_mask, prev_segment_idx, prev_segment_count = cache_segment
+                    if prev_bos_mask is not None:
+                        bos_mask = torch.cat([prev_bos_mask, bos_mask], dim=1)
+                        segment_idx = torch.cat([prev_segment_idx, segment_idx + prev_segment_idx[:, -1:]], dim=1)
 
         # embeddings
         emb = self.embed(tokens)
