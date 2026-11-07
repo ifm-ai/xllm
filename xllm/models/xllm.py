@@ -68,11 +68,11 @@ class XLLModel(nn.Module):
         self.dropout = cfg.dropout
         self.layerwise_ckpt = cfg.layerwise_ckpt
         self.layerwise_ckpt_layers = cfg.layerwise_ckpt_layers
+        self.tokenizer = tokenizer
 
     def ckpt_layer(self, i: int) -> bool:
         """Whether layer i runs under activation checkpointing."""
         return self.layerwise_ckpt and (self.layerwise_ckpt_layers is None or i < self.layerwise_ckpt_layers)
-        self.tokenizer = tokenizer
 
     @property
     def bos_id(self) -> int:
