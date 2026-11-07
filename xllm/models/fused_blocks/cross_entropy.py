@@ -5,6 +5,7 @@ import torch
 from torch import Tensor
 from torch.nn import functional as F
 
+from xllm.data import IGNORE_INDEX
 from xllm.distributed import (
     get_model_parallel_group,
     get_model_parallel_rank,
@@ -280,7 +281,7 @@ def fused_linear_cross_entropy_fwd(
     target: Tensor,
     mask: Optional[Tensor] = None,
     class_weight: Optional[Tensor] = None,
-    ignore_index: int = -100,
+    ignore_index: int = IGNORE_INDEX,
     label_smoothing: float = 0.0,
     compute_grad: bool = False,
     gather_input: bool = True,
@@ -312,7 +313,7 @@ def fused_linear_cross_entropy_bwd(
     target: Optional[Tensor],
     mask: Optional[Tensor] = None,
     class_weight: Optional[Tensor] = None,
-    ignore_index: int = -100,
+    ignore_index: int = IGNORE_INDEX,
     label_smoothing: float = 0.0,
     gather_input: bool = True,
 ) -> Tuple[Tensor, Tensor]:

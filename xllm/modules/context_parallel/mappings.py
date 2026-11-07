@@ -65,7 +65,6 @@ def _receive_grad_from_next(ctx: Any, grad: torch.Tensor, async_op: bool = False
         ctx.mark_dirty(grad)
 
     # Recevie from source.
-    # TODO: add original grad to recv grad
     if async_op:
         handle = torch.distributed.irecv(grad, src, group=group)
     else:

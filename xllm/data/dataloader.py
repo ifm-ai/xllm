@@ -20,7 +20,11 @@ from xllm.data.dataset_streamer.feature_builder.feature_builder import (
 )
 from xllm.data.dataset_streamer.templator.templator import SimpleJsonlTemplator
 from xllm.data.buffer_assembler.buffer_assembler import BufferAssembler
-from xllm.data.buffer_assembler.packer.packer import SimpleConcatPacker, BestFitPacker
+from xllm.data.buffer_assembler.packer.packer import (
+    SimpleConcatPacker,
+    BestFitPacker,
+    IGNORE_INDEX
+)
 from xllm.data.data_types import PackedSeq, Batch
 from xllm.data.dataset_streamer.tokenizer import Tokenizer
 
@@ -86,10 +90,10 @@ class MultiSourceDataLoader:
             }
         self.src_names = list(self._dataset_display_names.values())
 
-        eos_id = int(self.tokenizer.eos_id)
-        if eos_id < 0:
-            raise ValueError("Tokenizer must provide a non-negative eos_id")
-        self.pad_id = eos_id
+        bos_id = int(self.tokenizer.eos_id)
+        if bos_id < 0:
+            raise ValueError(f"Tokenizer must provide a non-negative bos_id ({bos_id})")
+        self.pad_id = bos_id
 
         _packing_type = packing_type.lower()
         if _packing_type == "bestfit":
@@ -357,7 +361,7 @@ class PPLDataLoader:
             (self.batch_size, length), fill_value=self.tokenizer.bos_id, dtype=np.int64
         )
         y = np.full(
-            (self.batch_size, length), fill_value=self.tokenizer.eos_id, dtype=np.int64
+            (self.batch_size, length), fill_value=IGNORE_INDEX, dtype=np.int64
         )
         return Batch(x=x, y=y)
 
@@ -366,8 +370,8 @@ class PPLDataLoader:
         x = np.array(tokens[:-1] + [self.tokenizer.pad_id] * pad_len, dtype=np.int64)
         y = np.array(tokens[1:] + [self.tokenizer.pad_id] * pad_len, dtype=np.int64)
         mask = y != self.tokenizer.pad_id
-        x[~mask] = self.tokenizer.eos_id
-        y[~mask] = self.tokenizer.eos_id
+        x[~mask] = self.tokenizer.bos_id
+        y[~mask] = IGNORE_INDEX
         return x, y, mask
 
     def close(self) -> None:
