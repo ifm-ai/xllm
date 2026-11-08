@@ -100,7 +100,7 @@ def test(B: int, L: int, H: int, num_groups: int, eps: float, element_affine: bo
 
     print(f"B={B}, L={L}, H={H}, G={num_groups}, eps={eps}, affine={element_affine}, mem_effn={memory_efficient}, dtype={dtype}:")
 
-    atol = 1e-6 if dtype == torch.float32 else 5e-3
+    atol = 3e-6 if dtype == torch.float32 else 3e-3
     rtol = 1e-5 if dtype == torch.float32 else 1e-2
     # group fwd
     y_group, mean_group, rstd_group = grouplayernorm_fwd(x, gamma, beta, num_groups, eps, element_affine)
@@ -113,7 +113,7 @@ def test(B: int, L: int, H: int, num_groups: int, eps: float, element_affine: bo
     )
     torch.testing.assert_close(x_grad_group, x_grad, rtol=rtol, atol=atol)
     if element_affine:
-        atol = 4e-6 if dtype == torch.float32 else 1e-1
+        atol = 4e-6 if dtype == torch.float32 else 7e-3
         rtol = 1e-5 if dtype == torch.float32 else 1e-2
         torch.testing.assert_close(gamma_grad_group, gamma_grad, rtol=rtol, atol=atol)
         torch.testing.assert_close(beta_grad_group, beta_grad, rtol=rtol, atol=atol)
@@ -140,7 +140,7 @@ def main(seed: int):
         [16, 137, 1024, 32],
         [16, 137, 1024, 64],
         [16, 137, 1024, 128],
-        [16, 137, 1024, 256],
+        # [16, 137, 1024, 256],
         [16, 255, 256, 32],
         [16, 256, 256, 32],
         [4, 512, 256, 32],

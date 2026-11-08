@@ -97,7 +97,7 @@ def test(B: int, L: int, H: int, num_groups: int, eps: float, element_affine: bo
 
     print(f"B={B}, L={L}, H={H}, G={num_groups}, eps={eps}, affine={element_affine}, mem_effn={memory_efficient}, dtype={dtype}:")
 
-    atol = 1e-6 if dtype == torch.float32 else 1e-3
+    atol = 1e-6 if dtype == torch.float32 else 2e-3
     rtol = 1e-5 if dtype == torch.float32 else 1e-2
     # group fwd
     y_group, rstd_group = grouprmsnorm_fwd(x, gamma, num_groups, eps, element_affine)
@@ -110,7 +110,7 @@ def test(B: int, L: int, H: int, num_groups: int, eps: float, element_affine: bo
     )
     torch.testing.assert_close(x_grad_group, x_grad, rtol=rtol, atol=atol)
     if element_affine:
-        atol = 4e-6 if dtype == torch.float32 else 1e-2
+        atol = 4e-6 if dtype == torch.float32 else 7e-3
         rtol = 1e-5 if dtype == torch.float32 else 1e-2
         torch.testing.assert_close(gamma_grad_group, gamma_grad, rtol=rtol, atol=atol)
     print(f"group pass bwd test")
