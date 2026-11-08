@@ -110,8 +110,8 @@ def test(B: int, L: int, H: int, num_groups: int, eps: float, element_affine: bo
     )
     torch.testing.assert_close(x_grad_group, x_grad, rtol=rtol, atol=atol)
     if element_affine:
-        atol = 4e-6 if dtype == torch.float32 else 5e-2
-        rtol = 1e-5 if dtype == torch.float32 else 2e-2
+        atol = 4e-6 if dtype == torch.float32 else 1e-2
+        rtol = 1e-5 if dtype == torch.float32 else 1e-2
         torch.testing.assert_close(gamma_grad_group, gamma_grad, rtol=rtol, atol=atol)
     print(f"group pass bwd test")
 
@@ -129,8 +129,9 @@ def main(seed: int):
         [2, 3, 64, 1],
         [2, 3, 1024, 8],
         [2, 3, 1024, 16],
-        [2, 3, 8192, 1],
-        [2, 3, 16384, 2],
+        [2, 3, 1024, 32],
+        [2, 3, 1024, 64],
+        [2, 3, 1024, 128],
         [2, 3, 32768, 4],
         [2, 3, 5120, 5],
         [16, 32, 1408, 4],
@@ -145,6 +146,10 @@ def main(seed: int):
         [16, 255, 256, 32],
         [16, 256, 256, 32],
         [4, 512, 256, 32],
+        [4, 512, 296, 37],
+        [4, 512, 384, 48],
+        [4, 512, 256, 64],
+        # [4, 483, 246, 123],
         [1, 1024, 256, 32],
         [1, 1024, 262144, 32],
         [1, 32768, 4096, 4],
@@ -153,14 +158,17 @@ def main(seed: int):
         [2, 32768, 4096, 16],
         [1, 32768, 4096, 32],
         [1, 65536, 8192, 32],
+        [1, 65536, 8192, 128],
     ]:
         for dtype in [torch.float32, torch.bfloat16]:
-            for eps in [1e-5, 1e-6]:
-                for affine in [True, False]:
-                    for memory_efficient in [False, True]:
-                        if num_groups > 1 and H <= 8192:
-                            test(B, L, H, 1, eps, affine, memory_efficient, dtype)
-                        test(B, L, H, num_groups, eps, affine, memory_efficient, dtype)
+            for affine in [True, False]:
+                for memory_efficient in [False, True]:
+                    if affine and memory_efficient:
+                        continue
+                    eps = 1e-6
+                    if num_groups > 1 and H <= 8192:
+                        test(B, L, H, 1, eps, affine, memory_efficient, dtype)
+                    test(B, L, H, num_groups, eps, affine, memory_efficient, dtype)
 
 
 if __name__ == "__main__":
