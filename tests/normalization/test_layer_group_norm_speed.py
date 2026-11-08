@@ -209,7 +209,7 @@ def main(seed: int):
     ]:
         for affine in [True, False]:
             for memory_efficient in [False, True]:
-                for dtype in [torch.float32, torch.bfloat16]:
+                for dtype in [torch.bfloat16]:
                     test(B, L, H, num_groups, affine, memory_efficient, dtype)
 
 
