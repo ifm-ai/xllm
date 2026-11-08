@@ -18,6 +18,7 @@ from xllm.modules.sliding_chunk_attention import (
     SlidingChunkSoftmaxAttention,
     SlidingChunkSoftdeltaAttention,
 )
+from xllm.modules.gates import ForgetGate
 from xllm.modules.adaptive_working_memory import AdaptiveWorkingMemory
 from xllm.modules.residual import build_residual
 from xllm.modules.model_parallel import (
@@ -234,6 +235,12 @@ class GatedDeltaAttention(nn.Module):
             awm_orthogonal_update,
             rmsnorm_eps,
         )
+        self.forget_gate = ForgetGate(
+            self.layer_id,
+            mdim,
+            kdim,
+            init_std
+        ) if awm_forget_gate else None
 
         self.attn_norm = GroupRMSNorm(
             hdim,

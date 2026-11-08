@@ -93,3 +93,20 @@ class ForgetGate(nn.Module):
         _init_affine_weight(self.weight, in_features, out_features, init_fn)
         _init_alphabet(self.alphabet, out_features)
 
+    def forward(self, x: Tensor) -> Tensor:
+        bsz, slen, _ = x.shape
+        # C/TP
+        a, b = torch.unbind(self.alphabet.view(self.output_size_per_partition, 2).float(), dim=1)  # fp32
+
+        # B*L x D/TP
+        x = rearrange(x, 'b l d -> (b l) d')
+        # (B*L x D/TP) x (D/TP x C) -> B*L x C -> B*L x C/TP
+        h = reduce_scatter_model_parallel_region(torch.mm(x, self.weight))
+        g = torch.exp(-torch.exp(a) * F.softplus(h + b)).to(x.dtype)  # bf16
+        g = rearrange(g, '(b l) c -> b l c', b=bsz)
+        return g
+
+    def extra_repr(self) -> str:
+        return 'in_features={} ({}), out_features={} ({})'.format(
+            self.in_features, self.input_size_per_partition, self.out_features, self.output_size_per_partition,
+        )
