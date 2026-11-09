@@ -108,6 +108,7 @@ class GatedDeltaAttention(nn.Module):
         self.causal_conv_backend = causal_conv_backend
         self.sca_backend = sca_backend
         self.attn_gate_fn = attn_gate_func
+        self.awm_forget_gate = awm_forget_gate
         self.awm_orthogonal_update = awm_orthogonal_update
         self.dropout = dropout
         self.attention_dropout = attention_dropout
@@ -232,6 +233,7 @@ class GatedDeltaAttention(nn.Module):
             self.head_dim,
             self.v_head_dim,
             self.chunk_size,
+            awm_forget_gate,
             awm_orthogonal_update,
             rmsnorm_eps,
         )
@@ -239,6 +241,7 @@ class GatedDeltaAttention(nn.Module):
             self.layer_id,
             mdim,
             kdim,
+            self.chunk_size,
             init_std
         ) if awm_forget_gate else None
 
@@ -283,7 +286,7 @@ class GatedDeltaAttention(nn.Module):
         width = self.q_conv.kernel_size - 1
         cdim = self.local_heads * self.head_dim + self.local_kv_heads * (self.head_dim * nk + self.v_head_dim)
         sdim = self.local_kv_heads * (self.head_dim * 3 + self.v_head_dim)
-        adim = self.local_kv_heads * (self.head_dim * self.v_head_dim + self.head_dim)
+        adim = self.local_kv_heads * (self.head_dim * self.v_head_dim + self.head_dim + (self.head_dim if self.awm_forget_gate else 0))
         prev_tensor = torch.empty(
             (bsz, n_groups * 2 + width * cdim + csize * sdim + adim),
             dtype=torch.float32, device=x.device, requires_grad=self.training
@@ -293,7 +296,7 @@ class GatedDeltaAttention(nn.Module):
 
     def _pack_prev_tensors(
         self, prev_mean, prev_var, conv_state_q, conv_state_k, conv_state_v,
-        prev_sk, prev_aqk, prev_akk, prev_v, memory, log_norm_term
+        prev_sk, prev_aqk, prev_akk, prev_v, prev_ag, memory, log_norm_term
     ):
         # B x (W-1) x D-> B x (W-1)*D
         conv_q = conv_state_q.flatten(1)
@@ -305,7 +308,12 @@ class GatedDeltaAttention(nn.Module):
         v = prev_v.flatten(1)
         m = memory.flatten(1)
         l = log_norm_term.flatten(1)
-        prev_tensor = torch.cat([prev_mean, prev_var, conv_q, conv_k, conv_v, k1, k2, k3, v, m, l], dim=-1)
+        if self.awm_forget_gate:
+            g = prev_ag.flatten(1)
+            prev_tensor = torch.cat([prev_mean, prev_var, conv_q, conv_k, conv_v, k1, k2, k3, v, g, m, l], dim=-1)
+        else:
+            assert prev_ag is None
+            prev_tensor = torch.cat([prev_mean, prev_var, conv_q, conv_k, conv_v, k1, k2, k3, v, m, l], dim=-1)
         return prev_tensor
 
     def _unpack_prev_tensors(self, x, prev_tensor):
@@ -323,11 +331,12 @@ class GatedDeltaAttention(nn.Module):
         conv_v_size = width * n_kv_heads * vdim
         ksize = csize * n_kv_heads * kdim
         vsize = csize * n_kv_heads * vdim
+        agsize = n_kv_heads * kdim if self.awm_forget_gate else 0
         msize = n_kv_heads * kdim * vdim
         lntsize = n_kv_heads * kdim
-        prev_mean, prev_var, conv_q, conv_k, conv_v, prev_sk, prev_aqk, prev_akk, prev_v, mem, lnt = torch.split(
+        prev_mean, prev_var, conv_q, conv_k, conv_v, prev_sk, prev_aqk, prev_akk, prev_v, prev_ag, mem, lnt = torch.split(
             prev_tensor,
-            [n_groups, n_groups, conv_q_size, conv_k_size, conv_v_size, ksize, ksize, ksize, vsize, msize, lntsize],
+            [n_groups, n_groups, conv_q_size, conv_k_size, conv_v_size, ksize, ksize, ksize, vsize, agsize, msize, lntsize],
             dim=-1
         )
         prev_mean = prev_mean.to(x)
@@ -339,9 +348,10 @@ class GatedDeltaAttention(nn.Module):
         prev_aqk = prev_aqk.view(bsz, n_kv_heads, csize, kdim).to(x)
         prev_akk = prev_akk.view(bsz, n_kv_heads, csize, kdim).to(x)
         prev_v = prev_v.view(bsz, csize, n_kv_heads, vdim).to(x)
+        prev_ag = prev_ag.view(bsz, n_kv_heads, kdim).to(x) if self.awm_forget_gate else None
         mem = mem.view(bsz, n_kv_heads, kdim, vdim).to(x)
         lnt = lnt.view(bsz, n_kv_heads, kdim)
-        return prev_mean, prev_var, conv_q, conv_k, conv_v, prev_sk, prev_aqk, prev_akk, prev_v, mem, lnt
+        return prev_mean, prev_var, conv_q, conv_k, conv_v, prev_sk, prev_aqk, prev_akk, prev_v, prev_ag, mem, lnt
 
     def forward(
         self,
@@ -353,7 +363,7 @@ class GatedDeltaAttention(nn.Module):
         stability_control: int = 0,
         deterministic: bool = True,
         cache: Optional[Tuple[Tuple[Tensor, Tensor, int],
-                              Tuple[Tensor, Tensor, Tensor, Tensor],
+                              Tuple[Tensor, Tensor, Tensor, Tensor, Tensor],
                               Tuple[Tensor, Tensor, Tensor],
                               Tuple[Tensor, Tensor, Tensor]]] = None,
     ) -> Tuple[Tensor, Optional[Any]]:
@@ -365,19 +375,21 @@ class GatedDeltaAttention(nn.Module):
             prev_count, prev_mean, prev_var = cache_norm
             conv_state_q, conv_state_k, conv_state_v = cache_conv
             prev_sk, prev_v, kv_count = cache_sca
-            prev_aqk, prev_akk, memory, log_norm_term = cache_awk
+            prev_aqk, prev_akk, prev_ag, memory, log_norm_term = cache_awk
         elif should_recv_from_prev():
             prev_count = self._receive_prev_count(x, bos_mask)
             prev_tensor = self._receive_prev_tensors(x)
-            (prev_mean, prev_var, conv_state_q, conv_state_k, conv_state_v,
-             prev_sk, prev_aqk, prev_akk, prev_v, memory, log_norm_term) = self._unpack_prev_tensors(x, prev_tensor)
+            (
+                prev_mean, prev_var, conv_state_q, conv_state_k, conv_state_v,
+                prev_sk, prev_aqk, prev_akk, prev_v, prev_ag, memory, log_norm_term
+            ) = self._unpack_prev_tensors(x, prev_tensor)
             kv_count = None
             cache_sca, cache_awk, cache_norm, cache_conv = None, None, None, None
         else:
             prev_count, prev_mean, prev_var = None, None, None
             conv_state_q, conv_state_k, conv_state_v = None, None, None
             prev_sk, prev_v, kv_count = None, None, None
-            prev_aqk, prev_akk, memory, log_norm_term = None, None, None, None
+            prev_aqk, prev_akk, prev_ag, memory, log_norm_term = None, None, None, None, None
             cache_sca, cache_awk, cache_norm, cache_conv = None, None, None, None
 
         if prev_v is not None and bos_mask is not None:
@@ -387,6 +399,11 @@ class GatedDeltaAttention(nn.Module):
 
         # B x L x D/TP
         x, prev_count, prev_mean, prev_var = self.timenorm(x, bos_mask_curr, prev_count, prev_mean, prev_var)
+
+        # awm gate
+        prev_length = prev_akk.shape[2] if prev_akk is not None else 0
+        ag = self.forget_gate(x, prev_length) if self.awm_forget_gate else None
+
         # B x L x D
         mx = gather_copy_model_parallel_region(x)
 
@@ -447,11 +464,11 @@ class GatedDeltaAttention(nn.Module):
             bos_mask, segment_idx, stability_control, deterministic
         )
         # AWM
-        awk, awk_mask, memory, log_norm_term, prev_aqk, prev_akk, _ = self.adaptive_working_memory(
-            xq, xk, v, memory, log_norm_term, prev_aqk, prev_akk, prev_av, segment_idx, prev_segment_count,
+        awk, memory, log_norm_term, prev_aqk, prev_akk, _, prev_ag = self.adaptive_working_memory(
+            xq, xk, v, ag, memory, log_norm_term, prev_aqk, prev_akk, prev_av, prev_ag, segment_idx, prev_segment_count,
         )
         if health_collector is not None:
-            health_collector.record_gekko_branches(self.layer_id, sca, awk, r, awk_mask)
+            health_collector.record_gekko_branches(self.layer_id, sca, awk, r)
         # B x L x E/TP
         attn = self.attn_norm(sca + awk) * r
         attn = memory_efficient_dropout(attn, self.hidden_dropout, self.training)
@@ -463,6 +480,7 @@ class GatedDeltaAttention(nn.Module):
             prev_v = prev_v.detach()
             prev_aqk = prev_aqk.detach()
             prev_akk = prev_akk.detach()
+            prev_ag = prev_ag.detach() if prev_ag is not None else prev_ag
             memory = memory.detach() if memory is not None else memory
             log_norm_term = log_norm_term.detach() if log_norm_term is not None else log_norm_term
             kv_count = kv_count + seq_len
@@ -472,12 +490,13 @@ class GatedDeltaAttention(nn.Module):
                 prev_aqk = prev_aqk[:, :, -self.chunk_size:]
                 prev_akk = prev_akk[:, :, -self.chunk_size:]
             cache_sca = (prev_sk, prev_v, kv_count)
-            cache_awk = (prev_aqk, prev_akk, memory, log_norm_term)
+            cache_awk = (prev_aqk, prev_akk, prev_ag, memory, log_norm_term)
         elif should_send_to_next():
             if bos_mask is not None:
                 send_to_next_context_parallel_region(prev_count)
             prev_tensor = self._pack_prev_tensors(
-                prev_mean, prev_var, conv_state_q, conv_state_k, conv_state_v, prev_sk, prev_aqk, prev_akk, prev_v, memory, log_norm_term
+                prev_mean, prev_var, conv_state_q, conv_state_k, conv_state_v,
+                prev_sk, prev_aqk, prev_akk, prev_v, prev_ag, memory, log_norm_term
             )
             prev_tensor = send_to_next_context_parallel_region(prev_tensor)
             attn = attn + prev_tensor.to(attn).mean() * 0

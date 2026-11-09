@@ -75,12 +75,14 @@ class ForgetGate(nn.Module):
         layer_id: int,
         in_features: int,
         out_features: int,
+        chunk_size: int,
         init_std: Optional[float] = None
     ):
         super().__init__()
         self.layer_id = layer_id
         self.in_features = in_features
         self.out_features = out_features
+        self.chunk_size = chunk_size
         self.init_std = init_std
 
         world_size = get_model_parallel_world_size()
@@ -93,20 +95,35 @@ class ForgetGate(nn.Module):
         _init_affine_weight(self.weight, in_features, out_features, init_fn)
         _init_alphabet(self.alphabet, out_features)
 
-    def forward(self, x: Tensor) -> Tensor:
-        bsz, slen, _ = x.shape
+    def forward(self, x: Tensor, prev_length: int) -> Optional[Tensor]:
+        bsz, seq_len, _ = x.shape
+
+        if seq_len < self.chunk_size and (seq_len + prev_length) % self.chunk_size != 0:
+            return None
+
         # C/TP
         a, b = torch.unbind(self.alphabet.view(self.output_size_per_partition, 2).float(), dim=1)  # fp32
 
-        # B*L x D/TP
-        x = rearrange(x, 'b l d -> (b l) d')
-        # (B*L x D/TP) x (D/TP x C) -> B*L x C -> B*L x C/TP
+        if seq_len >= self.chunk_size:
+            assert seq_len % self.chunk_size == 0
+            assert prev_length == 0 or prev_length == self.chunk_size
+            nc = seq_len // self.chunk_size
+            # B x N x C x D/TP -> B x N x D/TP
+            x = rearrange(x, 'b (n c) d -> b n c d', n=nc)[:, :, -1]
+            # B*N x D/TP
+            x = rearrange(x, ' b n d -> (b n) d')
+        else:
+            assert (seq_len + prev_length) % self.chunk_size == 0
+            # B x D/TP
+            x = x[:, -1]
+
+        # (B*N x D/TP) x (D/TP x S) -> B*N x S -> B*N x S/TP
         h = reduce_scatter_model_parallel_region(torch.mm(x, self.weight))
         g = torch.exp(-torch.exp(a) * F.softplus(h + b)).to(x.dtype)  # bf16
-        g = rearrange(g, '(b l) c -> b l c', b=bsz)
+        g = rearrange(g, '(b n) s -> b n s', b=bsz)
         return g
 
     def extra_repr(self) -> str:
-        return 'in_features={} ({}), out_features={} ({})'.format(
-            self.in_features, self.input_size_per_partition, self.out_features, self.output_size_per_partition,
+        return 'in_features={} ({}), out_features={} ({}), chunk={}'.format(
+            self.in_features, self.input_size_per_partition, self.out_features, self.output_size_per_partition, self.chunk_size
         )

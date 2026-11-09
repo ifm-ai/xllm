@@ -28,44 +28,48 @@ class AdaptiveWorkingMemoryFunc(torch.autograd.Function):
         qk: Tensor,
         k: Tensor,
         v: Tensor,
+        g: Tensor,
         chunk_size: int,
         memory: Optional[Tensor],
         log_norm_term: Optional[Tensor],
         prev_qk: Optional[Tensor],
         prev_k: Optional[Tensor],
         prev_v: Optional[Tensor],
+        prev_g: Optional[Tensor],
         segment_idx: Optional[Tensor] = None,
         prev_segment_count: Optional[Tensor] = None,
+        fgate: bool = False,
         ortho: bool = False,
         eps: float = 1e-6,
         health_layer_id: Optional[int] = None,
-    ) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
-        y, mask, mem, lnt = _adaptive_working_memory_fwd(
-            q, qk, k, v, chunk_size, memory, log_norm_term, prev_qk, prev_k, prev_v,
-            segment_idx, prev_segment_count, ortho, eps, health_layer_id
+    ) -> Tuple[Tensor, Tensor, Tensor]:
+        y, mem, lnt = _adaptive_working_memory_fwd(
+            q, qk, k, v, g, chunk_size, memory, log_norm_term, prev_qk, prev_k, prev_v, prev_g,
+            segment_idx, prev_segment_count, fgate, ortho, eps, health_layer_id
         )
         ctx.save_for_backward(
-            q, qk, k, v, memory, log_norm_term, prev_qk, prev_k, prev_v, segment_idx, prev_segment_count
+            q, qk, k, v, g, memory, log_norm_term, prev_qk, prev_k, prev_v, prev_g, segment_idx, prev_segment_count
         )
         ctx.chunk_size = chunk_size
+        ctx.fgate = fgate
         ctx.ortho = ortho
         ctx.eps = eps
-        return y, mask, mem, lnt
+        return y, mem, lnt
 
     @staticmethod
     def backward(
         ctx: FunctionCtx,
         y_grad: Tensor,
-        _,
         mem_grad: Tensor,
         lnt_grad: Tensor,
-    ) -> Tuple[Tensor, Tensor, Tensor, Tensor, None, Tensor, Tensor,
-               Optional[Tensor], Optional[Tensor], Optional[Tensor],
-               None, None, None, None, None]:
+    ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, None, Tensor, Tensor,
+               Optional[Tensor], Optional[Tensor], Optional[Tensor], Optional[Tensor],
+               None, None, None, None, None, None]:
         (
-            q, qk, k, v, memory, log_norm_term, prev_qk, prev_k, prev_v, segment_idx, prev_segment_count
+            q, qk, k, v, g, memory, log_norm_term, prev_qk, prev_k, prev_v, prev_g, segment_idx, prev_segment_count
          ) = ctx.saved_tensors
         chunk_size = ctx.chunk_size
+        fgate = ctx.fgate
         ortho = ctx.ortho
         eps = ctx.eps
         # accumulative memory
@@ -91,8 +95,8 @@ class AdaptiveWorkingMemoryFunc(torch.autograd.Function):
             prev_qk, prev_kk, prev_v, prev_k_fp32, prev_kk_fp32, prev_k_mask, ortho
         )
 
-        return (q_grad, qk_grad, k_grad, v_grad, None, mem_grad, lnt_grad,
-                prev_qk_grad, prev_k_grad, prev_v_grad, None, None, None, None, None)
+        return (q_grad, qk_grad, k_grad, v_grad, g_grad, None, mem_grad, lnt_grad,
+                prev_qk_grad, prev_k_grad, prev_v_grad, prev_g_grad, None, None, None, None, None, None)
 
 
 adaptive_working_memory = AdaptiveWorkingMemoryFunc.apply
@@ -103,14 +107,17 @@ def _adaptive_working_memory_fwd(
     qkey: Tensor,  # B x K x L x S
     key: Tensor,  # B x K x L x S
     value: Tensor,  # B x K x L x V
+    gate: Optional[Tensor],  # B x K x N x S
     chunk_size: int,
     memory: Optional[Tensor],  # B x K x S x V
     log_norm_term: Optional[Tensor],  # B x K x S
     prev_qkey: Optional[Tensor],  # B x K x C x S
     prev_key: Optional[Tensor],  # B x K x C x S
     prev_value: Optional[Tensor],  # B x K x C x V
+    prev_gate: Optional[Tensor],  # B x K x S
     segment_idx: Optional[Tensor] = None,  # B x L(+C)
     prev_segment_count: Optional[Tensor] = None,  # B
+    fgate: bool = False,
     ortho: bool = False,
     eps: float = 1e-6,
     health_layer_id: Optional[int] = None,
@@ -244,7 +251,7 @@ def _adaptive_working_memory_fwd(
     out_mask = rearrange(out_mask, 'b n c -> b (n c)')
     out.masked_fill_(rearrange(out_mask, 'b l -> b 1 l 1'), 0.)
 
-    return out, out_mask, memory, log_norm_term
+    return out, memory, log_norm_term
 
 
 def _adaptive_working_memory_accum_fwd(

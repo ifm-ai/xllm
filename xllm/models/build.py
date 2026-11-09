@@ -25,7 +25,6 @@ from xllm.models.transformer import Transformer
 logger = getLogger()
 
 
-
 def get_model_cls(arch: str):
     return {
         "transformer": Transformer,
@@ -168,7 +167,7 @@ def init_transformer_cache(model):
 
 
 def init_gekko_cache(model):
-    cache_layers = [((None, None, 0), (None, None, None, None), (None, None, None), (None, None, None)) for _ in range(model.num_layers)]
+    cache_layers = [((None, None, 0), (None, None, None, None, None), (None, None, None), (None, None, None)) for _ in range(model.num_layers)]
     cache_norm = (None, None, None)
     cache_segment = (None, None, None)
     cache = (cache_layers, cache_norm, cache_segment)

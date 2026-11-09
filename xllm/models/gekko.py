@@ -126,7 +126,7 @@ class GekkoBlock(nn.Module):
         attn_stability_control: int = 0,
         deterministic: bool = True,
         cache: Optional[Tuple[Tuple[Tensor, Tensor, int],
-                              Tuple[Tensor, Tensor, Tensor],
+                              Tuple[Tensor, Tensor, Tensor, Tensor, Tensor],
                               Tuple[Tensor, Tensor, Tensor],
                               Tensor]] = None,
     ) -> Tuple[Tensor, Optional[Tensor], Optional[Any]]:
@@ -363,7 +363,7 @@ class Gekko(XLLModel):
         attn_stability_control: int = 0,
         deterministic: bool = True,
         cache: Optional[Tuple[List[Tuple[Tuple[Tensor, Tensor, int],
-                                         Tuple[Tensor, Tensor, Tensor, Tensor],
+                                         Tuple[Tensor, Tensor, Tensor, Tensor, Tensor],
                                          Tuple[Tensor, Tensor, Tensor],
                                          Tuple[Tensor, Tensor, Tensor]]],
                               Tuple[Tensor, Tensor, Tensor],

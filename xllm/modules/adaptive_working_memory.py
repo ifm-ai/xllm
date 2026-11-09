@@ -22,6 +22,7 @@ class AdaptiveWorkingMemory(nn.Module):
         head_dim: int,
         v_head_dim: int,
         chunk_size: int,
+        forget_gate: bool,
         orthogonal_update: bool,
         rmsnorm_eps: float,
     ):
@@ -32,6 +33,7 @@ class AdaptiveWorkingMemory(nn.Module):
         self.head_dim = head_dim
         self.v_head_dim = v_head_dim
         self.chunk_size = chunk_size
+        self.fgate = forget_gate
         self.ortho = orthogonal_update
         self.eps = rmsnorm_eps
 
@@ -40,11 +42,13 @@ class AdaptiveWorkingMemory(nn.Module):
         xq: Tensor,  # B x L x (H*S)
         xk: Tensor,  # B x L x (K*S)
         xv: Tensor,  # B x L x (K*V)
+        xg: Optional[Tensor],  # B x N x (K*S)
         memory: Optional[Tensor],  # B x K x S x V
         log_norm_term: Optional[Tensor],  # B x K x S
         prev_qk: Optional[Tensor],  # B x K x C x S
         prev_kk: Optional[Tensor],  # B x K x C x S
         prev_v: Optional[Tensor],  # B x K x C x V
+        prev_g: Optional[Tensor],  # B x K x S
         segment_idx: Optional[Tensor] = None,  # B x L(+C)
         prev_segment_count: Optional[Tensor] = None,  # B
     ):
@@ -64,18 +68,19 @@ class AdaptiveWorkingMemory(nn.Module):
         # softmax to qk
         xqk = F.softmax(xqk, dim=-1, dtype=torch.float32).to(xqk)
         xv = rearrange(xv, 'b l (k v) -> b k l v', k=self.n_kv_heads)
+        if xg is not None:
+            xg = rearrange(xg, 'b n (k s) -> b k n s', k=self.n_kv_heads)
 
         if seq_len >= self.chunk_size:
-            out, mask, memory, log_norm_term = adaptive_working_memory(
-                xq, xqk, xkk, xv, self.chunk_size, memory, log_norm_term, prev_qk, prev_kk, prev_v,
-                segment_idx, prev_segment_count, self.ortho, self.eps, self.layer_id,
+            out, memory, log_norm_term = adaptive_working_memory(
+                xq, xqk, xkk, xv, xg, self.chunk_size, memory, log_norm_term, prev_qk, prev_kk, prev_v, prev_g,
+                segment_idx, prev_segment_count, self.fgate, self.ortho, self.eps, self.layer_id,
             )
             prev_qk = xqk[:, :, seq_len - self.chunk_size:]
             prev_kk = xkk[:, :, seq_len - self.chunk_size:]
             prev_v = xv[:, :, seq_len - self.chunk_size:]
+            prev_g = xg[:, :, -1]
         else:
-            # B x L
-            mask = torch.zeros(bsz, seq_len, dtype=torch.bool, device=xq.device)
             # tail or step-by-step generation mode
             xqk = torch.cat([prev_qk, xqk], dim=2) if prev_qk is not None else xqk
             xkk = torch.cat([prev_kk, xkk], dim=2) if prev_kk is not None else xkk
@@ -92,7 +97,6 @@ class AdaptiveWorkingMemory(nn.Module):
             if memory is None:
                 assert xqk.shape[2] <= self.chunk_size
                 out = torch.zeros(bsz, self.n_heads, seq_len, self.v_head_dim, dtype=xq.dtype, device=xq.device)
-                mask[:] = True
             else:
                 assert self.chunk_size < xqk.shape[2] <= self.chunk_size * 2
                 n_rep = self.n_heads // self.n_kv_heads
@@ -101,24 +105,29 @@ class AdaptiveWorkingMemory(nn.Module):
                 # (B x H x L x S) x (B x H x S x V) -> B x H x L x V
                 out = torch.matmul(xq, memory_)
                 if segment_idx is not None:
-                    mask = torch.ne(segment_idx, prev_segment_count.view(bsz, 1), out=mask)
+                    mask = torch.ne(segment_idx, prev_segment_count.view(bsz, 1))
                 else:
-                    mask[:] = torch.isinf(log_norm_term[:, 0:1, 0])
+                    mask = torch.isinf(log_norm_term[:, 0:1, 0])
                 out = torch.masked_fill(out, mask.view(bsz, 1, seq_len, 1), value=0.)
             # update memory
             if xqk.shape[2] % self.chunk_size == 0:
                 memory, log_norm_term = self.update_memory(
-                    xqk, xkk, xv, memory, log_norm_term, segment_idx, prev_segment_idx, prev_segment_count
+                    xqk, xkk, xv, memory, log_norm_term, prev_g,
+                    segment_idx, prev_segment_idx, prev_segment_count
                 )
+                prev_g = xg
+            else:
+                assert xg is None
+
             prev_qk = xqk
             prev_kk = xkk
             prev_v = xv
 
         out = rearrange(out, 'b h l v -> b l (h v)')
-        return out, mask, memory, log_norm_term, prev_qk, prev_kk, prev_v
+        return out, memory, log_norm_term, prev_qk, prev_kk, prev_v, prev_g
 
     def update_memory(
-        self, qkey, kkey, value, memory, log_norm_term,
+        self, qkey, kkey, value, memory, log_norm_term, prev_gate,
         segment_idx, prev_segment_idx, prev_segment_count
     ):
         bsz = qkey.shape[0]
@@ -160,6 +169,6 @@ class AdaptiveWorkingMemory(nn.Module):
         return memory, log_norm_term
 
     def extra_repr(self) -> str:
-        return 'heads={} ({}), qk_head_dim={}, v_head_dim={}, chunk={}, ortho={}, eps={}'.format(
-            self.n_heads, self.n_kv_heads, self.head_dim, self.v_head_dim, self.chunk_size, self.ortho, self.eps
+        return 'heads={} ({}), qk_head_dim={}, v_head_dim={}, chunk={}, fgate={}, ortho={}, eps={}'.format(
+            self.n_heads, self.n_kv_heads, self.head_dim, self.v_head_dim, self.chunk_size, self.fgate, self.ortho, self.eps
         )

@@ -295,7 +295,7 @@ class HealthMetricCollector:
     @torch.no_grad()
     def record_gekko_branches(
         self, layer_idx: int, sca: torch.Tensor, awk: torch.Tensor,
-        output_gate: torch.Tensor, unavailable_history_mask: torch.Tensor,
+        output_gate: torch.Tensor,
     ) -> None:
         if not self.recording or not self.enable_gekko_stats:
             return
@@ -310,7 +310,6 @@ class HealthMetricCollector:
         layer_stats["output_gate"] = self._local_stats(output_gate)
         for name, mask in (
             ("gate_near_zero", output_gate.detach().abs().lt(1e-3)),
-            ("history_available", ~unavailable_history_mask),
         ):
             # Only sum/count are consumed for fractions, not coordinate extrema.
             count = mask.sum(dtype=torch.float32)
