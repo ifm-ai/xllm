@@ -271,11 +271,11 @@ class RolesConf(Config):
     """Per-role hyperparameters (xllm/optim/roles.py); mup fills them in. Unset, training is unchanged."""
     embed: RoleConf = field(default_factory=RoleConf)
     hidden_matrix: RoleConf = field(default_factory=RoleConf)  # Muon matrices in the blocks, but residual_out
-    residual_out: RoleConf = field(default_factory=RoleConf)  # attention wo and FFN fc2, the branches' outputs (Muon)
-    hidden_vector: RoleConf = field(default_factory=RoleConf)  # norm gains and biases in the blocks
+    residual_out: RoleConf = field(default_factory=RoleConf)  # attention / GDA wo, FFN fc2: the branches' outputs (Muon)
+    hidden_vector: RoleConf = field(default_factory=RoleConf)  # norm gains, biases, gekko's conv kernels in the blocks
     final_norm: RoleConf = field(default_factory=RoleConf)
     readout: RoleConf = field(default_factory=RoleConf)
-    other: RoleConf = field(default_factory=RoleConf)  # the parameters no module tags (gekko, MoE); none under mup
+    other: RoleConf = field(default_factory=RoleConf)  # the parameters no module tags (MoE); none under mup
 
     def __post_init__(self):
         for f in fields(self):

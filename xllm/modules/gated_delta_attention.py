@@ -32,6 +32,7 @@ from xllm.modules.fused_ops import (
 )
 from xllm.utils import get_init_fn
 from xllm.optim.muon_spec import register_muon
+from xllm.optim.roles import register_role
 
 
 class GatedDeltaAttention(nn.Module):
@@ -259,6 +260,19 @@ class GatedDeltaAttention(nn.Module):
         register_muon(self.wo, tp_dim=1)
         if self.wg is not None:
             register_muon(self.wg, tp_dim=1)
+
+        # roles (xllm/optim/roles.py): the matrices as in attention, wo the branch's output; biases, norm gains and
+        # the depthwise causal-conv kernels as the blocks' vectors
+        for w in (self.wq, self.wk, self.wv, self.wr, self.wg):
+            if w is not None:
+                register_role(w, "weight", "hidden_matrix")
+        register_role(self.wo, "weight", "residual_out")
+        for module in (self.wv, self.wr, self.q_conv, self.k_conv, self.v_conv, self.timenorm, self.query_norm,
+                       self.key_norm, self.attn_norm):
+            register_role(module, "bias", "hidden_vector")
+        for module in (self.q_conv, self.k_conv, self.v_conv, self.timenorm, self.query_norm, self.key_norm,
+                       self.attn_norm):
+            register_role(module, "weight", "hidden_vector")
 
     def _receive_prev_count(self, x, bos_mask):
         bsz, seq_len, _ = x.size()

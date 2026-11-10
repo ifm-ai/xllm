@@ -81,10 +81,11 @@
 ## Parameter roles (`--roles.*`)
 
 A module declares the role of each parameter where it creates it, `register_role(module, name, role)`
-(`xllm/optim/roles.py`; the tag lives on the module, so it survives FSDP2). The Transformer's roles:
-`embed`, `hidden_matrix` (the Muon matrices in the blocks but `residual_out`), `residual_out`
-(attention `wo`, FFN `fc2`: the residual branches' outputs), `hidden_vector` (norm gains and biases
-in the blocks), `final_norm`, `readout`. A parameter no module tags is in `other` (gekko's, MoE's).
+(`xllm/optim/roles.py`; the tag lives on the module, so it survives FSDP2). The Transformer's and
+gekko's roles: `embed`, `hidden_matrix` (the Muon matrices in the blocks but `residual_out`),
+`residual_out` (attention / gated delta attention `wo`, FFN `fc2`: the residual branches' outputs),
+`hidden_vector` (norm gains, biases and gekko's causal-conv kernels in the blocks), `final_norm`,
+`readout`. A parameter no module tags is in `other` (MoE layers' routers and experts).
 
 Each role (`RolesConf` in `xllm/config.py`) has, unset by default (unset changes nothing):
 - `lr`, `eps`, `weight_decay`: factors on the configured values. AdamW steps one param group per

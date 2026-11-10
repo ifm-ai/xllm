@@ -91,8 +91,46 @@ def test_transformer_tags_every_parameter(options):
     assert {id(p) for p in model.parameters() if tags[id(p)] in MUON_ROLES} == muon_weights
 
 
+def gekko(**options):
+    from xllm.models.gekko import Gekko
+    cfg = ModelConf(**(dict(arch="gekko", model_dim=64, num_layers=2, num_heads=4, ffn_hidden_dim=128, vocab_size=32,
+                            init_mode="gaussian", swiglu=True) | options))
+    torch.manual_seed(0)
+    return Gekko(cfg, SimpleNamespace(bos_id=1, eos_id=2, pad_id=0))
+
+
+def expected_gekko_role(name):
+    if name.endswith(("gda.wo.weight", "nffn.fc2.weight")):
+        return "residual_out"
+    if re.search(r"(gda\.w[qkvrg]|nffn\.fc[13])\.weight$", name):
+        return "hidden_matrix"
+    if name.startswith(("embed.", "output.")):
+        return expected_role(name)
+    return "hidden_vector"  # biases, norm gains, the causal-conv kernels
+
+
+@pytest.mark.parametrize("options", [
+    {},  # timenorm, query_norm, wv's bias, the q / k / v causal convs, SwiGLU's fc3
+    dict(attn_act_func="softdelta"),  # its gate wg
+    dict(apply_bias_term=True),  # wr's bias
+    dict(swiglu=False),
+])
+def test_gekko_tags_every_parameter(options, cpu_transport):
+    model = gekko(**options)
+    tags = roles_lib.param_roles(model)
+    roles = {name: tags[id(p)] for name, p in model.named_parameters()}
+    assert roles == {name: expected_gekko_role(name) for name in roles}  # none left to `other`
+    muon_weights = {id(p) for p in muon.split_muon_params(model)[0]}
+    assert {id(p) for p in model.parameters() if tags[id(p)] in MUON_ROLES} == muon_weights
+    # a role reaches gekko's attention too, not only its FFN
+    opt = build_muon_cpu(model, CFG, RolesConf(hidden_matrix=RoleConf(lr=0.5)), cpu_transport)
+    scales = dict(zip(map(id, opt.param_groups[0]["params"]), opt.lr_scales))
+    assert scales[id(model.layers[0].gda.wq.weight)] == scales[id(model.layers[0].nffn.fc1.weight)] == 0.5
+    assert "other" not in [g.get("role") for g in opt.param_groups]
+
+
 def test_untagged_parameters_are_in_role_other(cpu_transport):
-    """As gekko's and MoE's, which have no register_role: they step at the role `other`'s values."""
+    """As MoE's, which have no register_role: they step at the role `other`'s values."""
     model = transformer()
     wq = model.layers[0].attention.wq
     del vars(wq)["param_roles"]  # a Muon matrix without a role
