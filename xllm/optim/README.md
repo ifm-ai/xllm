@@ -85,7 +85,8 @@ A module declares the role of each parameter where it creates it, `register_role
 gekko's roles: `embed`, `hidden_matrix` (the Muon matrices in the blocks but `residual_out`),
 `residual_out` (attention / gated delta attention `wo`, FFN `fc2`: the residual branches' outputs),
 `hidden_vector` (norm gains, biases and gekko's causal-conv kernels in the blocks), `final_norm`,
-`readout`. A parameter no module tags is in `other` (MoE layers' routers and experts).
+`readout`. A parameter no module tags is in `other` (MoE layers' routers and experts); with roles set,
+building the optimizer warns which parameters these are, by kind.
 
 Each role (`RolesConf` in `xllm/config.py`) has, unset by default (unset changes nothing):
 - `lr`, `eps`, `weight_decay`: factors on the configured values. AdamW steps one param group per

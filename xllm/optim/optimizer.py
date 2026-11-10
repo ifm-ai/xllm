@@ -26,10 +26,12 @@ def build_optimizer(model: nn.Module, cfg: OptimConf, total_steps: int, param_dt
                     roles: Optional[RolesConf] = None):
     """roles: per-role hyperparameters (xllm/optim/roles.py); the plain param groups unless some role scales the lr,
     eps or weight decay."""
-    from .roles import grouped
+    from .roles import grouped, warn_untagged
     logger.info("Starting build of optimizer...")
-    if roles is not None and not grouped(roles):
-        roles = None
+    if roles is not None:
+        warn_untagged(model, roles)
+        if not grouped(roles):
+            roles = None
     if cfg.optimizer == "muon":
         from .muon import build_muon
         optimizer = build_muon(model, cfg, roles)

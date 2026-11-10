@@ -6,6 +6,7 @@ Expected values are written out by hand, not recomputed with the code under test
 """
 import copy
 import json
+import logging
 import math
 import re
 from types import SimpleNamespace
@@ -146,6 +147,20 @@ def test_untagged_parameters_are_in_role_other(cpu_transport):
     assert scales.pop(id(wq.weight)) == [0.5, 2.0]
     assert all(s == [1.0, 1.0] for s in scales.values())
     assert roles_lib.clip_grad_scales(model, roles) == {id(wq.weight): 0.25, id(extra): 0.25}
+
+
+def test_untagged_parameters_are_named_when_roles_are_set(caplog):
+    """build_optimizer says which parameters a role set with --roles does not reach, by kind."""
+    model = transformer()
+    with caplog.at_level(logging.WARNING):
+        roles_lib.warn_untagged(model, RolesConf(hidden_matrix=RoleConf(lr=0.5)))  # every parameter has a role
+        for layer in model.layers:
+            del vars(layer.attention.wq)["param_roles"]
+        roles_lib.warn_untagged(model, RolesConf())  # no roles set: they step as configured, nothing to say
+        assert not caplog.records
+        roles_lib.warn_untagged(model, RolesConf(hidden_matrix=RoleConf(lr=0.5)))
+    (record,) = caplog.records
+    assert record.getMessage().endswith("{'layers.*.attention.wq.weight': 2}")
 
 
 def test_param_groups_reject_mismatched_roles():

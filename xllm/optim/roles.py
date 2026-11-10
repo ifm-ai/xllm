@@ -7,6 +7,7 @@ AdamW steps one param group per role; Muon scales each matrix's lr and weight de
 lr_scales / wd_scales). MuPConf is one preset of the roles. Unset values change nothing: no re-init, the optimizer's
 two groups (while no role's lr / eps / weight decay factor differs from 1), the plain clipping norm.
 """
+from collections import Counter
 from contextlib import contextmanager
 from dataclasses import fields
 from logging import getLogger
@@ -73,6 +74,19 @@ def require_roles(model: nn.Module):
     untagged = [name for name, p in model.named_parameters() if roles[id(p)] == "other"]
     if untagged:
         raise ValueError(f"mup needs a role on every parameter (register_role), these have none: {untagged}")
+
+
+def warn_untagged(model: nn.Module, roles: RolesConf):
+    """With roles set, the parameters no module tags (MoE layers' routers and experts) step with roles.other's values,
+    not with the role they would take: say which, by kind."""
+    if roles == RolesConf():
+        return
+    from .muon_spec import name_pattern
+    tags = param_roles(model)
+    untagged = Counter(name_pattern(name) for name, p in model.named_parameters() if tags[id(p)] == "other")
+    if untagged:
+        logger.warning(f"roles: parameters without a role step with roles.other's values (unset: the configured "
+                       f"ones): {dict(untagged)}")
 
 
 def grouped(roles: RolesConf) -> bool:
