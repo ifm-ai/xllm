@@ -23,7 +23,7 @@ from xllm.config import (
     ValidConf,
 )
 from xllm.models.xllm import XLLModel
-from xllm.optim import check_param_groups, param_group_names, restore_optimizer_config
+from xllm.optim import build_optimizer, check_param_groups, param_group_names, restore_optimizer_config
 from xllm.optim import roles as roles_lib
 from xllm.optim.muon_spec import muon_spec
 from xllm.utils import clip_grad_norm_
@@ -361,6 +361,20 @@ def test_role_groups_resume(cpu_transport, tmp_path):
         check_param_groups(plain, training_state, "checkpoint")
     with pytest.raises(ValueError, match=re.escape("checkpoint has optimizer param groups 2, this run 5")):
         check_param_groups(new, {"scheduler": {"base_lrs": [0.02, 1e-3]}}, "checkpoint")  # older: only the count
+
+
+def test_adamw_param_groups():
+    """optimizer=adamw, the default (torch's AdamW, whose group has no algorithm key): the names saved at a checkpoint
+    and checked on resume, also against a checkpoint from before the names were saved."""
+    opt, scheduler = build_optimizer(nn.Linear(2, 2), OptimConf(), 10, "bf16")
+    assert type(opt) is torch.optim.AdamW
+    training_state = {"param_groups": param_group_names(opt), "scheduler": scheduler.state_dict()}
+    assert training_state["param_groups"] == ["adamw"]
+    check_param_groups(opt, training_state, "checkpoint")
+    check_param_groups(opt, {"scheduler": scheduler.state_dict()}, "checkpoint")  # older: only the count
+    with pytest.raises(ValueError, match=re.escape(
+            "checkpoint has optimizer param groups ['muon', 'adamw'], this run ['adamw']")):
+        check_param_groups(opt, {"param_groups": ["muon", "adamw"], "scheduler": {}}, "checkpoint")
 
 
 def test_group_lrs(cpu_transport):

@@ -77,8 +77,9 @@ def restore_optimizer_config(optimizer, cfg: OptimConf, roles: Optional[RolesCon
 
 
 def param_group_names(optimizer) -> List[str]:
-    """Saved with the training state, to check a resume against (check_param_groups)."""
-    return [group.get("role", group["algorithm"]) for group in optimizer.param_groups]
+    """Saved with the training state, to check a resume against (check_param_groups). torch's AdamW
+    (optimizer=adamw) has no algorithm key: its one group is adamw."""
+    return [group.get("role") or group.get("algorithm", "adamw") for group in optimizer.param_groups]
 
 
 def check_param_groups(optimizer, training_state_dict: Dict, source: str):

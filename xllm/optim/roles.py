@@ -125,7 +125,7 @@ def log_param_groups(model: nn.Module, roles: RolesConf, optimizer: Optimizer):
 def group_lrs(optimizer: Optimizer, roles: RolesConf) -> Dict[str, float]:
     """Muon's current lrs by name: muon and adamw, or with role groups muon and one per role (the Muon roles' as
     muon x their factor)."""
-    lrs = {group.get("role", group["algorithm"]): float(group["lr"]) for group in optimizer.param_groups}
+    lrs = {group.get("role") or group["algorithm"]: float(group["lr"]) for group in optimizer.param_groups}
     if "adamw" not in lrs:
         lrs.update({role: lrs["muon"] * getattr(roles, role).factor("lr") for role in MUON_ROLES})
     return lrs
