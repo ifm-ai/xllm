@@ -110,11 +110,14 @@ The following is the corresponding `xattn` versions.
 <summary><strong>Flash Linear Attention: modules and operators</strong></summary>
 
 Install [Flash Linear Attention](https://github.com/fla-org/flash-linear-attention)
-for models using its modules or operators:
+for models using its modules or operators, such as `causal_conv_backend='fla'`
+(the default `triton` backend does not need it):
 
 ```bash
-python -m pip install flash-linear-attention
+python -m pip install fla-core==0.5.2
 ```
+
+0.6.0 removed the `fla.modules.conv` kernels that xLLM uses.
 
 </details>
 

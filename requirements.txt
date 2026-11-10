@@ -16,4 +16,3 @@ blobfile
 einops
 ninja
 packaging
-fla-core==0.5.2
