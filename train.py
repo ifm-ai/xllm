@@ -219,6 +219,12 @@ def set_optim_state(
         raise RuntimeError(f"Step mismatch: {scheduler._step_count - 1}/{state.step}")
 
 
+def restores_group_hparams(cfg: TrainerConf) -> bool:
+    """Whether a reload re-applies the configured per-group eps / weight decay over the checkpoint's.
+    mup sets them per role; tau_epoch's weight decay depends on cfg.steps, which a resumed run may change."""
+    return cfg.mup is not None or cfg.optim.tau_epoch is not None
+
+
 def main(cfg: TrainerConf):
     gc.disable()
     t_start = timer()
@@ -283,8 +289,8 @@ def main(cfg: TrainerConf):
 
     # build optimizer / scheduler
     optimizer, scheduler = build_optimizer(model, cfg.optim, cfg.steps, cfg.dtype, mup=cfg.mup)
-    # with mup, per-role eps / weight decay follow the config after a reload, like the LR
-    configured_group_hparams = get_group_hparams(optimizer) if cfg.mup is not None else None
+    # with mup or tau_epoch, per-group eps / weight decay follow the config after a reload, like the LR
+    configured_group_hparams = get_group_hparams(optimizer) if restores_group_hparams(cfg) else None
 
     # setup loggers
     enable_loggers = cfg.slurm.is_master and not cfg.disable_logging

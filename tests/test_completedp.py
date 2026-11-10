@@ -484,6 +484,26 @@ def test_resume_uses_configured_group_hparams():
     assert groups["embed"]["eps"] == pytest.approx(1e-10 / 2)
 
 
+def test_resume_with_tau_epoch_uses_configured_weight_decay():
+    import train
+
+    assert train.restores_group_hparams(trainer_conf_from_args(["--model.init_mode", "gaussian", "--optim.tau_epoch", "0.5"]))
+    assert not train.restores_group_hparams(trainer_conf_from_args(["--model.init_mode", "gaussian"]))
+    model = build(model_conf())
+    optimizer, scheduler = build_optimizer(model, optim_conf(tau_epoch=0.5), STEPS, "fp32")
+    train_steps(model, optimizer, scheduler, 2, seed=0)
+    optim_state = copy.deepcopy(optimizer.state_dict())
+    saved_wd = optimizer.param_groups[0]["weight_decay"]
+
+    # the resumed run trains for twice as many steps, so tau_epoch gives half the weight decay
+    optimizer, _ = build_optimizer(model, optim_conf(tau_epoch=0.5), 2 * STEPS, "fp32")
+    configured = get_group_hparams(optimizer)
+    set_sharded_optimizer_state(model, optimizer, optim_state, dcp=False)
+    assert optimizer.param_groups[0]["weight_decay"] == pytest.approx(saved_wd)
+    set_group_hparams(optimizer, configured)
+    assert optimizer.param_groups[0]["weight_decay"] == pytest.approx(saved_wd / 2)
+
+
 MUP_ARGS = [
     "--model.init_mode", "gaussian", "--model.model_dim", "256",
     "--mup.base_model_dim", "64", "--mup.base_init_embed_std", "1.0",
