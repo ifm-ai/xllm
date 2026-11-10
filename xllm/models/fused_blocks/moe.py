@@ -15,7 +15,6 @@ from xllm.modules.fused_ops import (
 from xllm.modules.moe.router import calc_probs
 from xllm.modules.moe.dedup import token_rank_hits, build_dedup_plan, masked_gather_sum
 from .utils import (
-    fused_permute_y_bwd_scores_grad,
     grouped_experts_fwd,
     grouped_experts_bwd,
 )
@@ -216,8 +215,6 @@ def moe_bwd(
     # B*L*K
     routing_indices_flat = routing_indices.flatten()
     sorted_indices = torch.argsort(routing_indices_flat, stable=True)
-    inverse_indices = torch.empty_like(sorted_indices)
-    inverse_indices[sorted_indices] = torch.arange(sorted_indices.numel(), device=sorted_indices.device)
     # rebuilt from the routing rather than kept from forward: cheap, and no extra state to save
     hits = token_rank_hits(routing_indices_flat, n_local_experts, topk, world_size)
     plan = build_dedup_plan(hits, sorted_indices, topk, rank, dest_counts, sum(input_splits[:rank]), curr_bsz)
@@ -285,18 +282,16 @@ def moe_bwd(
         # P x D: one row per local (token, expert) pair, in expert order
         xp = torch.index_select(xu, 0, plan.pair_rows)
         del xu
-        y2, eh1, eh1s, eh3, eh, expert_hidden_noise = grouped_experts_fwd(
-            xp, ew1, ew2, ew3, group_sizes, expert_backend, False, hidden_dropout, expert_hidden_rng_state
+        # the expert outputs are not needed: their routing scores' gradient comes from the backward below
+        _, eh1, eh1s, eh3, eh, expert_hidden_noise = grouped_experts_fwd(
+            xp, ew1, ew2, ew3, group_sizes, expert_backend, False, hidden_dropout, expert_hidden_rng_state,
+            with_output=False,
         )
     else:
-        xp = y2 = xu
+        xp = xu
         eh1, eh1s, eh3, eh = None, None, None, None
         ew1, ew2, ew3 = None, None, None
         expert_hidden_noise = None
-
-    # per-pair expert outputs return to their tokens for the routing scores' gradient
-    y2 = rearrange(y2, 'b (w d) -> (w b) d', w=world_size)
-    y2, handle_y2 = all_to_all(y2, output_splits, input_splits, parallel_region='model', async_op=True)
 
     if handle_y2_grad is not None:
         handle_y2_grad.wait()
@@ -309,10 +304,15 @@ def moe_bwd(
         pair_scores = scaled_topk_scores.reshape(-1)[plan.pairs]
         y2_grad = torch.index_select(yu_grad, 0, plan.pair_rows).mul_(pair_scores.unsqueeze(1))
         del yu_grad
-        xp_grad, ew1_grad, ew2_grad, ew3_grad = grouped_experts_bwd(
+        xp_grad, ew1_grad, ew2_grad, ew3_grad, output_dots = grouped_experts_bwd(
             y2_grad, xp, ew1, ew2, ew3, eh1, eh1s, eh3, eh, group_sizes, expert_backend,
-            True, hidden_dropout, expert_hidden_rng_state, expert_hidden_noise
+            True, hidden_dropout, expert_hidden_rng_state, expert_hidden_noise, with_output_dots=True,
         )
+        # routing scores' gradient, <out_grad, expert output>, for the local pairs; other ranks add theirs
+        # through the logits-gradient all-reduce below. A score that underflowed to 0 would give 0 / 0; its
+        # gradient is later multiplied by that score's probability, which is 0, so the clamp only avoids NaN.
+        topk_scores_grad = torch.zeros(bsz * seq_len * topk, device=xf.device, dtype=torch.float32)
+        topk_scores_grad[plan.pairs] = output_dots / pair_scores.float().clamp_min(torch.finfo(torch.float32).tiny)
         # B' x D: summed per local token
         xu_grad = masked_gather_sum(xp_grad, plan.pair_table, None, moe_permutation_backend)
         ew1_grad = rearrange(ew1_grad, 'n s d -> (n s) d')
@@ -320,6 +320,7 @@ def moe_bwd(
         ew3_grad = rearrange(ew3_grad, 'n s d -> (n s) d')
     else:
         xu_grad = yu_grad
+        topk_scores_grad = torch.zeros(bsz * seq_len * topk, device=xf.device, dtype=torch.float32)
         # FSDP must reduce the same parameters even when this rank has no expert tokens.
         ew1_grad = torch.zeros_like(expert_w1)
         ew2_grad = torch.zeros_like(expert_w2)
@@ -345,13 +346,8 @@ def moe_bwd(
         xf_grad_shared = None
         fc1_w_grad, fc3_w_grad = None, None
 
-    if handle_y2 is not None:
-        handle_y2.wait()
-
     # router grad
-    topk_scores_grad = fused_permute_y_bwd_scores_grad(
-        out_grad, inverse_indices, y2, bsz, seq_len, topk, moe_permutation_backend
-    )
+    topk_scores_grad = topk_scores_grad.view(bsz, seq_len, topk)
 
     if router_load_balancing_type is None:
         assert aux_loss_grad is None
