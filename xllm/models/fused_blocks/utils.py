@@ -822,6 +822,15 @@ def grouped_experts_fwd(
     return out, h1, h1s, h3, hidden, hidden_rng_state_or_noise
 
 
+def row_dots(a: Tensor, b: Tensor, chunk_rows: int = 16384) -> Tensor:
+    # fp32 row sums of a * b, in row chunks so the fp32 temporaries stay small
+    out = torch.empty(a.shape[0], dtype=torch.float32, device=a.device)
+    for start in range(0, a.shape[0], chunk_rows):
+        end = start + chunk_rows
+        out[start:end] = (a[start:end].float() * b[start:end].float()).sum(dim=-1)
+    return out
+
+
 def grouped_experts_bwd(
     y_grad: Tensor,
     x: Tensor,
@@ -842,7 +851,7 @@ def grouped_experts_bwd(
 ) -> Tuple[Tensor, ...]:
     h_grad, w2_grad = multi_group_matmul_bwd(y_grad, w2, hidden, group_sizes, True, backend)
     # per row, <y_grad, out> = <y_grad @ w2, hidden> = <h_grad, hidden>; taken before h_grad is reused in place
-    output_dots = (h_grad.float() * hidden.float()).sum(dim=-1) if with_output_dots else None
+    output_dots = row_dots(h_grad, hidden) if with_output_dots else None
     h_grad = memory_efficient_dropout_bwd(h_grad, dropout, hidden_rng_state, hidden_noise)
     # x_grad from h1
     h1s_grad = torch.mul(h_grad, h3, out=h3) if memory_efficient else h_grad * h3
