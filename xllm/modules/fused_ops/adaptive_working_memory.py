@@ -590,8 +590,9 @@ def _adaptive_working_memory_bwd(
             log_norm_term_grad = tmp_lnt_grad[1]
 
             # B x K x S x V -> B*K x S x V
-            memory_update_grad = rearrange(ratio[c] * memory_grad, 'b k s v -> (b k) s v')
-            memory_grad = rearrange((1.0 - ratio[c]) * memory_grad, 'b k s v -> (b k) s v')
+            curr_r = ratio[c].to(memory)
+            memory_update_grad = rearrange(curr_r * memory_grad, 'b k s v -> (b k) s v')
+            memory_grad = rearrange((1.0 - curr_r) * memory_grad, 'b k s v -> (b k) s v')
             curr_memory = rearrange(curr_memory, 'b k v s -> (b k) v s')
             # B*K x C x V
             vv_grad = torch.bmm(prev_kk, memory_update_grad)
