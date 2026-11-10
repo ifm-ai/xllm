@@ -805,8 +805,10 @@ def grouped_experts_fwd(
     backend: str,
     memory_efficient: bool,
     dropout: float,
-    hidden_rng_state: Optional[Tensor] = None
-) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Optional[Tensor]]:
+    hidden_rng_state: Optional[Tensor] = None,
+    with_output: bool = True,
+) -> Tuple[Optional[Tensor], Tensor, Tensor, Tensor, Tensor, Optional[Tensor]]:
+    # with_output=False stops before the last matmul, for a backward recompute that needs only the activations
     h1 = multi_group_matmul_fwd(x, w1, group_sizes, True, backend)
     h3 = multi_group_matmul_fwd(x, w3, group_sizes, True, backend)
     h1s = F.silu(h1)
@@ -816,7 +818,7 @@ def grouped_experts_fwd(
     else:
         hidden = h1s * h3
     hidden, hidden_rng_state_or_noise = memory_efficient_dropout_fwd(hidden, dropout, True, hidden_rng_state)
-    out = multi_group_matmul_fwd(hidden, w2, group_sizes, True, backend)
+    out = multi_group_matmul_fwd(hidden, w2, group_sizes, True, backend) if with_output else None
     return out, h1, h1s, h3, hidden, hidden_rng_state_or_noise
 
 
@@ -835,9 +837,12 @@ def grouped_experts_bwd(
     memory_efficient: bool,
     dropout: float,
     hidden_rng_state: Optional[Tensor],
-    hidden_noise: Optional[Tensor]
-) -> Tuple[Tensor, Tensor, Tensor, Optional[Tensor]]:
+    hidden_noise: Optional[Tensor],
+    with_output_dots: bool = False,
+) -> Tuple[Tensor, ...]:
     h_grad, w2_grad = multi_group_matmul_bwd(y_grad, w2, hidden, group_sizes, True, backend)
+    # per row, <y_grad, out> = <y_grad @ w2, hidden> = <h_grad, hidden>; taken before h_grad is reused in place
+    output_dots = (h_grad.float() * hidden.float()).sum(dim=-1) if with_output_dots else None
     h_grad = memory_efficient_dropout_bwd(h_grad, dropout, hidden_rng_state, hidden_noise)
     # x_grad from h1
     h1s_grad = torch.mul(h_grad, h3, out=h3) if memory_efficient else h_grad * h3
@@ -848,6 +853,8 @@ def grouped_experts_bwd(
     x_grad_h3, w3_grad = multi_group_matmul_bwd(h3_grad, w3, x, group_sizes, True, backend)
 
     x_grad = torch.add(x_grad, x_grad_h3, out=x_grad)
+    if with_output_dots:
+        return x_grad, w1_grad, w2_grad, w3_grad, output_dots
     return x_grad, w1_grad, w2_grad, w3_grad
 
 
