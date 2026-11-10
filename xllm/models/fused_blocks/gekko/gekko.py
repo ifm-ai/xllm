@@ -319,10 +319,10 @@ class GekkoBlockFunction(torch.autograd.Function):
             akk = akk.transpose(1, 2)
             av = xv_.transpose(1, 2)
 
-            awk_out, awk_mask, new_memory, new_lnt = adaptive_working_memory_fwd(
-                aq, aqk, akk, av, attention_chunk_size, memory, log_norm_term,
-                prev_aqk, prev_akk, prev_av, segment_idx, prev_segment_count,
-                awm_orthogonal_update, rmsnorm_eps, health_layer_id=layer_id,
+            awk_out, new_memory, new_lnt = adaptive_working_memory_fwd(
+                aq, aqk, akk, av, None, attention_chunk_size, memory, log_norm_term,
+                prev_aqk, prev_akk, prev_av, None, segment_idx, prev_segment_count,
+                False, awm_orthogonal_update, rmsnorm_eps, health_layer_id=layer_id,
             )
 
             _, handle8 = send_memory_to_next(new_memory)
@@ -352,10 +352,10 @@ class GekkoBlockFunction(torch.autograd.Function):
             akk = akk.transpose(1, 2)
             av = xv_.transpose(1, 2)
 
-            awk_out, awk_mask, new_memory, new_lnt = adaptive_working_memory_fwd(
-                aq, aqk, akk, av, attention_chunk_size, memory, log_norm_term,
-                prev_aqk, prev_akk, prev_av, segment_idx, prev_segment_count,
-                awm_orthogonal_update, rmsnorm_eps, health_layer_id=layer_id,
+            awk_out, new_memory, new_lnt = adaptive_working_memory_fwd(
+                aq, aqk, akk, av, None, attention_chunk_size, memory, log_norm_term,
+                prev_aqk, prev_akk, prev_av, None, segment_idx, prev_segment_count,
+                False, awm_orthogonal_update, rmsnorm_eps, health_layer_id=layer_id,
             )
 
             handle8 = None
@@ -365,7 +365,7 @@ class GekkoBlockFunction(torch.autograd.Function):
         sca_out = rearrange(sca_out, 'b l h v -> b l (h v)')
         awk_out = rearrange(awk_out, 'b h l v -> b l (h v)')
         if health_collector is not None:
-            health_collector.record_gekko_branches(layer_id, sca_out, awk_out, r, awk_mask)
+            health_collector.record_gekko_branches(layer_id, sca_out, awk_out, r)
         attn, _ = rmsnorm_fwd(sca_out + awk_out, None, local_heads, rmsnorm_eps)
         attn = torch.mul(attn, r, out=attn)
         attn, attn_out_rng_state = memory_efficient_dropout_fwd(attn, hidden_dropout, True)
@@ -728,8 +728,9 @@ class GekkoBlockFunction(torch.autograd.Function):
         akk = akk.transpose(1, 2)
         av = xv_.transpose(1, 2)
         memory_outs, lnt_outs, kv_outs, kk_outs, prev_outs = adaptive_working_memory_accum_fwd(
-            aq, aqk, akk, av, attention_chunk_size, memory, log_norm_term, prev_aqk, prev_akk, prev_av,
-            segment_idx, prev_segment_count, awm_orthogonal_update, rmsnorm_eps, awk_out is None
+            aq, aqk, akk, av, None, attention_chunk_size, memory, log_norm_term,
+            prev_aqk, prev_akk, prev_av, None, segment_idx, prev_segment_count,
+            False, awm_orthogonal_update, rmsnorm_eps, awk_out is None
         )
         accum_memory, memory_residual, memory_mask = memory_outs
         log_norm_term, curr_log_norm_term, accum_log_norm_term, ratio = lnt_outs
@@ -777,18 +778,18 @@ class GekkoBlockFunction(torch.autograd.Function):
                 handle_lnt.wait()
 
             (
-                aq_grad, aqk_grad, akk_grad, av_grad,
+                aq_grad, aqk_grad, akk_grad, av_grad, _,
                 memory_grad, log_norm_term_grad,
-                prev_aqk_grad, prev_akk_grad, prev_av_grad
+                prev_aqk_grad, prev_akk_grad, prev_av_grad, _
             ) = adaptive_working_memory_bwd(
                 awk_out_grad, memory_grad, log_norm_term_grad,
-                aq, aqk, awk_kkey, av, attention_chunk_size,
+                aq, aqk, awk_kkey, av, None, attention_chunk_size,
                 awk_rvalue, awk_rvalue_rstd, awk_vvalue, awk_avalue,
                 ak_fp32, akk_fp32, awk_key_mask,
                 accum_memory, memory_residual, memory_mask,
                 log_norm_term, curr_log_norm_term, accum_log_norm_term, ratio,
-                awk_out_mask, prev_aqk, prev_kkey, prev_av,
-                prev_k_fp32, prev_kk_fp32, prev_k_mask, awm_orthogonal_update
+                awk_out_mask, prev_aqk, prev_kkey, prev_av, None,
+                prev_k_fp32, prev_kk_fp32, prev_k_mask, False, awm_orthogonal_update
             )
 
             assert memory_grad is not None and log_norm_term_grad is not None
@@ -817,18 +818,18 @@ class GekkoBlockFunction(torch.autograd.Function):
                 handle_lnt.wait()
 
             (
-                aq_grad, aqk_grad, akk_grad, av_grad,
+                aq_grad, aqk_grad, akk_grad, av_grad, _,
                 memory_grad, log_norm_term_grad,
-                prev_aqk_grad, prev_akk_grad, prev_av_grad
+                prev_aqk_grad, prev_akk_grad, prev_av_grad, _
             ) = adaptive_working_memory_bwd(
                 awk_out_grad, memory_grad, log_norm_term_grad,
-                aq, aqk, awk_kkey, av, attention_chunk_size,
+                aq, aqk, awk_kkey, av, None, attention_chunk_size,
                 awk_rvalue, awk_rvalue_rstd, awk_vvalue, awk_avalue,
                 ak_fp32, akk_fp32, awk_key_mask,
                 accum_memory, memory_residual, memory_mask,
                 log_norm_term, curr_log_norm_term, accum_log_norm_term, ratio,
-                awk_out_mask, prev_aqk, prev_kkey, prev_av,
-                prev_k_fp32, prev_kk_fp32, prev_k_mask, awm_orthogonal_update
+                awk_out_mask, prev_aqk, prev_kkey, prev_av, None,
+                prev_k_fp32, prev_kk_fp32, prev_k_mask, False, awm_orthogonal_update
             )
 
             handle5 = None
