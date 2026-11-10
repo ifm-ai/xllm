@@ -126,6 +126,7 @@ def _adaptive_working_memory_fwd(
     bsz, n_heads, seq_len, qk_head_dim = query.shape
     _, n_kv_heads, _, v_head_dim = value.shape
     assert seq_len % chunk_size == 0
+    assert not fgate or not ortho, "orthogonal memory update does not support forget gate"
     nc = seq_len // chunk_size
     n_rep = n_heads // n_kv_heads
     if memory is None:
@@ -200,6 +201,7 @@ def _adaptive_working_memory_fwd(
     prev_qk = prev_qkey
     prev_kk = prev_kkey
     prev_v = prev_value
+    prev_g = prev_gate
     for c in range(nc):
         bos = c * chunk_size
         eos = (c + 1) * chunk_size
@@ -223,7 +225,7 @@ def _adaptive_working_memory_fwd(
             log_norm_term_curr = curr_log_norm_term[:, :, :, c]
             log_norm_term = torch.logaddexp(log_norm_term_curr, log_norm_term)
             # B x K x S x 1
-            ratio = rearrange(torch.exp(log_norm_term_curr - log_norm_term).to(memory), 'b k d -> b k d 1')
+            ratio = rearrange(torch.exp(log_norm_term_curr - log_norm_term), 'b k d -> b k d 1')
             if health_collector is not None:
                 health_collector.record_gekko_update_ratio(health_layer_id, ratio)
             # (B*K) x C x V
@@ -237,15 +239,22 @@ def _adaptive_working_memory_fwd(
                 rv, _ = group_rms_norm_fwd(rv, v_head_dim, 1, eps)
                 vv, _ = rejection_fwd(prev_v, rv)
             else:
-                vv = torch.baddbmm(prev_v, prev_qk, rearrange(memory, 'b k s v -> (b k) s v'), alpha=-1.0)
+                if prev_g is not None:
+                    prev_g = prev_g[..., None]
+                    gmemory = prev_g * memory
+                    ratio = 1.0 - prev_g + prev_g * ratio
+                else:
+                    gmemory = memory
+                vv = torch.baddbmm(prev_v, prev_qk, rearrange(gmemory, 'b k s v -> (b k) s v'), alpha=-1.0)
 
             # (B*K x S x C) x (B*K x C x V) -> B*K x S x V
             memory_update = rearrange(torch.bmm(prev_kk, vv), '(b k) s v -> b k s v', b=bsz)
-            memory = torch.addcmul(memory, memory_update - memory, ratio)
+            memory = torch.addcmul(memory, memory_update - memory, ratio.to(memory))
 
         prev_v = value[:, :, bos:eos]
         prev_qk = qkey[:, :, bos:eos]
         prev_kk = kkey[:, :, :, bos:eos]
+        prev_g = gate[:, :, c] if fgate else None
 
     # B x H x L x V
     out_mask = rearrange(out_mask, 'b n c -> b (n c)')
