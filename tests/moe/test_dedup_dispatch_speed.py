@@ -4,6 +4,8 @@ Launch one process per TP rank, e.g. a 36B-like layer at TP 2:
 
     torchrun --nproc_per_node 2 tests/moe/test_dedup_dispatch_speed.py \
         --model_dim 2560 --n_experts 100 --inter_dim 768 --topk 8 --tokens 65536
+
+It also runs on main, for a baseline.
 """
 import os
 
@@ -71,8 +73,9 @@ def main(
         torch.cuda.synchronize()
         times.append(start.elapsed_time(end))
 
-    # rows sent to other ranks per dispatch, one per (token, rank)
-    sent = routing_state[4]
+    # rows sent to other ranks per dispatch, one per (token, rank); main has no per-rank counts, so use its
+    # input splits there, one row per (token, expert)
+    sent = routing_state[4] if len(routing_state) > 4 else routing_state[1]
     stats = torch.tensor(
         [sorted(times)[len(times) // 2], float(sum(sent) - sent[rank])], device='cuda', dtype=torch.float64
     )
