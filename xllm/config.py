@@ -275,7 +275,8 @@ class RolesConf(Config):
     hidden_vector: RoleConf = field(default_factory=RoleConf)  # norm gains, biases, gekko's conv kernels in the blocks
     final_norm: RoleConf = field(default_factory=RoleConf)
     readout: RoleConf = field(default_factory=RoleConf)
-    other: RoleConf = field(default_factory=RoleConf)  # the parameters no module tags (MoE); none under mup
+    # the parameters no module tags (MoE); none under mup. Holds Muon matrices and AdamW tensors: eps reaches the latter
+    other: RoleConf = field(default_factory=RoleConf)
 
     def __post_init__(self):
         for f in fields(self):

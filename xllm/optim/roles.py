@@ -78,15 +78,24 @@ def require_roles(model: nn.Module):
 
 def warn_untagged(model: nn.Module, roles: RolesConf):
     """With roles set, the parameters no module tags (MoE layers' routers and experts) step with roles.other's values,
-    not with the role they would take: say which, by kind."""
+    not with the role they would take: say which, by kind. roles.other.eps reaches only their AdamW tensors (Muon
+    has no eps): say which matrices it misses."""
     if roles == RolesConf():
         return
-    from .muon_spec import name_pattern
+    from .muon_spec import name_pattern, split_muon_params
     tags = param_roles(model)
     untagged = Counter(name_pattern(name) for name, p in model.named_parameters() if tags[id(p)] == "other")
-    if untagged:
-        logger.warning(f"roles: parameters without a role step with roles.other's values (unset: the configured "
-                       f"ones): {dict(untagged)}")
+    if not untagged:
+        return
+    note = ""
+    if roles.other.factor("eps") != 1:
+        muon = {id(p) for p in split_muon_params(model)[0]}
+        matrices = sorted({name_pattern(name) for name, p in model.named_parameters()
+                           if tags[id(p)] == "other" and id(p) in muon})
+        if matrices:
+            note = f"; roles.other.eps does not reach their Muon matrices (Muon has no eps): {matrices}"
+    logger.warning(f"roles: parameters without a role step with roles.other's values (unset: the configured "
+                   f"ones): {dict(untagged)}{note}")
 
 
 def grouped(roles: RolesConf) -> bool:

@@ -91,7 +91,8 @@ building the optimizer warns which parameters these are, by kind.
 Each role (`RolesConf` in `xllm/config.py`) has, unset by default (unset changes nothing):
 - `lr`, `eps`, `weight_decay`: factors on the configured values. AdamW steps one param group per
   role; Muon scales each matrix's lr and weight decay (`lr_scales`, `wd_scales`), its decay
-  `lr * weight_decay` taking both factors, as AdamW's. `eps` is AdamW's only.
+  `lr * weight_decay` taking both factors, as AdamW's. `eps` is AdamW's only: the Muon roles reject it,
+  and in `other`, which holds both, it reaches only the AdamW tensors (the warning names the matrices).
 - `init_std`: a truncated normal init (at 3 std; 0: zeros) as the model is built (`init_roles`).
 - `clip_scale`: a factor on the role's gradients in the clipping norm; every gradient is still
   clipped by the same factor.

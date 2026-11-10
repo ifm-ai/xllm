@@ -163,6 +163,25 @@ def test_untagged_parameters_are_named_when_roles_are_set(caplog):
     assert record.getMessage().endswith("{'layers.*.attention.wq.weight': 2}")
 
 
+def test_other_eps_misses_muon_matrices(caplog, cpu_transport):
+    """roles.other.eps scales the AdamW tensors in `other`, not its Muon matrices (Muon has no eps); the warning
+    names those."""
+    model = transformer(num_layers=1)
+    wq = model.layers[0].attention.wq
+    del vars(wq)["param_roles"]  # a Muon matrix without a role
+    model.layers[0].attention.extra = nn.Parameter(torch.zeros(4))  # an AdamW tensor without a role
+    roles = RolesConf(other=RoleConf(eps=0.5))
+    opt = build_muon_cpu(model, CFG, roles, cpu_transport)
+    (group,) = [g for g in opt.param_groups if g.get("role") == "other"]
+    assert group["eps"] == 5e-9 and group["params"] == [model.layers[0].attention.extra]
+    assert opt.param_groups[0]["eps"] == CFG.epsilon  # Muon's group (wq): the configured eps, which Muon does not use
+    with caplog.at_level(logging.WARNING):
+        roles_lib.warn_untagged(model, roles)
+    (record,) = caplog.records
+    assert record.getMessage().endswith(
+        "; roles.other.eps does not reach their Muon matrices (Muon has no eps): ['layers.*.attention.wq.weight']")
+
+
 def test_param_groups_reject_mismatched_roles():
     model = transformer()
     del vars(model.layers[0].attention.wo)["muon_specs"]  # residual_out, but stepped by AdamW
