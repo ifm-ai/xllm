@@ -301,14 +301,16 @@ def _buffer(views: list[list[Tensor]]) -> tuple[list[Tensor], Tensor, list[Tenso
     return flat, buf, packed, [sum(t.numel() for t in ts) for ts in views]
 
 
-def build_muon(model: nn.Module, cfg: OptimConf, roles: RolesConf | None = None) -> Optimizer:
+def build_muon(model: nn.Module, cfg: OptimConf, roles: RolesConf | None = None,
+               mesh: DeviceMesh | None = None) -> Optimizer:
     """The model must be wrapped with FSDP2; Muon works over the shard dimension of the mesh its parameters live on.
-    roles: AdamW groups per role, Muon lr and weight decay factors per matrix (xllm/optim/roles.py)."""
+    roles: AdamW groups per role, Muon lr and weight decay factors per matrix (xllm/optim/roles.py).
+    mesh: the data-parallel mesh in place of the parameters' (the CPU tests pass a one-rank stand-in)."""
     from xllm.distributed import get_model_parallel_group, get_model_parallel_world_size
     from xllm.modules.model_parallel import ColumnParallelLinear, RowParallelLinear
     tp = get_model_parallel_world_size()
     muon_params, specs, names, adamw_params = split_muon_params(model)
-    if not muon_params or not hasattr(muon_params[0], "device_mesh"):
+    if not muon_params or (mesh is None and not hasattr(muon_params[0], "device_mesh")):
         raise ValueError("Muon requires a model wrapped with FSDP2 and at least one registered weight.")
     seen = set()
     for name, spec, p in zip(names, specs, muon_params):  # one line per kind of weight
@@ -325,12 +327,14 @@ def build_muon(model: nn.Module, cfg: OptimConf, roles: RolesConf | None = None)
             missed[name_pattern(f"{fqn}.weight")] += 1
     if missed:
         logger.warning(f"Muon: unregistered weights use AdamW: {dict(missed)}")
-    mesh = muon_params[0].device_mesh
+    if mesh is None:
+        mesh = muon_params[0].device_mesh
+        mesh = mesh if mesh.ndim == 1 else mesh["dp"]
     groups, lr_scales, wd_scales = adamw_params, None, None
     if roles is not None:
         from .roles import param_groups
         groups, lr_scales, wd_scales = param_groups(model, cfg, roles, muon_params)
-    optimizer = Muon(muon_params, specs, groups, mesh if mesh.ndim == 1 else mesh["dp"], cfg,
+    optimizer = Muon(muon_params, specs, groups, mesh, cfg,
                      tp_group=get_model_parallel_group() if tp > 1 else None, lr_scales=lr_scales, wd_scales=wd_scales)
     logger.info(f"Muon: {len(muon_params)} matrices / {len(optimizer.blocks)} blocks / "
                 f"{sum(p.numel() for p in muon_params)} params; AdamW: {len(adamw_params)} tensors / "

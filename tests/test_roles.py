@@ -46,12 +46,8 @@ def transformer(roles=None, **options):
 
 
 def build_muon_cpu(model, cfg, roles, cpu_transport):
-    """build_muon without FSDP2: the same split, role groups and scales."""
-    muon_params, specs, _, adamw_params = muon.split_muon_params(model)
-    lr_scales = wd_scales = None
-    if roles is not None:
-        adamw_params, lr_scales, wd_scales = roles_lib.param_groups(model, cfg, roles, muon_params)
-    opt = muon.Muon(muon_params, specs, adamw_params, LocalMesh(), cfg, lr_scales=lr_scales, wd_scales=wd_scales)
+    """build_muon itself, on a one-rank mesh in place of FSDP2's."""
+    opt = muon.build_muon(model, cfg, roles, mesh=LocalMesh())
     cpu_transport(opt)
     return opt
 
