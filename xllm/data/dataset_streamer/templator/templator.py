@@ -299,7 +299,7 @@ def apply_chat_template_randomized(
 
     has_tools = bool(conversation[0].get("tools", False))
     if has_tools:
-        if random.random() < 0.0001:
+        if rng.random() < 0.0001:
             for i, tool in enumerate(conversation[0]["tools"]):
                 if not ("type" in tool and tool["type"] == "function"):
                     conversation[0]["tools"][i] = {"type": "function", "function": tool}
