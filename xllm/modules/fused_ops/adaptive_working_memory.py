@@ -226,7 +226,7 @@ def _adaptive_working_memory_fwd(
             log_norm_term_curr = curr_log_norm_term[:, :, :, c]
             log_norm_term = torch.logaddexp(log_norm_term_curr, log_norm_term)
             # B x K x S x 1
-            ratio = rearrange(torch.exp(log_norm_term_curr - log_norm_term), 'b k s -> b k s 1')  # fp32
+            ratio = torch.exp(log_norm_term_curr - log_norm_term)[..., None]  # fp32
             if health_collector is not None:
                 health_collector.record_gekko_update_ratio(health_layer_id, ratio)
             # (B*K) x C x V
@@ -413,7 +413,7 @@ def _adaptive_working_memory_accum_fwd(
             log_norm_term_curr = curr_log_norm_term[:, :, :, c]
             log_norm_term = torch.logaddexp(log_norm_term_curr, log_norm_term)
             # B x K x S x 1
-            curr_r = rearrange(torch.exp(log_norm_term_curr - log_norm_term), 'b k d -> b k d 1')  # fp32
+            curr_r = torch.exp(log_norm_term_curr - log_norm_term)[..., None]  # fp32
             ratio[c] = curr_r
 
             if ortho:

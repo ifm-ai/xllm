@@ -79,7 +79,7 @@ class AdaptiveWorkingMemory(nn.Module):
             prev_qk = xqk[:, :, seq_len - self.chunk_size:]
             prev_kk = xkk[:, :, seq_len - self.chunk_size:]
             prev_v = xv[:, :, seq_len - self.chunk_size:]
-            prev_g = xg[:, :, -1]
+            prev_g = xg[:, :, -1] if self.fgate else None
         else:
             # tail or step-by-step generation mode
             xqk = torch.cat([prev_qk, xqk], dim=2) if prev_qk is not None else xqk
@@ -153,7 +153,7 @@ class AdaptiveWorkingMemory(nn.Module):
             prev_kk = F.softmax(prev_kk_fp32, dim=-1).to(kkey)
             curr_log_norm_term = torch.logsumexp(prev_kk_fp32, dim=-1)
             log_norm_term = torch.logsumexp(torch.stack([curr_log_norm_term, log_norm_term], dim=0), dim=0)
-            ratio = torch.exp(curr_log_norm_term - log_norm_term).to(memory).unsqueeze(3)
+            ratio = torch.exp(curr_log_norm_term - log_norm_term)[..., None]
             if self.ortho:
                 # B x H x C x V -> B*H x C x V
                 rv = rearrange(torch.matmul(prev_qk, memory), 'b h c v -> (b h) c v')
@@ -161,10 +161,17 @@ class AdaptiveWorkingMemory(nn.Module):
                 rv = rearrange(group_rms_norm(rv, None, 1, self.eps), '(b h) c v -> b h c v', b=bsz)
                 vv = rejection(prev_v, rv)
             else:
+                if prev_gate is not None:
+                    prev_gate = prev_gate[..., None]
+                    ratio = 1.0 - prev_gate + prev_gate * ratio
+                    gmemory = prev_gate.to(memory) * memory
+                else:
+                    gmemory = memory
                 # B x H x C x V
-                vv = prev_v - torch.matmul(prev_qk, memory)
+                vv = prev_v - torch.matmul(prev_qk, gmemory)
+
             memory_update = torch.matmul(prev_kk, vv)
-            memory = torch.addcmul(memory, memory_update - memory, ratio)
+            memory = torch.addcmul(memory, memory_update - memory, ratio.to(memory))
 
         return memory, log_norm_term
 
