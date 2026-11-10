@@ -318,8 +318,8 @@ class MuPConf(Config):
     base_init_hidden_std: float  # Init std of the hidden matrices at base width; x m_N^-1/2
     base_init_embed_std: float  # Init std of the embedding, the same at every width
     base_init_unembed_std: float  # Init std of the readout at base width; x m_N^-1
+    base_head_dim: int  # head_dim of the base model; the transfer keeps it fixed, checked against the model's
     alpha: float = 1.0  # Depth exponent in [0.5, 1]: c = m_L^-alpha
-    base_head_dim: Optional[int] = None  # head_dim of the base model, checked to equal the model's
     width_multiplier: Optional[float] = NOCLI()  # m_N, set by resolve()
     depth_multiplier: Optional[float] = NOCLI()  # m_L, set by resolve()
     branch_scale: Optional[float] = NOCLI()  # c = m_L^-alpha, set by resolve()
@@ -343,10 +343,10 @@ class MuPConf(Config):
 
     def resolve(self, model: ModelConf, optim: OptimConf, roles: RolesConf) -> None:
         """Check that the run supports mup; set the multipliers and the roles."""
-        for name in ("base_model_dim", "base_num_layers", "base_init_hidden_std", "base_init_embed_std",
-                     "base_init_unembed_std"):
+        for name in ("base_model_dim", "base_num_layers", "base_head_dim", "base_init_hidden_std",
+                     "base_init_embed_std", "base_init_unembed_std"):
             value = getattr(self, name)
-            if not math.isfinite(value) or value <= 0:
+            if value is None or not math.isfinite(value) or value <= 0:
                 raise ValueError(f"mup.{name} must be positive and finite, got {value}")
         if not 0.5 <= self.alpha <= 1.0:
             raise ValueError(f"mup.alpha must be in [0.5, 1], got {self.alpha}")
@@ -367,7 +367,7 @@ class MuPConf(Config):
             if actual not in supported:
                 raise ValueError(f"mup requires {name} in {supported}, got {actual!r}")
         head_dim = model.head_dim or model.model_dim // model.num_heads
-        if self.base_head_dim is not None and head_dim != self.base_head_dim:
+        if head_dim != self.base_head_dim:
             raise ValueError(f"mup keeps head_dim fixed across widths: model {head_dim}, "
                              f"mup.base_head_dim {self.base_head_dim}")
 

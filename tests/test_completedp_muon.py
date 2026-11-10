@@ -32,7 +32,7 @@ from tests.test_roles import build_muon_cpu
 def mup_conf(**kw):
     """m_N = 512 / 256 = 2, m_L = 16 / 4 = 4 with model_conf(); alpha 0.5 gives c = 4^-0.5 = 0.5."""
     return MuPConf(**dict(base_model_dim=256, base_num_layers=4, base_init_hidden_std=0.02,
-                          base_init_embed_std=0.5, base_init_unembed_std=0.04, alpha=0.5) | kw)
+                          base_init_embed_std=0.5, base_init_unembed_std=0.04, base_head_dim=64, alpha=0.5) | kw)
 
 
 def model_conf(**kw):
@@ -98,6 +98,7 @@ def test_resolve_sets_multipliers_and_roles():
     ({}, {}, {"alpha": 0.4}, "alpha"),
     ({}, {}, {"base_num_layers": 0}, "base_num_layers"),
     ({}, {}, {"base_head_dim": 32}, "mup keeps head_dim fixed across widths: model 64, mup.base_head_dim 32"),
+    ({}, {}, {"base_head_dim": None}, "mup.base_head_dim must be positive and finite, got None"),  # required
 ])
 def test_resolve_rejects_unsupported(model_kw, optim_kw, mup_kw, match):
     with pytest.raises(ValueError, match=match):
@@ -127,7 +128,7 @@ def test_trainer_conf_resolves_from_cli_and_config_json():
             "--model.num_layers", "16", "--model.num_heads", "8", "--model.init_mode", "gaussian",
             "--mup.base_model_dim", "256", "--mup.base_num_layers", "4", "--mup.alpha", "0.5",
             "--mup.base_init_hidden_std", "0.02", "--mup.base_init_embed_std", "0.5",
-            "--mup.base_init_unembed_std", "0.04"]
+            "--mup.base_init_unembed_std", "0.04", "--mup.base_head_dim", "64"]
     cfg = TrainerConf.from_cli(vars(TrainerConf.to_cli().parse_args(args)))
     assert cfg.mup.branch_scale == 0.5 and cfg.roles == resolved()[1]
     saved = json.loads(json.dumps(cfg.to_dict()))  # train.py's config.json holds the resolved roles
@@ -168,7 +169,8 @@ def test_mup_requires_a_role_on_every_parameter():
 def test_residual_out_init_is_c_times_plain_init():
     """The real Transformer: wo / fc2 are exactly c x their init without c (c a power of two), the rest equal."""
     cfg = dict(model_dim=128, num_heads=4, ffn_hidden_dim=256, vocab_size=64)
-    mup, roles = resolved(model_conf(num_layers=4, **cfg), base_model_dim=64, base_num_layers=1, alpha=1.0)
+    mup, roles = resolved(model_conf(num_layers=4, **cfg), base_model_dim=64, base_num_layers=1, base_head_dim=32,
+                          alpha=1.0)
     assert mup.branch_scale == 0.25
     plain = copy.deepcopy(roles)
     plain.residual_out.init_std = plain.hidden_matrix.init_std

@@ -112,7 +112,7 @@ E.g. `--roles.readout.lr 0.5 --roles.readout.weight_decay 0`.
 
 Width / depth transfer of the hyperparameters of a base model (arXiv:2512.22382; `MuPConf` in
 `xllm/config.py`), as a preset of the roles. Scale `num_heads`, `num_kv_heads` and `ffn_hidden_dim`
-with `model_dim` and keep `head_dim` fixed (`--mup.base_head_dim` checks it).
+with `model_dim` and keep `head_dim` fixed (`--mup.base_head_dim`, required, checks it).
 m_N = model_dim / base_model_dim, m_L = num_layers / base_num_layers, c = m_L^-alpha,
 sigma_h = base_init_hidden_std m_N^-1/2:
 
@@ -143,6 +143,6 @@ Supported: dense Transformers (no MoE, value heads or `scale_emb`; a plain resid
 
 ```bash
 --optim.optimizer muon --dcp_for_optimizer true --model.init_mode gaussian \
---mup.base_model_dim 1024 --mup.base_num_layers 8 --mup.alpha 1.0 \
+--mup.base_model_dim 1024 --mup.base_num_layers 8 --mup.base_head_dim 128 --mup.alpha 1.0 \
 --mup.base_init_hidden_std 0.02 --mup.base_init_embed_std 0.02 --mup.base_init_unembed_std 0.02
 ```
