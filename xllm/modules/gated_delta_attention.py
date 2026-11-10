@@ -348,7 +348,7 @@ class GatedDeltaAttention(nn.Module):
         prev_aqk = prev_aqk.view(bsz, n_kv_heads, csize, kdim).to(x)
         prev_akk = prev_akk.view(bsz, n_kv_heads, csize, kdim).to(x)
         prev_v = prev_v.view(bsz, csize, n_kv_heads, vdim).to(x)
-        prev_ag = prev_ag.view(bsz, n_kv_heads, kdim).to(x) if self.awm_forget_gate else None
+        prev_ag = prev_ag.view(bsz, n_kv_heads, kdim) if self.awm_forget_gate else None
         mem = mem.view(bsz, n_kv_heads, kdim, vdim).to(x)
         lnt = lnt.view(bsz, n_kv_heads, kdim)
         return prev_mean, prev_var, conv_q, conv_k, conv_v, prev_sk, prev_aqk, prev_akk, prev_v, prev_ag, mem, lnt

@@ -118,8 +118,8 @@ class ForgetGate(nn.Module):
             x = x[:, -1]
 
         # (B*N x D/TP) x (D/TP x S) -> B*N x S -> B*N x S/TP
-        h = reduce_scatter_model_parallel_region(torch.mm(x, self.weight))
-        g = torch.exp(-torch.exp(a) * F.softplus(h + b)).to(x.dtype)  # bf16
+        h = reduce_scatter_model_parallel_region(torch.mm(x, self.weight))  # bf16
+        g = torch.exp(-torch.exp(a) * F.softplus(h + b))  # fp32
         g = rearrange(g, '(b n) s -> b n s', b=bsz)
         return g
 

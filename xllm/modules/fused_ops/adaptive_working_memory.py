@@ -80,19 +80,20 @@ class AdaptiveWorkingMemoryFunc(torch.autograd.Function):
             (k_fp32, kk_fp32, key_mask),
             (prev_kk, prev_k_fp32, prev_kk_fp32, prev_k_mask)
         ) = _adaptive_working_memory_accum_fwd(
-            q, qk, k, v, chunk_size, memory, log_norm_term, prev_qk, prev_k, prev_v,
-            segment_idx, prev_segment_count, ortho, eps, False
+            q, qk, k, v, g, chunk_size, memory, log_norm_term,
+            prev_qk, prev_k, prev_v, prev_g,
+            segment_idx, prev_segment_count, fgate, ortho, eps, False
         )
         # backward
         (
-            q_grad, qk_grad, k_grad, v_grad, mem_grad, lnt_grad,
-            prev_qk_grad, prev_k_grad, prev_v_grad
+            q_grad, qk_grad, k_grad, v_grad, g_grad, mem_grad, lnt_grad,
+            prev_qk_grad, prev_k_grad, prev_v_grad, prev_g_grad
         ) = _adaptive_working_memory_bwd(
-            y_grad, mem_grad, lnt_grad, q, qk, kk, v, chunk_size,
+            y_grad, mem_grad, lnt_grad, q, qk, kk, v, g, chunk_size,
             rvalue, rvalue_rstd, vvalue, avalue, k_fp32, kk_fp32, key_mask,
             accum_memory, memory_residual, memory_mask,
             log_norm_term, curr_log_norm_term, accum_log_norm_term, ratio, out_mask,
-            prev_qk, prev_kk, prev_v, prev_k_fp32, prev_kk_fp32, prev_k_mask, ortho
+            prev_qk, prev_kk, prev_v, prev_g, prev_k_fp32, prev_kk_fp32, prev_k_mask, fgate, ortho
         )
 
         return (q_grad, qk_grad, k_grad, v_grad, g_grad, None, mem_grad, lnt_grad,
@@ -115,12 +116,12 @@ def _adaptive_working_memory_fwd(
     prev_key: Optional[Tensor],  # B x K x C x S
     prev_value: Optional[Tensor],  # B x K x C x V
     prev_gate: Optional[Tensor],  # B x K x S
-    segment_idx: Optional[Tensor] = None,  # B x L(+C)
-    prev_segment_count: Optional[Tensor] = None,  # B
-    fgate: bool = False,
-    ortho: bool = False,
-    eps: float = 1e-6,
-    health_layer_id: Optional[int] = None,
+    segment_idx: Optional[Tensor],  # B x L(+C)
+    prev_segment_count: Optional[Tensor],  # B
+    fgate: bool,
+    ortho: bool,
+    eps: float,
+    health_layer_id: Optional[int],
 ):
     health_collector = get_active_health_collector() if health_layer_id is not None else None
     bsz, n_heads, seq_len, qk_head_dim = query.shape
@@ -225,7 +226,7 @@ def _adaptive_working_memory_fwd(
             log_norm_term_curr = curr_log_norm_term[:, :, :, c]
             log_norm_term = torch.logaddexp(log_norm_term_curr, log_norm_term)
             # B x K x S x 1
-            ratio = rearrange(torch.exp(log_norm_term_curr - log_norm_term), 'b k d -> b k d 1')
+            ratio = rearrange(torch.exp(log_norm_term_curr - log_norm_term), 'b k s -> b k s 1')  # fp32
             if health_collector is not None:
                 health_collector.record_gekko_update_ratio(health_layer_id, ratio)
             # (B*K) x C x V
@@ -241,8 +242,8 @@ def _adaptive_working_memory_fwd(
             else:
                 if prev_g is not None:
                     prev_g = prev_g[..., None]
-                    gmemory = prev_g * memory
                     ratio = 1.0 - prev_g + prev_g * ratio
+                    gmemory = prev_g.to(memory) * memory
                 else:
                     gmemory = memory
                 vv = torch.baddbmm(prev_v, prev_qk, rearrange(gmemory, 'b k s v -> (b k) s v'), alpha=-1.0)
@@ -268,17 +269,20 @@ def _adaptive_working_memory_accum_fwd(
     qkey: Tensor,  # B x K x L x S
     key: Tensor,  # B x K x L x S
     value: Tensor,  # B x K x L x V
+    gate: Optional[Tensor],  # B x K x N x S
     chunk_size: int,
     memory: Optional[Tensor],  # B x K x S x V
     log_norm_term: Optional[Tensor],  # B x K x S
     prev_qkey: Optional[Tensor],  # B x K x C x S
     prev_key: Optional[Tensor],  # B x K x C x S
     prev_value: Optional[Tensor],  # B x K x C x V
-    segment_idx: Optional[Tensor] = None,  # B x L(+C)
-    prev_segment_count: Optional[Tensor] = None,  # B
-    ortho: bool = False,
-    eps: float = 1e-6,
-    recompute_out: bool = False
+    prev_gate: Optional[Tensor],  # B x K x S
+    segment_idx: Optional[Tensor],  # B x L(+C)
+    prev_segment_count: Optional[Tensor],  # B
+    fgate: bool,
+    ortho: bool,
+    eps: float,
+    recompute_out: bool
 ):
     bsz, n_heads, seq_len, qk_head_dim = query.shape
     _, n_kv_heads, _, v_head_dim = value.shape
@@ -335,7 +339,7 @@ def _adaptive_working_memory_accum_fwd(
     curr_log_norm_term = torch.empty(bsz, n_kv_heads, qk_head_dim, nc, dtype=torch.float32, device=key.device)
     torch.logsumexp(k_fp32[:, :, :, :-1], dim=4, out=curr_log_norm_term[:, :, :, 1:])
     accum_log_norm_term = torch.empty(bsz, n_kv_heads, qk_head_dim, nc, dtype=torch.float32, device=key.device)
-    ratio = torch.empty(nc, bsz, n_kv_heads, qk_head_dim, 1, dtype=key.dtype, device=key.device)
+    ratio = torch.empty(nc, bsz, n_kv_heads, qk_head_dim, 1, dtype=torch.float32, device=key.device)
 
     if prev_key is not None:
         assert prev_qkey is not None
@@ -373,10 +377,15 @@ def _adaptive_working_memory_accum_fwd(
         prev_qkey = rearrange(prev_qkey, 'b k c s -> (b k) c s')
         prev_kkey = rearrange(prev_kkey, 'b k s c -> (b k) s c')
         prev_value = rearrange(prev_value, 'b k c v -> (b k) c v')
+    if fgate:
+        gate = rearrange(gate, 'b k n s -> (b k) n s')
+        if prev_gate is not None:
+            prev_gate = rearrange(prev_gate, 'b k s -> (b k) s')
+
     prev_qk = prev_qkey
     prev_kk = prev_kkey
     prev_v = prev_value
-
+    prev_g = prev_gate
     for c in range(nc):
         bos = c * chunk_size
         eos = (c + 1) * chunk_size
@@ -404,7 +413,8 @@ def _adaptive_working_memory_accum_fwd(
             log_norm_term_curr = curr_log_norm_term[:, :, :, c]
             log_norm_term = torch.logaddexp(log_norm_term_curr, log_norm_term)
             # B x K x S x 1
-            ratio[c] = rearrange(torch.exp(log_norm_term_curr - log_norm_term).to(memory), 'b k d -> b k d 1')
+            curr_r = rearrange(torch.exp(log_norm_term_curr - log_norm_term), 'b k d -> b k d 1')  # fp32
+            ratio[c] = curr_r
 
             if ortho:
                 # (B*K x C x S) x (B*K x S x V) -> B*K x C x V
@@ -417,18 +427,25 @@ def _adaptive_working_memory_accum_fwd(
                 # B*K x C x 1
                 avalue[:, bos:eos] = avv
             else:
-                vv = torch.baddbmm(prev_v, prev_qk, rearrange(memory, 'b k s v -> (b k) s v'), alpha=-1.0)
+                if prev_g is not None:
+                    prev_g = prev_g[..., None]
+                    curr_r = 1.0 - prev_g + prev_g * curr_r
+                    gmemory = prev_g.to(memory) * memory
+                else:
+                    gmemory = memory
+                vv = torch.baddbmm(prev_v, prev_qk, rearrange(gmemory, 'b k s v -> (b k) s v'), alpha=-1.0)
 
             # B*K x C x V
             vvalue[:, bos:eos] = vv
             # (B*K x S x C) x (B*K x C x V) -> B*K x S x V
             memory_update = rearrange(torch.bmm(prev_kk, vv), '(b k) s v -> b k s v', b=bsz)
             memory_residual[c] = memory_update - memory
-            memory = torch.addcmul(memory, memory_residual[c], ratio[c])
+            memory = torch.addcmul(memory, memory_residual[c], curr_r.to(memory))
 
         prev_v = value[:, bos:eos]
         prev_qk = qkey[:, bos:eos]
         prev_kk = kkey[:, :, bos:eos]
+        prev_g = gate[:, c] if fgate else None
 
     # B x H x L x V
     out_mask = rearrange(out_mask, 'b n c -> b 1 (n c) 1')
@@ -449,6 +466,7 @@ def _adaptive_working_memory_bwd(
     qkey: Tensor,  # B x K x L x S
     kkey: Tensor,  # B*K x S x L
     value: Tensor,  # B x K x L x V
+    gate: Optional[Tensor],  # B x K x N x S
     chunk_size: int,
     rvalue: Tensor,  # B*K x L x V
     rvalue_rstd: Tensor,  # N x B*K*C x 1
@@ -468,9 +486,11 @@ def _adaptive_working_memory_bwd(
     prev_qkey: Optional[Tensor],  # B x K x C x S
     prev_kkey: Optional[Tensor],  # B*K x S x C
     prev_value: Optional[Tensor],  # B x K x C x V
+    prev_gate: Optional[Tensor],  # B x K x S
     prev_k_fp32: Optional[Tensor],
     prev_kk_fp32: Optional[Tensor],
     prev_k_mask: Optional[Tensor],
+    fgate: bool,
     ortho: bool
 ):
     bsz, n_heads, seq_len, qk_head_dim = query.shape
@@ -484,9 +504,11 @@ def _adaptive_working_memory_bwd(
     qkey_grad = torch.zeros_like(qkey)
     key_grad = torch.zeros_like(qkey)
     value_grad = torch.zeros(bsz, n_kv_heads, seq_len, v_head_dim, dtype=out_grad.dtype, device=out_grad.device)
+    gate_grad = torch.zeros_like(gate) if fgate else None
     prev_qkey_grad = None
     prev_key_grad = None
     prev_value_grad = None
+    prev_gate_grad = None
     curr_log_norm_term_grad = torch.empty_like(curr_log_norm_term)
 
     out_grad = rearrange(out_grad.masked_fill(out_mask, 0.), 'b h l v -> (b h) l v')
@@ -627,7 +649,8 @@ def _adaptive_working_memory_bwd(
         if prev_k_mask is not None:
             prev_key_grad.masked_fill_(prev_k_mask, value=0.)
 
-    return query_grad, qkey_grad, key_grad, value_grad, memory_grad, log_norm_term_grad, prev_qkey_grad, prev_key_grad, prev_value_grad
+    return query_grad, qkey_grad, key_grad, value_grad, gate_grad, memory_grad, log_norm_term_grad, \
+        prev_qkey_grad, prev_key_grad, prev_value_grad, prev_gate_grad
 
 
 def adaptive_working_memory_fwd(
@@ -635,22 +658,25 @@ def adaptive_working_memory_fwd(
     qkey: Tensor,
     key: Tensor,
     value: Tensor,
+    gate: Optional[Tensor],
     chunk_size: int,
     memory: Optional[Tensor],
     log_norm_term: Optional[Tensor],
     prev_qkey: Optional[Tensor],
     prev_key: Optional[Tensor],
     prev_value: Optional[Tensor],
+    prev_gate: Optional[Tensor],
     segment_idx: Optional[Tensor] = None,
     prev_segment_count: Optional[Tensor] = None,
+    fgate: bool = False,
     ortho: bool = False,
     eps: float = 1e-6,
     health_layer_id: Optional[int] = None,
-) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
+) -> Tuple[Tensor, Tensor, Tensor]:
     return _adaptive_working_memory_fwd(
-        query, qkey, key, value, chunk_size, memory, log_norm_term,
-        prev_qkey, prev_key, prev_value,
-        segment_idx, prev_segment_count, ortho, eps, health_layer_id
+        query, qkey, key, value, gate, chunk_size, memory, log_norm_term,
+        prev_qkey, prev_key, prev_value, prev_gate, segment_idx, prev_segment_count,
+        fgate, ortho, eps, health_layer_id
     )
 
 
@@ -659,14 +685,17 @@ def adaptive_working_memory_accum_fwd(
     qkey: Tensor,
     key: Tensor,
     value: Tensor,
+    gate: Optional[Tensor],
     chunk_size: int,
     memory: Optional[Tensor],
     log_norm_term: Optional[Tensor],
     prev_qkey: Optional[Tensor],
     prev_key: Optional[Tensor],
     prev_value: Optional[Tensor],
+    prev_gate: Optional[Tensor],
     segment_idx: Optional[Tensor] = None,
     prev_segment_count: Optional[Tensor] = None,
+    fgate: bool = False,
     ortho: bool = False,
     eps: float = 1e-6,
     recompute_out: bool = False,
@@ -676,9 +705,9 @@ def adaptive_working_memory_accum_fwd(
            Tuple[Tensor, Tensor, Tensor],
            Tuple[Tensor, Tensor, Tensor, Tensor]]:
     return _adaptive_working_memory_accum_fwd(
-        query, qkey, key, value, chunk_size, memory, log_norm_term,
-        prev_qkey, prev_key, prev_value,
-        segment_idx, prev_segment_count, ortho, eps, recompute_out
+        query, qkey, key, value, gate, chunk_size, memory, log_norm_term,
+        prev_qkey, prev_key, prev_value, prev_gate, segment_idx, prev_segment_count,
+        fgate, ortho, eps, recompute_out
     )
 
 
@@ -690,6 +719,7 @@ def adaptive_working_memory_bwd(
     qkey: Tensor,
     kkey: Tensor,
     value: Tensor,
+    gate: Optional[Tensor],
     chunk_size: int,
     rvalue: Tensor,
     rvalue_rstd: Tensor,
@@ -709,17 +739,20 @@ def adaptive_working_memory_bwd(
     prev_qkey: Optional[Tensor],
     prev_kkey: Optional[Tensor],
     prev_value: Optional[Tensor],
+    prev_gate: Optional[Tensor],
     prev_k_fp32: Optional[Tensor],
     prev_kk_fp32: Optional[Tensor],
     prev_k_mask: Optional[Tensor],
+    fgate: bool,
     ortho: bool
-) -> Tuple[Tensor, Tensor, Tensor, Tensor,
+) -> Tuple[Tensor, Tensor, Tensor, Tensor, Optional[Tensor],
            Optional[Tensor], Optional[Tensor], Optional[Tensor],
-           Optional[Tensor], Optional[Tensor]]:
+           Optional[Tensor], Optional[Tensor], Optional[Tensor]]:
     return _adaptive_working_memory_bwd(
-        out_grad, memory_grad, log_norm_term_grad, query, qkey, kkey, value, chunk_size,
-        rvalue, rvalue_rstd, vvalue, avalue, k_fp32, kk_fp32, key_mask,
+        out_grad, memory_grad, log_norm_term_grad, query, qkey, kkey, value, gate,
+        chunk_size, rvalue, rvalue_rstd, vvalue, avalue, k_fp32, kk_fp32, key_mask,
         accum_memory, memory_residual, memory_mask,
-        log_norm_term, curr_log_norm_term, accum_log_norm_term, ratio, out_mask,
-        prev_qkey, prev_kkey, prev_value, prev_k_fp32, prev_kk_fp32, prev_k_mask, ortho
+        log_norm_term, curr_log_norm_term, accum_log_norm_term,
+        ratio, out_mask, prev_qkey, prev_kkey, prev_value, prev_gate,
+        prev_k_fp32, prev_kk_fp32, prev_k_mask, fgate, ortho
     )
