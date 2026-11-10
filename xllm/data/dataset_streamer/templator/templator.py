@@ -40,25 +40,6 @@ SYSTEM = (
     "You are K2, a helpful assistant created by Mohamed bin Zayed University of Artificial Intelligence "
     "(MBZUAI) Institute of Foundation Models (IFM)."
 )
-SEARCH_TOOL = [
-    {
-        "name": "search",
-        "description": "Semantic search over a document corpus. Returns relevant passages with document IDs.",
-        "parameters": {
-            "properties": {
-                "query": {
-                    "type": "string",
-                    "description": "The search query to find relevant documents",
-                },
-                "return_fulltext": {
-                    "type": "boolean",
-                    "description": "If true, return full document text instead of passages",
-                },
-            },
-            "required": ["query"],
-        },
-    }
-]
 
 GREETING_PHRASES = [
     "Hello! How can I help you?",
@@ -299,10 +280,8 @@ def apply_chat_template_randomized(
         if any(not isinstance(tool, dict) for tool in tools):
             raise ChatTemplateError("every conversation tool must be an object")
 
-    do_insert_system_prompt = rng.random() < 0.0003
-    do_insert_search_tools = rng.random() < 0.0001
-    do_insert_greeting = rng.random() < 0.0001
-    tools_to_insert = list(SEARCH_TOOL) if do_insert_search_tools else []
+    do_insert_system_prompt = rng.random() < 0.0001
+    tools_to_insert = []
     do_insert_tools = len(tools_to_insert) > 0
 
     if conversation[0]["role"] == "system":
@@ -318,28 +297,9 @@ def apply_chat_template_randomized(
             new_system_message["tools"] = tools_to_insert
         conversation.insert(0, new_system_message)
 
-    if do_insert_greeting:
-        if conversation[0]["role"] == "user":
-            insert_at = 0
-        elif (
-            conversation[0]["role"] == "system"
-            and len(conversation) > 1
-            and conversation[1]["role"] == "user"
-        ):
-            insert_at = 1
-        else:
-            insert_at = None
-        if insert_at is not None:
-            think_key = _detect_think_key(conversation)
-            conversation.insert(insert_at, {
-                "role": "assistant",
-                "content": GREETING_PHRASES[rng.randint(len(GREETING_PHRASES))],
-                think_key: "",
-            })
-
     has_tools = bool(conversation[0].get("tools", False))
     if has_tools:
-        if rng.random() < 0.05:
+        if random.random() < 0.0001:
             for i, tool in enumerate(conversation[0]["tools"]):
                 if not ("type" in tool and tool["type"] == "function"):
                     conversation[0]["tools"][i] = {"type": "function", "function": tool}
