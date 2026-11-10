@@ -110,29 +110,11 @@ The following is the corresponding `xattn` versions.
 <summary><strong>Flash Linear Attention: modules and operators</strong></summary>
 
 Install [Flash Linear Attention](https://github.com/fla-org/flash-linear-attention)
-for models using its modules or operators, such as `causal_conv_backend='fla'`
-(the default `triton` backend does not need it):
+for models using its modules or operators:
 
 ```bash
-python -m pip install fla-core==0.5.2
+python -m pip install flash-linear-attention
 ```
-
-Why exactly 0.5.2: xLLM calls `causal_conv1d_fwd` and `causal_conv1d_bwd` from
-`fla.modules.conv.triton`
-(`xllm/modules/fused_ops/conv/fla_causal_conv1d.py`).
-
-- 0.4.1 and older do not have `fla.modules.conv.triton`.
-- 0.4.2 has it, but its pointer arithmetic overflows int32 on large tensors
-  (fixed in 0.5.0).
-- 0.5.0 computes wrong backward gradients when `dy` is not contiguous (fixed in
-  0.5.1).
-- 0.6.0 moved the kernels to `fla.modules.causal_conv1d` and renamed `BT` to
-  `chunk_size`, so xLLM's import fails.
-- 0.5.2 is the newest release that still has `fla.modules.conv.triton`, with
-  both fixes.
-
-`fla-core` is enough: it holds these modules and needs only `einops`.
-`flash-linear-attention==0.5.2` also works, and adds `transformers>=4.45`.
 
 </details>
 
