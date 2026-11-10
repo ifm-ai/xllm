@@ -309,9 +309,10 @@ def moe_bwd(
             True, hidden_dropout, expert_hidden_rng_state, expert_hidden_noise, with_output_dots=True,
         )
         # routing scores' gradient, <out_grad, expert output>, for the local pairs; other ranks add theirs
-        # through the logits-gradient all-reduce below
+        # through the logits-gradient all-reduce below. A score that underflowed to 0 would give 0 / 0; its
+        # gradient is later multiplied by that score's probability, which is 0, so the clamp only avoids NaN.
         topk_scores_grad = torch.zeros(bsz * seq_len * topk, device=xf.device, dtype=torch.float32)
-        topk_scores_grad[plan.pairs] = output_dots / pair_scores.float()
+        topk_scores_grad[plan.pairs] = output_dots / pair_scores.float().clamp_min(torch.finfo(torch.float32).tiny)
         # B' x D: summed per local token
         xu_grad = masked_gather_sum(xp_grad, plan.pair_table, None, moe_permutation_backend)
         ew1_grad = rearrange(ew1_grad, 'n s d -> (n s) d')
