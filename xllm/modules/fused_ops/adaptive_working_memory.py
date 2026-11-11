@@ -622,6 +622,7 @@ def _adaptive_working_memory_bwd(
             if prev_g is not None:
                 gmemory_grad = torch.bmm(prev_qk, rv_grad)
                 gmemory_grad = rearrange(gmemory_grad, '(b k) s v -> b k s v', b=bsz)
+                memory_grad = rearrange(memory_grad, '(b k) s v -> b k s v', b=bsz)
                 memory_grad = torch.add(memory_grad, prev_g * gmemory_grad, out=memory_grad)
                 prev_g_grad = torch.add(prev_g_grad, (gmemory_grad * curr_memory).sum(dim=3).float(), out=prev_g_grad)
                 gmemory = rearrange(prev_g * curr_memory, 'b k s v -> (b k) v s')
