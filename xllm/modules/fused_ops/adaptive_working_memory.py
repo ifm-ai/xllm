@@ -377,10 +377,6 @@ def _adaptive_working_memory_accum_fwd(
         prev_qkey = rearrange(prev_qkey, 'b k c s -> (b k) c s')
         prev_kkey = rearrange(prev_kkey, 'b k s c -> (b k) s c')
         prev_value = rearrange(prev_value, 'b k c v -> (b k) c v')
-    if fgate:
-        gate = rearrange(gate, 'b k n s -> (b k) n s')
-        if prev_gate is not None:
-            prev_gate = rearrange(prev_gate, 'b k s -> (b k) s')
 
     prev_qk = prev_qkey
     prev_kk = prev_kkey
@@ -437,7 +433,7 @@ def _adaptive_working_memory_accum_fwd(
 
             # B*K x C x V
             vvalue[:, bos:eos] = vv
-            # (B*K x S x C) x (B*K x C x V) -> B*K x S x V
+            # (B*K x S x C) x (B*K x C x V) -> B*K x S x V -> B x K x S x V
             memory_update = rearrange(torch.bmm(prev_kk, vv), '(b k) s v -> b k s v', b=bsz)
             memory_residual[c] = memory_update - memory
             memory = torch.addcmul(memory, memory_residual[c], curr_r.to(memory))
