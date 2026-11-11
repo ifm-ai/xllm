@@ -583,8 +583,8 @@ def _adaptive_working_memory_bwd(
             # B x K x S x 1
             curr_r = ratio[c]
             if prev_g is not None:
-                ratio_grad = ratio_grad * prev_g
                 prev_g_grad = ratio_grad * (ratio[c].squeeze(3) - 1.0)
+                ratio_grad = ratio_grad * prev_g
                 prev_g = prev_g[..., None]
                 curr_r = 1.0 - prev_g + prev_g * curr_r
             else:
