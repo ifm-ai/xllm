@@ -441,7 +441,7 @@ def _adaptive_working_memory_accum_fwd(
         prev_v = value[:, bos:eos]
         prev_qk = qkey[:, bos:eos]
         prev_kk = kkey[:, :, bos:eos]
-        prev_g = gate[:, c] if fgate else None
+        prev_g = gate[:, :, c] if fgate else None
 
     # B x H x L x V
     out_mask = rearrange(out_mask, 'b n c -> b 1 (n c) 1')
