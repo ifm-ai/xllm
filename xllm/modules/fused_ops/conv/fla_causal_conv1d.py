@@ -4,13 +4,22 @@ import torch
 from torch import Tensor
 import torch.nn.functional as F
 
-from fla.modules.conv.triton import (
-    causal_conv1d_fwd,
-    causal_conv1d_bwd
-)
-from fla.ops.utils import prepare_chunk_indices
+try:
+    from fla.modules.conv.triton import (
+        causal_conv1d_fwd,
+        causal_conv1d_bwd
+    )
+    from fla.ops.utils import prepare_chunk_indices
+    FLA_CAUSAL_CONV1D_ENABLED = True
+except ImportError:
+    FLA_CAUSAL_CONV1D_ENABLED = False
 from einops import rearrange
 from xllm.modules.utils import get_cu_seqlens_from_bos_mask
+
+FLA_MISSING = (
+    "causal_conv_backend='fla' needs Flash Linear Attention: "
+    "python -m pip install fla-core==0.5.2"
+)
 
 
 def _fla_causal_conv1d_fwd(
@@ -40,6 +49,7 @@ def _fla_causal_conv1d_fwd(
         final_states (Optional[Tensor]): (batch, width - 1, dim)
         (cu_seqlens, chunk_indices)
     """
+    assert FLA_CAUSAL_CONV1D_ENABLED, FLA_MISSING
     BT = 64
     bsz, seq_len, dim = x.shape
     width = weight.shape[1]
@@ -118,6 +128,7 @@ def _fla_causal_conv1d_bwd(
         weight_grad (Tensor): (dim, width)
         bias_grad (Optional[Tensor]): (dim)
     """
+    assert FLA_CAUSAL_CONV1D_ENABLED, FLA_MISSING
     BT = 64
     bsz, seq_len, dim = x.shape
     width = weight.shape[1]
