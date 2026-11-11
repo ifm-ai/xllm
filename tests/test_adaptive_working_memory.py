@@ -103,7 +103,8 @@ def manual_awk(
                 rv = rv / norm
                 uv = manual_rejection(vt, rv)
             else:
-                uv = vt - torch.matmul(qkt, g.unsqueeze(3) * prev_memory)
+                gmm = g.unsqueeze(3) * prev_memory if fgate else prev_memory
+                uv = vt - torch.matmul(qkt, gmm)
             # B x K x 1 x S/H
             uk = torch.exp(kt) / curr_norm_term.unsqueeze(2)
             # B x K x S/H x V/H
