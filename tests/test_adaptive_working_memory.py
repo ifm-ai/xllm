@@ -151,7 +151,7 @@ def awk_fwd(
     out, memory, log_norm_term = adaptive_working_memory_fwd(
         xq, xqk, xkk, xv, xg, chunk_size, memory, log_norm_term,
         prev_qk, prev_kk, prev_v, prev_g,
-        segment_idx, prev_segment_count, ortho, eps
+        segment_idx, prev_segment_count, fgate, ortho, eps
     )
 
     prev_qk = xqk[:, :, length - chunk_size:]
