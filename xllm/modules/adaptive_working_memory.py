@@ -135,6 +135,7 @@ class AdaptiveWorkingMemory(nn.Module):
         bsz = qkey.shape[0]
         if memory is None:
             assert qkey.shape[2] == self.chunk_size
+            assert prev_gate is None
             memory = torch.zeros(bsz, self.n_kv_heads, self.head_dim, self.v_head_dim, dtype=qkey.dtype, device=qkey.device)
             log_norm_term = torch.full((bsz, self.n_kv_heads, self.head_dim), float("-inf"), device=qkey.device)
         else:

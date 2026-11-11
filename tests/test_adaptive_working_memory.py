@@ -27,9 +27,11 @@ def manual_awk(
     xqk: Tensor,  # B x K x L x S
     xkk: Tensor,  # B x K x L x S
     xv: Tensor,  # B x K x L x V
+    xg: Tensor,  # B x K x N x S
     chunk_size: int,
     bos_mask: Tensor,  # B x L
     segment_idx: Tensor,  # B x L
+    fgate: bool,
     ortho: bool
 ):
     bsz, n_heads, length, qk_head_dim = xq.shape
@@ -70,6 +72,7 @@ def manual_awk(
             curr_norm_term = curr_norm_term + torch.exp(kk[:, :, t])
 
         prev_memory = next_memory
+        g = xg[:, :, c] if fgate else 1.0
         for t in range(chunk_size):
             # B x H x 1 x S/H
             qt = q[:, :, t:(t + 1)]
@@ -100,7 +103,7 @@ def manual_awk(
                 rv = rv / norm
                 uv = manual_rejection(vt, rv)
             else:
-                uv = vt - torch.matmul(qkt, prev_memory)
+                uv = vt - torch.matmul(qkt, g * prev_memory)
             # B x K x 1 x S/H
             uk = torch.exp(kt) / curr_norm_term.unsqueeze(2)
             # B x K x S/H x V/H
@@ -109,7 +112,9 @@ def manual_awk(
 
         norm_term = norm_term + curr_norm_term
         # B x K x S/H x 1
-        ratio = (curr_norm_term / norm_term).unsqueeze(3)
+        ratio = 1.0 - g + g * (curr_norm_term / norm_term)
+        ratio = ratio.unsqueeze(3)
+
         memory = next_memory
         next_memory = (1.0 - ratio) * prev_memory + ratio * update_memory
         update_memory = torch.zeros(bsz, n_kv_heads, qk_head_dim, v_head_dim, dtype=xq.dtype, device=xq.device)
@@ -126,35 +131,40 @@ def awk_fwd(
     xqk: Tensor,  # B x K x L x S
     xkk: Tensor,  # B x K x L x S
     xv: Tensor,  # B x K x L x V
+    xg: Tensor,  # B x K x N x S
     memory,
     log_norm_term,
     prev_qk,
     prev_kk,
     prev_v,
+    prev_g,
     chunk_size,
     segment_idx,
     prev_segment_count,
+    fgate,
     ortho,
     eps,
 ):
     bsz, n_heads, length, qk_head_dim = xq.shape
     _, n_kv_heads, _, v_head_dim = xv.shape
 
-    out, _, memory, log_norm_term = adaptive_working_memory_fwd(
-        xq, xqk, xkk, xv, chunk_size, memory, log_norm_term, prev_qk, prev_kk, prev_v,
+    out, memory, log_norm_term = adaptive_working_memory_fwd(
+        xq, xqk, xkk, xv, xg, chunk_size, memory, log_norm_term,
+        prev_qk, prev_kk, prev_v, prev_g,
         segment_idx, prev_segment_count, ortho, eps
     )
 
     prev_qk = xqk[:, :, length - chunk_size:]
     prev_kk = xkk[:, :, length - chunk_size:]
     prev_v = xv[:, :, length - chunk_size:]
+    prev_g = xg[:, :, -1] if fgate else None
     if segment_idx is not None:
         prev_segment_idx = segment_idx[:, length - chunk_size:]
         prev_segment_count = segment_idx[:, max(length - chunk_size - 1, 0)]
     else:
         prev_segment_idx = None
         prev_segment_count = None
-    return out, memory, log_norm_term, prev_qk, prev_kk, prev_v, prev_segment_idx, prev_segment_count
+    return out, memory, log_norm_term, prev_qk, prev_kk, prev_v, prev_g, prev_segment_idx, prev_segment_count
 
 
 def awk_bwd(
@@ -165,39 +175,41 @@ def awk_bwd(
     xqk: Tensor,  # B x K x L x S
     xkk: Tensor,  # B x K x L x S
     xv: Tensor,  # B x K x L x V
+    xg: Tensor,  # B x K x N x S
     memory,
     log_norm_term,
     prev_qk,
     prev_kk,
     prev_v,
+    prev_g,
     chunk_size,
     segment_idx,
     prev_segment_count,
+    fgate,
     ortho,
     eps,
 ):
     memory_outs, lnt_outs, kv_outs, kk_outs, prev_outs = adaptive_working_memory_accum_fwd(
-        xq, xqk, xkk, xv, chunk_size, memory, log_norm_term, prev_qk, prev_kk, prev_v,
-        segment_idx, prev_segment_count, ortho, eps, False
+        xq, xqk, xkk, xv, xg, chunk_size, memory, log_norm_term, prev_qk, prev_kk, prev_v, prev_g,
+        segment_idx, prev_segment_count, fgate, ortho, eps, False
     )
     accum_memory, memory_residual, memory_mask = memory_outs
     log_norm_term, curr_log_norm_term, accum_log_norm_term, ratio = lnt_outs
     awk_kkey, awk_rvalue, awk_rvalue_rstd, awk_vvalue, awk_avalue, awk_out_rec, awk_out_mask = kv_outs
     ak_fp32, akk_fp32, awk_key_mask = kk_outs
     prev_kkey, prev_k_fp32, prev_kk_fp32, prev_k_mask = prev_outs
-    q_grad, qk_grad, kk_grad, v_grad, mem_grad, lnt_grad, prev_qk_grad, prev_kk_grad, prev_v_grad = adaptive_working_memory_bwd(
-        y_grad, mem_grad, lnt_grad,
-        xq, xqk, awk_kkey, xv, chunk_size,
+    q_grad, qk_grad, kk_grad, v_grad, g_grad, mem_grad, lnt_grad, \
+        prev_qk_grad, prev_kk_grad, prev_v_grad, prev_g_grad = adaptive_working_memory_bwd(
+        y_grad, mem_grad, lnt_grad, xq, xqk, awk_kkey, xv, xg, chunk_size,
         awk_rvalue, awk_rvalue_rstd, awk_vvalue, awk_avalue,
-        ak_fp32, akk_fp32, awk_key_mask,
-        accum_memory, memory_residual, memory_mask,
+        ak_fp32, akk_fp32, awk_key_mask, accum_memory, memory_residual, memory_mask,
         log_norm_term, curr_log_norm_term, accum_log_norm_term, ratio, awk_out_mask,
-        prev_qk, prev_kkey, prev_v, prev_k_fp32, prev_kk_fp32, prev_k_mask, ortho
+        prev_qk, prev_kkey, prev_v, prev_g, prev_k_fp32, prev_kk_fp32, prev_k_mask, fgate, ortho
     )
-    return q_grad, qk_grad, kk_grad, v_grad, mem_grad, lnt_grad, prev_qk_grad, prev_kk_grad, prev_v_grad
+    return q_grad, qk_grad, kk_grad, v_grad, g_grad, mem_grad, lnt_grad, prev_qk_grad, prev_kk_grad, prev_v_grad, prev_g_grad
 
 
-def test(B: int, L: int, H: int, HKV: int, D: int, chunk_size: int, ortho: bool, multi_segment: bool, dtype: str):
+def test(B: int, L: int, H: int, HKV: int, D: int, chunk_size: int, fgate: bool, ortho: bool, multi_segment: bool, dtype: str):
     bos_ratio = 0.2
     eps = 1e-6
     pt_dtype = {"fp32": torch.float32, "bf16": torch.bfloat16, "fp16": torch.float16}[dtype]
@@ -209,6 +221,12 @@ def test(B: int, L: int, H: int, HKV: int, D: int, chunk_size: int, ortho: bool,
         query = F.softmax(query, dim=-1, dtype=torch.float32).to(query)
         qkey = F.softmax(key, dim=-1, dtype=torch.float32).to(key)
 
+        if fgate:
+            gate = torch.randn(B, HKV, L // chunk_size, D, requires_grad=False, dtype=torch.float32, device="cuda")
+            gate = torch.sigmoid(gate)
+        else:
+            gate = None
+
         bos_mask = torch.rand(B, L, requires_grad=False, device='cuda') < bos_ratio if multi_segment else None
         segment_idx = torch.cumsum(bos_mask, dim=-1) if multi_segment else None
 
@@ -216,9 +234,12 @@ def test(B: int, L: int, H: int, HKV: int, D: int, chunk_size: int, ortho: bool,
     qk = qkey.clone().detach().requires_grad_(True)
     kk = key.clone().detach().requires_grad_(True)
     v = value.clone().detach().requires_grad_(True)
+    g = gate.clone().detach().requires_grad_(True) if fgate else None
+
 
     y_manual, memory_manual = manual_awk(
-        q.double(), qk.double(), kk.double(), v.double(), chunk_size, bos_mask, segment_idx, ortho
+        q.double(), qk.double(), kk.double(), v.double(), g.double() if fgate else None,
+        chunk_size, bos_mask, segment_idx, fgate, ortho
     )
     y_manual_flat = y_manual.flatten()
     num_elem_y = y_manual_flat.shape[0]
@@ -231,6 +252,7 @@ def test(B: int, L: int, H: int, HKV: int, D: int, chunk_size: int, ortho: bool,
     qk_grad = qk.grad
     kk_grad = kk.grad
     v_grad = v.grad
+    g_grad = g.grad if fgate else None
 
     with torch.no_grad():
         atol = {"fp32": 1e-6, "bf16": 1e-2, "fp16": 1e-3}[dtype]
@@ -246,29 +268,46 @@ def test(B: int, L: int, H: int, HKV: int, D: int, chunk_size: int, ortho: bool,
         else:
             seg1, seg2 = segment_idx.chunk(2, dim=1)
 
-        y1, memory1, log_norm_term1, prev_qk1, prev_kk1, prev_v1, prev_seg1, prev_count1 = awk_fwd(
-            q1, qk1, kk1, v1, None, None, None, None, None, chunk_size, seg1, None, ortho, eps,
+        if fgate:
+            L1 = q1.shape[2]
+            L2 = q2.shape[2]
+            assert L1 + L2 == L
+            assert L1 % chunk_size == 0 and L2 % chunk_size == 0
+            g1 = g[:, :, :(L1 // chunk_size)]
+            g2 = g[:, :, (L1 // chunk_size):]
+        else:
+            g1 = g2 = None
+
+
+        y1, memory1, log_norm_term1, prev_qk1, prev_kk1, prev_v1, prev_g1, prev_seg1, prev_count1 = awk_fwd(
+            q1, qk1, kk1, v1, g1, None, None, None, None, None, None,
+            chunk_size, seg1, None, fgate, ortho, eps,
         )
         if segment_idx is not None:
             seg2 = torch.cat([prev_seg1, seg2], dim=1)
-        y2, memory2, log_norm_term2, prev_qk2, prev_kk2, prev_v2, prev_seg2, prev_count2 = awk_fwd(
-            q2, qk2, kk2, v2, memory1, log_norm_term1, prev_qk1, prev_kk1, prev_v1, chunk_size, seg2, prev_count1, ortho, eps
+        y2, memory2, log_norm_term2, prev_qk2, prev_kk2, prev_v2, prev_g2, prev_seg2, prev_count2 = awk_fwd(
+            q2, qk2, kk2, v2, g2, memory1, log_norm_term1, prev_qk1, prev_kk1, prev_v1, prev_g1,
+            chunk_size, seg2, prev_count1, fgate, ortho, eps
         )
 
         torch.testing.assert_close(torch.cat([y1, y2], dim=2), y_manual.to(pt_dtype), rtol=rtol, atol=atol)
         torch.testing.assert_close(memory2, memory_manual.to(pt_dtype), rtol=rtol, atol=atol)
         print(f"B={B}, L={L}, H={H} ({HKV}), D={D}, chunk={chunk_size}, ortho={ortho}, mseg={multi_segment}, dtype={dtype}: pass fwd test")
 
-        q2_grad, qk2_grad, kk2_grad, v2_grad, mem_grad, lnt_grad, prev_qk1_grad, prev_kk1_grad, prev_v1_grad = awk_bwd(
-            y2_grad, None, None, q2, qk2, kk2, v2, memory1, log_norm_term1,
-            prev_qk1, prev_kk1, prev_v1, chunk_size, seg2, prev_count1, ortho, eps
+        q2_grad, qk2_grad, kk2_grad, v2_grad, g2_grad, mem_grad, lnt_grad, \
+            prev_qk1_grad, prev_kk1_grad, prev_v1_grad, prev_g1_grad = awk_bwd(
+            y2_grad, None, None, q2, qk2, kk2, v2, g2, memory1, log_norm_term1,
+            prev_qk1, prev_kk1, prev_v1, prev_g1, chunk_size, seg2, prev_count1, fgate, ortho, eps
         )
-        q1_grad, qk1_grad, kk1_grad, v1_grad, mem_grad, lnt_grad, prev_qk_grad, prev_kk_grad, prev_v_grad = awk_bwd(
-            y1_grad, mem_grad, lnt_grad, q1, qk1, kk1, v1, None, None, None, None, None, chunk_size, seg1, None, ortho, eps
+        q1_grad, qk1_grad, kk1_grad, v1_grad, g1_grad, mem_grad, lnt_grad, \
+            prev_qk_grad, prev_kk_grad, prev_v_grad, prev_g_grad = awk_bwd(
+            y1_grad, mem_grad, lnt_grad, q1, qk1, kk1, v1, g1, None, None,
+            None, None, None, None, chunk_size, seg1, None, fgate, ortho, eps
         )
         qk1_grad[:, :, -chunk_size:] += prev_qk1_grad
         kk1_grad[:, :, -chunk_size:] += prev_kk1_grad
         v1_grad[:, :, -chunk_size:] += prev_v1_grad
+        g1_grad[:, :, -1] += prev_g1_grad
 
         atol = {"fp32": 1e-6, "bf16": 1e-2, "fp16": 1e-3}[dtype]
         rtol = {"fp32": 1e-5, "bf16": 1e-2, "fp16": 1e-3}[dtype]
@@ -276,11 +315,13 @@ def test(B: int, L: int, H: int, HKV: int, D: int, chunk_size: int, ortho: bool,
         torch.testing.assert_close(torch.cat([qk1_grad, qk2_grad], dim=2), qk_grad, rtol=rtol, atol=atol)
         torch.testing.assert_close(torch.cat([kk1_grad, kk2_grad], dim=2), kk_grad, rtol=rtol, atol=atol)
         torch.testing.assert_close(torch.cat([v1_grad, v2_grad], dim=2), v_grad, rtol=rtol, atol=atol)
+        torch.testing.assert_close(torch.cat([g1_grad, g2_grad], dim=2), g_grad, rtol=rtol, atol=atol)
         assert mem_grad is None
         assert lnt_grad is None
         assert prev_qk_grad is None
         assert prev_kk_grad is None
         assert prev_v_grad is None
+        assert prev_g_grad is None
         print(f"B={B}, L={L}, H={H} ({HKV}), D={D}, chunk={chunk_size}, ortho={ortho}, mseg={multi_segment}, dtype={dtype}: pass bwd test")
 
 
@@ -299,11 +340,12 @@ def main(seed: int, dtype: str):
         [2, 16384, 4, 139, 2048],
         [1, 32768, 5, 128, 4096],
     ]:
-        for ortho in [False, True]:
-            test(B, L, H, H, D, chunk, ortho, False, dtype)
-            test(B, L, H, H, D, chunk, ortho, True, dtype)
+        for fgate in [False, True]:
+            ortho = False
+            test(B, L, H, H, D, chunk, fgate, ortho, False, dtype)
+            test(B, L, H, H, D, chunk, fgate, ortho, True, dtype)
             if H >= 4:
-                test(B, L, H, H // 4, D, chunk, ortho, True, dtype)
+                test(B, L, H, H // 4, D, chunk, fgate, ortho, True, dtype)
 
 
 if __name__ == "__main__":
