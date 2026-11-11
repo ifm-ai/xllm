@@ -17,10 +17,12 @@ from xllm.modules.fused_ops import (
     flash_attention_bwd as flash_bwd,
     xattn_causal_flash_attn_fwd as xattn_fwd,
     xattn_causal_flash_attn_bwd as xattn_bwd,
+    xattn_softdelta_attn_fwd,
+    xattn_softdelta_attn_bwd,
     causal_conv1d_fwd as conv1d_fwd,
     causal_conv1d_bwd as conv1d_bwd,
-    sliding_chunk_attention_fwd as sca_fwd,
-    sliding_chunk_attention_bwd as sca_bwd,
+    sliding_chunk_softmax_attention_fwd as sca_fwd,
+    sliding_chunk_softmax_attention_bwd as sca_bwd,
     multi_group_matmul_fwd,
     multi_group_matmul_bwd,
 )
@@ -413,7 +415,7 @@ def normalize_bwd(
     return x_grad, grad_weight, grad_bias
 
 
-def recompute_flash_attention_lse(
+def recompute_flash_attention(
     xq: Tensor,
     xk: Tensor,
     xv: Tensor,
@@ -424,7 +426,7 @@ def recompute_flash_attention_lse(
     rng_state: Optional[Tensor],
     stability_control: int,
     backend: str,
-) -> Tuple[Tensor, Tensor, Tensor, Optional[Tensor]]:
+) -> Tuple[Tensor, Tensor, Optional[Tensor]]:
     if rng_state is not None:
         assert dropout > 0, dropout
         org_rng_state = torch.cuda.get_rng_state()
@@ -432,7 +434,7 @@ def recompute_flash_attention_lse(
     else:
         org_rng_state = None
 
-    y, y_for_bwd, lse, flash_rng_state, _ = flash_attention_fwd(
+    y, lse, flash_rng_state, _ = flash_attention_fwd(
         xq, xk, xv, bos_mask, segments, scale, dropout, stability_control, backend, save_aux=True
     )
     if rng_state is not None:
@@ -440,7 +442,7 @@ def recompute_flash_attention_lse(
         assert org_rng_state is not None
         torch.cuda.set_rng_state(org_rng_state)
 
-    return y, y_for_bwd, lse, flash_rng_state
+    return y, lse, flash_rng_state
 
 
 def flash_attention_fwd(
@@ -454,7 +456,7 @@ def flash_attention_fwd(
     stability_control: int,
     backend: str,
     save_aux: bool
-) -> Tuple[Tensor, Optional[Tensor], Optional[Tensor],
+) -> Tuple[Tensor, Optional[Tensor],
            Optional[Tensor], Optional[Tensor]]:
     rng_state = None if dropout == 0 else torch.cuda.get_rng_state()
     if backend == 'flash':
@@ -468,9 +470,10 @@ def flash_attention_fwd(
         y, lse, flash_rng_state = flash_fwd(
             xq, xk, xv, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, scale, dropout, True,
         )
-        y_for_bwd = y if save_aux else None
         lse = lse if save_aux else None
     elif backend == 'xattn':
+        assert dropout == 0, 'xattn causal attn does not support attention drop.'
+        flash_rng_state = None
         if segments is not None:
             segidx, total_seqlen_k = segments
             xk = xk[:, -total_seqlen_k:]
@@ -480,12 +483,11 @@ def flash_attention_fwd(
         else:
             segidx = None
 
-        y, y_for_bwd, lse = xattn_fwd(xq, xk, xv, scale, bos_mask, segidx, stability_control, requires_grad=save_aux)
-        flash_rng_state = None
+        y, lse = xattn_fwd(xq, xk, xv, scale, bos_mask, segidx, stability_control, requires_grad=save_aux)
     else:
         raise ValueError(f"Unknown causal attention backend: {backend}")
 
-    return y, y_for_bwd, lse, flash_rng_state, rng_state
+    return y, lse, flash_rng_state, rng_state
 
 
 def flash_attention_bwd(
@@ -533,6 +535,112 @@ def flash_attention_bwd(
         raise ValueError(f"Unknown causal attention backend: {backend}")
 
 
+def recompute_softdelta_attn(
+    xq: torch.Tensor,
+    kq: torch.Tensor,
+    xk: torch.Tensor,
+    xv: torch.Tensor,
+    g: torch.Tensor,
+    bos_mask: Optional[Tensor],
+    segments: Optional[Any],
+    scale: Optional[float],
+    dropout: float,
+    rng_state: Optional[Tensor],
+    stability_control: int,
+    backend: str,
+) -> Tuple[Tensor, Tensor, Tensor, Optional[Tensor]]:
+    if rng_state is not None:
+        assert dropout > 0, dropout
+        org_rng_state = torch.cuda.get_rng_state()
+        torch.cuda.set_rng_state(rng_state)
+    else:
+        org_rng_state = None
+
+    y, readers, lse, flash_rng_state, _ = softdelta_attn_fwd(
+        xq, kq, xk, xv, g, bos_mask, segments, scale, dropout, stability_control, backend, save_aux=True
+    )
+
+    if rng_state is not None:
+        # reset the original rng state
+        assert org_rng_state is not None
+        torch.cuda.set_rng_state(org_rng_state)
+
+    return y, readers, lse, flash_rng_state
+
+
+def softdelta_attn_fwd(
+    xq: torch.Tensor,
+    kq: torch.Tensor,
+    xk: torch.Tensor,
+    xv: torch.Tensor,
+    g: torch.Tensor,
+    bos_mask: Optional[Tensor],
+    segments: Optional[Any],
+    scale: Optional[float],
+    dropout: float,
+    stability_control: int,
+    backend: str,
+    save_aux: bool
+) -> Tuple[Tensor, Optional[Tensor], Tensor,
+           Optional[Tensor], Optional[Tensor]]:
+    rng_state = None if dropout == 0 else torch.cuda.get_rng_state()
+    if backend == 'xattn':
+        assert dropout == 0, 'xattn softdelta attn does not support attention drop.'
+        flash_rng_state = None
+        if segments is not None:
+            segidx, total_seqlen_k = segments
+            xk = xk[:, -total_seqlen_k:]
+            xv = xv[:, -total_seqlen_k:]
+            bos_mask = bos_mask[:, -total_seqlen_k:]
+            segidx = segidx[:, -total_seqlen_k:]
+        else:
+            segidx = None
+
+        y, readers, lse = xattn_softdelta_attn_fwd(
+            xq, kq, xk, xv, g, scale, bos_mask, segidx, stability_control, save_aux
+        )
+    else:
+        raise ValueError(f"Unknown softdelta attention backend: {backend}")
+
+    return y, readers, lse, flash_rng_state, rng_state
+
+
+def softdelta_attn_bwd(
+    y_grad: Tensor,
+    y: Tensor,
+    xq: Tensor,
+    kq: Tensor,
+    xk: Tensor,
+    xv: Tensor,
+    g: Tensor,
+    readers: Tensor,
+    lse: Tensor,
+    bos_mask: Optional[Tensor],
+    segments: Optional[Any],
+    scale: float,
+    dropout: float,
+    rng_state: Optional[Tensor],
+    stability_control: int,
+    deterministic: bool,
+    backend: str,
+) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
+    if backend == 'xattn':
+        if segments is not None:
+            segidx, total_seqlen_k = segments
+            xk = xk[:, -total_seqlen_k:]
+            xv = xv[:, -total_seqlen_k:]
+            bos_mask = bos_mask[:, -total_seqlen_k:]
+            segidx = segidx[:, -total_seqlen_k:]
+        else:
+            segidx = None
+
+        return xattn_softdelta_attn_bwd(
+            y_grad, xq, kq, xk, xv, g, y, readers, lse, scale, bos_mask, segidx, stability_control, deterministic
+        )
+    else:
+        raise ValueError(f"Unknown softdelta attention backend: {backend}")
+
+
 def recompute_sliding_chunk_attention(
     xq: Tensor,
     xk: Tensor,
@@ -547,7 +655,7 @@ def recompute_sliding_chunk_attention(
     stability_control: int,
     backend: str,
     rng_state: Optional[Tensor]
-) -> Tuple[Tensor, Optional[Tensor], Tensor]:
+) -> Tuple[Tensor, Tensor]:
     # set rng state to the state in fwd
     if rng_state is not None:
         assert dropout > 0, dropout
@@ -556,7 +664,7 @@ def recompute_sliding_chunk_attention(
     else:
         org_rng_state = None
 
-    y, y_for_bwd, aux = sca_fwd(
+    y, aux = sca_fwd(
         xq, xk, xv, chunk_size, scale, prev_k, prev_v, bos_mask, segment_idx,
         dropout, stability_control, backend, requires_grad=True
     )
@@ -565,7 +673,7 @@ def recompute_sliding_chunk_attention(
         assert org_rng_state is not None
         torch.cuda.set_rng_state(org_rng_state)
 
-    return y, y_for_bwd, aux
+    return y, aux
 
 
 def sliding_chunk_attention_fwd(
@@ -582,13 +690,13 @@ def sliding_chunk_attention_fwd(
     stability_control: int,
     backend: str,
     save_aux: bool
-) -> Tuple[Tensor, Optional[Tensor], Optional[Tensor], Optional[Tensor]]:
+) -> Tuple[Tensor, Optional[Tensor], Optional[Tensor]]:
     rng_state = None if dropout == 0 else torch.cuda.get_rng_state()
-    y, y_for_bwd, aux = sca_fwd(
+    y, aux = sca_fwd(
         xq, xk, xv, chunk_size, scale, prev_k, prev_v, bos_mask, segment_idx,
         dropout, stability_control, backend, requires_grad=save_aux
     )
-    return y, y_for_bwd, aux, rng_state
+    return y, aux, rng_state
 
 
 def sliding_chunk_attention_bwd(
@@ -865,7 +973,9 @@ def apply_ropes(xq: Tensor, xk: Tensor, freqs_cis: Tensor, head_dim: int, rope_h
     if rope_head_dim == head_dim:
         xq, xk = apply_rotary_embeddings(xq, xk, freqs_cis=freqs_cis, backward=backward)
     elif rope_head_dim > 0:
-        xq_rope, xk_rope = apply_rotary_embeddings(xq[:, :, :, :rope_head_dim], xk[:, :, :, :rope_head_dim], freqs_cis=freqs_cis, backward=backward)
+        xq_rope, xk_rope = apply_rotary_embeddings(
+            xq[:, :, :, :rope_head_dim], xk[:, :, :, :rope_head_dim], freqs_cis=freqs_cis, backward=backward
+        )
         xq = torch.cat((xq_rope, xq[:, :, :, rope_head_dim:]), dim=-1)
         xk = torch.cat((xk_rope, xk[:, :, :, rope_head_dim:]), dim=-1)
     return xq, xk

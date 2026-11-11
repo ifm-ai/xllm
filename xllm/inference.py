@@ -17,16 +17,17 @@ def inference(
     tokens: torch.Tensor,
     targets: torch.Tensor,
     multi_segments: bool,
+    attn_stability_control: int,
 ) -> torch.Tensor:
     model.eval()
 
     if multi_segments:
         if model.support_multi_segments_with_cache():
-            return _inference_with_cache(model, tokens, targets, multi_segments)
+            return _inference_with_cache(model, tokens, targets, multi_segments, attn_stability_control)
         else:
-            return _inference_without_cache(model, tokens, targets, multi_segments)
+            return _inference_without_cache(model, tokens, targets, multi_segments, attn_stability_control)
     else:
-        return _inference_with_cache(model, tokens, targets, multi_segments)
+        return _inference_with_cache(model, tokens, targets, multi_segments, attn_stability_control)
 
 
 def _inference_with_cache(
@@ -34,6 +35,7 @@ def _inference_with_cache(
     tokens: torch.Tensor,
     targets: torch.Tensor,
     multi_segments: bool,
+    attn_stability_control: int,
 ) -> torch.Tensor:
     model.eval()
 
@@ -52,7 +54,10 @@ def _inference_with_cache(
         # B x L x V
         x = tokens[:, s:e]
         y = targets[:, s:e]
-        loss, _, cache = model(x, multi_segments, targets=y, cache=cache)
+        loss, _, cache = model(
+            x, multi_segments, targets=y, cache=cache,
+            attn_stability_control=attn_stability_control
+        )
         losses.append(loss)
 
     if prev_pos < max_length:
@@ -71,10 +76,14 @@ def _inference_without_cache(
     tokens: torch.Tensor,
     targets: torch.Tensor,
     multi_segments: bool,
+    attn_stability_control: int,
 ) -> torch.Tensor:
     model.eval()
 
-    loss, _, _ = model(tokens, multi_segments, targets=targets)
+    loss, _, _ = model(
+        tokens, multi_segments, targets=targets,
+        attn_stability_control=attn_stability_control
+    )
     return loss
 
 

@@ -4,31 +4,33 @@ import torch
 from torch import Tensor
 try:
     from xattn.ops import (
-        causal_flash_attn,
-        causal_flash_attn_fwd,
-        causal_flash_attn_bwd
+        softdelta_attention,
+        softdelta_attention_fwd,
+        softdelta_attention_bwd
     )
-    XATTN_FLASH_ATTN_ENABLED = True
+    XATTN_SOFTDELTA_ATTN_ENABLED = True
 except ImportError:
-    XATTN_FLASH_ATTN_ENABLED = False
+    XATTN_SOFTDELTA_ATTN_ENABLED = False
 
 
-def xattn_causal_flash_attn(
+def xattn_softdelta_attn(
     q: torch.Tensor,
-    k: torch.Tensor,
+    qk: torch.Tensor,
+    kk: torch.Tensor,
     v: torch.Tensor,
+    g: torch.Tensor,
     scale: Optional[float] = None,
     bos_mask: Optional[Tensor] = None,
     segment_idx: Optional[Tensor] = None,
     high_precision_level: int = 0,
     deterministic: bool = False
 ) -> Tensor:
-    assert XATTN_FLASH_ATTN_ENABLED, "xattn was not installed."
+    assert XATTN_SOFTDELTA_ATTN_ENABLED, "xattn was not installed."
     if bos_mask is not None:
         segment_idx = None
 
-    return causal_flash_attn(
-        q, k, v, scale,
+    return softdelta_attention(
+        q, kk, qk, v, g, scale,
         bos_mask=bos_mask,
         segment_idx=segment_idx,
         high_precision_level=high_precision_level,
@@ -36,51 +38,57 @@ def xattn_causal_flash_attn(
     )
 
 
-def xattn_causal_flash_attn_fwd(
+def xattn_softdelta_attn_fwd(
     q: torch.Tensor,
-    k: torch.Tensor,
+    qk: torch.Tensor,
+    kk: torch.Tensor,
     v: torch.Tensor,
+    g: torch.Tensor,
     scale: Optional[float] = None,
     bos_mask: Optional[Tensor] = None,
     segment_idx: Optional[Tensor] = None,
     high_precision_level: int = 0,
     requires_grad: bool = False
 ) -> Tuple[Tensor, Optional[Tensor], Tensor]:
-    assert XATTN_FLASH_ATTN_ENABLED, "xattn was not installed."
+    assert XATTN_SOFTDELTA_ATTN_ENABLED, "xattn was not installed."
     if bos_mask is not None:
         segment_idx = None
 
-    y, y_fp32, lse = causal_flash_attn_fwd(
-        q, k, v, scale,
+    y, readers, lse = softdelta_attention_fwd(
+        q, kk, qk, v, g, scale,
         bos_mask=bos_mask,
         segment_idx=segment_idx,
         high_precision_level=high_precision_level
     )
     lse = lse if requires_grad else None
-    y_for_bwd = (y if high_precision_level == 0 else y_fp32) if requires_grad else None
-    return y, y_for_bwd, lse
+    readers = readers if requires_grad else None
+    return y, readers, lse
 
 
-def xattn_causal_flash_attn_bwd(
+def xattn_softdelta_attn_bwd(
     y_grad: Tensor,
     q: Tensor,
-    k: Tensor,
+    qk: torch.Tensor,
+    kk: Tensor,
     v: Tensor,
-    y: Tensor,
+    g: torch.Tensor,
+    y: torch.Tensor,
+    readers: Tensor,
     lse: Tensor,
     scale: Optional[float] = None,
     bos_mask: Optional[Tensor] = None,
     segment_idx: Optional[Tensor] = None,
     high_precision_level: int = 0,
     deterministic: bool = False
-) -> Tuple[Tensor, Tensor, Tensor]:
-    assert XATTN_FLASH_ATTN_ENABLED, "xattn was not installed."
+) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
+    assert XATTN_SOFTDELTA_ATTN_ENABLED, "xattn was not installed."
     if bos_mask is not None:
         segment_idx = None
 
-    return causal_flash_attn_bwd(
-        y_grad, q, k, v, y, lse, scale,
+    dq, dkk, dv, dg, dqk = softdelta_attention_bwd(
+        y_grad, q, kk, qk, v, g, y, readers, lse, scale,
         bos_mask=bos_mask, segment_idx=segment_idx,
         high_precision_level=high_precision_level,
         deterministic=deterministic
     )
+    return dq, dqk, dkk, dv, dg

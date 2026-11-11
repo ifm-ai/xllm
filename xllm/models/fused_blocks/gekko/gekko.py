@@ -96,7 +96,6 @@ class GekkoBlockFunction(torch.autograd.Function):
         bv: Optional[torch.Tensor],  # (v/MP)
         wr: torch.Tensor,  # (v/MP, d)
         br: Optional[torch.Tensor],  # (v/MP)
-        wg: Optional[torch.Tensor],  # (d/MP, d)
         wo: torch.Tensor,  # (d, v/MP)
         q_conv_w: torch.Tensor,  # (w, d/MP)
         k_conv_w: torch.Tensor,  # (w, d/MP)
@@ -104,23 +103,23 @@ class GekkoBlockFunction(torch.autograd.Function):
         causal_conv_backend: str,
         causal_conv_weight_normalization: bool,
         qnorm_w: torch.Tensor,  # (s/MP)
+        knorm_w: torch.Tensor,  # (s/MP)
         local_heads: int,
         local_kv_heads: int,
         attention_chunk_size: int,
         head_dim: int,
         v_head_dim: int,
         rope_head_dim: int,
+        attn_act_func: str,
         attn_gate_func: str,
         sca_backend: str,
         awm_orthogonal_update: bool,
-        attn_res_w: Optional[torch.Tensor],  # (d/MP, c)
         ffn_norm_w: torch.Tensor,  # (d)
         ffn_norm_b: torch.Tensor,  # (d)
         ffn_norm_local_groups: int,
         fc1_w: torch.Tensor,
         fc2_w: torch.Tensor,
         fc3_w: Optional[torch.Tensor],
-        ffn_res_w: Optional[torch.Tensor],  # (d/MP, c)
         dropout: float,
         attention_dropout: float,
         hidden_dropout: float,
@@ -241,7 +240,7 @@ class GekkoBlockFunction(torch.autograd.Function):
             handle4 = None
             handle5 = None
 
-        sk, _ = rmsnorm_fwd(xk_, None, local_kv_heads, rmsnorm_eps)
+        sk, _ = rmsnorm_fwd(xk_, knorm_w, local_kv_heads, rmsnorm_eps)
         sk = rearrange(sk, 'b l (k s) -> b l k s', k=local_kv_heads)
         health_collector = get_active_health_collector()
         # Partial RoPE mutates sk; reduce its pre-RoPE vectors before that update.
@@ -320,23 +319,23 @@ class GekkoBlockFunction(torch.autograd.Function):
             akk = akk.transpose(1, 2)
             av = xv_.transpose(1, 2)
 
-            awk_out, awk_mask, new_memory, new_lnt = adaptive_working_memory_fwd(
-                aq, aqk, akk, av, attention_chunk_size, memory, log_norm_term,
-                prev_aqk, prev_akk, prev_av, segment_idx, prev_segment_count,
-                awm_orthogonal_update, rmsnorm_eps, health_layer_id=layer_id,
+            awk_out, new_memory, new_lnt = adaptive_working_memory_fwd(
+                aq, aqk, akk, av, None, attention_chunk_size, memory, log_norm_term,
+                prev_aqk, prev_akk, prev_av, None, segment_idx, prev_segment_count,
+                False, awm_orthogonal_update, rmsnorm_eps, health_layer_id=layer_id,
             )
 
             _, handle8 = send_memory_to_next(new_memory)
             _, handle9 = send_log_norm_term_to_next(new_lnt)
 
-            sca_out, sca_for_save, sca_aux, attn_w_rng_state = sliding_chunk_attention_fwd(
+            sca_out, sca_aux, attn_w_rng_state = sliding_chunk_attention_fwd(
                 sq, sk, xv_, attention_chunk_size, sca_scale, prev_sk, prev_sv,
                 bos_mask, segment_idx, attention_dropout, attn_stability_control, sca_backend, not recompute_sca
             )
             # B x L x E
             r = attn_gate_fn(F.linear(mx, wr, br))
         else:
-            sca_out, sca_for_save, sca_aux, attn_w_rng_state = sliding_chunk_attention_fwd(
+            sca_out, sca_aux, attn_w_rng_state = sliding_chunk_attention_fwd(
                 sq, sk, xv_, attention_chunk_size, sca_scale, prev_sk, prev_sv,
                 bos_mask, segment_idx, attention_dropout, attn_stability_control, sca_backend, not recompute_sca
             )
@@ -353,23 +352,20 @@ class GekkoBlockFunction(torch.autograd.Function):
             akk = akk.transpose(1, 2)
             av = xv_.transpose(1, 2)
 
-            awk_out, awk_mask, new_memory, new_lnt = adaptive_working_memory_fwd(
-                aq, aqk, akk, av, attention_chunk_size, memory, log_norm_term,
-                prev_aqk, prev_akk, prev_av, segment_idx, prev_segment_count,
-                awm_orthogonal_update, rmsnorm_eps, health_layer_id=layer_id,
+            awk_out, new_memory, new_lnt = adaptive_working_memory_fwd(
+                aq, aqk, akk, av, None, attention_chunk_size, memory, log_norm_term,
+                prev_aqk, prev_akk, prev_av, None, segment_idx, prev_segment_count,
+                False, awm_orthogonal_update, rmsnorm_eps, health_layer_id=layer_id,
             )
 
             handle8 = None
             handle9 = None
 
-        if not recompute_sca and sca_for_save is None:
-            assert sca_backend == 'swift'
-            sca_for_save = sca_out
         # B x L x E
         sca_out = rearrange(sca_out, 'b l h v -> b l (h v)')
         awk_out = rearrange(awk_out, 'b h l v -> b l (h v)')
         if health_collector is not None:
-            health_collector.record_gekko_branches(layer_id, sca_out, awk_out, r, awk_mask)
+            health_collector.record_gekko_branches(layer_id, sca_out, awk_out, r)
         attn, _ = rmsnorm_fwd(sca_out + awk_out, None, local_heads, rmsnorm_eps)
         attn = torch.mul(attn, r, out=attn)
         attn, attn_out_rng_state = memory_efficient_dropout_fwd(attn, hidden_dropout, True)
@@ -421,19 +417,17 @@ class GekkoBlockFunction(torch.autograd.Function):
             bv,  # (v/MP)
             wr,  # (v/MP, d)
             br,  # (v/MP)
-            wg,  # (h/MP, d)
             wo,  # (v/MP, d)
             q_conv_w,  # (w, d/MP)
             k_conv_w,  # (w, d/MP)
             v_conv_w,  # (w, v/MP)
             qnorm_w,  # (s/MP)
-            attn_res_w,  # (d/MP, c)
+            knorm_w,  # (s/MP)
             ffn_norm_w,  # (d)
             ffn_norm_b,  # (d)
             fc1_w,
             fc2_w,
             fc3_w,
-            ffn_res_w,  # (d/MP, c)
             prev_count,  # (bsz)
             prev_mean,  # (bsz, n_groups/MP)
             prev_var,  # (bsz, n_groups/MP)
@@ -445,7 +439,7 @@ class GekkoBlockFunction(torch.autograd.Function):
             conv_state_v,  # (bsz, width-1, v/MP)
             prev_k,  # (bsz, chunk, s/MP * 2)
             prev_v,  # (bsz, chunk, v/MP)
-            sca_for_save,  # (bsz, slen, h/MP, v/MP)
+            sca_out if not recompute_sca else None,  # (bsz, slen, h/MP, v/MP)
             sca_aux,  # (bsz, h/MP, slen, chunksize)
             awk_out if not recompute_awk else None,  # (bsz, slen, v/MP)
             memory,  # (bsz, h/MP, s/(h*MP), v/(h*MP))
@@ -460,6 +454,7 @@ class GekkoBlockFunction(torch.autograd.Function):
         ctx.head_dim = head_dim
         ctx.v_head_dim = v_head_dim
         ctx.rope_head_dim = rope_head_dim
+        ctx.attn_act_func = attn_act_func
         ctx.attn_gate_func = attn_gate_func
         ctx.awm_orthogonal_update = awm_orthogonal_update
         ctx.causal_conv_backend = causal_conv_backend
@@ -511,19 +506,17 @@ class GekkoBlockFunction(torch.autograd.Function):
             bv,  # (v/MP)
             wr,  # (v/MP, d)
             br,  # (v/MP)
-            wg,  # (h/MP, d)
             wo,  # (v/MP, d)
             q_conv_w,  # (w, d/MP)
             k_conv_w,  # (w, d/MP)
             v_conv_w,  # (w, v/MP)
             qnorm_w,  # (s/MP)
-            attn_res_w,  # (d/MP, c)
+            knorm_w,  # (s/MP)
             ffn_norm_w,  # (d)
             ffn_norm_b,  # (d)
             fc1_w,
             fc2_w,
             fc3_w,
-            ffn_res_w,  # (d/MP, c)
             prev_count,  # (bsz)
             prev_mean,  # (bsz, n_groups/MP)
             prev_var,  # (bsz, n_groups/MP)
@@ -535,7 +528,7 @@ class GekkoBlockFunction(torch.autograd.Function):
             conv_state_v,  # (bsz, width-1, v/MP)
             prev_k,  # (bsz, chunk, s/MP)
             prev_v,  # (bsz, chunk, v/MP)
-            sca_for_save,  # (bsz, slen, h/MP, v/MP)
+            sca_out,  # (bsz, slen, slen, v/MP)
             sca_aux,  # (bsz, h/MP, slen, chunksize)
             awk_out,  # (bsz, slen, v/MP)
             memory,  # (bsz, h/MP, s/(h*MP), v/(h*MP))
@@ -563,6 +556,7 @@ class GekkoBlockFunction(torch.autograd.Function):
         head_dim = ctx.head_dim
         v_head_dim = ctx.v_head_dim
         rope_head_dim = ctx.rope_head_dim
+        attn_act_func = ctx.attn_act_func
         attn_gate_func = ctx.attn_gate_func
         attn_gate_fn = {"silu": F.silu, "softplus": partial(F.softplus, beta=math.log(2))}[attn_gate_func]
         attn_gate_fn_bwd = {
@@ -686,10 +680,10 @@ class GekkoBlockFunction(torch.autograd.Function):
             causal_conv_weight_normalization, causal_conv_backend, deterministic
         )
 
-        sk_, sk_rstd = rmsnorm_fwd(xk_, None, local_kv_heads, rmsnorm_eps)
+        sk, sk_rstd = rmsnorm_fwd(xk_, knorm_w, local_kv_heads, rmsnorm_eps)
         sq, sq_rstd = rmsnorm_fwd(xq_, qnorm_w, local_heads, rmsnorm_eps)
         # B x L x H x S
-        sk = rearrange(sk_, 'b l (k s) -> b l k s', k=local_kv_heads)
+        sk = rearrange(sk, 'b l (k s) -> b l k s', k=local_kv_heads)
         sq = rearrange(sq, 'b l (h s) -> b l h s', h=local_heads)
         # apply rotary embeddings
         sq, sk = apply_ropes(sq, sk, freqs_cis, head_dim, rope_head_dim, False)
@@ -719,25 +713,24 @@ class GekkoBlockFunction(torch.autograd.Function):
             handle_prev_v = None
 
         # recompute attention output
-        if sca_for_save is None:
+        if sca_out is None:
             assert sca_aux is None
-            sca_out, sca_for_save, sca_aux = recompute_sliding_chunk_attention(
+            sca_out, sca_aux = recompute_sliding_chunk_attention(
                 sq, sk, xv_, attention_chunk_size, sca_scale, prev_sk, prev_sv, bos_mask, segment_idx,
                 attention_dropout, attn_stability_control, sca_backend, attn_w_rng_state
             )
-        else:
-            sca_out = sca_for_save.to(x.dtype)
+            # B x L x E
+            sca_out = rearrange(sca_out, 'b l h v -> b l (h v)')
 
-        # B x L x E
-        sca_out = rearrange(sca_out, 'b l h v -> b l (h v)')
         # B x L x H x S -> B x H x L x S
         aq = aq.transpose(1, 2)
         aqk = aqk.transpose(1, 2)
         akk = akk.transpose(1, 2)
         av = xv_.transpose(1, 2)
         memory_outs, lnt_outs, kv_outs, kk_outs, prev_outs = adaptive_working_memory_accum_fwd(
-            aq, aqk, akk, av, attention_chunk_size, memory, log_norm_term, prev_aqk, prev_akk, prev_av,
-            segment_idx, prev_segment_count, awm_orthogonal_update, rmsnorm_eps, awk_out is None
+            aq, aqk, akk, av, None, attention_chunk_size, memory, log_norm_term,
+            prev_aqk, prev_akk, prev_av, None, segment_idx, prev_segment_count,
+            False, awm_orthogonal_update, rmsnorm_eps, awk_out is None
         )
         accum_memory, memory_residual, memory_mask = memory_outs
         log_norm_term, curr_log_norm_term, accum_log_norm_term, ratio = lnt_outs
@@ -769,6 +762,7 @@ class GekkoBlockFunction(torch.autograd.Function):
         sca_out_grad = mem_effn_rmsnorm_bwd(attn_norm_grad, attn_norm, attn_rstd, local_heads)
         # B x L x E -> B x L x H x E
         sca_out_grad = rearrange(sca_out_grad, 'b l (h v) -> b l h v', h=local_heads)
+        sca_out = rearrange(sca_out, 'b l (h v) -> b l h v', h=local_heads)
         # B x L x H x E -> B x H x L x E
         awk_out_grad = sca_out_grad.transpose(1, 2)
 
@@ -784,18 +778,18 @@ class GekkoBlockFunction(torch.autograd.Function):
                 handle_lnt.wait()
 
             (
-                aq_grad, aqk_grad, akk_grad, av_grad,
+                aq_grad, aqk_grad, akk_grad, av_grad, _,
                 memory_grad, log_norm_term_grad,
-                prev_aqk_grad, prev_akk_grad, prev_av_grad
+                prev_aqk_grad, prev_akk_grad, prev_av_grad, _
             ) = adaptive_working_memory_bwd(
                 awk_out_grad, memory_grad, log_norm_term_grad,
-                aq, aqk, awk_kkey, av, attention_chunk_size,
+                aq, aqk, awk_kkey, av, None, attention_chunk_size,
                 awk_rvalue, awk_rvalue_rstd, awk_vvalue, awk_avalue,
                 ak_fp32, akk_fp32, awk_key_mask,
                 accum_memory, memory_residual, memory_mask,
                 log_norm_term, curr_log_norm_term, accum_log_norm_term, ratio,
-                awk_out_mask, prev_aqk, prev_kkey, prev_av,
-                prev_k_fp32, prev_kk_fp32, prev_k_mask, awm_orthogonal_update
+                awk_out_mask, prev_aqk, prev_kkey, prev_av, None,
+                prev_k_fp32, prev_kk_fp32, prev_k_mask, False, awm_orthogonal_update
             )
 
             assert memory_grad is not None and log_norm_term_grad is not None
@@ -803,7 +797,7 @@ class GekkoBlockFunction(torch.autograd.Function):
             _, handle7 = send_log_norm_term_grad_to_prev(log_norm_term_grad)
 
             sq_grad, sk_grad, xv_grad, prev_sk_grad, prev_sv_grad = sliding_chunk_attention_bwd(
-                sca_out_grad, sq, sk, xv_, sca_for_save, sca_aux, attention_chunk_size, sca_scale,
+                sca_out_grad, sq, sk, xv_, sca_out, sca_aux, attention_chunk_size, sca_scale,
                 prev_sk, prev_sv, bos_mask, segment_idx, attn_stability_control, deterministic, sca_backend
             )
             assert prev_aqk_grad is not None and prev_akk_grad is not None and prev_av_grad is not None
@@ -815,7 +809,7 @@ class GekkoBlockFunction(torch.autograd.Function):
             _, handle5 = send_prev_key_or_value_grad_to_prev(prev_v_grad)
         else:
             sq_grad, sk_grad, xv_grad, prev_sk_grad, prev_sv_grad = sliding_chunk_attention_bwd(
-                sca_out_grad, sq, sk, xv_, sca_for_save, sca_aux, attention_chunk_size, sca_scale,
+                sca_out_grad, sq, sk, xv_, sca_out, sca_aux, attention_chunk_size, sca_scale,
                 prev_sk, prev_sv, bos_mask, segment_idx, attn_stability_control, deterministic, sca_backend
             )
 
@@ -824,18 +818,18 @@ class GekkoBlockFunction(torch.autograd.Function):
                 handle_lnt.wait()
 
             (
-                aq_grad, aqk_grad, akk_grad, av_grad,
+                aq_grad, aqk_grad, akk_grad, av_grad, _,
                 memory_grad, log_norm_term_grad,
-                prev_aqk_grad, prev_akk_grad, prev_av_grad
+                prev_aqk_grad, prev_akk_grad, prev_av_grad, _
             ) = adaptive_working_memory_bwd(
                 awk_out_grad, memory_grad, log_norm_term_grad,
-                aq, aqk, awk_kkey, av, attention_chunk_size,
+                aq, aqk, awk_kkey, av, None, attention_chunk_size,
                 awk_rvalue, awk_rvalue_rstd, awk_vvalue, awk_avalue,
                 ak_fp32, akk_fp32, awk_key_mask,
                 accum_memory, memory_residual, memory_mask,
                 log_norm_term, curr_log_norm_term, accum_log_norm_term, ratio,
-                awk_out_mask, prev_aqk, prev_kkey, prev_av,
-                prev_k_fp32, prev_kk_fp32, prev_k_mask, awm_orthogonal_update
+                awk_out_mask, prev_aqk, prev_kkey, prev_av, None,
+                prev_k_fp32, prev_kk_fp32, prev_k_mask, False, awm_orthogonal_update
             )
 
             handle5 = None
@@ -887,7 +881,7 @@ class GekkoBlockFunction(torch.autograd.Function):
         # apply rotary embeddings
         sk_grad = apply_rope(sk_grad, freqs_cis, head_dim, rope_head_dim, True)
         # k norm grad
-        xk_grad = mem_effn_rmsnorm_bwd(rearrange(sk_grad, 'b l k s -> b l (k s)'), sk_, sk_rstd, local_kv_heads)
+        xk_grad, knorm_w_grad = rmsnorm_bwd(rearrange(sk_grad, 'b l k s -> b l (k s)'), xk_, sk_rstd, knorm_w, local_kv_heads)
 
         aqk_grad = torch.ops.aten._softmax_backward_data(
             aqk_grad.float(), aqk_fp32, -1, torch.float32
@@ -1027,7 +1021,6 @@ class GekkoBlockFunction(torch.autograd.Function):
             bv_grad,
             wr_grad,
             br_grad,
-            None,
             wo_grad,
             q_conv_w_grad,
             k_conv_w_grad,
@@ -1035,23 +1028,23 @@ class GekkoBlockFunction(torch.autograd.Function):
             None,  # causal_conv_backend
             None,  # causal_conv_weight_normalization
             qnorm_w_grad,
+            knorm_w_grad,
             None,  # local heads
             None,  # local kv heads
             None,  # chunk size
             None,  # head dim
             None,  # v head dim
             None,  # rope head dim
+            None,  # attn act func
             None,  # attn gate func
             None,  # sca backend
             None,  # awm_orthogonal_update
-            None,  # attn_res_w
             ffn_norm_w_grad,
             ffn_norm_b_grad,
             None,  # ffn_norm local groups
             fc1_w_grad,
             fc2_w_grad,
             fc3_w_grad,
-            None,  # ffn_res_w
             None,  # dropout
             None,  # attention dropout
             None,  # hidden dropout

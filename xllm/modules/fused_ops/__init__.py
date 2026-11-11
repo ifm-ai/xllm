@@ -12,25 +12,33 @@ from .rejection import (
     rejection_fwd,
     rejection_bwd
 )
-from .attention.swift import (
+from xllm.modules.fused_ops.attention.softmax.swift import (
     swift_efficient_attention,
     swift_efficient_attention_fwd,
     swift_efficient_attention_bwd,
 )
-from .attention.flash import (
+from xllm.modules.fused_ops.attention.softmax.flash import (
     flash_attention,
     flash_attention_fwd,
     flash_attention_bwd
 )
-from .attention.xattn import (
+from xllm.modules.fused_ops.attention.softmax.xattn import (
     xattn_causal_flash_attn,
     xattn_causal_flash_attn_fwd,
     xattn_causal_flash_attn_bwd
 )
-from .attention.sca import (
-    sliding_chunk_attention,
-    sliding_chunk_attention_fwd,
-    sliding_chunk_attention_bwd
+from xllm.modules.fused_ops.attention.softmax.sca import (
+    sliding_chunk_softmax_attention,
+    sliding_chunk_softmax_attention_fwd,
+    sliding_chunk_softmax_attention_bwd
+)
+from xllm.modules.fused_ops.attention.softdelta.xattn import (
+    xattn_softdelta_attn,
+    xattn_softdelta_attn_fwd,
+    xattn_softdelta_attn_bwd
+)
+from xllm.modules.fused_ops.attention.softdelta.sca import (
+    sliding_chunk_softdelta_attention,
 )
 from .adaptive_working_memory import (
     adaptive_working_memory,

@@ -3,6 +3,7 @@ import math
 import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
+from einops import rearrange
 
 from xllm.distributed import (
     get_model_parallel_world_size,
@@ -98,11 +99,11 @@ class MultiheadAttention(nn.Module):
         )
 
         init_fn = get_init_fn(init_mode, dim=mdim, std=init_std)
-        nq = {"softmax": 1, "softdelta": 2}[attn_act_func]
-        assert nq is not None
+
+        # query project
         self.wq = ColumnParallelLinear(
             mdim,
-            self.n_heads * self.head_dim * nq,
+            self.n_heads * self.head_dim,
             bias=False,
             input_is_parallel=False,
             disable_input_reduce=True,
@@ -110,9 +111,11 @@ class MultiheadAttention(nn.Module):
             init_method=init_fn
         )
 
+        # key & value projections
+        nk = {"softmax": 1, "softdelta": 2}[attn_act_func]
         self.wk = ColumnParallelLinear(
             mdim,
-            self.n_kv_heads * self.head_dim,
+            self.n_kv_heads * self.head_dim * nk,
             bias=False,
             input_is_parallel=False,
             disable_input_reduce=True,
@@ -130,39 +133,35 @@ class MultiheadAttention(nn.Module):
             init_method=init_fn
         )
 
+        # attention gate projection
+        rdim ={"softmax": 0, "softdelta": self.n_heads}[attn_act_func]
+        if self.apply_attn_gate:
+            rdim += self.n_heads * self.head_dim
         self.wr = ColumnParallelLinear(
             mdim,
-            self.n_heads * self.head_dim,
+            rdim,
             bias=False,
             input_is_parallel=False,
             disable_input_reduce=True,
             gather_output=False,
             init_method=init_fn
-        ) if self.apply_attn_gate else None
+        ) if rdim > 0 else None
 
-        self.wg = RowParallelLinear(
-            mdim,
-            self.n_heads,
-            bias=False,
-            input_is_parallel=True,
-            parallel_output=True,
-            init_method=init_fn
-        ) if self.attn_act_func == "softdelta" else None
-
+        # qk-norm
         self.query_norm = GroupRMSNorm(
-            self.n_heads * self.head_dim * nq,
-            num_groups=self.n_heads * nq,
+            self.n_heads * self.head_dim,
+            num_groups=self.n_heads,
             elementwise_affine=True,
             eps=rmsnorm_eps,
             memory_efficient=False,
         ) if self.qknorm else None
 
         self.key_norm = GroupRMSNorm(
-            self.n_kv_heads * self.head_dim,
-            num_groups=self.n_kv_heads,
-            elementwise_affine=False,
+            self.n_kv_heads * self.head_dim * nk,
+            num_groups=self.n_kv_heads * nk,
+            elementwise_affine=True,
             eps=rmsnorm_eps,
-            memory_efficient=True,  # for knorm, always use efficient memory
+            memory_efficient=False,
         ) if self.qknorm else None
 
         if self.attn_act_func == "softmax":
@@ -213,8 +212,6 @@ class MultiheadAttention(nn.Module):
         if not self.norm.gather_input:
             x = gather_copy_model_parallel_region(x)
 
-        # B x L x H
-        g = torch.sigmoid(self.wg(x)) if self.wg is not None else None
         # B x L x D
         xq = self.wq(x)
         xk = self.wk(x)
@@ -222,15 +219,25 @@ class MultiheadAttention(nn.Module):
         if self.qknorm:
             xq = self.query_norm(xq)
             xk = self.key_norm(xk)
+
+        if self.wr is not None:
+            rg = rearrange(self.wr(x), 'b l (h s) -> b l h s', h=self.local_heads)
+            # B x L x H*S
+            r = rearrange(rg[:, :, :, :self.head_dim], 'b l h s -> b l (h s)') if self.apply_attn_gate else None
+            # B x L x H
+            g = rg[:, :, :, -1] if self.attn_act_func == 'softdelta' else None
+        else:
+            r = g = None
+
         # B x L x (H*S)
         attn, new_cache = self.causal_attention(
             xq, xk, xv, g, freqs_cis, bos_mask, segments, stability_control, deterministic, cache
         )
         if self.apply_attn_gate:
             if self.attn_gate_fn == "silu":
-                r = F.silu(self.wr(x))
+                r = F.silu(r)
             elif self.attn_gate_fn == "softplus":
-                r = F.softplus(self.wr(x), beta=math.log(2))
+                r = F.softplus(r, beta=math.log(2))
             else:
                 raise ValueError(f"Unknown attention gate function {self.attn_gate_fn}")
             attn = attn * r

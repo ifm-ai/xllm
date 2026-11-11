@@ -73,6 +73,7 @@ class GekkoBlock(nn.Module):
             chunk_size=cfg.chunk_size,
             attn_act_func=cfg.attn_act_func,
             attn_gate_func=cfg.attn_gate_func,
+            awm_forget_gate=cfg.apply_awm_gate,
             awm_orthogonal_update=cfg.awm_orthogonal_update,
             causal_conv_width=cfg.causal_conv_width,
             causal_conv_backend=cfg.causal_conv_backend,
@@ -125,7 +126,7 @@ class GekkoBlock(nn.Module):
         attn_stability_control: int = 0,
         deterministic: bool = True,
         cache: Optional[Tuple[Tuple[Tensor, Tensor, int],
-                              Tuple[Tensor, Tensor, Tensor],
+                              Tuple[Tensor, Tensor, Tensor, Tensor, Tensor],
                               Tuple[Tensor, Tensor, Tensor],
                               Tensor]] = None,
     ) -> Tuple[Tensor, Optional[Tensor], Optional[Any]]:
@@ -153,7 +154,6 @@ class GekkoBlock(nn.Module):
                 self.gda.wv.bias,
                 self.gda.wr.weight,
                 self.gda.wr.bias,
-                self.gda.wg.weight if self.gda.attn_act_func == 'softdelta' else None,
                 self.gda.wo.weight,
                 self.gda.q_conv.weight,
                 self.gda.k_conv.weight,
@@ -161,23 +161,23 @@ class GekkoBlock(nn.Module):
                 self.gda.causal_conv_backend,
                 self.gda.q_conv.normalize_weight,
                 self.gda.query_norm.weight,
+                self.gda.key_norm.weight,
                 self.gda.local_heads,
                 self.gda.local_kv_heads,
                 self.gda.chunk_size,
                 self.gda.head_dim,
                 self.gda.v_head_dim,
                 self.gda.rope_head_dim,
+                self.gda.attn_act_func,
                 self.gda.attn_gate_fn,
                 self.gda.sca_backend,
                 self.gda.awm_orthogonal_update,
-                None,
                 self.nffn.norm.weight,
                 self.nffn.norm.bias,
                 self.nffn.norm.groups_per_partition,
                 self.nffn.fc1.weight,
                 self.nffn.fc2.weight,
                 self.nffn.fc3.weight if self.nffn.swiglu else None,
-                None,
                 self.gda.dropout,
                 self.gda.attention_dropout,
                 self.gda.hidden_dropout,
@@ -317,7 +317,6 @@ class GekkoOutputLayer(nn.Module):
             return loss, cache
 
 
-
 class Gekko(XLLModel):
     """
     Gekko Architecture in
@@ -364,7 +363,7 @@ class Gekko(XLLModel):
         attn_stability_control: int = 0,
         deterministic: bool = True,
         cache: Optional[Tuple[List[Tuple[Tuple[Tensor, Tensor, int],
-                                         Tuple[Tensor, Tensor, Tensor, Tensor],
+                                         Tuple[Tensor, Tensor, Tensor, Tensor, Tensor],
                                          Tuple[Tensor, Tensor, Tensor],
                                          Tuple[Tensor, Tensor, Tensor]]],
                               Tuple[Tensor, Tensor, Tensor],
@@ -489,11 +488,11 @@ class Gekko(XLLModel):
         # conv params
         conv_params_per_block = self.causal_conv_width * (self.num_heads * self.head_dim + self.num_kv_heads * (self.head_dim + self.v_head_dim))
         # norm params
-        norm_params_per_block = self.model_dim * (3 if self.apply_rmsnorm else 4) + self.head_dim * self.num_heads
+        norm_params_per_block = self.model_dim * (3 if self.apply_rmsnorm else 4) + self.head_dim * (self.num_heads + self.num_kv_heads)
         if self.attn_act_func == 'softdelta':
-            gda_params_per_block += self.model_dim * self.num_heads * (self.head_dim + 1)
-            conv_params_per_block += self.causal_conv_width * self.num_heads * self.head_dim
-            norm_params_per_block += self.head_dim * self.num_heads
+            gda_params_per_block += self.model_dim * (self.num_kv_heads * self.head_dim + self.num_heads)
+            conv_params_per_block += self.causal_conv_width * self.num_kv_heads * self.head_dim
+            norm_params_per_block += self.num_kv_heads * self.head_dim
         # FFN
         ffn_params_per_block = self.model_dim * self.ffn_hidden_dim * (3 if self.swiglu else 2)
         ffn_params_per_block += num_params_in_residual(self.residual_func, self.model_dim, self.residual_heads, self.ffn_hidden_dim)
@@ -531,6 +530,11 @@ class Gekko(XLLModel):
         conv_flops = self.causal_conv_width * (q_dim + k_dim + v_dim) * 2
         sca_flops = self.model_dim * (q_dim + k_dim + v_dim + h_dim)
         sca_flops += (q_dim + h_dim) * self.chunk_size * 1.5
+        if self.attn_act_func == 'softdelta':
+            conv_flops += self.causal_conv_width * k_dim * 2
+            norm_flops += k_dim * 2
+            sca_flops += self.model_dim * (k_dim + self.num_heads)
+            sca_flops += k_dim * self.chunk_size * 1.5
         awk_flops = (k_dim * 2 + q_dim) * self.v_head_dim
         attn_flops = sca_flops + awk_flops + self.model_dim * h_dim
         ffn_flops = self.model_dim * self.ffn_hidden_dim * (3 if self.swiglu else 2)
@@ -558,8 +562,9 @@ ConfStore["gekko-4B"] = ModelConf(arch='gekko', num_layers=36, model_dim=2560, n
                                   causal_conv_width=4, causal_conv_weight_normalization=True, ffn_hidden_dim=9216, swiglu=True,
                                   layernorm_num_groups=2, timenorm_num_groups=40, timenorm_eps=1e-5, layernorm_eps=1e-5, rmsnorm_eps=1e-6)
 
-ConfStore["gekko-7.1B"] = ModelConf(arch='gekko', num_layers=32, model_dim=4096, num_heads=4, num_kv_heads=4, head_dim=256, v_head_dim=2048,
-                                    causal_conv_width=4, chunk_size=4096, rope_base=500000, ffn_hidden_dim=8192, swiglu=True,
+ConfStore["gekko-7B"] = ModelConf(arch='gekko', num_layers=38, model_dim=4096, num_heads=48, num_kv_heads=8,
+                                    head_dim=128, v_head_dim=128, rope_head_dim=128, rope_base=500000, chunk_size=4096,
+                                    causal_conv_width=4, causal_conv_weight_normalization=True, ffn_hidden_dim=8192, swiglu=True,
                                     layernorm_num_groups=4, timenorm_num_groups=64, timenorm_eps=1e-5, layernorm_eps=1e-5, rmsnorm_eps=1e-6)
 
 # fmt: on

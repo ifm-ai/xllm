@@ -9,8 +9,8 @@ import flash_attn_3._C  # Registers operators with PyTorch
 flash_attn_gpu = torch.ops.flash_attn_3
 
 from xllm.modules.fused_ops import (
-    sliding_chunk_attention_fwd,
-    sliding_chunk_attention_bwd,
+    sliding_chunk_softmax_attention_fwd,
+    sliding_chunk_softmax_attention_bwd,
     swift_efficient_attention_fwd,
     swift_efficient_attention_bwd,
 )
@@ -79,19 +79,19 @@ def test_sliding_chunk_attention_speed(
         # warm up
         for i in range(100):
             deterministic = i % 2 == 0
-            _, y_bwd, aux = sliding_chunk_attention_fwd(
+            y, aux = sliding_chunk_softmax_attention_fwd(
                 query, key, value, chunk_size, 1.0, None, None,
                 bos_mask, segment_idx, 0.0, level, backend, True
             )
-            sliding_chunk_attention_bwd(
-                out_grad, query, key, value, y_bwd, aux, chunk_size, 1.0, None, None,
+            sliding_chunk_softmax_attention_bwd(
+                out_grad, query, key, value, y, aux, chunk_size, 1.0, None, None,
                 bos_mask, segment_idx, level, deterministic, backend
             )
         torch.cuda.synchronize()
 
         start = timer()
         for _ in range(epochs):
-            _, y_bwd, aux = sliding_chunk_attention_fwd(
+            y, aux = sliding_chunk_softmax_attention_fwd(
                 query, key, value, chunk_size, 1.0, None, None,
                 bos_mask, segment_idx, 0.0, level, backend, True
             )
@@ -108,8 +108,8 @@ def test_sliding_chunk_attention_speed(
         deterministic = True
         start = timer()
         for _ in range(epochs):
-            sliding_chunk_attention_bwd(
-                out_grad, query, key, value, y_bwd, aux, chunk_size, 1.0, None, None,
+            sliding_chunk_softmax_attention_bwd(
+                out_grad, query, key, value, y, aux, chunk_size, 1.0, None, None,
                 bos_mask, segment_idx, level, deterministic, backend
             )
         torch.cuda.synchronize()
@@ -121,8 +121,8 @@ def test_sliding_chunk_attention_speed(
             deterministic = False
             start = timer()
             for _ in range(epochs):
-                sliding_chunk_attention_bwd(
-                    out_grad, query, key, value, y_bwd, aux, chunk_size, 1.0, None, None,
+                sliding_chunk_softmax_attention_bwd(
+                    out_grad, query, key, value, y, aux, chunk_size, 1.0, None, None,
                     bos_mask, segment_idx, level, deterministic, backend
                 )
             torch.cuda.synchronize()
@@ -223,8 +223,8 @@ def test(B: int, L: int, H: int, HKV: int, D: int, V: int, chunk_size: int, avg_
     # test_chunk_wise_attention_speed(query, key, value, out_grad, chunk_size * 2, epochs)
     # if D == V and dtype in ['bf16', 'fp16']:
     #     test_flash_sliding_window_attention_speed(query, key, value, out_grad, chunk_size * 2, 1.0 / math.sqrt(D), epochs)
-    test_sliding_chunk_attention_speed(query, key, value, out_grad, chunk_size, bos_mask, segment_idx, False, 'swift', epochs)
-    for level in range(5):
+    # test_sliding_chunk_attention_speed(query, key, value, out_grad, chunk_size, bos_mask, segment_idx, False, 'swift', epochs)
+    for level in range(2):
         test_sliding_chunk_attention_speed(query, key, value, out_grad, chunk_size, bos_mask, segment_idx, level, 'xattn', epochs)
         test_sliding_chunk_attention_speed(query, key, value, out_grad, chunk_size, None, segment_idx, level, 'xattn', epochs)
     print("*" * 70)

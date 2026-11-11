@@ -9,7 +9,9 @@ from xllm.modules.fused_ops import (
     flash_attention_fwd,
     flash_attention_bwd,
     xattn_causal_flash_attn_fwd,
-    xattn_causal_flash_attn_bwd
+    xattn_causal_flash_attn_bwd,
+    xattn_softdelta_attn_fwd,
+    xattn_softdelta_attn_bwd
 )
 
 
@@ -66,17 +68,17 @@ def test_flash_attention_speed(
         print(f'flash attn bwd: {delta:.2f}s ({delta1:.2f}s)')
 
 
-def test_xattn_attention_speed(
+def test_xattn_softmax_attn_speed(
     query, key, value, out_grad, bos_mask, segment_idx, high_prevision_level, scale, epochs
 ):
     with torch.no_grad():
         # warm up
         for _ in range(100):
-            y, y_bwd, lse = xattn_causal_flash_attn_fwd(
+            y, lse = xattn_causal_flash_attn_fwd(
                 query, key, value, scale, bos_mask, segment_idx, high_prevision_level, requires_grad=True
             )
             xattn_causal_flash_attn_bwd(
-                out_grad, query, key, value, y_bwd, lse,
+                out_grad, query, key, value, y, lse,
                 scale, bos_mask, segment_idx, high_prevision_level, deterministic=False
             )
 
@@ -87,19 +89,19 @@ def test_xattn_attention_speed(
 
         start = timer()
         for _ in range(epochs):
-            y, y_bwd, lse = xattn_causal_flash_attn_fwd(
+            y, lse = xattn_causal_flash_attn_fwd(
                 query, key, value, scale, bos_mask, segment_idx, high_prevision_level, requires_grad=True
             )
 
         torch.cuda.synchronize()
 
         delta = timer() - start
-        print(f'xattn-{api}{suffix} fwd: {delta:.2f}s')
+        print(f'xattn-softmax-{api}{suffix} fwd: {delta:.2f}s')
 
         start = timer()
         for _ in range(epochs):
             xattn_causal_flash_attn_bwd(
-                out_grad, query, key, value, y_bwd, lse,
+                out_grad, query, key, value, y, lse,
                 scale, bos_mask, segment_idx, high_prevision_level, deterministic=True
             )
         torch.cuda.synchronize()
@@ -109,13 +111,65 @@ def test_xattn_attention_speed(
         start = timer()
         for _ in range(epochs):
             xattn_causal_flash_attn_bwd(
-                out_grad, query, key, value, y_bwd, lse,
+                out_grad, query, key, value, y, lse,
                 scale, bos_mask, segment_idx, high_prevision_level, deterministic=False
             )
         torch.cuda.synchronize()
 
         delta = timer() - start
-        print(f'xattn-{api}{suffix} bwd: {delta:.2f}s ({delta1:.2f}s)')
+        print(f'xattn-softmax-{api}{suffix} bwd: {delta:.2f}s ({delta1:.2f}s)')
+
+
+def test_xattn_softdelta_attn_speed(
+    query, qkey, kkey, value, g, out_grad, bos_mask, segment_idx, high_prevision_level, scale, epochs
+):
+    with torch.no_grad():
+        # warm up
+        for _ in range(100):
+            y, readers, lse = xattn_softdelta_attn_fwd(
+                query, qkey, kkey, value, g, scale, bos_mask, segment_idx, high_prevision_level, requires_grad=True
+            )
+            xattn_softdelta_attn_bwd(
+                out_grad, query, qkey, kkey, value, g, y, readers, lse,
+                scale, bos_mask, segment_idx, high_prevision_level, deterministic=False
+            )
+
+        torch.cuda.synchronize()
+
+        api = 'bos' if bos_mask is not None else 'segidx'
+        suffix = f"-{high_prevision_level}"
+
+        start = timer()
+        for _ in range(epochs):
+            y, readers, lse = xattn_softdelta_attn_fwd(
+                query, qkey, kkey, value, g, scale, bos_mask, segment_idx, high_prevision_level, requires_grad=True
+            )
+
+        torch.cuda.synchronize()
+
+        delta = timer() - start
+        print(f'xattn-softdelta-{api}{suffix} fwd: {delta:.2f}s')
+
+        start = timer()
+        for _ in range(epochs):
+            xattn_softdelta_attn_bwd(
+                out_grad, query, qkey, kkey, value, g, y, readers, lse,
+                scale, bos_mask, segment_idx, high_prevision_level, deterministic=True
+            )
+        torch.cuda.synchronize()
+
+        delta1 = timer() - start
+
+        start = timer()
+        for _ in range(epochs):
+            xattn_softdelta_attn_bwd(
+                out_grad, query, qkey, kkey, value, g, y, readers, lse,
+                scale, bos_mask, segment_idx, high_prevision_level, deterministic=False
+            )
+        torch.cuda.synchronize()
+
+        delta = timer() - start
+        print(f'xattn-softdelta-{api}{suffix} bwd: {delta:.2f}s ({delta1:.2f}s)')
 
 
 def test(B: int, L: int, H: int, G: int, D: int, avg_len: int, dtype: str):
@@ -126,8 +180,10 @@ def test(B: int, L: int, H: int, G: int, D: int, avg_len: int, dtype: str):
     pt_dtype = {"fp32": torch.float32, "bf16": torch.bfloat16, "fp16": torch.float16}[dtype]
     with torch.no_grad():
         query = torch.randn(B, L, H, D, requires_grad=False, dtype=pt_dtype, device="cuda")
+        qkey = torch.randn(B, L, G, D, requires_grad=False, dtype=pt_dtype, device="cuda")
         key = torch.randn(B, L, G, D, requires_grad=False, dtype=pt_dtype, device="cuda")
         value = torch.randn(B, L, G, D, requires_grad=False, dtype=pt_dtype, device="cuda")
+        g = torch.randn(B, L, H, requires_grad=False, dtype=pt_dtype, device="cuda")
 
         bos_mask = torch.rand(B, L, requires_grad=False, device='cuda') < bos_ratio
         segment_idx = torch.cumsum(bos_mask, dim=-1)
@@ -140,8 +196,10 @@ def test(B: int, L: int, H: int, G: int, D: int, avg_len: int, dtype: str):
         out_grad = torch.randn(B, L, H, D, requires_grad=False, dtype=pt_dtype, device="cuda")
 
     query = query.detach()
+    qkey = qkey.detach()
     key = key.detach()
     value = value.detach()
+    g = g.detach()
     out_grad = out_grad.detach()
     bos_mask = bos_mask.detach()
     segment_idx = segment_idx.detach()
@@ -149,11 +207,14 @@ def test(B: int, L: int, H: int, G: int, D: int, avg_len: int, dtype: str):
     print(f"B={B}, L={L}, H={H} ({G}), D={D}, AvgL={avg_len}, dtype={dtype}:")
     epochs = 5000
     test_flash_attention_speed(query, key, value, out_grad, cu_seqlens_k, max_seqlen_k, scale, epochs)
-    for level in range(5):
-        test_xattn_attention_speed(query, key, value, out_grad, bos_mask, segment_idx, level, scale, epochs)
-        test_xattn_attention_speed(query, key, value, out_grad, None, segment_idx, level, scale, epochs)
+    for level in range(2):
+        test_xattn_softmax_attn_speed(query, key, value, out_grad, bos_mask, segment_idx, level, scale, epochs)
+        test_xattn_softmax_attn_speed(query, key, value, out_grad, None, segment_idx, level, scale, epochs)
 
-    print("*" * 70)
+        test_xattn_softdelta_attn_speed(query, qkey, key, value, g, out_grad, bos_mask, segment_idx, level, scale, epochs)
+        test_xattn_softdelta_attn_speed(query, qkey, key, value, g, out_grad, None, segment_idx, level, scale, epochs)
+
+    print("*" * 80)
 
 
 def main(seed: int, dtype: str):

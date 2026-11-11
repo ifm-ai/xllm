@@ -22,6 +22,7 @@ class AdaptiveWorkingMemory(nn.Module):
         head_dim: int,
         v_head_dim: int,
         chunk_size: int,
+        forget_gate: bool,
         orthogonal_update: bool,
         rmsnorm_eps: float,
     ):
@@ -32,20 +33,22 @@ class AdaptiveWorkingMemory(nn.Module):
         self.head_dim = head_dim
         self.v_head_dim = v_head_dim
         self.chunk_size = chunk_size
+        self.fgate = forget_gate
         self.ortho = orthogonal_update
         self.eps = rmsnorm_eps
 
     def forward(
         self,
         xq: Tensor,  # B x L x (H*S)
-        xqk: Tensor,  # B x L x (K*S)
-        xkk: Tensor,  # B x L x (K*S)
+        xk: Tensor,  # B x L x (K*S)
         xv: Tensor,  # B x L x (K*V)
+        xg: Optional[Tensor],  # B x N x (K*S)
         memory: Optional[Tensor],  # B x K x S x V
         log_norm_term: Optional[Tensor],  # B x K x S
         prev_qk: Optional[Tensor],  # B x K x C x S
         prev_kk: Optional[Tensor],  # B x K x C x S
         prev_v: Optional[Tensor],  # B x K x C x V
+        prev_g: Optional[Tensor],  # B x K x S
         segment_idx: Optional[Tensor] = None,  # B x L(+C)
         prev_segment_count: Optional[Tensor] = None,  # B
     ):
@@ -55,23 +58,29 @@ class AdaptiveWorkingMemory(nn.Module):
         # B x L x H*S -> B x H x L x S
         xq = rearrange(xq, 'b l (h s) -> b h l s', h=self.n_heads)
         xq = F.softmax(xq, dim=-1, dtype=torch.float32).to(xq)
-        # B x L x K*S|V -> B x K x L x S|V
-        xqk = rearrange(xqk, 'b l (k s) -> b k l s', k=self.n_kv_heads)
+        xk = rearrange(xk, 'b l (k s) -> b k l s', k=self.n_kv_heads)
+        if xk.shape[3] == self.head_dim:
+            xqk = xkk = xk  # shared qk & kk
+        else:
+            assert xk.shape[3] == 2 * self.head_dim  # separate qk & kk
+            xqk = xk[:, :, :, :self.head_dim]
+            xkk = xk[:, :, :, self.head_dim:]
+        # softmax to qk
         xqk = F.softmax(xqk, dim=-1, dtype=torch.float32).to(xqk)
-        xkk = rearrange(xkk, 'b l (k s) -> b k l s', k=self.n_kv_heads)
         xv = rearrange(xv, 'b l (k v) -> b k l v', k=self.n_kv_heads)
+        if xg is not None:
+            xg = rearrange(xg, 'b n (k s) -> b k n s', k=self.n_kv_heads)
 
         if seq_len >= self.chunk_size:
-            out, mask, memory, log_norm_term = adaptive_working_memory(
-                xq, xqk, xkk, xv, self.chunk_size, memory, log_norm_term, prev_qk, prev_kk, prev_v,
-                segment_idx, prev_segment_count, self.ortho, self.eps, self.layer_id,
+            out, memory, log_norm_term = adaptive_working_memory(
+                xq, xqk, xkk, xv, xg, self.chunk_size, memory, log_norm_term, prev_qk, prev_kk, prev_v, prev_g,
+                segment_idx, prev_segment_count, self.fgate, self.ortho, self.eps, self.layer_id,
             )
             prev_qk = xqk[:, :, seq_len - self.chunk_size:]
             prev_kk = xkk[:, :, seq_len - self.chunk_size:]
             prev_v = xv[:, :, seq_len - self.chunk_size:]
+            prev_g = xg[:, :, -1] if self.fgate else None
         else:
-            # B x L
-            mask = torch.zeros(bsz, seq_len, dtype=torch.bool, device=xq.device)
             # tail or step-by-step generation mode
             xqk = torch.cat([prev_qk, xqk], dim=2) if prev_qk is not None else xqk
             xkk = torch.cat([prev_kk, xkk], dim=2) if prev_kk is not None else xkk
@@ -88,7 +97,6 @@ class AdaptiveWorkingMemory(nn.Module):
             if memory is None:
                 assert xqk.shape[2] <= self.chunk_size
                 out = torch.zeros(bsz, self.n_heads, seq_len, self.v_head_dim, dtype=xq.dtype, device=xq.device)
-                mask[:] = True
             else:
                 assert self.chunk_size < xqk.shape[2] <= self.chunk_size * 2
                 n_rep = self.n_heads // self.n_kv_heads
@@ -97,29 +105,37 @@ class AdaptiveWorkingMemory(nn.Module):
                 # (B x H x L x S) x (B x H x S x V) -> B x H x L x V
                 out = torch.matmul(xq, memory_)
                 if segment_idx is not None:
-                    mask = torch.ne(segment_idx, prev_segment_count.view(bsz, 1), out=mask)
+                    mask = torch.ne(segment_idx, prev_segment_count.view(bsz, 1))
                 else:
-                    mask[:] = torch.isinf(log_norm_term[:, 0:1, 0])
+                    mask = torch.isinf(log_norm_term[:, 0:1, 0])
                 out = torch.masked_fill(out, mask.view(bsz, 1, seq_len, 1), value=0.)
             # update memory
             if xqk.shape[2] % self.chunk_size == 0:
                 memory, log_norm_term = self.update_memory(
-                    xqk, xkk, xv, memory, log_norm_term, segment_idx, prev_segment_idx, prev_segment_count
+                    xqk, xkk, xv, memory, log_norm_term, prev_g,
+                    segment_idx, prev_segment_idx, prev_segment_count
                 )
+                assert xg.shape[2] == 1
+                # B x K x S
+                prev_g = xg.squeeze(2)
+            else:
+                assert xg is None
+
             prev_qk = xqk
             prev_kk = xkk
             prev_v = xv
 
         out = rearrange(out, 'b h l v -> b l (h v)')
-        return out, mask, memory, log_norm_term, prev_qk, prev_kk, prev_v
+        return out, memory, log_norm_term, prev_qk, prev_kk, prev_v, prev_g
 
     def update_memory(
-        self, qkey, kkey, value, memory, log_norm_term,
+        self, qkey, kkey, value, memory, log_norm_term, prev_gate,
         segment_idx, prev_segment_idx, prev_segment_count
     ):
         bsz = qkey.shape[0]
         if memory is None:
             assert qkey.shape[2] == self.chunk_size
+            assert prev_gate is None
             memory = torch.zeros(bsz, self.n_kv_heads, self.head_dim, self.v_head_dim, dtype=qkey.dtype, device=qkey.device)
             log_norm_term = torch.full((bsz, self.n_kv_heads, self.head_dim), float("-inf"), device=qkey.device)
         else:
@@ -140,7 +156,7 @@ class AdaptiveWorkingMemory(nn.Module):
             prev_kk = F.softmax(prev_kk_fp32, dim=-1).to(kkey)
             curr_log_norm_term = torch.logsumexp(prev_kk_fp32, dim=-1)
             log_norm_term = torch.logsumexp(torch.stack([curr_log_norm_term, log_norm_term], dim=0), dim=0)
-            ratio = torch.exp(curr_log_norm_term - log_norm_term).to(memory).unsqueeze(3)
+            ratio = torch.exp(curr_log_norm_term - log_norm_term)[..., None]
             if self.ortho:
                 # B x H x C x V -> B*H x C x V
                 rv = rearrange(torch.matmul(prev_qk, memory), 'b h c v -> (b h) c v')
@@ -148,14 +164,21 @@ class AdaptiveWorkingMemory(nn.Module):
                 rv = rearrange(group_rms_norm(rv, None, 1, self.eps), '(b h) c v -> b h c v', b=bsz)
                 vv = rejection(prev_v, rv)
             else:
+                if prev_gate is not None:
+                    prev_gate = prev_gate[..., None]
+                    ratio = 1.0 - prev_gate + prev_gate * ratio
+                    gmemory = prev_gate.to(memory) * memory
+                else:
+                    gmemory = memory
                 # B x H x C x V
-                vv = prev_v - torch.matmul(prev_qk, memory)
+                vv = prev_v - torch.matmul(prev_qk, gmemory)
+
             memory_update = torch.matmul(prev_kk, vv)
-            memory = torch.addcmul(memory, memory_update - memory, ratio)
+            memory = torch.addcmul(memory, memory_update - memory, ratio.to(memory))
 
         return memory, log_norm_term
 
     def extra_repr(self) -> str:
-        return 'heads={} ({}), qk_head_dim={}, v_head_dim={}, chunk={}, ortho={}, eps={}'.format(
-            self.n_heads, self.n_kv_heads, self.head_dim, self.v_head_dim, self.chunk_size, self.ortho, self.eps
+        return 'heads={} ({}), qk_head_dim={}, v_head_dim={}, chunk={}, fgate={}, ortho={}, eps={}'.format(
+            self.n_heads, self.n_kv_heads, self.head_dim, self.v_head_dim, self.chunk_size, self.fgate, self.ortho, self.eps
         )

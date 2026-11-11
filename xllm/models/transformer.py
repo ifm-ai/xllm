@@ -136,24 +136,24 @@ class TransformerBlock(nn.Module):
                 self.attention.wq.weight,
                 self.attention.wk.weight,
                 self.attention.wv.weight,
-                self.attention.wr.weight if self.attention.apply_attn_gate else None,
-                self.attention.wg.weight if self.attention.attn_act_func == 'softdelta' else None,
+                self.attention.wr.weight if self.attention.wr is not None else None,
                 self.attention.wo.weight,
                 self.attention.query_norm.weight if self.attention.qknorm else None,
+                self.attention.key_norm.weight if self.attention.qknorm else None,
                 self.attention.local_heads,
                 self.attention.local_kv_heads,
                 self.attention.head_dim,
                 self.attention.rope_head_dim,
+                self.attention.attn_act_func,
+                self.attention.apply_attn_gate,
                 self.attention.attn_gate_fn,
                 self.attention.causal_attn_backend,
-                None,
                 self.nffn.norm.weight,
                 self.nffn.norm.bias,
                 self.nffn.norm.groups_per_partition,
                 self.nffn.fc1.weight,
                 self.nffn.fc2.weight,
                 self.nffn.fc3.weight if self.nffn.swiglu else None,
-                None,
                 self.dropout,
                 self.attention.attention_dropout,
                 self.attention.hidden_dropout,
@@ -282,17 +282,18 @@ class TransformerMoEBlock(nn.Module):
                 self.attention.wq.weight,
                 self.attention.wk.weight,
                 self.attention.wv.weight,
-                self.attention.wr.weight if self.attention.apply_attn_gate else None,
-                self.attention.wg.weight if self.attention.attn_act_func == 'softdelta' else None,
+                self.attention.wr.weight if self.attention.wr is not None else None,
                 self.attention.wo.weight,
                 self.attention.query_norm.weight if self.attention.qknorm else None,
+                self.attention.key_norm.weight if self.attention.qknorm else None,
                 self.attention.local_heads,
                 self.attention.local_kv_heads,
                 self.attention.head_dim,
                 self.attention.rope_head_dim,
+                self.attention.attn_act_func,
+                self.attention.apply_attn_gate,
                 self.attention.attn_gate_fn,
                 self.attention.causal_attn_backend,
-                None,
                 self.moe.norm.weight,
                 self.moe.norm.bias,
                 self.moe.norm.groups_per_partition,
@@ -315,7 +316,6 @@ class TransformerMoEBlock(nn.Module):
                 self.moe.experts.weight2,
                 self.moe.experts.weight3,
                 self.moe.experts.backend,
-                None,
                 self.dropout,
                 self.attention.attention_dropout,
                 self.attention.hidden_dropout,
@@ -452,10 +452,10 @@ class TransformerMoVABlock(nn.Module):
                 self.mova.wq.weight,
                 self.mova.wk.weight,
                 self.mova.wv.weight,
-                self.mova.wr.weight if self.mova.apply_attn_gate else None,
-                self.mova.wg.weight if self.mova.attn_act_func == 'softdelta' else None,
+                self.mova.wr.weight if self.mova.wr is not None else None,
                 self.mova.wo.weight,
                 self.mova.query_norm.weight if self.mova.qknorm else None,
+                self.mova.key_norm.weight if self.mova.qknorm else None,
                 self.mova.local_heads,
                 self.mova.local_kv_heads,
                 self.mova.head_dim,
@@ -465,9 +465,10 @@ class TransformerMoVABlock(nn.Module):
                 self.mova.topk,
                 self.mova.router.bias,
                 self.mova.value_backend,
+                self.mova.attn_act_func,
+                self.mova.apply_attn_gate,
                 self.mova.attn_gate_fn,
                 self.mova.causal_attn_backend,
-                None,
                 self.moe.norm.weight,
                 self.moe.norm.bias,
                 self.moe.norm.groups_per_partition,
@@ -490,7 +491,6 @@ class TransformerMoVABlock(nn.Module):
                 self.moe.experts.weight2,
                 self.moe.experts.weight3,
                 self.moe.experts.backend,
-                None,
                 self.dropout,
                 self.mova.attention_dropout,
                 self.mova.hidden_dropout,
@@ -781,16 +781,17 @@ class Transformer(XLLModel):
 
     def num_parameters(self):
         embed_params = self.model_dim * self.vocab_size * 2
-        attn_params_per_block = self.model_dim * (self.num_heads + self.num_kv_heads) * self.head_dim * 2
+        nk = {"softmax": 1, "softdelta": 2}[self.attn_act_func]
+        attn_params_per_block = self.model_dim * (self.num_heads * 2 + self.num_kv_heads * (nk + 1)) * self.head_dim
         if self.attn_act_func == 'softdelta':
-            attn_params_per_block += self.model_dim * self.num_heads * (self.head_dim + 1)
+            attn_params_per_block += self.model_dim * self.num_heads
         if self.apply_attn_gate:
             attn_params_per_block += self.model_dim * self.num_heads * self.head_dim
         attn_params_per_block += num_params_in_residual(self.residual_func, self.model_dim, self.residual_heads, self.num_heads * self.head_dim)
         # Norm
         norm_params_per_block = self.model_dim * (2 if self.apply_rmsnorm else 4)
         if self.qknorm:
-            norm_params_per_block += self.head_dim * self.num_heads
+            norm_params_per_block += (self.num_heads + self.num_kv_heads * nk) * self.head_dim
         # FFN
         ffn_params_per_block = self.model_dim * self.ffn_hidden_dim * (3 if self.swiglu else 2)
         ffn_params_per_block += num_params_in_residual(self.residual_func, self.model_dim, self.residual_heads, self.ffn_hidden_dim)
@@ -799,9 +800,9 @@ class Transformer(XLLModel):
         activated_params += (attn_params_per_block + ffn_params_per_block) * self.num_dense_layers + embed_params
         total_params = activated_params
         if self.num_values > 0:
-            mova_qko_params = self.model_dim * (self.num_heads * 2 + self.num_kv_heads) * self.head_dim
+            mova_qko_params = self.model_dim * (self.num_heads * 2 + self.num_kv_heads * nk) * self.head_dim
             if self.attn_act_func == 'softdelta':
-                mova_qko_params += self.model_dim * self.num_heads * (self.head_dim + 1)
+                mova_qko_params += self.model_dim * self.num_heads
             if self.apply_attn_gate:
                 mova_qko_params += self.model_dim * self.num_heads * self.head_dim
             mova_qko_params += num_params_in_residual(self.residual_func, self.model_dim, self.residual_heads, self.num_heads * self.head_dim)
@@ -831,10 +832,11 @@ class Transformer(XLLModel):
         expansion_factor = 6
         embed_flops = self.model_dim + self.vocab_size
         logits_flops = self.model_dim * self.vocab_size
+        nk = {"softmax": 1, "softdelta": 2}[self.attn_act_func]
         norm_flops = self.model_dim * (4 if self.apply_rmsnorm else 8)
         if self.qknorm:
-            norm_flops += self.head_dim * self.num_heads * 2
-        attn_flops = self.model_dim * (self.num_heads + self.num_kv_heads) * self.head_dim * 2
+            norm_flops += (self.num_heads + self.num_kv_heads * nk) * self.head_dim * 2
+        attn_flops = self.model_dim * (self.num_heads * 2 + self.num_kv_heads * (nk + 1)) * self.head_dim
 
         # FFN
         ffn_flops = self.model_dim * self.ffn_hidden_dim * (3 if self.swiglu else 2)
@@ -844,7 +846,7 @@ class Transformer(XLLModel):
         res_flops = 0.0
 
         # MoVA
-        mova_flops = self.model_dim * (self.num_heads * 2 + self.num_kv_heads) * self.head_dim
+        mova_flops = self.model_dim * (self.num_heads * 2 + self.num_kv_heads * nk) * self.head_dim
         mova_flops += self.model_dim * self.num_kv_heads * self.head_dim * self.num_activated_values
         mova_flops += self.model_dim * self.num_values
 
@@ -856,10 +858,10 @@ class Transformer(XLLModel):
             attn_flops += self.num_heads * self.head_dim * seq_len
             mova_flops += self.num_heads * self.head_dim * seq_len
         elif self.attn_act_func == 'softdelta':
-            attn_flops += self.model_dim * self.num_heads * (self.head_dim + 1)
-            attn_flops += self.num_heads * self.head_dim * seq_len * 2  # two qkv
-            mova_flops += self.model_dim * self.num_heads * (self.head_dim + 1)
-            mova_flops += self.num_heads * self.head_dim * seq_len * 2  # two qkv
+            attn_flops += self.model_dim * self.num_heads
+            attn_flops += (self.num_heads + self.num_kv_heads) * self.head_dim * seq_len  # qkv - kkv
+            mova_flops += self.model_dim * self.num_heads
+            mova_flops += (self.num_heads + self.num_kv_heads) * self.head_dim * seq_len  # qkv - kkv
         else:
             raise ValueError(f"Unknown attention activation function: {self.attn_act_func}")
 

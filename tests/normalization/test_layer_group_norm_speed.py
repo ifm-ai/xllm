@@ -204,10 +204,12 @@ def main(seed: int):
         [2, 32768, 8192, 8],
         [1, 65536, 8192, 8],
         [1, 65536, 8192, 32],
+        [1, 65536, 8192, 64],
+        [1, 65536, 8192, 128]
     ]:
         for affine in [True, False]:
             for memory_efficient in [False, True]:
-                for dtype in [torch.float32, torch.bfloat16]:
+                for dtype in [torch.bfloat16]:
                     test(B, L, H, num_groups, affine, memory_efficient, dtype)
 
 
