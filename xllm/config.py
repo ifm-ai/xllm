@@ -107,6 +107,7 @@ class ModelConf(Config):
     arch: str = "transformer"  # Architecture: transformer or gekko
     ddp_backend: str = 'fsdp2'  # Distributed parameter sharding implementation: fsdp1 or fsdp2
     num_layers: int = 8
+    full_attention_interval: int = 0  # Gekko: 0 = unchanged; 4 = full/Gekko/Gekko/Gekko, starting with full attention
     model_dim: int = 1024  # Dimensions of token hidden state and residual stream
     # Attention
     chunk_size: int = 2048  # Used for local attention, memory update in Gekko and prefilling.
@@ -190,6 +191,18 @@ class ModelConf(Config):
 
     def __post_init__(self):
         assert self.arch in ['transformer', 'gekko']
+        if isinstance(self.full_attention_interval, bool) or not isinstance(self.full_attention_interval, int):
+            raise ValueError('full_attention_interval must be an integer')
+        if self.full_attention_interval:
+            if self.arch != 'gekko' or self.full_attention_interval < 2:
+                raise ValueError('full_attention_interval requires arch=gekko and an interval >= 2')
+            if self.num_experts or self.num_values:
+                raise ValueError('Hybrid Gekko currently requires dense FFNs')
+            head_dim = self.model_dim // self.num_heads if self.head_dim is None else self.head_dim
+            if self.v_head_dim is not None and self.v_head_dim != head_dim:
+                raise ValueError('Hybrid full attention requires v_head_dim=head_dim')
+            if self.fused_block and self.causal_attn_backend not in ('flash', 'xattn'):
+                raise ValueError('Fused hybrid full attention requires flash or xattn')
         assert self.ddp_backend in ['fsdp1', 'fsdp2']
 
         assert self.causal_attn_backend in [None, "swift", "flash", 'xattn']

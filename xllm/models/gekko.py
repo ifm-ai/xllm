@@ -36,6 +36,7 @@ from xllm.modules.utils import (
     get_segment_idx_from_bos_mask
 )
 from xllm.models.xllm import XLLModel
+from xllm.models.transformer import Transformer, TransformerBlock, TransformerOutputLayer
 from xllm.models.fused_blocks import (
     GekkoBlockFunction,
     GekkoOutputLayerFunction
@@ -326,6 +327,9 @@ class Gekko(XLLModel):
         self.chunk_size = cfg.chunk_size
         self.context_parallel_size = get_context_parallel_world_size()
         self.context_parallel_rank = get_context_parallel_rank()
+        self.full_attention_layers = tuple(
+            range(0, self.num_layers, cfg.full_attention_interval)
+        ) if cfg.full_attention_interval else ()
 
         if cfg.ddp_backend == 'fsdp1':
             from torch.distributed.fsdp.wrap import wrap
@@ -347,10 +351,12 @@ class Gekko(XLLModel):
 
         self.layers = nn.ModuleList()
         for layer_id in range(self.num_layers):
-            layer = GekkoBlock(cfg, layer_id)
+            block_cls = TransformerBlock if layer_id in self.full_attention_layers else GekkoBlock
+            layer = block_cls(cfg, layer_id)
             self.layers.append(wrap(layer))
 
-        self.output = wrap(GekkoOutputLayer(cfg))
+        output_cls = TransformerOutputLayer if self.full_attention_layers else GekkoOutputLayer
+        self.output = wrap(output_cls(cfg))
 
     def forward(
         self,
@@ -383,6 +389,13 @@ class Gekko(XLLModel):
             segment_idx = None
             prev_segment_count = None
 
+        full_bos_mask = bos_mask
+        full_segments = None
+        if self.full_attention_layers and multi_segments:
+            if cache is not None:
+                raise ValueError('Hybrid full attention does not support packed inference with cache')
+            full_segments = Transformer.get_segment_arg(self, full_bos_mask)
+
         if self.training:
             assert cache is None, "training model does not support kv cache."
             assert seq_len % self.context_parallel_size == 0
@@ -393,6 +406,8 @@ class Gekko(XLLModel):
             start = self.context_parallel_rank * seq_len
             prev = max(0, start - self.chunk_size)
             end = (self.context_parallel_rank + 1) * seq_len
+            if full_bos_mask is not None:
+                full_bos_mask = full_bos_mask[:, :end]
             tokens = tokens[:, start:end]
             if bos_mask is not None:
                 if self.context_parallel_rank > 0:
@@ -405,7 +420,10 @@ class Gekko(XLLModel):
         else:
             assert self.context_parallel_size == 1, "inference mode does not support context parallel."
             cache_layers, cache_output, cache_segment = cache
-            start = 0 if cache_layers[0][0] is None else cache_layers[0][0][-1]
+            if self.full_attention_layers:
+                start = cache_layers[0][-1]
+            else:
+                start = 0 if cache_layers[0][0] is None else cache_layers[0][0][-1]
             end = start + seq_len
             if seq_len >= self.chunk_size:
                 assert start % self.chunk_size == 0 and end % self.chunk_size == 0
@@ -427,17 +445,20 @@ class Gekko(XLLModel):
         aux_loss_sum = None
         for i, layer in enumerate(self.layers):
             layer_cache = cache_layers[i] if cache is not None else None
+            if i in self.full_attention_layers:
+                args = (x, freq_cis, full_bos_mask, full_segments,
+                        moe_router_load_balancing_type, attn_stability_control,
+                        deterministic, layer_cache)
+            else:
+                args = (x, freq_cis, bos_mask, segment_idx, prev_segment_count,
+                        moe_router_load_balancing_type, attn_stability_control,
+                        deterministic, layer_cache)
             if self.layerwise_ckpt:
                 x, aux_loss, layer_cache = checkpoint(
-                    layer, x, freq_cis, bos_mask, segment_idx, prev_segment_count,
-                    moe_router_load_balancing_type, attn_stability_control, deterministic,
-                    layer_cache, use_reentrant=False, preserve_rng_state=True
+                    layer, *args, use_reentrant=False, preserve_rng_state=True
                 )
             else:
-                x, aux_loss, layer_cache = layer(
-                    x, freq_cis, bos_mask, segment_idx, prev_segment_count,
-                    moe_router_load_balancing_type, attn_stability_control, deterministic, layer_cache
-                )
+                x, aux_loss, layer_cache = layer(*args)
 
             if aux_loss is not None:
                 aux_loss_sum = aux_loss if aux_loss_sum is None else aux_loss_sum + aux_loss
@@ -445,7 +466,10 @@ class Gekko(XLLModel):
             if cache is not None:
                 cache_layers[i] = layer_cache
 
-        logits_or_loss, cache_output = self.output(x, targets, token_mask, bos_mask, cache_output)
+        if self.full_attention_layers:
+            logits_or_loss = self.output(x, targets, token_mask)
+        else:
+            logits_or_loss, cache_output = self.output(x, targets, token_mask, bos_mask, cache_output)
         if targets is not None and self.context_parallel_size > 1:
             logits_or_loss = gather_from_context_parallel_region(logits_or_loss)
 
@@ -468,9 +492,13 @@ class Gekko(XLLModel):
         return logits_or_loss, aux_loss_sum, cache
 
     def support_multi_segments_with_cache(self) -> bool:
-        return True
+        return not self.full_attention_layers
 
     def num_parameters(self):
+        if self.full_attention_layers:
+            total = sum(parameter.numel() for parameter in self.parameters())
+            embed = self.embed.weight.numel() + self.output.output.weight.numel()
+            return total, total, embed
         embed_params = self.model_dim * self.vocab_size * 2
         gda_params_per_block = self.model_dim * (self.num_heads + self.num_kv_heads) * (self.head_dim + self.v_head_dim)
         # out proj
@@ -536,6 +564,12 @@ class Gekko(XLLModel):
         total_tflops += self.num_dense_layers * ffn_flops
         total_tflops += (self.num_layers - self.num_dense_layers) * moe_flops
         total_tflops = total_tflops * expansion_factor / 10 ** 12
+        if self.full_attention_layers:
+            # Replace the per-layer Gekko estimate with the existing full-attention estimate.
+            full_attn_flops = self.model_dim * (q_dim + k_dim + v_dim + h_dim)
+            full_attn_flops += (q_dim + h_dim) * seq_len
+            delta = full_attn_flops - (timestep_norm_flops + conv_flops + attn_flops)
+            total_tflops += len(self.full_attention_layers) * delta * expansion_factor / 10 ** 12
         return total_tflops
 
 
