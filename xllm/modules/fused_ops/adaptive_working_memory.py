@@ -587,12 +587,13 @@ def _adaptive_working_memory_bwd(
                 ratio_grad = ratio_grad * prev_g
                 prev_g = prev_g[..., None]
                 curr_r = 1.0 - prev_g + prev_g * curr_r
+                prev_g = prev_g.to(memory)  # bf16
             else:
                 prev_g_grad = None
 
             log_norm_term_curr = curr_log_norm_term[:, :, :, c]
             lnt_curr_grad = ratio_grad * ratio[c].squeeze(3)
-            log_norm_term_grad = log_norm_term_grad - ratio_grad * ratio[c].squeeze(3)
+            log_norm_term_grad = log_norm_term_grad - lnt_curr_grad
             tmp_lnt_grad = logsumexp_backward(
                 log_norm_term_grad, torch.stack([log_norm_term_curr, log_norm_term_prev], dim=0),
                 log_norm_term, dim=0, grad_out=tmp_lnt_grad
@@ -603,7 +604,7 @@ def _adaptive_working_memory_bwd(
             # B x K x S x V -> B*K x S x V
             curr_r = curr_r.to(memory)
             memory_update_grad = rearrange(curr_r * memory_grad, 'b k s v -> (b k) s v')
-            memory_grad = rearrange((1.0 - curr_r) * memory_grad, 'b k s v -> (b k) s v')
+            prev_kk_grad = rearrange(torch.bmm(memory_update_grad, vv), '(b k) s c -> b k s c', b=bsz).float()
             # B*K x C x V
             vv_grad = torch.bmm(prev_kk, memory_update_grad)
             if ortho:
@@ -613,16 +614,23 @@ def _adaptive_working_memory_bwd(
                 v_grad = vv_grad
                 rv_grad = -vv_grad
 
-            gmemory_grad = torch.baddbmm(memory_grad, prev_qk, rv_grad, out=memory_grad)
-            gmemory_grad = rearrange(gmemory_grad, '(b k) s v -> b k s v', b=bsz)
+            # v grad
+            v_grad = rearrange(v_grad, '(b h) c v -> b h c v', b=bsz)
+            # update memory grad
+            memory_grad = rearrange((1.0 - curr_r) * memory_grad, 'b k s v -> (b k) s v')
+
             if prev_g is not None:
-                prev_g = prev_g.to(memory)
-                memory_grad = prev_g * gmemory_grad
+                gmemory_grad = torch.bmm(prev_qk, rv_grad)
+                gmemory_grad = rearrange(gmemory_grad, '(b k) s v -> b k s v', b=bsz)
+                memory_grad = torch.add(memory_grad, prev_g * gmemory_grad, out=memory_grad)
                 prev_g_grad = torch.add(prev_g_grad, (gmemory_grad * curr_memory).sum(dim=3).float(), out=prev_g_grad)
-                gmemory = prev_g * curr_memory
+                gmemory = rearrange(prev_g * curr_memory, 'b k s v -> (b k) v s')
+                prev_qk_grad = rearrange(torch.bmm(rv_grad, gmemory), '(b k) c s -> b k c s', b=bsz)
             else:
-                memory_grad = gmemory_grad
-                gmemory = curr_memory
+                memory_grad = torch.baddbmm(memory_grad, prev_qk, rv_grad, out=memory_grad)
+                memory_grad = rearrange(memory_grad, '(b k) s v -> b k s v', b=bsz)
+                curr_memory = rearrange(curr_memory, 'b k s v -> (b k) v s')
+                prev_qk_grad = rearrange(torch.bmm(rv_grad, curr_memory), '(b k) c s -> b k c s', b=bsz)
 
             if mmask is not None:
                 log_norm_term_grad.masked_fill_(mmask, value=0.)
@@ -632,11 +640,6 @@ def _adaptive_working_memory_bwd(
             # B x K x S x V
             mem_grad_from_out = rearrange(torch.bmm(q, og), '(b k n) s v -> b k n s v', b=bsz, k=n_kv_heads).sum(dim=2)
             memory_grad = torch.add(memory_grad, mem_grad_from_out, out=memory_grad)
-
-            gmemory = rearrange(gmemory, 'b k s v -> (b k) v s')
-            prev_qk_grad = rearrange(torch.bmm(rv_grad, gmemory), '(b k) c s -> b k c s', b=bsz)
-            prev_kk_grad = rearrange(torch.bmm(memory_update_grad, vv), '(b k) s c -> b k s c', b=bsz).float()
-            v_grad = rearrange(v_grad, '(b h) c v -> b h c v', b=bsz)
 
             if c == 0:
                 prev_value_grad = v_grad
