@@ -538,7 +538,10 @@ def _adaptive_working_memory_bwd(
         # B*K x C x V
         prev_v = value[:, pbos:bos] if c > 0 else prev_value
         # B x K x S
-        prev_g = gate[:, :, c - 1] if c > 0 else prev_gate
+        if fgate:
+            prev_g = gate[:, :, c - 1] if c > 0 else prev_gate
+        else:
+            prev_g = None
 
         # B*K x V x C
         vv = vvalue[:, :, bos:eos]
