@@ -115,7 +115,9 @@ class AdaptiveWorkingMemory(nn.Module):
                     xqk, xkk, xv, memory, log_norm_term, prev_g,
                     segment_idx, prev_segment_idx, prev_segment_count
                 )
-                prev_g = xg
+                assert xg.shape[2] == 1
+                # B x K x S
+                prev_g = xg.squeeze(2)
             else:
                 assert xg is None
 
