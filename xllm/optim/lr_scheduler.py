@@ -1,4 +1,5 @@
 from functools import partial
+from copy import deepcopy
 import math
 from torch.optim import lr_scheduler
 
@@ -120,3 +121,15 @@ def build_lr_scheduler(optimizer, cfg: OptimConf, total_steps: int):
     lr_fn = build_lr_fn(cfg, total_steps)
     scheduler = lr_scheduler.LambdaLR(optimizer, lr_fn)
     return scheduler
+
+
+def load_lr_scheduler_state(scheduler, state, cfg: OptimConf):
+    state = deepcopy(state)
+    if len(state['base_lrs']) != len(scheduler.base_lrs):
+        raise ValueError(
+            f"Checkpoint has {len(state['base_lrs'])} LR groups, expected {len(scheduler.base_lrs)}"
+        )
+    # Base LRs come from the config, one per param group, so LRs can be changed
+    # on resume while keeping the scheduler position and the groups' ratios.
+    state['base_lrs'] = list(scheduler.base_lrs)
+    scheduler.load_state_dict(state)

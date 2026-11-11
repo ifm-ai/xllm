@@ -147,6 +147,8 @@ def build_model_fsdp2(
             model = wrap(model.cuda())
             model.train()
 
+        model._xllm_fsdp_mesh = device_mesh
+        model._xllm_dion_mesh = device_mesh['dp']
         return model
 
 
