@@ -72,7 +72,7 @@ def manual_awk(
             curr_norm_term = curr_norm_term + torch.exp(kk[:, :, t])
 
         prev_memory = next_memory
-        g = xg[:, :, c].unsqueeze(3) if fgate else 1.0
+        g = xg[:, :, c] if fgate else 1.0
         for t in range(chunk_size):
             # B x H x 1 x S/H
             qt = q[:, :, t:(t + 1)]
@@ -103,7 +103,7 @@ def manual_awk(
                 rv = rv / norm
                 uv = manual_rejection(vt, rv)
             else:
-                uv = vt - torch.matmul(qkt, g * prev_memory)
+                uv = vt - torch.matmul(qkt, g.unsqueeze(3) * prev_memory)
             # B x K x 1 x S/H
             uk = torch.exp(kt) / curr_norm_term.unsqueeze(2)
             # B x K x S/H x V/H
@@ -111,8 +111,9 @@ def manual_awk(
             update_memory = update_memory + kvb
 
         norm_term = norm_term + curr_norm_term
-        # B x K x S/H x 1
+        # B x K x S/H
         ratio = 1.0 - g + g * (curr_norm_term / norm_term)
+        # B x K x S/H x 1
         ratio = ratio.unsqueeze(3)
 
         memory = next_memory
