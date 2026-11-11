@@ -41,10 +41,14 @@ SYSTEM = (
     "(MBZUAI) Institute of Foundation Models (IFM)."
 )
 
-TOOL_PRESENTATION_FORMATS = json.loads(
-    os.getenv("TOOL_PRESENTATION_FORMATS", '["json", "xml", "xml", "markdown", "markdown"]')
-)
-TOOL_CALL_FORMATS = json.loads(os.getenv("TOOL_CALL_FORMATS", '["json", "xml", "xml", "xml_typed"]'))
+def _require_env(name: str) -> str:
+    value = os.getenv(name)
+    if value is None:
+        raise RuntimeError(f"Environment variable {name} is not set")
+    return value
+
+TOOL_PRESENTATION_FORMATS = json.loads(_require_env("TOOL_PRESENTATION_FORMATS"))
+TOOL_CALL_FORMATS = json.loads(_require_env("TOOL_CALL_FORMATS"))
 
 
 def _field(obj: Any, name: str) -> Any:
