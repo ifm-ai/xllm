@@ -72,7 +72,7 @@ def manual_awk(
             curr_norm_term = curr_norm_term + torch.exp(kk[:, :, t])
 
         prev_memory = next_memory
-        g = xg[:, :, c] if fgate else 1.0
+        g = xg[:, :, c].unsqueeze(3) if fgate else 1.0
         for t in range(chunk_size):
             # B x H x 1 x S/H
             qt = q[:, :, t:(t + 1)]
@@ -292,7 +292,7 @@ def test(B: int, L: int, H: int, HKV: int, D: int, chunk_size: int, fgate: bool,
 
         torch.testing.assert_close(torch.cat([y1, y2], dim=2), y_manual.to(pt_dtype), rtol=rtol, atol=atol)
         torch.testing.assert_close(memory2, memory_manual.to(pt_dtype), rtol=rtol, atol=atol)
-        print(f"B={B}, L={L}, H={H} ({HKV}), D={D}, chunk={chunk_size}, ortho={ortho}, mseg={multi_segment}, dtype={dtype}: pass fwd test")
+        print(f"B={B}, L={L}, H={H} ({HKV}), D={D}, chunk={chunk_size}, fgate={fgate}, ortho={ortho}, mseg={multi_segment}, dtype={dtype}: pass fwd test")
 
         q2_grad, qk2_grad, kk2_grad, v2_grad, g2_grad, mem_grad, lnt_grad, \
             prev_qk1_grad, prev_kk1_grad, prev_v1_grad, prev_g1_grad = awk_bwd(
@@ -324,7 +324,7 @@ def test(B: int, L: int, H: int, HKV: int, D: int, chunk_size: int, fgate: bool,
         assert prev_kk_grad is None
         assert prev_v_grad is None
         assert prev_g_grad is None
-        print(f"B={B}, L={L}, H={H} ({HKV}), D={D}, chunk={chunk_size}, ortho={ortho}, mseg={multi_segment}, dtype={dtype}: pass bwd test")
+        print(f"B={B}, L={L}, H={H} ({HKV}), D={D}, chunk={chunk_size}, fgate={fgate}, ortho={ortho}, mseg={multi_segment}, dtype={dtype}: pass bwd test")
 
 
 def main(seed: int, dtype: str):
