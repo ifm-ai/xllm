@@ -307,7 +307,8 @@ def test(B: int, L: int, H: int, HKV: int, D: int, chunk_size: int, fgate: bool,
         qk1_grad[:, :, -chunk_size:] += prev_qk1_grad
         kk1_grad[:, :, -chunk_size:] += prev_kk1_grad
         v1_grad[:, :, -chunk_size:] += prev_v1_grad
-        g1_grad[:, :, -1] += prev_g1_grad
+        if fgate:
+            g1_grad[:, :, -1] += prev_g1_grad
 
         atol = {"fp32": 1e-6, "bf16": 1e-2, "fp16": 1e-3}[dtype]
         rtol = {"fp32": 1e-5, "bf16": 1e-2, "fp16": 1e-3}[dtype]
@@ -315,7 +316,8 @@ def test(B: int, L: int, H: int, HKV: int, D: int, chunk_size: int, fgate: bool,
         torch.testing.assert_close(torch.cat([qk1_grad, qk2_grad], dim=2), qk_grad, rtol=rtol, atol=atol)
         torch.testing.assert_close(torch.cat([kk1_grad, kk2_grad], dim=2), kk_grad, rtol=rtol, atol=atol)
         torch.testing.assert_close(torch.cat([v1_grad, v2_grad], dim=2), v_grad, rtol=rtol, atol=atol)
-        torch.testing.assert_close(torch.cat([g1_grad, g2_grad], dim=2), g_grad, rtol=rtol, atol=atol)
+        if fgate:
+            torch.testing.assert_close(torch.cat([g1_grad, g2_grad], dim=2), g_grad, rtol=rtol, atol=atol)
         assert mem_grad is None
         assert lnt_grad is None
         assert prev_qk_grad is None
