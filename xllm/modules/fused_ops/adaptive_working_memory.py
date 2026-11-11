@@ -537,6 +537,8 @@ def _adaptive_working_memory_bwd(
         prev_kk = kkey[:, pbos:bos] if c > 0 else prev_kkey
         # B*K x C x V
         prev_v = value[:, pbos:bos] if c > 0 else prev_value
+        # B x K x S
+        prev_g = gate[:, :, c - 1] if c > 0 else prev_gate
 
         # B*K x V x C
         vv = vvalue[:, :, bos:eos]
@@ -579,6 +581,16 @@ def _adaptive_working_memory_bwd(
 
             # B x K x S
             ratio_grad = (memory_grad * memory_residual[c]).sum(dim=3).float()
+            # B x K x S x 1
+            curr_r = ratio[c]
+            if prev_g is not None:
+                ratio_grad = ratio_grad * prev_g
+                prev_g_grad = ratio_grad * (ratio[c].squeeze(3) - 1.0)
+                prev_g = prev_g[..., None]
+                curr_r = 1.0 - prev_g + prev_g * curr_r
+            else:
+                prev_g_grad = None
+
             log_norm_term_curr = curr_log_norm_term[:, :, :, c]
             lnt_curr_grad = ratio_grad * ratio[c].squeeze(3)
             log_norm_term_grad = log_norm_term_grad - ratio_grad * ratio[c].squeeze(3)
@@ -590,10 +602,9 @@ def _adaptive_working_memory_bwd(
             log_norm_term_grad = tmp_lnt_grad[1]
 
             # B x K x S x V -> B*K x S x V
-            curr_r = ratio[c].to(memory)
+            curr_r = curr_r.to(memory)
             memory_update_grad = rearrange(curr_r * memory_grad, 'b k s v -> (b k) s v')
             memory_grad = rearrange((1.0 - curr_r) * memory_grad, 'b k s v -> (b k) s v')
-            curr_memory = rearrange(curr_memory, 'b k v s -> (b k) v s')
             # B*K x C x V
             vv_grad = torch.bmm(prev_kk, memory_update_grad)
             if ortho:
@@ -603,8 +614,14 @@ def _adaptive_working_memory_bwd(
                 v_grad = vv_grad
                 rv_grad = -vv_grad
 
-            memory_grad = torch.baddbmm(memory_grad, prev_qk, rv_grad, out=memory_grad)
-            memory_grad = rearrange(memory_grad, '(b k) s v -> b k s v', b=bsz)
+            gmemory_grad = torch.baddbmm(memory_grad, prev_qk, rv_grad, out=memory_grad)
+            gmemory_grad = rearrange(gmemory_grad, '(b k) s v -> b k s v', b=bsz)
+            if prev_g is not None:
+                memory_grad = prev_g * gmemory_grad
+                prev_g_grad = torch.add(prev_g_grad, (gmemory_grad * curr_memory).sum(dim=3).float(), out=prev_g_grad)
+            else:
+                memory_grad = gmemory_grad
+
             if mmask is not None:
                 log_norm_term_grad.masked_fill_(mmask, value=0.)
                 memory_grad.masked_fill_(mmask.unsqueeze(1), value=0.)
@@ -614,8 +631,9 @@ def _adaptive_working_memory_bwd(
             mem_grad_from_out = rearrange(torch.bmm(q, og), '(b k n) s v -> b k n s v', b=bsz, k=n_kv_heads).sum(dim=2)
             memory_grad = torch.add(memory_grad, mem_grad_from_out, out=memory_grad)
 
-            prev_kk_grad = rearrange(torch.bmm(memory_update_grad, vv), '(b k) s c -> b k s c', b=bsz).float()
+            curr_memory = rearrange(curr_memory, 'b k v s -> (b k) v s')
             prev_qk_grad = rearrange(torch.bmm(rv_grad, curr_memory), '(b k) c s -> b k c s', b=bsz)
+            prev_kk_grad = rearrange(torch.bmm(memory_update_grad, vv), '(b k) s c -> b k s c', b=bsz).float()
             v_grad = rearrange(v_grad, '(b h) c v -> b h c v', b=bsz)
 
             if c == 0:
@@ -624,12 +642,15 @@ def _adaptive_working_memory_bwd(
                     prev_kk_grad, prev_kk_fp32, -1, torch.float32
                 ).to(qkey), 'b h s c -> b h c s')
                 prev_qkey_grad = prev_qk_grad
+                prev_gate_grad = prev_g_grad
             else:
                 value_grad[:, :, pbos:bos] = v_grad
                 key_grad[:, :, pbos:bos] = rearrange(torch.ops.aten._softmax_backward_data(
                     prev_kk_grad, kk_fp32[:, :, :, c - 1], -1, torch.float32
                 ).to(qkey), 'b h s c -> b h c s')
                 qkey_grad[:, :, pbos:bos] = prev_qk_grad
+                if fgate:
+                    gate_grad[:, :, c - 1] = prev_g_grad
 
     # B x H x S/H x (N-1) x C -> B x H x S/H x (N-1)*C -> B x H x (N-1)*C x S/H
     key_grad_log_term = logsumexp_backward(
