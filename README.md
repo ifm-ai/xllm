@@ -175,6 +175,7 @@ Conversion and serving checkpoints of xLLM is supported by [xBridges](https://gi
 | --- | --- |
 | **Prepare training data** | [Data loader](xllm/data/README.md): JSONL formats, online tokenization, packing, and resume. |
 | **Configure and launch training** | [Experiment scripts](examples/) and [configuration](xllm/config.py); entry point: [train.py](train.py). |
+| **Transfer hyperparameters across width and depth** | [Complete(d)P scaling](xllm/optim/README.md): the `mup` config. |
 | **Evaluate a model** | [Evaluation guide](xllm/eval/README.md); entry point: [eval.py](eval.py). |
 | **Export to Hugging Face** | [Checkpoint conversion](https://github.com/ifm-ai/xbridges/blob/main/xbridges/huggingface/README.md). |
 | **Serve with vLLM** | [vLLM integration](https://github.com/ifm-ai/xbridges/blob/main/xbridges/vllm/README.md). |

@@ -14,12 +14,14 @@ def build_residual(
     num_heads: Optional[int],
     num_features: Optional[int] = None,
     eps: Optional[float] = None,
-    init_std: Optional[float] = None
+    init_std: Optional[float] = None,
+    multiplier: float = 1.0,
 ) -> nn.Module:
     if residual_func in ['base', 'add']:
-        return BaseResidual(rc_id, model_dim)
+        return BaseResidual(rc_id, model_dim, multiplier)
     elif residual_func == 'ortho':
         assert num_heads is not None
+        assert multiplier == 1.0, 'ortho residual does not support a branch multiplier'
         return OrthoResidual(rc_id, model_dim, num_heads, eps)
     else:
         raise ValueError(f"Unknown residual function: {residual_func}")

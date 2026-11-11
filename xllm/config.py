@@ -5,8 +5,10 @@ from pathlib import Path
 from typing import List, Dict
 import os
 import json
+import math
 
 from xllm.configuration import Config
+from xllm.configuration.configuration import NOCLI
 from xllm.distributed import (
     model_parallel_is_initialized,
     get_data_parallel_world_size,
@@ -84,10 +86,12 @@ class OptimConf(Config):
     lr: float = 1e-3  # AdamW learning rate after warmup
     warmup: int = 2000  # Num of steps for LR warmup. 0 means no warmup
     weight_decay: float = 0.1  # Decoupled weight decay
+    no_decay_embed_readout: bool = False  # Exclude the token embedding and the readout matrix from weight decay
+    tau_epoch: Optional[float] = None  # If set, the base weight decay is 1 / (lr * tau_epoch * steps) instead of weight_decay
     epsilon: float = 1e-8
     beta1: float = 0.9
     beta2: float = 0.98
-    clip: float = 1.0  # Global gradient L2 norm clipping threshold, before applying loss scale.
+    clip: float = 1.0  # Global gradient L2 norm clipping threshold, before applying loss scale. <= 0 disables clipping.
     scheduler: str = "cosine"  # LR scheduler: linear, cosine, constant, or wsd (warmup-stable-decay)
     lr_init_ratio: float = 1e-4  # The initial LR = lr_init_ratio * lr
     lr_end_ratio: float = 0.01  # The ending LR = lr_end_ratio * lr. Also the end value if using a cosine scheduler
@@ -100,6 +104,7 @@ class OptimConf(Config):
         assert self.warmup >= 0
         if self.scheduler == 'wsd':
             assert self.wsd_decay_duration_steps is not None, 'decay duration steps is required for WSD.'
+        assert self.tau_epoch is None or self.tau_epoch > 0, f"tau_epoch must be positive, got {self.tau_epoch}"
 
 
 @dataclass
@@ -148,6 +153,9 @@ class ModelConf(Config):
     init_std: Optional[float] = None  # Init std for gaussian; If None, deriving from input dimensions. he/xavier requires None
     init_embed_std: Optional[float] = None  # Std used to truncate normal init of embedding weights. If None, = 1 / sqrt(model_dim)
     init_logits_std: Optional[float] = None  # Std used to truncate normal init of output projection weights. If None, = 1 / sqrt(model_dim)
+    zero_query: bool = NOCLI(False)  # Zero-init query weights. Set by the mup config.
+    zero_readout: bool = NOCLI(False)  # Zero-init readout weights. Set by the mup config.
+    residual_multiplier: float = NOCLI(1.0)  # Multiplier on attention/FFN branch outputs before the residual add. Set by the mup config.
     # Input & output
     vocab_size: int = -1  # Defined later by tokenizer
     # Normalization
@@ -235,6 +243,114 @@ class ModelConf(Config):
                 assert self.causal_attn_backend is not None, 'requiring efficient attention when using fused block'
 
 
+def _head_geometry(model: ModelConf):
+    head_dim = model.model_dim // model.num_heads if model.head_dim is None else model.head_dim
+    num_kv_heads = model.num_heads if model.num_kv_heads is None else model.num_kv_heads
+    return head_dim, num_kv_heads
+
+
+def validate_mup_width_family(base_model: ModelConf, model: ModelConf) -> None:
+    """Check that two configs are in one Complete(d)P width family.
+
+    head_dim and vocab_size stay fixed; num_heads, num_kv_heads and ffn_hidden_dim
+    scale proportionally with model_dim. Depth may differ.
+    """
+    base_head_dim, base_kv_heads = _head_geometry(base_model)
+    head_dim, num_kv_heads = _head_geometry(model)
+    if head_dim != base_head_dim:
+        raise ValueError(f"head_dim must stay fixed, got {base_head_dim} -> {head_dim}")
+    if model.vocab_size != base_model.vocab_size:
+        raise ValueError(f"vocab_size must stay fixed, got {base_model.vocab_size} -> {model.vocab_size}")
+    for name, base_value, value in (
+        ("num_heads", base_model.num_heads, model.num_heads),
+        ("num_kv_heads", base_kv_heads, num_kv_heads),
+        ("ffn_hidden_dim", base_model.ffn_hidden_dim, model.ffn_hidden_dim),
+    ):
+        if value * base_model.model_dim != base_value * model.model_dim:
+            raise ValueError(
+                f"{name} must scale with model_dim, got {base_value} -> {value} "
+                f"for model_dim {base_model.model_dim} -> {model.model_dim}"
+            )
+
+
+@dataclass
+class MuPConf(Config):
+    """Complete(d)P width/depth scaling relative to a base model (arXiv:2512.22382, Table 1)."""
+    base_model_dim: int  # model_dim of the base model the hyperparameters were tuned on
+    base_init_embed_std: float  # Embedding init std, used at every width
+    base_init_hidden_std: float  # Hidden-matrix init std at base width; scaled by m_N^-1/2
+    base_init_unembed_std: float  # Readout init std at base width; scaled by m_N^-1
+    zero_query: bool = False  # Zero-init query weights; not supported with model.qknorm
+    zero_readout: bool = False  # Zero-init readout weights
+    base_num_layers: Optional[int] = None  # num_layers of the base model. Set together with alpha to enable depth scaling
+    alpha: Optional[float] = None  # Depth exponent in [0.5, 1]; residual branches are scaled by m_L^-alpha
+    width_multiplier: Optional[float] = NOCLI()  # m_N = model_dim / base_model_dim, set by resolve()
+    depth_multiplier: Optional[float] = NOCLI()  # m_L = num_layers / base_num_layers, set by resolve()
+
+    def resolve(self, model: ModelConf) -> None:
+        """Validate the model for Complete(d)P and set its init stds and residual multiplier."""
+        for name, value in (
+            ("base_model_dim", self.base_model_dim),
+            ("base_init_embed_std", self.base_init_embed_std),
+            ("base_init_hidden_std", self.base_init_hidden_std),
+            ("base_init_unembed_std", self.base_init_unembed_std),
+        ):
+            if not math.isfinite(value) or value <= 0:
+                raise ValueError(f"mup.{name} must be positive and finite, got {value}")
+        for name, actual, supported in (
+            ("arch", model.arch, ["transformer"]),
+            ("ddp_backend", model.ddp_backend, ["fsdp2"]),
+            ("init_mode", model.init_mode, ["gaussian"]),
+            ("num_experts", model.num_experts, [0]),
+            ("num_values", model.num_values, [0]),
+            ("scale_emb", model.scale_emb, [False]),
+            ("residual_func", model.residual_func, ["base", "add"]),
+        ):
+            if actual not in supported:
+                raise ValueError(f"mup requires model.{name} in {supported}, got {actual!r}")
+        if self.zero_query and model.qknorm:
+            # QK-norm rescales each query head to unit RMS, so a zero-init query is full size after the first step
+            raise ValueError(
+                "mup.zero_query does not work with model.qknorm: QK-norm rescales the query to unit size, "
+                "so zero init has no effect after the first step. Set mup.zero_query false or model.qknorm false; "
+                "mup.zero_readout can still be used."
+            )
+
+        self.width_multiplier = model.model_dim / self.base_model_dim
+        self.depth_multiplier = 1.0
+        residual_multiplier = 1.0
+        if (self.base_num_layers is None) != (self.alpha is None):
+            raise ValueError("mup.base_num_layers and mup.alpha must be set together")
+        if self.base_num_layers is not None:
+            if self.base_num_layers <= 0:
+                raise ValueError(f"mup.base_num_layers must be positive, got {self.base_num_layers}")
+            if not 0.5 <= self.alpha <= 1.0:
+                raise ValueError(f"mup.alpha must be in [0.5, 1], got {self.alpha}")
+            if model.fused_block:
+                raise ValueError("mup depth scaling requires model.fused_block=False")
+            self.depth_multiplier = model.num_layers / self.base_num_layers
+            residual_multiplier = self.depth_multiplier ** -self.alpha
+
+        # model init std -> (value at this width, mup setting it comes from)
+        resolved = {
+            "init_embed_std": (self.base_init_embed_std, "base_init_embed_std"),
+            "init_std": (self.base_init_hidden_std / math.sqrt(self.width_multiplier), "base_init_hidden_std"),
+            "init_logits_std": (self.base_init_unembed_std / self.width_multiplier, "base_init_unembed_std"),
+        }
+        for name, (value, base_name) in resolved.items():
+            current = getattr(model, name)
+            # an equal value is allowed, e.g. a config.json saved by an earlier mup run
+            if current is not None and not math.isclose(current, value, rel_tol=1e-9):
+                raise ValueError(
+                    f"model.{name}={current} conflicts with mup, which sets it to {value} at this width. "
+                    f"Unset model.{name} and set mup.{base_name} (the value at the base width) instead."
+                )
+            setattr(model, name, value)
+        model.zero_query = self.zero_query
+        model.zero_readout = self.zero_readout
+        model.residual_multiplier = residual_multiplier
+
+
 @dataclass
 class ValidConf(Config):
     # Tasks to evaluate
@@ -311,6 +427,7 @@ class TrainerConf(Config):
     valid: ValidConf
     tokenizer: TokenizerConf
     dataloader: DataLoaderConfig  # Configs for multi-source data loading.
+    mup: Optional[MuPConf] = None  # Complete(d)P width/depth scaling. None leaves training unchanged.
 
     # Training data / iterator
     data: str = ""  # Comma seperated data mix. Each mix is formatted as path:weight:json_key:source_format. Weights need not sum to 1.
@@ -441,3 +558,6 @@ class TrainerConf(Config):
         elif self.model.arch in ['gekko']:
             assert self.model.layernorm_num_groups % self.model_parallel_size == 0, \
                 f"{self.model.layernorm_num_groups}/{self.model_parallel_size}"
+
+        if self.mup is not None:
+            self.mup.resolve(self.model)

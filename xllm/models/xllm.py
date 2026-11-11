@@ -134,7 +134,8 @@ class XLLModel(nn.Module):
                 dist.all_reduce(total_norm, group=model_parallel_process_group)
                 total_norm = total_norm ** (1.0 / norm_type)
 
-        clip_grads_with_norm_(parameters, max_norm, total_norm, None)
+        if math.isfinite(max_norm):
+            clip_grads_with_norm_(parameters, max_norm, total_norm, None)
         total_norm_cpu = total_norm.item()
         return total_norm_cpu
 
