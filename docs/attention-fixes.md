@@ -1,5 +1,5 @@
 ---
-date: 2026-10-16
+date: 2026-10-21
 ---
 
 # Attention correctness fixes
@@ -9,7 +9,7 @@ Based on `release_v1.01` at `cd40545`. No hybrid, optimizer or training-recipe c
 | Fix | Affected settings |
 | --- | --- |
 | Preserve inputs during partial RoPE | Fused attention with `0 < rope_head_dim < head_dim`; normalization backward can otherwise read rotated values. |
-| Trim packed metadata on the sequence axis; allow segment IDs without a BOS mask | Regular full-attention xattn and shared fused xattn forward/backward helpers. |
+| Trim packed metadata on the sequence axis | Regular full-attention xattn and shared fused xattn forward/backward helpers. |
 | Keep normalized convolution weights/gradients FP32 through softmax backward | Gekko with normalized Triton short convolutions; BF16 rounding amplified small kernel-gradient errors, especially with long-context CP. The fast kernels remain enabled. |
 
 The last issue appeared in our [32K CP4 qualification](https://wandb.ai/mbzuai-llm/xllm-release-v1.01-muon/runs/9z1d7xgm);
@@ -17,6 +17,10 @@ the correction passed [the follow-up](https://wandb.ai/mbzuai-llm/xllm-release-v
 These identify observed qualification failures, not an audit of production checkpoints.
 The release already contains the earlier fused backward/backend repairs.
 The separate memory-efficient RMSNorm divide-by-zero issue is not fixed here.
+
+Packed xattn always receives a BOS mask alongside segment IDs: every caller
+builds both from the same tokens, and fused blocks build segments only when a
+BOS mask exists. The helpers therefore no longer accept segment IDs alone.
 
 Focused CUDA regressions:
 

@@ -34,8 +34,7 @@ def test_partial_rope_preserves_input(paired):
             assert not torch.equal(rotated[..., :64], saved[..., :64])
 
 
-@pytest.mark.parametrize('with_bos', [False, True])
-def test_packed_xattn_trims_metadata_in_forward_and_backward(with_bos):
+def test_packed_xattn_trims_metadata_in_forward_and_backward():
     torch.manual_seed(17)
     q = torch.randn(2, 128, 4, 128, device='cuda', dtype=torch.bfloat16, requires_grad=True)
     k = torch.randn(2, 256, 1, 128, device='cuda', dtype=torch.bfloat16, requires_grad=True)
@@ -43,8 +42,7 @@ def test_packed_xattn_trims_metadata_in_forward_and_backward(with_bos):
     bos = torch.zeros(2, 256, device='cuda', dtype=torch.bool)
     bos[:, [0, 128, 173]] = True
     segments = bos.cumsum(1, dtype=torch.int64)
-    bos = bos if with_bos else None
-    tail_bos = bos[:, -128:] if with_bos else None
+    tail_bos = bos[:, -128:]
     scale = 128 ** -0.5
     expected = utils.xattn_fwd(q, k[:, -128:], v[:, -128:], scale, tail_bos, segments[:, -128:], 0, True)
     actual = utils.flash_attention_fwd(q, k, v, bos, (segments, 128), scale, 0, 0, 'xattn', True)
