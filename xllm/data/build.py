@@ -11,7 +11,7 @@ def build_data_loader(tokenizer: Tokenizer, cfg: TrainerConf) -> MultiSourceData
     ----------------------
     cfg.data                : weighted source string; each source is path:weight:json_key:source_format
     cfg.seq_len             : sequence length
-    cfg.batch_size          : batch size per data-parallel rank, resolved by train.py
+    cfg.batch_size          : batch size per data-parallel rank and micro-batch, resolved by train.py
     cfg.data_parallel_rank  : current rank index
     cfg.data_parallel_size  : total number of data-parallel ranks
     cfg.dataloader.buffer_size   : refill token-budget multiplier; target tokens ~= buffer_size * seq_len

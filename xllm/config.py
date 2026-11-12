@@ -332,8 +332,9 @@ class TrainerConf(Config):
     disable_logging: bool = False  # Whether to disable metric logging via MetricLogger, including JSONL, TensorBoard, and W&B.
 
     # Training hyperparameters
-    batch_size: Optional[int] = None  # Num of sequences per DP rank per step. Set either this or global_batch_size.
-    global_batch_size: Optional[int] = None  # Total batch size across DP ranks. Must be divisible by DP; batch_size is derived from this.
+    batch_size: Optional[int] = None  # Num of sequences per DP rank per micro-batch. Set either this or global_batch_size.
+    global_batch_size: Optional[int] = None  # Total batch size per step across DP ranks and micro-batches. Must be divisible by DP * gradient_accumulation_steps; batch_size is derived from this.
+    gradient_accumulation_steps: int = 1  # Num of micro-batches per step; their gradients accumulate before one optimizer step.
     seq_len: int = 8192  # Num of tokens in each sequence. Must be divisible by context_parallel_size * model.chunk_size.
     multi_segments: bool = True  # Whether to segment docs using BOS token. This will prevent attention across document boundaries.
     deterministic: bool = False  # Whether to request deterministic computations when supported.
@@ -411,6 +412,7 @@ class TrainerConf(Config):
         assert self.dtype in ["bf16", "fp16", "fp32"]
         if self.dtype == "fp16":
             assert self.loss_rescaling, "loss rescaling needed for fp16!"
+        assert self.gradient_accumulation_steps >= 1
 
         # MoE
         if self.model.num_experts > 0:

@@ -38,7 +38,7 @@ class MultiSourceDataLoader:
     Arguments:
     - data_mix_str: e.g. "path1:0.6:text:text,path2:0.4:conversation:chat_assistant"
     - seq_len: Sequence length.
-    - batch_size: Batch size per data-parallel rank.
+    - batch_size: Batch size per data-parallel rank and micro-batch.
     - num_buffered_seq: Refill token-budget multiplier. Each refill targets roughly
       num_buffered_seq * seq_len tokens across the weighted data mix before packing.
       The actual number of packed sequences can differ because records are read

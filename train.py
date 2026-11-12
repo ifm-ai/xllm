@@ -138,14 +138,16 @@ def initialize_run(cfg: TrainerConf):
 
 
 def set_batch_size(cfg: TrainerConf):
+    num_micro_batches = cfg.data_parallel_size * cfg.gradient_accumulation_steps
     if cfg.global_batch_size is None:
         assert cfg.batch_size is not None
-        cfg.global_batch_size = cfg.data_parallel_size * cfg.batch_size
+        cfg.global_batch_size = num_micro_batches * cfg.batch_size
     else:
         assert cfg.batch_size is None
-        assert cfg.global_batch_size % cfg.data_parallel_size == 0, \
-            f"global batch size ({cfg.global_batch_size}) is not divisible by data parallel size ({cfg.data_parallel_size})."
-        cfg.batch_size = cfg.global_batch_size // cfg.data_parallel_size
+        assert cfg.global_batch_size % num_micro_batches == 0, \
+            f"global batch size ({cfg.global_batch_size}) is not divisible by data parallel size ({cfg.data_parallel_size}) " \
+            f"* gradient accumulation steps ({cfg.gradient_accumulation_steps})."
+        cfg.batch_size = cfg.global_batch_size // num_micro_batches
 
 
 def get_optim_state(
@@ -373,53 +375,59 @@ def main(cfg: TrainerConf):
 
     while state.step < cfg.steps:
         torch.cuda.reset_peak_memory_stats()
-        # data loading
+        # data loading: all micro-batches of the step, so that every micro-batch loss is normalized by the step's tokens
         t1 = timer()
-        batch = next(batch_iterator)
-        x = torch.from_numpy(batch.x).cuda()
-        y = torch.from_numpy(batch.y).cuda()
-        mask = None if batch.mask is None else torch.from_numpy(batch.mask).cuda()
-        if cfg.dataloader.packing_type == "bestfit":
-            padding_ratios.append(batch.padding_ratio)
-            truncation_ratios.append(batch.truncation_ratio)
+        micro_batches = []
+        for _ in range(cfg.gradient_accumulation_steps):
+            batch = next(batch_iterator)
+            x = torch.from_numpy(batch.x).cuda()
+            y = torch.from_numpy(batch.y).cuda()
+            mask = None if batch.mask is None else torch.from_numpy(batch.mask).cuda()
+            if cfg.dataloader.packing_type == "bestfit":
+                padding_ratios.append(batch.padding_ratio)
+                truncation_ratios.append(batch.truncation_ratio)
 
-        if cfg.sync_check_freq > 0 and state.step % cfg.sync_check_freq == 0:
-            logger.info("Checking batch randomness at step: {}, ...".format(state.step))
-            check_batch_for_sync({"x": x, "y": y, "mask": mask})
-            logger.info(f"Pass batch randomness checking.")
+            if cfg.sync_check_freq > 0 and state.step % cfg.sync_check_freq == 0:
+                logger.info("Checking batch randomness at step: {}, ...".format(state.step))
+                check_batch_for_sync({"x": x, "y": y, "mask": mask})
+                logger.info(f"Pass batch randomness checking.")
+            micro_batches.append((x, y, mask))
 
         # fwd-bwd
         s_fwd_bwd = timer()
         timings.data_loading += s_fwd_bwd - t1
 
-        last_nw += y.nelement()
-
-        tok_loss, aux_loss, _ = model(
-            tokens=x, targets=y, token_mask=mask, multi_segments=cfg.multi_segments,
-            moe_router_load_balancing_type=cfg.moe_router_load_balancing_type,
-            attn_stability_control=cfg.attn_stability_control, deterministic=cfg.deterministic
-        )
-
-        if mask is None:
-            num_tokens = torch.tensor(tok_loss.numel(), dtype=torch.int64, device=tok_loss.device)
-        else:
-            num_tokens = mask.to(torch.int64).sum()
+        num_tokens = torch.zeros((), dtype=torch.int64, device=x.device)
+        for _, y, mask in micro_batches:
+            num_tokens += y.numel() if mask is None else mask.to(torch.int64).sum()
         # reduce num tokens across data parallel ranks
         torch.distributed.all_reduce(num_tokens, group=get_data_parallel_group())
         num_tokens_per_rank = num_tokens / (cfg.data_parallel_size * cfg.context_parallel_size)
-        train_loss = tok_loss.sum() / (num_tokens_per_rank + 1e-6).to(tok_loss)
-        # calculate loss for logging
-        loss = train_loss.detach() / cfg.context_parallel_size
 
-        if aux_loss is not None:
-            num_aux_loss = model.num_layers - model.num_dense_layers
-            aux_loss = aux_loss / num_aux_loss
-            train_loss = train_loss + cfg.moe_aux_loss_coeff * aux_loss
+        loss, aux_loss = 0.0, None
+        for x, y, mask in micro_batches:
+            last_nw += y.nelement()
 
-        if cfg.loss_rescaling:
-            train_loss = state.scale * train_loss
+            tok_loss, micro_aux_loss, _ = model(
+                tokens=x, targets=y, token_mask=mask, multi_segments=cfg.multi_segments,
+                moe_router_load_balancing_type=cfg.moe_router_load_balancing_type,
+                attn_stability_control=cfg.attn_stability_control, deterministic=cfg.deterministic
+            )
 
-        train_loss.backward()
+            train_loss = tok_loss.sum() / (num_tokens_per_rank + 1e-6).to(tok_loss)
+            # calculate loss for logging
+            loss = loss + train_loss.detach() / cfg.context_parallel_size
+
+            if micro_aux_loss is not None:
+                num_aux_loss = model.num_layers - model.num_dense_layers
+                micro_aux_loss = micro_aux_loss / (num_aux_loss * cfg.gradient_accumulation_steps)
+                train_loss = train_loss + cfg.moe_aux_loss_coeff * micro_aux_loss
+                aux_loss = micro_aux_loss.detach() if aux_loss is None else aux_loss + micro_aux_loss.detach()
+
+            if cfg.loss_rescaling:
+                train_loss = state.scale * train_loss
+
+            train_loss.backward()
 
         # grad clip
         s_clip = timer()
