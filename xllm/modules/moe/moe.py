@@ -15,7 +15,6 @@ from xllm.modules.model_parallel import (
     scatter_to_model_parallel_region,
 )
 from xllm.modules.moe import all_to_all_expert_parallel_region
-from xllm.distributed.utils import divide_and_check_no_remainder
 from xllm.modules.fused_ops import memory_efficient_dropout
 from xllm.modules.layer_norm import GroupLayerNorm
 from xllm.modules.rms_norm import GroupRMSNorm
@@ -24,6 +23,7 @@ from xllm.health_metrics import get_active_health_collector
 from xllm.utils import get_init_fn
 from .router import TopKRouter
 from .expert import Expert
+from .layout import ExpertLayout
 from .dedup import token_rank_hits, build_dedup_plan, gather_rows, weighted_sum
 
 
@@ -69,11 +69,12 @@ class NormalizedMoE(nn.Module):
         self.init_mode = init_mode
         self.init_std = init_std
 
-        rank = get_model_parallel_rank()
-        world_size = get_model_parallel_world_size()
-        self.n_local_experts = divide_and_check_no_remainder(num_experts, world_size)
-        self.expert_start_idx = rank * self.n_local_experts
-        self.expert_end_idx = (rank + 1) * self.n_local_experts
+        self.layout = ExpertLayout.from_process_groups(num_experts)
+        if self.layout.e_out > 1:
+            raise NotImplementedError("EP > TP is not supported yet")
+        self.n_local_experts = self.layout.n_local
+        self.expert_start_idx = self.layout.start
+        self.expert_end_idx = self.layout.end
 
         norm_cls = GroupRMSNorm if apply_rmsnorm else GroupLayerNorm
         norm_eps = rmsnorm_eps if apply_rmsnorm else layernorm_eps
