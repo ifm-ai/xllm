@@ -113,7 +113,9 @@ def initialize_run(cfg: TrainerConf):
     logger.info("Done init of torch.distributed.")
 
     logger.info("Starting init of model parallel...")
-    initialize_model_parallel(cfg.model_parallel_size, cfg.context_parallel_size, cfg.nccl_timeout)
+    initialize_model_parallel(
+        cfg.model_parallel_size, cfg.context_parallel_size, cfg.nccl_timeout, expert_parallel_size=cfg.expert_parallel_size
+    )
     logger.info("Done init of model parallel.")
 
     logger.info(

@@ -325,6 +325,7 @@ class TrainerConf(Config):
 
     # Parallelism
     model_parallel_size: int = 1  # Num of model/tensor parallel.
+    expert_parallel_size: Optional[int] = None  # Num of GPUs splitting the routed experts. A multiple of model_parallel_size; EP / TP must divide DP. If None, = model_parallel_size.
     context_parallel_size: int = 1  # Num of context parallel. Splits sequences along the token dimension.
     fully_sharded_size: Optional[int] = None  # Num of FSDP shard group. If None, = DP.
 
@@ -426,6 +427,12 @@ class TrainerConf(Config):
         # MoE
         if self.model.num_experts > 0:
             assert self.model.num_experts % self.model_parallel_size == 0, f"{self.model.num_experts}/{self.model_parallel_size}"
+        if self.expert_parallel_size is not None:
+            assert self.expert_parallel_size % self.model_parallel_size == 0, f"{self.expert_parallel_size}/{self.model_parallel_size}"
+            if self.model.num_experts > 0:
+                assert self.model.num_experts % self.expert_parallel_size == 0, f"{self.model.num_experts}/{self.expert_parallel_size}"
+            if self.expert_parallel_size != self.model_parallel_size:
+                raise NotImplementedError("EP > TP is not supported yet")
         if self.moe_router_load_balancing_type is not None:
             assert self.moe_router_load_balancing_type in ['dot', 'entropy']
             assert self.moe_aux_loss_coeff >= 0.0
