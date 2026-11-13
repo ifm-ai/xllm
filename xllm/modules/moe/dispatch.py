@@ -14,6 +14,7 @@ replica's TP group computes experts for (M = T when EP = TP); n, the tokens this
     plan(routing_indices, tokens_per_expert, scores)
                                                 who sends what where, and the rows of each local expert
     dispatch(x, plan).wait()                    T x D/TP -> n x D, the full rows of this rank's tokens
+    start_dispatch(x, outer)                    the first hop of dispatch, before the rest of the plan exists
     combine(y, plan).wait()                     n x D -> T x D/TP, summed over the ranks that computed them
     local_scores(scores, plan)                  T x K routing scores (those given to plan) -> M x K, the scores
                                                 of the M tokens
@@ -24,7 +25,8 @@ the fused blocks run other work in between. With overlap=True (the fused blocks,
 NodeDispatcher also starts its second hop without blocking the calling stream: it runs on the dispatchers'
 side stream (side_stream) as soon as the first hop ends, and wait() only makes the calling stream wait for
 it. combine is the adjoint of dispatch, which dispatch_rows and combine_rows use for autograd. The fused
-blocks keep plan.state between forward and backward and rebuild the plan with replan.
+blocks keep plan.state between forward and backward and rebuild the plan with replan; at EP > TP, replan_outer
+rebuilds its first hop's part (plan.outer) alone, so start_dispatch starts that hop before the TP part is built.
 """
 import dataclasses
 import os
@@ -229,11 +231,18 @@ class TPDispatcher:
         """plan, given the counts it would read (see counts) instead of reading them: no host sync."""
         return self._build(routing_indices, self._hits(routing_indices), self._state(expert_counts, dest_counts))
 
-    def replan(self, routing_indices: Tensor, state: TPState) -> DispatchPlan:
+    def replan_outer(self, routing_indices: Tensor, state: TPState) -> None:
+        # one hop: no first hop to start ahead
+        return None
+
+    def replan(self, routing_indices: Tensor, state: TPState, outer: None = None) -> DispatchPlan:
         """The plan for the same routing, rebuilt without communication or sync from its state."""
         return self._build(routing_indices, self._hits(routing_indices), state)
 
-    def dispatch(self, x: Tensor, plan: DispatchPlan, overlap: bool = False) -> Pending:
+    def start_dispatch(self, x: Tensor, outer: None) -> None:
+        return None
+
+    def dispatch(self, x: Tensor, plan: DispatchPlan, overlap: bool = False, started: None = None) -> Pending:
         # one hop: overlap changes nothing
         # S x D/TP: each token's slice once per rank holding one of its experts
         send = torch.index_select(x, 0, plan.tp.send_tokens)
@@ -346,11 +355,6 @@ class NodeDispatcher:
         mine = rest // self.n_local == self.outer_rank
         return torch.where(mine, indices // self.share * self.n_local + rest % self.n_local, self.n_node)
 
-    def _build(self, routing_indices: Tensor, state: NodeState, tp_plan: DispatchPlan) -> DispatchPlan:
-        send_tokens, home_table = self._send_lists(routing_indices, state.send_splits)
-        outer = OuterPlan(send_tokens, home_table, state.send_splits, state.recv_splits)
-        return DispatchPlan(tp_plan.tp, tp_plan.group_sizes, tp_plan.n_tokens, state, outer)
-
     def _counts(self, routing_indices: Tensor, tokens_per_expert: Tensor) -> Tuple[Tensor, Tensor]:
         """T x E_out hits (see _hits), and E_out x (1 + n_node + TP) counts: for the tokens sent to each replica,
         their number, then what that replica's TPDispatcher.counts reads from them: the tokens of each of its
@@ -413,13 +417,22 @@ class NodeDispatcher:
         outer = OuterPlan(send_tokens, home_table, send_splits, recv_splits)
         return DispatchPlan(tp_plan.tp, tp_plan.group_sizes, tp_plan.n_tokens, state, outer)
 
-    def replan(self, routing_indices: Tensor, state: NodeState) -> DispatchPlan:
-        """The plan for the same routing, rebuilt without communication or sync from its state."""
-        return self._build(routing_indices, state, self.tp.replan(state.node_indices.long(), state.tp))
+    def replan_outer(self, routing_indices: Tensor, state: NodeState) -> OuterPlan:
+        """plan.outer of replan, alone: enough for start_dispatch."""
+        send_tokens, home_table = self._send_lists(routing_indices, state.send_splits)
+        return OuterPlan(send_tokens, home_table, state.send_splits, state.recv_splits)
 
-    def _to_replicas(self, x: Tensor, plan: DispatchPlan) -> Tuple[Tensor, Any, Tensor]:
-        send = torch.index_select(x, 0, plan.outer.send_tokens)
-        output, handle = all_to_all(send, plan.outer.send_splits, plan.outer.recv_splits, self.group, self.e_out)
+    def replan(self, routing_indices: Tensor, state: NodeState, outer: Optional[OuterPlan] = None) -> DispatchPlan:
+        """The plan for the same routing, rebuilt without communication or sync from its state; outer, if
+        given, is replan_outer's."""
+        if outer is None:
+            outer = self.replan_outer(routing_indices, state)
+        tp_plan = self.tp.replan(state.node_indices.long(), state.tp)
+        return DispatchPlan(tp_plan.tp, tp_plan.group_sizes, tp_plan.n_tokens, state, outer)
+
+    def _to_replicas(self, x: Tensor, outer: OuterPlan) -> Tuple[Tensor, Any, Tensor]:
+        send = torch.index_select(x, 0, outer.send_tokens)
+        output, handle = all_to_all(send, outer.send_splits, outer.recv_splits, self.group, self.e_out)
         return output, handle, send
 
     def _from_replicas(self, y: Tensor, plan: DispatchPlan) -> Pending:
@@ -428,8 +441,13 @@ class NodeDispatcher:
         finish = lambda output: masked_gather_sum(output, plan.outer.home_table, None, self.backend)
         return Pending(output, handle, finish, keep=y)
 
-    def dispatch(self, x: Tensor, plan: DispatchPlan, overlap: bool = False) -> Pending:
-        output, handle, send = self._to_replicas(x, plan)
+    def start_dispatch(self, x: Tensor, outer: OuterPlan) -> Tuple[Tensor, Any, Tensor]:
+        """Start the first hop of dispatch(x, plan) for plan.outer = outer; pass the result to dispatch as started."""
+        return self._to_replicas(x, outer)
+
+    def dispatch(self, x: Tensor, plan: DispatchPlan, overlap: bool = False,
+                 started: Optional[Tuple[Tensor, Any, Tensor]] = None) -> Pending:
+        output, handle, send = started if started is not None else self._to_replicas(x, plan.outer)
         if not overlap:
             # M x D/TP received, then n x D inside the TP group, both at wait()
             finish = lambda output: self.tp.dispatch(output, plan).wait()
@@ -466,7 +484,7 @@ class NodeDispatcher:
 
     def send_scores(self, scores: Tensor, plan: DispatchPlan) -> Tensor:
         """T x K -> M x K, the scores of the received tokens, sent apart from the plan (check_plan)."""
-        output, handle, _ = self._to_replicas(scores.reshape(-1, self.topk), plan)
+        output, handle, _ = self._to_replicas(scores.reshape(-1, self.topk), plan.outer)
         handle.wait()
         return output
 

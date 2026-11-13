@@ -164,6 +164,16 @@ def moe_bwd(
 ):
     bsz, seq_len, _ = xf.size()
     n_local_experts = dispatcher.n_local
+    # B*L*K
+    routing_indices_flat = routing_indices.flatten()
+    x_rows = xf.view(bsz * seq_len, -1)
+    grad_rows = out_grad.reshape(bsz * seq_len, -1)
+    # the layer input and the output gradient go to the experts again. At EP > TP their first hop, to the expert
+    # group's replicas, needs only its own part of the plan: it starts first, and runs under the recompute below
+    outer = dispatcher.replan_outer(routing_indices_flat, dispatch_state)
+    xu = dispatcher.start_dispatch(x_rows, outer)
+    yu_grad = dispatcher.start_dispatch(grad_rows, outer)
+
     # recompute router
     if original_scores is None:
         routing_logits = F.linear(xf, router_w).to(torch.float32)
@@ -197,18 +207,16 @@ def moe_bwd(
         topk_scores = org_topk_scores
     scaled_topk_scores = (topk_scores * routing_scaling_factor if routing_scaling_factor else topk_scores).to(xf)
 
-    # B*L*K
-    routing_indices_flat = routing_indices.flatten()
     # rebuilt from the routing rather than kept from forward: cheap, and less state to save
-    plan = dispatcher.replan(routing_indices_flat, dispatch_state)
+    plan = dispatcher.replan(routing_indices_flat, dispatch_state, outer)
     group_sizes = plan.group_sizes
 
     # recompute xp: each token's slice goes once to every rank holding one of its experts
     overlap = moe_overlap()
-    xu = dispatcher.dispatch(xf.view(bsz * seq_len, -1), plan, overlap)
+    xu = dispatcher.dispatch(x_rows, plan, overlap, started=xu)
 
     # the output gradient goes the same way, unscaled; the owner applies the routing scores
-    yu_grad = dispatcher.dispatch(out_grad.reshape(bsz * seq_len, -1), plan, overlap)
+    yu_grad = dispatcher.dispatch(grad_rows, plan, overlap, started=yu_grad)
 
     if original_scores is None:
         # Router indices
