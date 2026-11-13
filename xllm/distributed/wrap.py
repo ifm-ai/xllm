@@ -1,8 +1,8 @@
 import contextlib
-from typing import Any, Generator, Optional
+from typing import Any, Generator, Optional, Sequence
 import torch.nn as nn
 from torch.distributed.device_mesh import DeviceMesh
-from torch.distributed.fsdp import fully_shard, register_fsdp_forward_method
+from torch.distributed.fsdp import FSDPModule, fully_shard, register_fsdp_forward_method
 
 
 @contextlib.contextmanager
@@ -55,6 +55,25 @@ def wrap_experts(module: nn.Module) -> nn.Module:
     module = wrap(module, **overrides)
     register_fsdp_forward_method(module, "run_fused")
     return module
+
+
+def prefetch_experts_in_backward(units: Sequence[nn.Module]) -> None:
+    """
+    Make each unit gather in backward the unit before it together with its experts.
+
+    Args:
+        units: the units in forward order, e.g. the layers then the output layer.
+
+    By default, FSDP2 gathers in backward the unit whose forward ended just
+    before. A layer and its experts are two units whose forwards end one
+    right after the other, so one of them gathers the other, already
+    gathered, and a part of the layer below would only be gathered once its
+    backward starts.
+    """
+    for unit, prev in zip(units[1:], units[:-1]):
+        experts = getattr(getattr(prev, "moe", None), "experts", None)
+        if isinstance(unit, FSDPModule) and isinstance(prev, FSDPModule) and isinstance(experts, FSDPModule):
+            unit.set_modules_to_backward_prefetch([prev, experts])
 
 
 class _ConfigAutoWrap:

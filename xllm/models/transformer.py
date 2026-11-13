@@ -619,7 +619,7 @@ class Transformer(XLLModel):
             wrap_experts = lambda module: module
         else:
             assert cfg.ddp_backend == 'fsdp2'
-            from xllm.distributed.wrap import wrap, wrap_experts
+            from xllm.distributed.wrap import wrap, wrap_experts, prefetch_experts_in_backward
 
         init_fn = get_init_fn('gaussian', dim=self.model_dim, std=cfg.init_embed_std)
         self.embed = wrap(ParallelEmbedding(
@@ -645,6 +645,8 @@ class Transformer(XLLModel):
             self.layers.append(wrap(layer))
 
         self.output = wrap(TransformerOutputLayer(cfg))
+        if cfg.ddp_backend == 'fsdp2':
+            prefetch_experts_in_backward(list(self.layers) + [self.output])
 
     def forward(
         self,
