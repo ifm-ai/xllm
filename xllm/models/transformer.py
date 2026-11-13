@@ -268,11 +268,11 @@ class TransformerMoEBlock(nn.Module):
         attn_stability_control: int = 0,
         deterministic: bool = True,
         cache: Optional[Tuple[Tensor, Tensor, int]] = None,
+        experts_gathered: bool = False,
     ) -> Tuple[Tensor, Optional[Tensor], Optional[Any]]:
         if self.fused_block and self.training:
             fn = TransformerMoEBlockFunction
-            # the experts run inside the fused block: run it as their forward, for their FSDP unit
-            return self.moe.experts.run_fused(lambda x, expert_w1, expert_w2, expert_w3: fn.apply(
+            block = lambda x, expert_w1, expert_w2, expert_w3: fn.apply(
                 self.layer_id,
                 x,
                 freqs_cis,
@@ -332,7 +332,12 @@ class TransformerMoEBlock(nn.Module):
                 self.recompute_fc1_out,
                 self.recompute_fc3_out,
                 self.recompute_router,
-            ), x)
+            )
+            if experts_gathered:
+                # the caller runs this layer as the experts' forward (see Transformer.run_layer)
+                return block(x, self.moe.experts.weight1, self.moe.experts.weight2, self.moe.experts.weight3)
+            # the experts run inside the fused block: run it as their forward, for their FSDP unit
+            return self.moe.experts.run_fused(block, x)
 
         y, cache = self.attention(
             x, freqs_cis, bos_mask, segments, attn_stability_control, deterministic, cache
@@ -437,11 +442,11 @@ class TransformerMoVABlock(nn.Module):
         attn_stability_control: int = 0,
         deterministic: bool = True,
         cache: Optional[Tuple[Tensor, Tensor, int]] = None,
+        experts_gathered: bool = False,
     ) -> Tuple[Tensor, Optional[Tensor], Optional[Any]]:
         if self.fused_block and self.training:
             fn = TransformerMoVABlockFunction
-            # the experts run inside the fused block: run it as their forward, for their FSDP unit
-            return self.moe.experts.run_fused(lambda x, expert_w1, expert_w2, expert_w3: fn.apply(
+            block = lambda x, expert_w1, expert_w2, expert_w3: fn.apply(
                 self.layer_id,
                 x,
                 freqs_cis,
@@ -506,7 +511,12 @@ class TransformerMoVABlock(nn.Module):
                 self.recompute_fc1_out,
                 self.recompute_fc3_out,
                 self.recompute_router,
-            ), x)
+            )
+            if experts_gathered:
+                # the caller runs this layer as the experts' forward (see Transformer.run_layer)
+                return block(x, self.moe.experts.weight1, self.moe.experts.weight2, self.moe.experts.weight3)
+            # the experts run inside the fused block: run it as their forward, for their FSDP unit
+            return self.moe.experts.run_fused(block, x)
 
         y, aux_loss_mova, cache = self.mova(
             x, freqs_cis, bos_mask, segments, attn_stability_control, deterministic, cache, moe_router_load_balancing_type
@@ -648,6 +658,17 @@ class Transformer(XLLModel):
         if cfg.ddp_backend == 'fsdp2':
             prefetch_experts_in_backward(list(self.layers) + [self.output])
 
+    def run_layer(self, layer: nn.Module, x: Tensor, *args: Any) -> Tuple[Tensor, Optional[Tensor], Optional[Any]]:
+        """Return layer(x, *args); a fused MoE layer in training runs as the forward of its experts."""
+        if isinstance(layer, (TransformerMoEBlock, TransformerMoVABlock)) and layer.fused_block and self.training:
+            # The fused block computes the experts. With the layer inside the experts' call rather than the
+            # experts inside the layer's, FSDP reduce-scatters the layer's other gradients before the experts'
+            # (it waits for one reduce-scatter to end before the next), so the experts' one overlaps the
+            # backward of the layer below instead of holding up the start of it.
+            # The layer reads the gathered weights from the experts module.
+            return layer.moe.experts.run_fused(lambda x, *_: layer(x, *args, experts_gathered=True), x)
+        return layer(x, *args)
+
     def forward(
         self,
         tokens: Tensor,
@@ -702,13 +723,13 @@ class Transformer(XLLModel):
             layer_cache = cache[i] if cache is not None else None
             if self.layerwise_ckpt:
                 x, aux_loss, layer_cache = checkpoint(
-                    layer, x, freq_cis, bos_mask, segments, moe_router_load_balancing_type,
+                    self.run_layer, layer, x, freq_cis, bos_mask, segments, moe_router_load_balancing_type,
                     attn_stability_control, deterministic, layer_cache,
                     use_reentrant=False, preserve_rng_state=True
                 )
             else:
-                x, aux_loss, layer_cache = layer(
-                    x, freq_cis, bos_mask, segments, moe_router_load_balancing_type,
+                x, aux_loss, layer_cache = self.run_layer(
+                    layer, x, freq_cis, bos_mask, segments, moe_router_load_balancing_type,
                     attn_stability_control, deterministic, layer_cache
                 )
 
