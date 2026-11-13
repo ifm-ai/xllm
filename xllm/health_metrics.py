@@ -238,8 +238,10 @@ class HealthMetricCollector:
     @torch.no_grad()
     def record_query_key_stats(
         self, layer_idx: int, q: torch.Tensor, k: torch.Tensor, kq: Optional[torch.Tensor] = None,
+        gate: Optional[torch.Tensor] = None,
     ) -> None:
-        """Record Q/K; kq is softdelta's second query set and is logged as kq_stats when given."""
+        """Record Q/K. Softdelta also passes kq (logged as kq_stats) and its subtraction-gate logits
+        (sigmoid logged as softdelta_gate_stats)."""
         if not self.recording or not self.enable_query_key_stats:
             return
         if layer_idx in self.query_key_stats_records:
@@ -256,6 +258,8 @@ class HealthMetricCollector:
             layer_stats[f"{name}_vector_l2"] = self._local_stats(
                 torch.linalg.vector_norm(x.detach(), dim=-1, dtype=torch.float32)
             )
+        if gate is not None:
+            layer_stats["gate"] = self._local_stats(torch.sigmoid(gate.detach().float()))
         self.query_key_stats_records[layer_idx] = layer_stats
 
     @torch.no_grad()
@@ -631,12 +635,11 @@ class HealthMetricCollector:
                 f"got layers {sorted(self.query_key_stats_records)} at step {step}"
             )
         elif self.enable_query_key_stats:
-            # kq is presence-driven; every rank packs the same layout only if every layer agrees.
-            with_kq = [i for i in layers if "kq" in self.query_key_stats_records[i]]
-            if with_kq and len(with_kq) != len(layers):
-                problems.append(
-                    f"Second-query (kq) records at step {step} cover layers {with_kq} only"
-                )
+            # kq and the gate are presence-driven; every rank packs the same layout only if every layer agrees.
+            for name in ("kq", "gate"):
+                present = [i for i in layers if name in self.query_key_stats_records[i]]
+                if present and len(present) != len(layers):
+                    problems.append(f"Softdelta {name} records at step {step} cover layers {present} only")
         if self.enable_logits_stats and self.logits_stats_record is None:
             problems.append(f"Missing logit statistics at step {step}")
         if (self.enable_weight_norms or self.enable_gradient_norms) and (
@@ -707,6 +710,8 @@ class HealthMetricCollector:
                         ("vector_l2_mean", "vector_l2_min", "vector_l2_max"),
                         qk_stats[f"{name}_vector_l2"],
                     ))
+                if "gate" in qk_stats:
+                    entries.append((f"softdelta_gate_stats/{layer}", ("mean", "min", "max"), qk_stats["gate"]))
 
         if self.enable_gekko_stats:
             for layer_idx in layers:
@@ -792,15 +797,11 @@ class HealthMetricCollector:
                 metrics[f"{prefix}/awk_energy_fraction"] = (
                     awk_squared / total_energy if total_energy > 0 else float("nan")
                 )
-                for name in ("sca_squared", "awk_squared", "gate_near_zero", "history_available"):
+                for name in ("sca_squared", "awk_squared", "gate_near_zero"):
                     for stat in ("min", "max"):
                         del metrics[f"{prefix}/{name}/{stat}"]
                 del metrics[f"{prefix}/sca_squared/mean"], metrics[f"{prefix}/awk_squared/mean"]
-                for name, metric_name in (
-                    ("gate_near_zero", "output_gate/near_zero_fraction"),
-                    ("history_available", "awk_history_available_fraction"),
-                ):
-                    metrics[f"{prefix}/{metric_name}"] = metrics.pop(f"{prefix}/{name}/mean")
+                metrics[f"{prefix}/output_gate/near_zero_fraction"] = metrics.pop(f"{prefix}/gate_near_zero/mean")
                 ratio_count = entry_counts[f"{prefix}/awk_update_ratio"]
                 metrics[f"{prefix}/awk_update_ratio/count"] = ratio_count
                 if ratio_count == 0:
