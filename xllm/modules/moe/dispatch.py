@@ -5,6 +5,8 @@ back, summed per token. The MoE layers only see this interface, so each expert p
 implementation of it:
 
     TPDispatcher    EP = TP: the TP ranks of a replica split the experts, tokens move inside the TP group.
+    NodeDispatcher  EP = TP x E_out: E_out replicas (nodes at TP 8) split the experts; a token goes once to
+                    every replica holding one of its experts, then inside that replica's TP group.
 
 Token sets: T, the tokens of this replica (every TP rank holds a 1/TP slice of each); M, the tokens this
 replica's TP group computes experts for (M = T when EP = TP); n, the tokens this rank computes. Steps:
@@ -32,8 +34,9 @@ from xllm.distributed import (
     get_model_parallel_group,
     get_model_parallel_rank,
     get_model_parallel_world_size,
+    get_expert_outer_group,
 )
-from .dedup import DedupPlan, token_rank_hits, build_dedup_plan, masked_gather_sum
+from .dedup import DedupPlan, token_rank_hits, build_send_lists, build_dedup_plan, masked_gather_sum
 from .layout import ExpertLayout
 
 
@@ -75,6 +78,28 @@ class TPState:
 
 
 @dataclass
+class NodeState:
+    """What NodeDispatcher.replan needs besides the routing indices."""
+    # rows sent to and received from each replica of the expert group
+    send_splits: List[int]
+    recv_splits: List[int]
+    # M*K int32: the experts of the received tokens, in the TP group's numbering (see NodeDispatcher)
+    node_indices: Tensor
+    tp: TPState
+
+
+@dataclass
+class OuterPlan:
+    """The T tokens of a replica to the replicas of its expert group (NodeDispatcher)."""
+    # S: token ids to send, grouped by destination replica, ascending within a group
+    send_tokens: Tensor
+    # T x E_out: row of the send buffer holding (token, replica), -1 if the token skips that replica
+    home_table: Tensor
+    send_splits: List[int]
+    recv_splits: List[int]
+
+
+@dataclass
 class DispatchPlan:
     # the M tokens to the TP ranks, and the (token, expert) pairs of this rank
     tp: DedupPlan
@@ -84,6 +109,8 @@ class DispatchPlan:
     n_tokens: int
     # kept by the fused blocks for replan
     state: Any
+    # EP > TP: the T tokens to the replicas that compute them
+    outer: Optional[OuterPlan] = None
 
     @property
     def n_pairs(self) -> int:
@@ -167,6 +194,121 @@ class TPDispatcher:
         return grad
 
 
+class NodeDispatcher:
+    """EP = TP x E_out: once per replica, then inside the replica's TP group.
+
+    The GPU at TP rank k of replica o owns the experts k * N / TP + o * n_local + [0, n_local) (ExpertLayout),
+    so the replica o owns TP x n_local experts. A token goes to each replica holding one of its experts once,
+    each TP rank sending its 1/TP slice to the same TP rank there (the expert outer group); that replica runs
+    TPDispatcher on the M tokens it received, numbering its experts k * n_local + i and every other expert
+    TP * n_local (masked), and sums its experts' outputs per token before they go back. The routing indices
+    and scores of the sent tokens go along with them. Every TP rank of a replica sends and receives the same
+    tokens in the same order, so the replica's TP ranks agree on the M tokens and their routing.
+
+    Per layer and rank, besides TPDispatcher's traffic on the M tokens: S x D/TP rows over the expert outer
+    group in each dispatch and combine, S the (token, other replica) pairs plus the token's own replica,
+    S x K int32 indices once per plan and S x K scores once per local_scores and scores_grad, and one
+    all-to-all of E_out counts per plan.
+    """
+
+    def __init__(self, layout: ExpertLayout, topk: int, backend: str):
+        assert layout.e_out > 1
+        self.topk = topk
+        self.backend = backend
+        self.n_local = layout.n_local
+        # experts of one TP rank across the expert group
+        self.share = layout.n_experts // layout.tp
+        self.outer_rank = layout.outer_rank
+        self.e_out = layout.e_out
+        self.group = get_expert_outer_group()
+        self.n_node = layout.tp * layout.n_local
+        self.tp = TPDispatcher(self.n_node, self.n_local, topk, backend, masked=True)
+
+    def _send_lists(self, routing_indices: Tensor, send_splits: List[int]) -> Tuple[Tensor, Tensor]:
+        hits = self._hits(routing_indices)
+        _, send_tokens, _, home_table = build_send_lists(hits, send_splits)
+        return send_tokens, home_table
+
+    def _hits(self, routing_indices: Tensor) -> Tensor:
+        # T x E_out: whether a token picked an expert of each replica of the expert group
+        dest = routing_indices.view(-1, self.topk) % self.share // self.n_local
+        hits = torch.zeros(dest.size(0), self.e_out, dtype=torch.bool, device=dest.device)
+        return hits.scatter_(1, dest, True)
+
+    def _node_indices(self, indices: Tensor) -> Tensor:
+        """The experts of this replica numbered k * n_local + i, the others n_node."""
+        rest = indices % self.share
+        mine = rest // self.n_local == self.outer_rank
+        return torch.where(mine, indices // self.share * self.n_local + rest % self.n_local, self.n_node)
+
+    def _build(self, routing_indices: Tensor, state: NodeState, tp_plan: DispatchPlan) -> DispatchPlan:
+        send_tokens, home_table = self._send_lists(routing_indices, state.send_splits)
+        outer = OuterPlan(send_tokens, home_table, state.send_splits, state.recv_splits)
+        return DispatchPlan(tp_plan.tp, tp_plan.group_sizes, tp_plan.n_tokens, state, outer)
+
+    def plan(self, routing_indices: Tensor, tokens_per_expert: Tensor) -> DispatchPlan:
+        """routing_indices: T*K flat expert indices. tokens_per_expert is not used."""
+        hits = self._hits(routing_indices)
+        send_counts = hits.sum(dim=0)
+        ones = [1] * self.e_out
+        recv_counts, handle = all_to_all(send_counts, ones, ones, self.group, self.e_out)
+        handle.wait()
+        counts = torch.cat([send_counts, recv_counts]).tolist()
+        send_splits, recv_splits = counts[:self.e_out], counts[self.e_out:]
+        _, send_tokens, _, home_table = build_send_lists(hits, send_splits)
+
+        # the routing of the tokens each replica receives
+        send_indices = routing_indices.view(-1, self.topk).index_select(0, send_tokens).int()
+        recv_indices, handle = all_to_all(send_indices, send_splits, recv_splits, self.group, self.e_out)
+        handle.wait()
+        # M*K
+        node_indices = self._node_indices(recv_indices.long()).flatten()
+        tp_plan = self.tp.plan(node_indices, torch.bincount(node_indices, minlength=self.n_node + 1)[:self.n_node])
+
+        # int32: half the memory, kept until backward
+        state = NodeState(send_splits, recv_splits, node_indices.int(), tp_plan.state)
+        outer = OuterPlan(send_tokens, home_table, send_splits, recv_splits)
+        return DispatchPlan(tp_plan.tp, tp_plan.group_sizes, tp_plan.n_tokens, state, outer)
+
+    def replan(self, routing_indices: Tensor, state: NodeState) -> DispatchPlan:
+        """The plan for the same routing, rebuilt without communication or sync from its state."""
+        return self._build(routing_indices, state, self.tp.replan(state.node_indices.long(), state.tp))
+
+    def _to_replicas(self, x: Tensor, plan: DispatchPlan) -> Tuple[Tensor, Any, Tensor]:
+        send = torch.index_select(x, 0, plan.outer.send_tokens)
+        output, handle = all_to_all(send, plan.outer.send_splits, plan.outer.recv_splits, self.group, self.e_out)
+        return output, handle, send
+
+    def _from_replicas(self, y: Tensor, plan: DispatchPlan) -> Pending:
+        output, handle = all_to_all(y, plan.outer.recv_splits, plan.outer.send_splits, self.group, self.e_out)
+        # T rows: add up the parts returned by each replica
+        finish = lambda output: masked_gather_sum(output, plan.outer.home_table, None, self.backend)
+        return Pending(output, handle, finish)
+
+    def dispatch(self, x: Tensor, plan: DispatchPlan) -> Pending:
+        output, handle, send = self._to_replicas(x, plan)
+        # M x D/TP received, then n x D inside the TP group
+        finish = lambda output: self.tp.dispatch(output, plan).wait()
+        return Pending(output, handle, finish, keep=send)
+
+    def combine(self, y: Tensor, plan: DispatchPlan) -> Pending:
+        # M x D/TP: summed over this replica's experts, then sent back
+        return self._from_replicas(self.tp.combine(y, plan).wait(), plan)
+
+    def local_scores(self, scores: Tensor, plan: DispatchPlan) -> Tensor:
+        return _LocalScores.apply(scores, self, plan)
+
+    def send_scores(self, scores: Tensor, plan: DispatchPlan) -> Tensor:
+        """T x K -> M x K, the scores of the received tokens. Use local_scores for autograd."""
+        output, handle, _ = self._to_replicas(scores.reshape(-1, self.topk), plan)
+        handle.wait()
+        return output
+
+    def scores_grad(self, grad: Tensor, plan: DispatchPlan) -> Tensor:
+        """M x K -> T x K: each slot's gradient comes from the replica that computed it, the others add 0."""
+        return self._from_replicas(grad.reshape(-1, self.topk).contiguous(), plan).wait()
+
+
 @dataclass
 class _Saved:
     """Stands for a tensor of a plan saved for backward."""
@@ -206,11 +348,24 @@ def _saved_plan(ctx) -> DispatchPlan:
     return _put_tensors(ctx.plan, ctx.saved_tensors)
 
 
+class _LocalScores(torch.autograd.Function):
+
+    @staticmethod
+    def forward(ctx, scores: Tensor, dispatcher: NodeDispatcher, plan: DispatchPlan) -> Tensor:
+        _save_plan(ctx, dispatcher, plan)
+        ctx.shape = scores.shape
+        return dispatcher.send_scores(scores, plan)
+
+    @staticmethod
+    def backward(ctx, grad: Tensor):
+        return ctx.dispatcher.scores_grad(grad, _saved_plan(ctx)).view(ctx.shape), None, None
+
+
 def build_dispatcher(layout: ExpertLayout, topk: int, backend: str):
     """The dispatcher of the calling rank's expert layout."""
     if layout.e_out == 1:
         return TPDispatcher(layout.n_experts, layout.n_local, topk, backend)
-    raise NotImplementedError("EP > TP is not supported yet")
+    return NodeDispatcher(layout, topk, backend)
 
 
 class _DispatchRows(torch.autograd.Function):

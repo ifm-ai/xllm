@@ -85,12 +85,8 @@ def check(tp: int, cp: int, ep: int) -> list:
     if not torch.equal(counts['expert outer'], tp_share):
         errors.append("outer group does not own its TP rank's share")
 
-    if e_out > 1:
-        try:
-            NormalizedMoE(0, 64, 16, N_EXPERTS, 2, 0)
-            errors.append("NormalizedMoE accepted E_out > 1")
-        except NotImplementedError:
-            pass
+    # every layout builds its MoE layer
+    NormalizedMoE(0, 64, 16, N_EXPERTS, 2, 0)
     return errors
 
 
