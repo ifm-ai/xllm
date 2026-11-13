@@ -6,7 +6,10 @@ import fire
 from xllm.modules.fused_ops import (
     multi_group_matmul_fwd,
     multi_group_matmul_bwd,
+    multi_group_matmul_dgrad,
+    multi_group_matmul_wgrad,
 )
+from xllm.modules.fused_ops.mgmm.multi_group_matmul import _multi_group_matmul
 
 
 def manual_mgmm(
@@ -122,7 +125,108 @@ def test(bsz: int, n_experts: int, d_in: int, d_out: int, transpose: bool, dtype
         print(f"B={bsz}, N={n_experts}, d=({d_in}, {d_out}), transpose={transpose}, dtype={dtype}: pass te bwd test")
 
 
-def main(seed: int, dtype: str):
+# group sizes for the split checks: random, empty groups at the start, middle and end, one group, all empty
+SPLIT_CASES = [
+    # (group sizes, d_in, d_out)
+    ([3, 2], 4, 5),
+    ([0, 5, 0, 8], 7, 10),
+    ([4, 0, 0, 9, 0], 16, 16),
+    ([40, 0, 33, 0, 51, 0, 60, 0], 32, 64),
+    ([0, 0, 0, 77], 64, 32),
+    ([128], 64, 48),
+    ([0, 0, 0], 32, 16),
+    ([0], 16, 16),
+    ([300, 0, 211, 517, 0, 101, 0, 400], 256, 512),
+    ([1024, 0, 2048, 512, 0, 0, 1536, 977], 1024, 512),
+]
+SPLIT_BACKENDS = ['te', 'torch', 'sequential', 'nested']
+
+
+def busy_stream(device):
+    # unrelated work queued on the stream, which also reuses freed blocks of the caching allocator
+    a = torch.randn(1024, 1024, device=device)
+    for _ in range(4):
+        a = torch.tanh(a @ a.t() / 32)
+    junk = [torch.full((1 << 18,), float('nan'), device=device) for _ in range(8)]
+    del junk
+    return a.sum()
+
+
+def equal(name: str, a, b) -> bool:
+    if a is None or b is None:
+        ok = a is None and b is None
+    else:
+        ok = a.shape == b.shape and a.dtype == b.dtype and torch.equal(a, b)
+    if not ok:
+        print(f"FAIL {name}")
+    return ok
+
+
+def check_mgmm_split(group_sizes, d_in: int, d_out: int, transpose: bool, pt_dtype, backend: str) -> bool:
+    """dgrad and wgrad called alone, in either order or with other work between them, must be bitwise equal to
+    the backend's joint backward (_multi_group_matmul with a 3rd input, which MultiGroupMatMulFunc and
+    multi_group_matmul_bwd use)."""
+    n, bsz = len(group_sizes), sum(group_sizes)
+    inp1 = torch.randn(bsz, d_in, dtype=pt_dtype, device="cuda")
+    inp2 = torch.randn(n, *((d_out, d_in) if transpose else (d_in, d_out)), dtype=pt_dtype, device="cuda")
+    out_grad = torch.randn(bsz, d_out, dtype=pt_dtype, device="cuda")
+    tag = f"{backend} gs={group_sizes} d=({d_in}, {d_out}) transpose={transpose} {pt_dtype}"
+    try:
+        ref1, ref2 = _multi_group_matmul(out_grad, inp2, inp1, group_sizes, not transpose, backend)
+    except Exception as e:  # a case the backend does not support: the split must not support it either
+        try:
+            multi_group_matmul_bwd(out_grad, inp2, inp1, group_sizes, transpose, backend)
+        except Exception:
+            print(f"skip {tag}: joint and split both raise {type(e).__name__}")
+            return True
+        print(f"FAIL {tag}: joint raises {type(e).__name__} but split does not")
+        return False
+
+    ok = True
+    g1, g2 = multi_group_matmul_bwd(out_grad, inp2, inp1, group_sizes, transpose, backend)
+    ok &= equal(f"{tag}: bwd dgrad", g1, ref1)
+    ok &= equal(f"{tag}: bwd wgrad", g2, ref2)
+    # wgrad first
+    g2 = multi_group_matmul_wgrad(out_grad, inp2, inp1, group_sizes, transpose, backend)
+    g1 = multi_group_matmul_dgrad(out_grad, inp2, group_sizes, transpose, backend)
+    ok &= equal(f"{tag}: wgrad-first dgrad", g1, ref1)
+    ok &= equal(f"{tag}: wgrad-first wgrad", g2, ref2)
+    # dgrad, other work on the stream, then wgrad
+    g1 = multi_group_matmul_dgrad(out_grad, inp2, group_sizes, transpose, backend)
+    other = torch.randn_like(out_grad)
+    multi_group_matmul_bwd(other, inp2, inp1, group_sizes, transpose, backend)
+    busy_stream(inp1.device)
+    del other
+    g2 = multi_group_matmul_wgrad(out_grad, inp2, inp1, group_sizes, transpose, backend)
+    ok &= equal(f"{tag}: deferred dgrad", g1, ref1)
+    ok &= equal(f"{tag}: deferred wgrad", g2, ref2)
+    torch.cuda.synchronize()
+    return ok
+
+
+def split(seed: int):
+    """Bitwise checks of the split backward, in bf16 and fp32; exits with 1 if any fails."""
+    torch.backends.cuda.matmul.allow_tf32 = False
+    n_checks, n_fail = 0, 0
+    for pt_dtype in [torch.bfloat16, torch.float32]:
+        torch.manual_seed(seed)
+        for group_sizes, d_in, d_out in SPLIT_CASES:
+            for backend in SPLIT_BACKENDS:
+                for transpose in [False, True]:
+                    n_checks += 1
+                    n_fail += not check_mgmm_split(group_sizes, d_in, d_out, transpose, pt_dtype, backend)
+        print(f"mgmm split {pt_dtype}: {n_checks} cases, {n_fail} failed")
+    print(f"{'FAIL' if n_fail else 'PASS'}: {n_fail} of {n_checks} cases failed")
+    if n_fail:
+        raise SystemExit(1)
+
+
+def main(seed: int, dtype: str = 'bf16', split_only: bool = False):
+    """--split_only runs only the bitwise checks of the split backward (both dtypes), e.g.
+        python tests/moe/test_mgmm.py --seed 0 --split_only
+    """
+    if split_only:
+        return split(seed)
     print(f"Initializing random seed to {seed}")
     np.random.seed(seed)
     torch.manual_seed(seed)
