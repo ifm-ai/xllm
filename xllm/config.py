@@ -187,6 +187,7 @@ class ModelConf(Config):
     recompute_fc1_out: bool = False  # Whether to recompute fc1 outputs in dense FFNs or shared experts in fused block.
     recompute_fc3_out: bool = False  # Whether to recompute fc3 outputs in dense SwiGLU FFNs or shared experts in fused block.
     recompute_router: bool = False  # Whether to recompute router scores for MoE/MoVA in fused block.
+    moe_prefetch_dispatch: bool = False  # At EP > TP, whether the backward of each fused MoE layer starts the first hop (to the expert group's other replicas) of the next layer's input dispatch, under its attention backward. Keeps the MoE input (T x D/TP per GPU) of each layer until then. No effect with moe_keep_dispatched.
     moe_keep_dispatched: bool = False  # Whether the fused block keeps each MoE layer's dispatched input (n x D per GPU, n its tokens) for backward, instead of sending it to the experts again.
 
     recompute_logits: bool = False  # Whether to recompute logits in output layer. Independent of fused_block. True = recompute logits and compute grad_X/grad_W during backward, False = precompute grad_X/grad_W during forward.

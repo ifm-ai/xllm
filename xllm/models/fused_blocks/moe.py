@@ -1,4 +1,5 @@
 from functools import partial
+from typing import Optional
 import torch
 from torch.nn import functional as F
 from einops import rearrange
@@ -14,7 +15,7 @@ from xllm.modules.fused_ops import (
 )
 from xllm.modules.moe.router import calc_probs
 from xllm.modules.moe.dedup import masked_gather_sum
-from xllm.modules.moe.dispatch import moe_overlap
+from xllm.modules.moe.dispatch import moe_overlap, NodeDispatcher
 from .utils import (
     grouped_experts_fwd,
     grouped_experts_bwd,
@@ -25,14 +26,63 @@ from .distributed import (
 )
 
 
+class PrefetchSlot:
+    """A fused MoE layer's part in the backward prefetch of the dispatch (moe_prefetch_dispatch, EP > TP).
+
+    The backward of a MoE layer sends the layer input to the expert group's replicas again. That first hop needs
+    only the input and the routing, known since forward: the backward of the MoE layer after it, which runs just
+    before, starts it once its own MoE part is done, so the hop runs under that layer's attention backward instead
+    of at the start of this one. The layer's forward fills its slot (fill: the input rows, kept until then, and
+    the routing), the next layer's backward starts the hop (start_previous) and this layer's backward takes it
+    (take). The slots link the layers of one forward pass (DispatchPrefetch); the autograd nodes hold them, so
+    nothing outlives the graph. Every rank runs the layers in the same order and fills the same slots, so the
+    ranks of the expert outer group start the same hops in the same order.
+    """
+
+    def __init__(self, previous: Optional['PrefetchSlot']):
+        # the slot of the MoE layer before this one in forward: its backward comes right after this one's
+        self.previous = previous
+        self._inputs = None
+        self._started = None
+
+    def fill(self, dispatcher, routing_indices, state, x):
+        self._inputs = (dispatcher, routing_indices, state, x)
+
+    def start_previous(self):
+        """Start the first hop of the previous layer's backward dispatch, if it has one."""
+        previous, self.previous = self.previous, None
+        if previous is not None and previous._inputs is not None:
+            dispatcher, routing_indices, state, x = previous._inputs
+            previous._inputs = None
+            outer = dispatcher.replan_outer(routing_indices, state)
+            previous._started = (outer, dispatcher.start_dispatch(x, outer))
+
+    def take(self):
+        """(plan.outer, the started first hop) for moe_bwd, or None if it was not started."""
+        started, self._started, self._inputs = self._started, None, None
+        return started
+
+
+class DispatchPrefetch:
+    """The PrefetchSlots of one forward pass, one per fused MoE layer, in order."""
+
+    def __init__(self):
+        self._last = None
+
+    def slot(self) -> PrefetchSlot:
+        self._last = PrefetchSlot(self._last)
+        return self._last
+
+
 def moe_fwd(
     xf, router_w, router_bias, routing_score_func, routing_scaling_factor, router_load_balancing_type,
     fc1_w, fc2_w, fc3_w, n_experts, dispatcher, topk,
     expert_w1, expert_w2, expert_w3, expert_backend, moe_permutation_backend,
-    hidden_dropout, recompute_fc1_out, recompute_fc3_out, keep_dispatched=False,
+    hidden_dropout, recompute_fc1_out, recompute_fc3_out, keep_dispatched=False, prefetch=None,
 ):
     """keep_dispatched: also return the dispatched input (n x D, this rank's tokens) for moe_bwd, which then does
-    not send it again; otherwise None."""
+    not send it again; otherwise None. prefetch: this layer's PrefetchSlot, filled at EP > TP unless
+    keep_dispatched."""
     bsz, seq_len, _ = xf.size()
     # Router logits
     # B x L x N
@@ -102,6 +152,9 @@ def moe_fwd(
     # B' x D: local tokens, rebuilt
     xu = xu.wait()
     dispatched = xu if keep_dispatched else None
+    if prefetch is not None and not keep_dispatched and isinstance(dispatcher, NodeDispatcher):
+        # T x D/TP: kept until the backward of the next MoE layer starts this one's first hop
+        prefetch.fill(dispatcher, routing_indices_flat, plan.state, xf.view(bsz * seq_len, -1))
     # the routing scores of the tokens this TP group computes
     scores = dispatcher.local_scores(topk_scores, plan)
     if plan.n_pairs > 0:
@@ -164,9 +217,10 @@ def moe_bwd(
     router_w, router_bias, router_bias_update_rate, routing_score_func, routing_scaling_factor, router_load_balancing_type,
     h1, h3, fc1_w, fc2_w, fc3_w, n_experts, dispatcher, topk, expert_w1, expert_w2, expert_w3,
     expert_backend, moe_permutation_backend, hidden_dropout, dispatch_state,
-    expert_hidden_rng_state, shared_hidden_rng_state, gather_before_norm, dispatched=None,
+    expert_hidden_rng_state, shared_hidden_rng_state, gather_before_norm, dispatched=None, prefetched=None,
 ):
-    """dispatched: the dispatched input that moe_fwd kept (keep_dispatched), or None to send it again."""
+    """dispatched: the dispatched input that moe_fwd kept (keep_dispatched), or None to send it again.
+    prefetched: PrefetchSlot.take(), the first hop of the input's dispatch if the next layer's backward started it."""
     bsz, seq_len, _ = xf.size()
     n_local_experts = dispatcher.n_local
     # B*L*K
@@ -176,8 +230,12 @@ def moe_bwd(
     # the layer input (unless forward kept it) and the output gradient go to the experts again. At EP > TP their
     # first hop, to the expert group's replicas, needs only its own part of the plan: it starts first, and runs
     # under the recompute below
-    outer = dispatcher.replan_outer(routing_indices_flat, dispatch_state)
-    xu = dispatcher.start_dispatch(x_rows, outer) if dispatched is None else None
+    if prefetched is not None:
+        assert dispatched is None
+        outer, xu = prefetched
+    else:
+        outer = dispatcher.replan_outer(routing_indices_flat, dispatch_state)
+        xu = dispatcher.start_dispatch(x_rows, outer) if dispatched is None else None
     yu_grad = dispatcher.start_dispatch(grad_rows, outer)
 
     # recompute router

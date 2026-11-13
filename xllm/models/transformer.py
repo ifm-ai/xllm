@@ -42,6 +42,7 @@ from xllm.models.fused_blocks import (
     TransformerMoVABlockFunction,
     TransformerOutputLayerFunction,
 )
+from xllm.models.fused_blocks.moe import DispatchPrefetch
 from xllm.utils import get_init_fn
 
 
@@ -270,6 +271,7 @@ class TransformerMoEBlock(nn.Module):
         deterministic: bool = True,
         cache: Optional[Tuple[Tensor, Tensor, int]] = None,
         experts_gathered: bool = False,
+        prefetch: Optional[DispatchPrefetch] = None,
     ) -> Tuple[Tensor, Optional[Tensor], Optional[Any]]:
         if self.fused_block and self.training:
             fn = TransformerMoEBlockFunction
@@ -334,6 +336,7 @@ class TransformerMoEBlock(nn.Module):
                 self.recompute_fc3_out,
                 self.recompute_router,
                 self.moe_keep_dispatched,
+                prefetch.slot() if prefetch is not None else None,
             )
             if experts_gathered:
                 # the caller runs this layer as the experts' forward (see Transformer.run_layer)
@@ -446,6 +449,7 @@ class TransformerMoVABlock(nn.Module):
         deterministic: bool = True,
         cache: Optional[Tuple[Tensor, Tensor, int]] = None,
         experts_gathered: bool = False,
+        prefetch: Optional[DispatchPrefetch] = None,
     ) -> Tuple[Tensor, Optional[Tensor], Optional[Any]]:
         if self.fused_block and self.training:
             fn = TransformerMoVABlockFunction
@@ -515,6 +519,7 @@ class TransformerMoVABlock(nn.Module):
                 self.recompute_fc3_out,
                 self.recompute_router,
                 self.moe_keep_dispatched,
+                prefetch.slot() if prefetch is not None else None,
             )
             if experts_gathered:
                 # the caller runs this layer as the experts' forward (see Transformer.run_layer)
@@ -625,6 +630,7 @@ class Transformer(XLLModel):
     def __init__(self, cfg: ModelConf, tokenizer: Tokenizer):
         super().__init__(cfg, tokenizer)
         self.chunk_size = cfg.chunk_size
+        self.moe_prefetch_dispatch = cfg.moe_prefetch_dispatch and cfg.fused_block
         self.context_parallel_size = get_context_parallel_world_size()
         self.context_parallel_rank = get_context_parallel_rank()
 
@@ -662,15 +668,20 @@ class Transformer(XLLModel):
         if cfg.ddp_backend == 'fsdp2':
             prefetch_experts_in_backward(list(self.layers) + [self.output])
 
-    def run_layer(self, layer: nn.Module, x: Tensor, *args: Any) -> Tuple[Tensor, Optional[Tensor], Optional[Any]]:
-        """Return layer(x, *args); a fused MoE layer in training runs as the forward of its experts."""
+    def run_layer(
+        self, layer: nn.Module, x: Tensor, *args: Any, prefetch: Optional[DispatchPrefetch] = None
+    ) -> Tuple[Tensor, Optional[Tensor], Optional[Any]]:
+        """Return layer(x, *args); a fused MoE layer in training runs as the forward of its experts, with its
+        slot of prefetch (moe_prefetch_dispatch)."""
         if isinstance(layer, (TransformerMoEBlock, TransformerMoVABlock)) and layer.fused_block and self.training:
             # The fused block computes the experts. With the layer inside the experts' call rather than the
             # experts inside the layer's, FSDP reduce-scatters the layer's other gradients before the experts'
             # (it waits for one reduce-scatter to end before the next), so the experts' one overlaps the
             # backward of the layer below instead of holding up the start of it.
             # The layer reads the gathered weights from the experts module.
-            return layer.moe.experts.run_fused(lambda x, *_: layer(x, *args, experts_gathered=True), x)
+            return layer.moe.experts.run_fused(
+                lambda x, *_: layer(x, *args, experts_gathered=True, prefetch=prefetch), x
+            )
         return layer(x, *args)
 
     def forward(
@@ -723,6 +734,10 @@ class Transformer(XLLModel):
 
         aux_loss_sum = None
         health_collector = get_active_health_collector()
+        # the fused MoE layers' backward prefetch links the layers of this pass; only when a backward follows
+        prefetch = None
+        if self.moe_prefetch_dispatch and self.training and torch.is_grad_enabled() and not self.layerwise_ckpt:
+            prefetch = DispatchPrefetch()
         for i, layer in enumerate(self.layers):
             layer_cache = cache[i] if cache is not None else None
             if self.layerwise_ckpt:
@@ -734,7 +749,7 @@ class Transformer(XLLModel):
             else:
                 x, aux_loss, layer_cache = self.run_layer(
                     layer, x, freq_cis, bos_mask, segments, moe_router_load_balancing_type,
-                    attn_stability_control, deterministic, layer_cache
+                    attn_stability_control, deterministic, layer_cache, prefetch=prefetch,
                 )
 
             if health_collector is not None:

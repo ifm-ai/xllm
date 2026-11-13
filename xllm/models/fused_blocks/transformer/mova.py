@@ -98,6 +98,7 @@ class TransformerMoVABlockFunction(torch.autograd.Function):
         recompute_fc3_out: bool,
         recompute_router: bool,
         keep_dispatched: bool,
+        prefetch: Optional[Any],  # PrefetchSlot
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], None]:
 
         bsz, seq_len, _ = x.size()
@@ -175,7 +176,7 @@ class TransformerMoVABlockFunction(torch.autograd.Function):
             xf, moe_router_w,  moe_router_bias, routing_score_func, routing_scaling_factor, router_load_balancing_type,
             fc1_w, fc2_w, fc3_w, n_experts, dispatcher, moe_topk,
             expert_w1, expert_w2, expert_w3, expert_backend, moe_permutation_backend,
-            hidden_dropout, recompute_fc1_out, recompute_fc3_out, keep_dispatched,
+            hidden_dropout, recompute_fc1_out, recompute_fc3_out, keep_dispatched, prefetch,
         )
         original_scores, routing_indices, org_topk_scores, tokens_per_expert = routing_out
         health_collector = get_active_health_collector()
@@ -259,6 +260,7 @@ class TransformerMoVABlockFunction(torch.autograd.Function):
         ctx.routing_scaling_factor = routing_scaling_factor
         ctx.router_load_balancing_type = router_load_balancing_type
         ctx.dispatch_state = dispatch_state
+        ctx.prefetch = prefetch
         # misc
         ctx.layernorm_eps = layernorm_eps
         ctx.rmsnorm_eps = rmsnorm_eps
@@ -436,7 +438,11 @@ class TransformerMoVABlockFunction(torch.autograd.Function):
             h1, h3, fc1_w, fc2_w, fc3_w, n_experts, dispatcher, moe_topk, expert_w1, expert_w2, expert_w3,
             expert_backend, moe_permutation_backend, hidden_dropout, dispatch_state,
             expert_hidden_rng_state, shared_hidden_rng_state, gather_before_norm, dispatched,
+            ctx.prefetch.take() if ctx.prefetch is not None else None,
         )
+        if ctx.prefetch is not None:
+            # the first hop of the next MoE layer to run backward runs under the rest of this one
+            ctx.prefetch.start_previous()
 
         xo_grad, moe_norm_w_grad, moe_norm_b_grad = layer_or_rmsnorm_bwd(
             xf_grad, xo_, xo_mean, xo_invvar, moe_norm_w, moe_norm_b, norm_local_groups, apply_rmsnorm
@@ -600,4 +606,5 @@ class TransformerMoVABlockFunction(torch.autograd.Function):
             None,  # recompute_fc3_out
             None,  # recompute_router
             None,  # keep_dispatched
+            None,  # prefetch
         )

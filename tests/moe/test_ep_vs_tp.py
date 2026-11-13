@@ -18,6 +18,11 @@ round-off at EP > TP and EP = TP, be finite, and be bitwise equal in two runs. V
   fused_serial  the same in the serial order of XLLM_MOE_SERIAL=1 (one stream); bitwise equal to fused
   fused_keep    fused with keep_dispatched: the backward takes the forward's dispatched input instead of sending
                 it again; bitwise equal to fused
+  fused_chain   two fused layers (same weights), the second on the first's output, stalled as fused; the routed
+                experts' gradients are summed over the layers (each layer's are also compared bitwise below). In
+                bf16 only the bitwise checks apply: the second layer's routing differs between EP by round-off
+  fused_prefetch  fused_chain with the backward prefetch of the dispatch (moe_prefetch_dispatch): the second
+                layer's backward starts the first's first hop; bitwise equal to fused_chain
 
 The dispatch checks its plan (NodeDispatcher.check_plan): the counts and the routing scores sent with the
 routing against those read from it and sent apart. Last, one plan, without these checks, must block the host
@@ -50,7 +55,7 @@ from xllm.distributed import (
     get_model_parallel_rank,
     get_model_parallel_world_size,
 )
-from xllm.models.fused_blocks.moe import moe_fwd, moe_bwd
+from xllm.models.fused_blocks.moe import moe_fwd, moe_bwd, DispatchPrefetch
 import xllm.modules.moe.dispatch as dispatch_module
 from xllm.modules.moe.dispatch import build_dispatcher, NodeDispatcher
 from xllm.modules.moe.layout import ExpertLayout
@@ -60,7 +65,8 @@ from tests.moe.test_ep_dispatch import local_weights
 
 AUX_COEFF = 0.01
 BIAS_UPDATE_RATE = 1e-3
-VARIANTS = ('plain', 'ckpt', 'no_grad', 'inference', 'fused', 'fused_serial', 'fused_keep')
+VARIANTS = ('plain', 'ckpt', 'no_grad', 'inference', 'fused', 'fused_serial', 'fused_keep', 'fused_chain',
+            'fused_prefetch')
 
 
 def tp_cols(x: Tensor) -> slice:
@@ -205,6 +211,56 @@ def run_fused(x: Tensor, out_grad: Tensor, weights, bias, layout: ExpertLayout, 
     return got
 
 
+def run_fused_chain(x: Tensor, out_grad: Tensor, weights, bias, layout: ExpertLayout, topk, backend,
+                    stall_ms: float = 0.0, prefetch: bool = False, delay: str = 'side'):
+    """Two fused MoE layers with the same weights, the second on the first's output, as Transformer runs them;
+    with prefetch, linked by a DispatchPrefetch. Keys local_* are compared bitwise only (not across EP)."""
+    if stall_ms > 0:
+        with stalled_side_stream(stall_ms, delay):
+            return run_fused_chain(x, out_grad, weights, bias, layout, topk, backend, prefetch=prefetch)
+    cols = tp_cols(x)
+    dim = cols.stop - cols.start
+    w = local_weights(weights, layout, cols)
+    dispatcher = build_dispatcher(layout, topk, backend)
+    chain = DispatchPrefetch() if prefetch else None
+    layers = []
+    xf = x[..., cols].contiguous()
+    for _ in range(2):
+        b = None if bias is None else bias.clone()
+        slot = chain.slot() if chain is not None else None
+        out, aux, routing_out, (h1, h3), state, rng_states, _ = moe_fwd(
+            xf, w['router_w'], b, 'sigmoid', SCALING_FACTOR, 'dot', w['s1'], w['s2'], w['s3'],
+            layout.n_experts, dispatcher, topk, w['w1'], w['w2'], w['w3'], 'sequential', backend, 0.0, False, False,
+            False, slot,
+        )
+        layers.append((xf, b, aux, routing_out, h1, h3, state, rng_states, slot))
+        xf = out
+    got = {'out': out.float()}
+    grad = out_grad[..., cols].contiguous()
+    for i in (1, 0):
+        xf, b, aux, routing_out, h1, h3, state, rng_states, slot = layers[i]
+        aux_grad = torch.tensor(AUX_COEFF, device=xf.device, dtype=aux.dtype)
+        prefetched = slot.take() if slot is not None else None
+        # the second layer's backward started the first's hop, at EP > TP
+        assert (prefetched is not None) == (prefetch and layout.e_out > 1 and i == 0), (i, layout)
+        grad, g1, g2, g3, _, _, _, rw_grad = moe_bwd(
+            grad, aux_grad, xf, xf.view(-1, dim), *routing_out,
+            w['router_w'], b, None if b is None else BIAS_UPDATE_RATE, 'sigmoid', SCALING_FACTOR, 'dot',
+            h1, h3, w['s1'], w['s2'], w['s3'], layout.n_experts, dispatcher, topk, w['w1'], w['w2'], w['w3'],
+            'sequential', backend, 0.0, state, *rng_states, False, None, prefetched,
+        )
+        if slot is not None:
+            slot.start_previous()
+        got.update({f'router_w{i}': rw_grad.float(), f'aux{i}': aux.detach().float().view(1),
+                    f'local_w1_{i}': g1, f'local_w2_{i}': g2, f'local_w3_{i}': g3})
+        if b is not None:
+            got[f'bias{i}'] = b.float()
+    got['x'] = grad.float()
+    for k in EXPERT_KEYS:
+        got[k] = got[f'local_{k}_0'].float() + got[f'local_{k}_1'].float()
+    return got
+
+
 def global_expert_grads(got: Dict[str, Tensor], layout: ExpertLayout) -> Dict[str, Tensor]:
     """The routed experts' gradients by global expert index, summed over all GPUs: the same at every EP."""
     out = {}
@@ -326,7 +382,10 @@ def main(
             initialize_model_parallel(tp, cp, timeout=600, expert_parallel_size=size)
             layout = ExpertLayout.from_process_groups(n_experts)
             assert (layout.tp, layout.e_out) == (tp, size // tp)
-            if variant in ('fused', 'fused_keep'):
+            if variant in ('fused_chain', 'fused_prefetch'):
+                run = lambda i: run_fused_chain(x, out_grad, weights, bias, layout, topk, backend, stall_ms,
+                                                prefetch=variant == 'fused_prefetch', delay=('side', 'main')[i])
+            elif variant in ('fused', 'fused_keep'):
                 # the first run delays the side stream, the second the calling stream
                 run = lambda i: run_fused(x, out_grad, weights, bias, layout, topk, backend, stall_ms,
                                           keep_dispatched=variant == 'fused_keep', delay=('side', 'main')[i])
@@ -341,7 +400,7 @@ def main(
             else:
                 run = lambda i: run_unfused(variant, x, out_grad, weights, bias, layout, topk, backend)
             got = run(0)
-            if variant in ('plain', 'ckpt', 'fused', 'fused_serial', 'fused_keep'):
+            if variant in ('plain', 'ckpt', 'fused', 'fused_serial', 'fused_keep', 'fused_chain', 'fused_prefetch'):
                 again = run(1)
                 errors += [f"{variant} ep={size} {k}: two runs differ" for k in got
                            if not torch.equal(got[k], again[k])]
@@ -353,13 +412,19 @@ def main(
         at_tp, at_ep = results[variant, tp], results[variant, ep]
         worst = {}
         for k in at_tp:
+            if k.startswith('local_'):
+                continue
             worst[k] = rel_err(at_ep[k], at_tp[k]) if at_tp[k].numel() else 0.0
+            # in bf16 the second layer of a chain routes some tokens differently at the two EP: its input, the
+            # first layer's output, rounds differently. Only the bitwise checks apply there
+            if variant in ('fused_chain', 'fused_prefetch') and dtype == 'bf16':
+                continue
             if not worst[k] < tol:
                 errors.append(f"{variant} {k}: rel_err(ep={ep} vs ep={tp}) {worst[k]:.2e} >= {tol:.0e}")
         # the checkpoint recomputes the same layer, the forward does not depend on autograd, the overlap of the
         # fused blocks only changes the order of independent work, and the kept input is what backward sends again
         same_as = {'ckpt': 'plain', 'no_grad': 'plain', 'inference': 'plain', 'fused_serial': 'fused',
-                   'fused_keep': 'fused'}.get(variant)
+                   'fused_keep': 'fused', 'fused_prefetch': 'fused_chain'}.get(variant)
         if same_as in variants:
             for size in (tp, ep):
                 errors += [f"{variant} ep={size} {k}: differs from {same_as}" for k in results[variant, size]
