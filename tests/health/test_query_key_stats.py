@@ -129,6 +129,22 @@ def test_single_decoder_layer_logs_its_post_rope_query_key(overrides):
     for name in reference:
         assert _query_key(metrics, name, 0) == pytest.approx(reference[name], rel=1e-5, abs=1e-6)
     assert ("kq_stats/layer_000/mean" in metrics) == (overrides.get("attn_act_func") == "softdelta")
+    assert ("softdelta_gate_stats/layer_000/mean" in metrics) == (overrides.get("attn_act_func") == "softdelta")
+
+
+@pytest.mark.parametrize("overrides", [{}, {"num_heads": 4, "num_kv_heads": 2}])
+def test_softdelta_logs_its_subtraction_gate(overrides):
+    model = tiny_transformer(num_layers=1, attn_act_func="softdelta", **overrides)
+    gates = []  # softdelta's forward takes (xq, xk, xv, g, ...); the output subtracts sigmoid(g) * out2
+    model.layers[0].attention.causal_attention.register_forward_pre_hook(
+        lambda module, args: gates.append(torch.sigmoid(args[3]))
+    )
+
+    metrics = logged_metrics(model, enable_query_key_stats=True)
+
+    gate = gates[0]
+    expected = [gate.mean().item(), gate.min().item(), gate.max().item()]
+    assert stats(metrics, "softdelta_gate_stats/layer_000") == pytest.approx(expected, rel=1e-5)
 
 
 # Entire tiny model
