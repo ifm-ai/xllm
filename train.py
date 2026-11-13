@@ -306,7 +306,7 @@ def main(cfg: TrainerConf):
         global_rank=cfg.slurm.global_rank,
         world_size=cfg.slurm.world_size,
         keep_last=cfg.keep_n_last_checkpoints,
-        keep_checkpoint_every_step=cfg.eval_freq if cfg.keep_eval_checkpoints else -1,
+        keep_checkpoint_every_step=cfg.eval_freq if cfg.keep_eval_checkpoints and cfg.eval_freq > 0 else -1,
         cfg=cfg,
         async_checkpointing=cfg.async_checkpointing,
     )
