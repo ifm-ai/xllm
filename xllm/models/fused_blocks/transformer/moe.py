@@ -3,12 +3,14 @@ import math
 import torch
 from einops import rearrange
 
+from xllm.distributed import get_model_parallel_world_size
 from xllm.distributed.utils import reshape_gathered_tensor_along_specific_dim
 from xllm.health_metrics import get_active_health_collector
 from xllm.modules.fused_ops import (
     memory_efficient_dropout_fwd,
     memory_efficient_dropout_bwd,
 )
+from xllm.modules.rms_norm import partitioned_rms_norm_fwd, partitioned_rms_norm_bwd
 from xllm.models.fused_blocks.utils import (
     layer_or_rmsnorm_fwd,
     layer_or_rmsnorm_bwd,
@@ -98,6 +100,8 @@ class TransformerMoEBlockFunction(torch.autograd.Function):
 
         bsz, seq_len, _ = x.size()
         residual = x
+        # the MoE input is used as D/TP slices, so an RMSNorm that would gather normalises the slices instead
+        moe_norm_partitioned = gather_before_norm and apply_rmsnorm
 
         x_ = x
         handle_moe_norm_w = None
@@ -108,6 +112,7 @@ class TransformerMoEBlockFunction(torch.autograd.Function):
                 attn_norm_w, _ = all_gather(attn_norm_w, parallel_region='model', async_op=False)
             if attn_norm_b is not None:
                 attn_norm_b, _ = all_gather(attn_norm_b, parallel_region='model', async_op=False)
+        if gather_before_norm and not moe_norm_partitioned:
             if moe_norm_w is not None:
                 moe_norm_w, handle_moe_norm_w = all_gather(moe_norm_w, parallel_region='model', async_op=True)
             if moe_norm_b is not None:
@@ -145,19 +150,25 @@ class TransformerMoEBlockFunction(torch.autograd.Function):
         xo = torch.add(xh, residual, out=xh)
         residual = xo
 
-        xo_ = xo
-        if gather_before_norm:
-            xo_, _ = all_gather(xo, parallel_region='model', async_op=False)
-            if handle_moe_norm_w is not None:
-                handle_moe_norm_w.wait()
-                moe_norm_w = reshape_gathered_tensor_along_specific_dim(moe_norm_w, gather_dim=0)
-            if handle_moe_norm_b is not None:
-                handle_moe_norm_b.wait()
-                moe_norm_b = reshape_gathered_tensor_along_specific_dim(moe_norm_b, gather_dim=0)
+        if moe_norm_partitioned:
+            xf, _ = partitioned_rms_norm_fwd(
+                xo, moe_norm_w + 1.0 if moe_norm_w is not None else None, xo.size(-1) * get_model_parallel_world_size(),
+                rmsnorm_eps,
+            )
+        else:
+            xo_ = xo
+            if gather_before_norm:
+                xo_, _ = all_gather(xo, parallel_region='model', async_op=False)
+                if handle_moe_norm_w is not None:
+                    handle_moe_norm_w.wait()
+                    moe_norm_w = reshape_gathered_tensor_along_specific_dim(moe_norm_w, gather_dim=0)
+                if handle_moe_norm_b is not None:
+                    handle_moe_norm_b.wait()
+                    moe_norm_b = reshape_gathered_tensor_along_specific_dim(moe_norm_b, gather_dim=0)
 
-        xf, _, _ = layer_or_rmsnorm_fwd(xo_, moe_norm_w, moe_norm_b, norm_local_groups, layernorm_eps, rmsnorm_eps, apply_rmsnorm)
-        if gather_before_norm:
-            xf = scatter(xf, parallel_region='model')
+            xf, _, _ = layer_or_rmsnorm_fwd(xo_, moe_norm_w, moe_norm_b, norm_local_groups, layernorm_eps, rmsnorm_eps, apply_rmsnorm)
+            if gather_before_norm:
+                xf = scatter(xf, parallel_region='model')
 
         # MoE forward
         out, aux_loss, routing_out, shared_hiddens, routing_state, rng_states = moe_fwd(
@@ -368,18 +379,29 @@ class TransformerMoEBlockFunction(torch.autograd.Function):
         residual_grad = out_grad
 
         # recompute xf
+        moe_norm_partitioned = gather_before_norm and apply_rmsnorm
         xo_ = xo
+        if moe_norm_partitioned:
+            # before the async gather of x below: NCCL runs a group's operations in order, so the norm's small
+            # all-reduce issued after it would wait for the whole gather
+            moe_norm_w1 = moe_norm_w + 1.0 if moe_norm_w is not None else None
+            xf, xo_invvar = partitioned_rms_norm_fwd(
+                xo, moe_norm_w1, xo.size(-1) * get_model_parallel_world_size(), rmsnorm_eps
+            )
+
         x_ = x
         handle_x = None
         if gather_before_norm:
-            xo_, _ = all_gather(xo, parallel_region='model', async_op=False)
+            if not moe_norm_partitioned:
+                xo_, _ = all_gather(xo, parallel_region='model', async_op=False)
             x_, handle_x = all_gather(x, parallel_region='model', async_op=True)
 
-        xf, xo_mean, xo_invvar = layer_or_rmsnorm_fwd(
-            xo_, moe_norm_w, moe_norm_b, norm_local_groups, layernorm_eps, rmsnorm_eps, apply_rmsnorm
-        )
-        if gather_before_norm:
-            xf = scatter(xf, parallel_region='model')
+        if not moe_norm_partitioned:
+            xf, xo_mean, xo_invvar = layer_or_rmsnorm_fwd(
+                xo_, moe_norm_w, moe_norm_b, norm_local_groups, layernorm_eps, rmsnorm_eps, apply_rmsnorm
+            )
+            if gather_before_norm:
+                xf = scatter(xf, parallel_region='model')
 
         xf_flat = xf.flatten(end_dim=-2)
         # output dropout
@@ -404,19 +426,25 @@ class TransformerMoEBlockFunction(torch.autograd.Function):
             router_w, router_bias, router_bias_update_rate, routing_score_func, routing_scaling_factor, router_load_balancing_type,
             h1, h3, fc1_w, fc2_w, fc3_w, n_experts, n_local_experts, topk, expert_w1, expert_w2, expert_w3,
             expert_backend, moe_permutation_backend, hidden_dropout, group_sizes, input_splits, output_splits, curr_bsz,
-            expert_hidden_rng_state, shared_hidden_rng_state, gather_before_norm,
+            expert_hidden_rng_state, shared_hidden_rng_state, gather_before_norm and not moe_norm_partitioned,
         )
 
-        xo_grad, moe_norm_w_grad, moe_norm_b_grad = layer_or_rmsnorm_bwd(
-            xf_grad, xo_, xo_mean, xo_invvar, moe_norm_w, moe_norm_b, norm_local_groups, apply_rmsnorm
-        )
+        if moe_norm_partitioned:
+            xo_grad, moe_norm_w_grad = partitioned_rms_norm_bwd(
+                xf_grad, xo, xo_invvar, moe_norm_w1, xo.size(-1) * get_model_parallel_world_size()
+            )
+            moe_norm_b_grad = None
+        else:
+            xo_grad, moe_norm_w_grad, moe_norm_b_grad = layer_or_rmsnorm_bwd(
+                xf_grad, xo_, xo_mean, xo_invvar, moe_norm_w, moe_norm_b, norm_local_groups, apply_rmsnorm
+            )
 
-        if gather_before_norm:
-            xo_grad = scatter(xo_grad, parallel_region='model').contiguous()
-            if moe_norm_w_grad is not None:
-                moe_norm_w_grad = scatter(moe_norm_w_grad, parallel_region='model')
-            if moe_norm_b_grad is not None:
-                moe_norm_b_grad = scatter(moe_norm_b_grad, parallel_region='model')
+            if gather_before_norm:
+                xo_grad = scatter(xo_grad, parallel_region='model').contiguous()
+                if moe_norm_w_grad is not None:
+                    moe_norm_w_grad = scatter(moe_norm_w_grad, parallel_region='model')
+                if moe_norm_b_grad is not None:
+                    moe_norm_b_grad = scatter(moe_norm_b_grad, parallel_region='model')
 
         residual_grad = torch.add(xo_grad, residual_grad, out=xo_grad)
         xh_grad = residual_grad
