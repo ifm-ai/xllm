@@ -113,7 +113,7 @@ def run_fused(x, weights, router_bias, out_grad, n_experts, topk, backend, gathe
     xf = x[..., cols].contiguous()
     bias = None if router_bias is None else router_bias.clone()
 
-    out, _, routing_out, (h1, h3), dispatch_state, rng_states = moe_fwd(
+    out, _, routing_out, (h1, h3), dispatch_state, rng_states, _ = moe_fwd(
         xf, w['router_w'], bias, 'sigmoid', SCALING_FACTOR, None, w['s1'], w['s2'], w['s3'],
         n_experts, dispatcher, topk,
         w['w1'], w['w2'], w['w3'], 'sequential', backend, 0.0, recompute_shared, recompute_shared,

@@ -196,6 +196,7 @@ class TransformerMoEBlock(nn.Module):
         self.recompute_fc1_out = cfg.recompute_fc1_out
         self.recompute_fc3_out = cfg.recompute_fc3_out
         self.recompute_router = cfg.recompute_router
+        self.moe_keep_dispatched = cfg.moe_keep_dispatched
         self.dropout = cfg.dropout
         self.apply_rmsnorm = cfg.apply_rmsnorm
         self.layernorm_eps = cfg.layernorm_eps
@@ -332,6 +333,7 @@ class TransformerMoEBlock(nn.Module):
                 self.recompute_fc1_out,
                 self.recompute_fc3_out,
                 self.recompute_router,
+                self.moe_keep_dispatched,
             )
             if experts_gathered:
                 # the caller runs this layer as the experts' forward (see Transformer.run_layer)
@@ -362,6 +364,7 @@ class TransformerMoVABlock(nn.Module):
         self.recompute_fc1_out = cfg.recompute_fc1_out
         self.recompute_fc3_out = cfg.recompute_fc3_out
         self.recompute_router = cfg.recompute_router
+        self.moe_keep_dispatched = cfg.moe_keep_dispatched
         self.dropout = cfg.dropout
         self.apply_rmsnorm = cfg.apply_rmsnorm
         self.layernorm_eps = cfg.layernorm_eps
@@ -511,6 +514,7 @@ class TransformerMoVABlock(nn.Module):
                 self.recompute_fc1_out,
                 self.recompute_fc3_out,
                 self.recompute_router,
+                self.moe_keep_dispatched,
             )
             if experts_gathered:
                 # the caller runs this layer as the experts' forward (see Transformer.run_layer)

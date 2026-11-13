@@ -16,6 +16,8 @@ round-off at EP > TP and EP = TP, be finite, and be bitwise equal in two runs. V
              of the side stream; neither is made to wait for the other, and the free memory of both streams is
              first filled with NaN, so a missing wait (either way) or a buffer reused too early gives wrong values
   fused_serial  the same in the serial order of XLLM_MOE_SERIAL=1 (one stream); bitwise equal to fused
+  fused_keep    fused with keep_dispatched: the backward takes the forward's dispatched input instead of sending
+                it again; bitwise equal to fused
 
 The dispatch checks its plan (NodeDispatcher.check_plan): the counts and the routing scores sent with the
 routing against those read from it and sent apart. Last, one plan, without these checks, must block the host
@@ -58,7 +60,7 @@ from tests.moe.test_ep_dispatch import local_weights
 
 AUX_COEFF = 0.01
 BIAS_UPDATE_RATE = 1e-3
-VARIANTS = ('plain', 'ckpt', 'no_grad', 'inference', 'fused', 'fused_serial')
+VARIANTS = ('plain', 'ckpt', 'no_grad', 'inference', 'fused', 'fused_serial', 'fused_keep')
 
 
 def tp_cols(x: Tensor) -> slice:
@@ -171,20 +173,22 @@ def stalled_side_stream(ms: float, delay: str):
 
 
 def run_fused(x: Tensor, out_grad: Tensor, weights, bias, layout: ExpertLayout, topk, backend, stall_ms: float = 0.0,
-              delay: str = 'side'):
+              keep_dispatched: bool = False, delay: str = 'side'):
     if stall_ms > 0:
         with stalled_side_stream(stall_ms, delay):
-            return run_fused(x, out_grad, weights, bias, layout, topk, backend)
+            return run_fused(x, out_grad, weights, bias, layout, topk, backend, keep_dispatched=keep_dispatched)
     cols = tp_cols(x)
     dim = cols.stop - cols.start
     w = local_weights(weights, layout, cols)
     dispatcher = build_dispatcher(layout, topk, backend)
     xf = x[..., cols].contiguous()
     b = None if bias is None else bias.clone()
-    out, aux, routing_out, (h1, h3), state, rng_states = moe_fwd(
+    out, aux, routing_out, (h1, h3), state, rng_states, dispatched = moe_fwd(
         xf, w['router_w'], b, 'sigmoid', SCALING_FACTOR, 'dot', w['s1'], w['s2'], w['s3'],
         layout.n_experts, dispatcher, topk, w['w1'], w['w2'], w['w3'], 'sequential', backend, 0.0, False, False,
+        keep_dispatched,
     )
+    assert (dispatched is not None) == keep_dispatched
     original_scores, routing_indices, org_topk_scores, tokens_per_expert = routing_out
     aux_grad = torch.tensor(AUX_COEFF, device=xf.device, dtype=aux.dtype)
     xf_grad, g1, g2, g3, _, _, _, rw_grad = moe_bwd(
@@ -192,7 +196,7 @@ def run_fused(x: Tensor, out_grad: Tensor, weights, bias, layout: ExpertLayout, 
         original_scores, routing_indices, org_topk_scores, tokens_per_expert,
         w['router_w'], b, None if b is None else BIAS_UPDATE_RATE, 'sigmoid', SCALING_FACTOR, 'dot',
         h1, h3, w['s1'], w['s2'], w['s3'], layout.n_experts, dispatcher, topk, w['w1'], w['w2'], w['w3'],
-        'sequential', backend, 0.0, state, *rng_states, False,
+        'sequential', backend, 0.0, state, *rng_states, False, dispatched,
     )
     got = {'out': out.float(), 'x': xf_grad.float(), 'router_w': rw_grad.float(), 'w1': g1, 'w2': g2, 'w3': g3,
            'aux': aux.detach().float().view(1)}
@@ -322,10 +326,10 @@ def main(
             initialize_model_parallel(tp, cp, timeout=600, expert_parallel_size=size)
             layout = ExpertLayout.from_process_groups(n_experts)
             assert (layout.tp, layout.e_out) == (tp, size // tp)
-            if variant == 'fused':
+            if variant in ('fused', 'fused_keep'):
                 # the first run delays the side stream, the second the calling stream
                 run = lambda i: run_fused(x, out_grad, weights, bias, layout, topk, backend, stall_ms,
-                                          delay=('side', 'main')[i])
+                                          keep_dispatched=variant == 'fused_keep', delay=('side', 'main')[i])
             elif variant == 'fused_serial':
                 def run(i):
                     # what XLLM_MOE_SERIAL=1 sets at import
@@ -337,7 +341,7 @@ def main(
             else:
                 run = lambda i: run_unfused(variant, x, out_grad, weights, bias, layout, topk, backend)
             got = run(0)
-            if variant in ('plain', 'ckpt', 'fused', 'fused_serial'):
+            if variant in ('plain', 'ckpt', 'fused', 'fused_serial', 'fused_keep'):
                 again = run(1)
                 errors += [f"{variant} ep={size} {k}: two runs differ" for k in got
                            if not torch.equal(got[k], again[k])]
@@ -352,9 +356,10 @@ def main(
             worst[k] = rel_err(at_ep[k], at_tp[k]) if at_tp[k].numel() else 0.0
             if not worst[k] < tol:
                 errors.append(f"{variant} {k}: rel_err(ep={ep} vs ep={tp}) {worst[k]:.2e} >= {tol:.0e}")
-        # the checkpoint recomputes the same layer, the forward does not depend on autograd, and the overlap of
-        # the fused blocks only changes the order of independent work
-        same_as = {'ckpt': 'plain', 'no_grad': 'plain', 'inference': 'plain', 'fused_serial': 'fused'}.get(variant)
+        # the checkpoint recomputes the same layer, the forward does not depend on autograd, the overlap of the
+        # fused blocks only changes the order of independent work, and the kept input is what backward sends again
+        same_as = {'ckpt': 'plain', 'no_grad': 'plain', 'inference': 'plain', 'fused_serial': 'fused',
+                   'fused_keep': 'fused'}.get(variant)
         if same_as in variants:
             for size in (tp, ep):
                 errors += [f"{variant} ep={size} {k}: differs from {same_as}" for k in results[variant, size]

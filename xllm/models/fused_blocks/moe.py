@@ -29,8 +29,10 @@ def moe_fwd(
     xf, router_w, router_bias, routing_score_func, routing_scaling_factor, router_load_balancing_type,
     fc1_w, fc2_w, fc3_w, n_experts, dispatcher, topk,
     expert_w1, expert_w2, expert_w3, expert_backend, moe_permutation_backend,
-    hidden_dropout, recompute_fc1_out, recompute_fc3_out,
+    hidden_dropout, recompute_fc1_out, recompute_fc3_out, keep_dispatched=False,
 ):
+    """keep_dispatched: also return the dispatched input (n x D, this rank's tokens) for moe_bwd, which then does
+    not send it again; otherwise None."""
     bsz, seq_len, _ = xf.size()
     # Router logits
     # B x L x N
@@ -99,6 +101,7 @@ def moe_fwd(
 
     # B' x D: local tokens, rebuilt
     xu = xu.wait()
+    dispatched = xu if keep_dispatched else None
     # the routing scores of the tokens this TP group computes
     scores = dispatcher.local_scores(topk_scores, plan)
     if plan.n_pairs > 0:
@@ -151,7 +154,8 @@ def moe_fwd(
     return (
         out, aux_loss, (original_scores, routing_indices, org_topk_scores, tokens_per_expert), (h1, h3),
         plan.state,
-        (expert_hidden_rng_state, shared_hidden_rng_state)
+        (expert_hidden_rng_state, shared_hidden_rng_state),
+        dispatched,
     )
 
 
@@ -160,18 +164,20 @@ def moe_bwd(
     router_w, router_bias, router_bias_update_rate, routing_score_func, routing_scaling_factor, router_load_balancing_type,
     h1, h3, fc1_w, fc2_w, fc3_w, n_experts, dispatcher, topk, expert_w1, expert_w2, expert_w3,
     expert_backend, moe_permutation_backend, hidden_dropout, dispatch_state,
-    expert_hidden_rng_state, shared_hidden_rng_state, gather_before_norm,
+    expert_hidden_rng_state, shared_hidden_rng_state, gather_before_norm, dispatched=None,
 ):
+    """dispatched: the dispatched input that moe_fwd kept (keep_dispatched), or None to send it again."""
     bsz, seq_len, _ = xf.size()
     n_local_experts = dispatcher.n_local
     # B*L*K
     routing_indices_flat = routing_indices.flatten()
     x_rows = xf.view(bsz * seq_len, -1)
     grad_rows = out_grad.reshape(bsz * seq_len, -1)
-    # the layer input and the output gradient go to the experts again. At EP > TP their first hop, to the expert
-    # group's replicas, needs only its own part of the plan: it starts first, and runs under the recompute below
+    # the layer input (unless forward kept it) and the output gradient go to the experts again. At EP > TP their
+    # first hop, to the expert group's replicas, needs only its own part of the plan: it starts first, and runs
+    # under the recompute below
     outer = dispatcher.replan_outer(routing_indices_flat, dispatch_state)
-    xu = dispatcher.start_dispatch(x_rows, outer)
+    xu = dispatcher.start_dispatch(x_rows, outer) if dispatched is None else None
     yu_grad = dispatcher.start_dispatch(grad_rows, outer)
 
     # recompute router
@@ -213,7 +219,8 @@ def moe_bwd(
 
     # recompute xp: each token's slice goes once to every rank holding one of its experts
     overlap = moe_overlap()
-    xu = dispatcher.dispatch(x_rows, plan, overlap, started=xu)
+    if dispatched is None:
+        xu = dispatcher.dispatch(x_rows, plan, overlap, started=xu)
 
     # the output gradient goes the same way, unscaled; the owner applies the routing scores
     yu_grad = dispatcher.dispatch(grad_rows, plan, overlap, started=yu_grad)
@@ -256,8 +263,9 @@ def moe_bwd(
         h_grad, fc2_w_grad, h1s = None, None, None
         handle_h, h_noise = None, None
 
-    # B' x D: local tokens, rebuilt
-    xu = xu.wait()
+    # B' x D: local tokens, rebuilt (or kept by forward)
+    xu = xu.wait() if dispatched is None else dispatched
+    del dispatched
     # the routing scores of the tokens this TP group computes; EP > TP: those received in forward, kept in
     # the plan state, which equal the recomputed ones bitwise
     scores = dispatcher.local_scores(scaled_topk_scores, plan)

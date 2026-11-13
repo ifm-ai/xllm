@@ -49,7 +49,7 @@ def main(
     ew3 = torch.randn(n_local * inter_dim, model_dim, device='cuda', dtype=torch.bfloat16) / model_dim ** 0.5
 
     def step():
-        _, _, routing_out, _, dispatch_state, rng_states = moe_fwd(
+        _, _, routing_out, _, dispatch_state, rng_states, _ = moe_fwd(
             xf, router_w, None, 'sigmoid', 2.5, None, None, None, None,
             n_experts, dispatcher, topk,
             ew1, ew2, ew3, expert_backend, permutation_backend, 0.0, False, False,

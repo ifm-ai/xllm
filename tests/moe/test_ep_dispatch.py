@@ -63,7 +63,7 @@ def run_fused(x, out_grad, weights, router_bias, layout, topk, backend):
     dispatcher = build_dispatcher(layout, topk, backend)
     xf = x[..., cols].contiguous()
     bias = None if router_bias is None else router_bias.clone()
-    out, _, routing_out, (h1, h3), dispatch_state, rng_states = moe_fwd(
+    out, _, routing_out, (h1, h3), dispatch_state, rng_states, _ = moe_fwd(
         xf, w['router_w'], bias, 'sigmoid', SCALING_FACTOR, None, w['s1'], w['s2'], w['s3'],
         layout.n_experts, dispatcher, topk, w['w1'], w['w2'], w['w3'], 'sequential', backend, 0.0, False, False,
     )

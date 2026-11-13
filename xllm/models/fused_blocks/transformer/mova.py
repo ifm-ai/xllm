@@ -97,6 +97,7 @@ class TransformerMoVABlockFunction(torch.autograd.Function):
         recompute_fc1_out: bool,
         recompute_fc3_out: bool,
         recompute_router: bool,
+        keep_dispatched: bool,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], None]:
 
         bsz, seq_len, _ = x.size()
@@ -170,11 +171,11 @@ class TransformerMoVABlockFunction(torch.autograd.Function):
             xf = scatter(xf, parallel_region='model')
 
         # MoE forward
-        out, aux_loss_moe, routing_out, shared_hiddens, dispatch_state, rng_states = moe_fwd(
+        out, aux_loss_moe, routing_out, shared_hiddens, dispatch_state, rng_states, dispatched = moe_fwd(
             xf, moe_router_w,  moe_router_bias, routing_score_func, routing_scaling_factor, router_load_balancing_type,
             fc1_w, fc2_w, fc3_w, n_experts, dispatcher, moe_topk,
             expert_w1, expert_w2, expert_w3, expert_backend, moe_permutation_backend,
-            hidden_dropout, recompute_fc1_out, recompute_fc3_out
+            hidden_dropout, recompute_fc1_out, recompute_fc3_out, keep_dispatched,
         )
         original_scores, routing_indices, org_topk_scores, tokens_per_expert = routing_out
         health_collector = get_active_health_collector()
@@ -235,6 +236,7 @@ class TransformerMoVABlockFunction(torch.autograd.Function):
             tokens_per_expert,  # (n_experts)
             h1 if not recompute_fc1_out else None,  # (bsz, slen, v/MP)
             h3 if not recompute_fc3_out else None,  # (bsz, slen, v/MP)
+            dispatched,  # (n, d): the MoE input of this GPU's tokens, if keep_dispatched
         )
         ctx.local_heads = local_heads
         ctx.local_kv_heads = local_kv_heads
@@ -336,6 +338,7 @@ class TransformerMoVABlockFunction(torch.autograd.Function):
             tokens_per_expert,  # (n_experts)
             h1,  # (bsz, slen, v/MP)
             h3,  # (bsz, slen, v/MP)
+            dispatched,  # (n, d)
         ) = ctx.saved_tensors
 
         local_heads = ctx.local_heads
@@ -432,7 +435,7 @@ class TransformerMoVABlockFunction(torch.autograd.Function):
             moe_router_w, moe_router_bias, router_bias_update_rate, routing_score_func, routing_scaling_factor, router_load_balancing_type,
             h1, h3, fc1_w, fc2_w, fc3_w, n_experts, dispatcher, moe_topk, expert_w1, expert_w2, expert_w3,
             expert_backend, moe_permutation_backend, hidden_dropout, dispatch_state,
-            expert_hidden_rng_state, shared_hidden_rng_state, gather_before_norm,
+            expert_hidden_rng_state, shared_hidden_rng_state, gather_before_norm, dispatched,
         )
 
         xo_grad, moe_norm_w_grad, moe_norm_b_grad = layer_or_rmsnorm_bwd(
@@ -596,4 +599,5 @@ class TransformerMoVABlockFunction(torch.autograd.Function):
             None,  # recompute_fc1_out
             None,  # recompute_fc3_out
             None,  # recompute_router
+            None,  # keep_dispatched
         )
