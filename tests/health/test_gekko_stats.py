@@ -42,14 +42,13 @@ RATIOS = (torch.tensor([0.25, 0.75]), torch.tensor([0.5]))  # one call per AWM m
 SCA = torch.full((1, 2, 8), 3.0)  # (batch, seq, heads * v): RMS 3
 AWK = torch.full((1, 2, 8), 4.0)  # RMS 4
 GATE = torch.tensor([[[0.0, 0.0005, 0.5, -2.0]]])  # 2 of 4 within 1e-3 of zero
-UNAVAILABLE = torch.tensor([[True, False, False, False]])  # history missing at 1 of 4 positions
 
 
 def _record_layer(collector, layer_idx=0, ratios=RATIOS, sca=SCA, awk=AWK):
     collector.record_gekko_query_key_stats(layer_idx, Q, K, SQ, sca_key_l2=SK_L2)
     for ratio in ratios:
         collector.record_gekko_update_ratio(layer_idx, ratio)
-    collector.record_gekko_branches(layer_idx, sca, awk, GATE, UNAVAILABLE)
+    collector.record_gekko_branches(layer_idx, sca, awk, GATE)
 
 
 # Statistics
@@ -72,7 +71,7 @@ def test_raw_and_normed_query_key_norms():
     assert stats(metrics, f"{PREFIX}/sca_key_l2") == pytest.approx([2.0, 1.0, 3.0])
 
 
-def test_branch_energy_gate_and_history_metrics():
+def test_branch_energy_and_gate_metrics():
     collector = _collector()
     _record_layer(collector)
 
@@ -83,7 +82,6 @@ def test_branch_energy_gate_and_history_metrics():
     assert metrics[f"{PREFIX}/awk_energy_fraction"] == pytest.approx(16 / 25)
     assert stats(metrics, f"{PREFIX}/output_gate") == pytest.approx([-1.4995 / 4, -2.0, 0.5])
     assert metrics[f"{PREFIX}/output_gate/near_zero_fraction"] == 0.5
-    assert metrics[f"{PREFIX}/awk_history_available_fraction"] == 0.75
 
 
 @pytest.mark.parametrize("ratios, expected", [
@@ -108,7 +106,7 @@ def test_gekko_metric_names():
     assert {name[len(PREFIX) + 1:] for name in metrics if name.startswith(PREFIX)} == {
         *(f"sca_query_l2/{s}" for s in STATS), *(f"sca_key_l2/{s}" for s in STATS),
         *(f"output_gate/{s}" for s in STATS), "output_gate/near_zero_fraction",
-        "sca_rms", "awk_rms", "awk_energy_fraction", "awk_history_available_fraction",
+        "sca_rms", "awk_rms", "awk_energy_fraction",
         *(f"awk_update_ratio/{s}" for s in (*STATS, "count")),
     }
 
@@ -139,12 +137,12 @@ def test_gekko_records_must_follow_the_hook_order():
     with pytest.raises((KeyError, RuntimeError)):
         collector.record_gekko_update_ratio(0, RATIOS[0])
     with pytest.raises((KeyError, RuntimeError)):
-        collector.record_gekko_branches(0, SCA, AWK, GATE, UNAVAILABLE)
+        collector.record_gekko_branches(0, SCA, AWK, GATE)
     _record_layer(collector)
     with pytest.raises(RuntimeError, match="Duplicate"):
         collector.record_gekko_query_key_stats(0, Q, K, SQ, sca_key_l2=SK_L2)
     with pytest.raises(RuntimeError, match="Duplicate Gekko branches"):
-        collector.record_gekko_branches(0, SCA, AWK, GATE, UNAVAILABLE)
+        collector.record_gekko_branches(0, SCA, AWK, GATE)
 
 
 @pytest.mark.parametrize("partial, message", [

@@ -792,15 +792,11 @@ class HealthMetricCollector:
                 metrics[f"{prefix}/awk_energy_fraction"] = (
                     awk_squared / total_energy if total_energy > 0 else float("nan")
                 )
-                for name in ("sca_squared", "awk_squared", "gate_near_zero", "history_available"):
+                for name in ("sca_squared", "awk_squared", "gate_near_zero"):
                     for stat in ("min", "max"):
                         del metrics[f"{prefix}/{name}/{stat}"]
                 del metrics[f"{prefix}/sca_squared/mean"], metrics[f"{prefix}/awk_squared/mean"]
-                for name, metric_name in (
-                    ("gate_near_zero", "output_gate/near_zero_fraction"),
-                    ("history_available", "awk_history_available_fraction"),
-                ):
-                    metrics[f"{prefix}/{metric_name}"] = metrics.pop(f"{prefix}/{name}/mean")
+                metrics[f"{prefix}/output_gate/near_zero_fraction"] = metrics.pop(f"{prefix}/gate_near_zero/mean")
                 ratio_count = entry_counts[f"{prefix}/awk_update_ratio"]
                 metrics[f"{prefix}/awk_update_ratio/count"] = ratio_count
                 if ratio_count == 0:
