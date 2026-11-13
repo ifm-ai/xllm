@@ -326,7 +326,7 @@ class TrainerConf(Config):
 
     # Parallelism
     model_parallel_size: int = 1  # Num of model/tensor parallel.
-    expert_parallel_size: Optional[int] = None  # Num of GPUs splitting the routed experts. A multiple of model_parallel_size; EP / TP must divide DP. If None, = model_parallel_size.
+    expert_parallel_size: Optional[int] = None  # Num of GPUs splitting the routed experts. If None, = model_parallel_size. A multiple of model_parallel_size dividing model.num_experts; EP / TP must divide DP. EP > TP needs fsdp2, and changing EP on resume needs dcp_for_optimizer (see README).
     context_parallel_size: int = 1  # Num of context parallel. Splits sequences along the token dimension.
     fully_sharded_size: Optional[int] = None  # Num of FSDP shard group. If None, = DP.
 
