@@ -277,9 +277,11 @@ def moe_bwd(
         pair_scores = scores.reshape(-1)[plan.tp.pairs]
         y2_grad = torch.index_select(yu_grad, 0, plan.tp.pair_rows).mul_(pair_scores.unsqueeze(1))
         del yu_grad
-        xp_grad, ew1_grad, ew2_grad, ew3_grad, output_dots = grouped_experts_bwd(
+        # the expert weight gradients are deferred: they run under the combine below
+        xp_grad, expert_wgrad, output_dots = grouped_experts_bwd(
             y2_grad, xp, ew1, ew2, ew3, eh1, eh1s, eh3, eh, group_sizes, expert_backend,
             True, hidden_dropout, expert_hidden_rng_state, expert_hidden_noise, with_output_dots=True,
+            defer_wgrad=True,
         )
         # routing scores' gradient, <out_grad, expert output>, for the local pairs; other ranks add theirs
         # through the logits-gradient all-reduce below. A score that underflowed to 0 would give 0 / 0; its
@@ -288,20 +290,32 @@ def moe_bwd(
         topk_scores_grad[plan.tp.pairs] = output_dots / pair_scores.float().clamp_min(torch.finfo(torch.float32).tiny)
         # B' x D: summed per local token
         xu_grad = masked_gather_sum(xp_grad, plan.tp.pair_table, None, moe_permutation_backend)
+        del xp_grad
+    else:
+        xu_grad = yu_grad
+        topk_scores_grad = torch.zeros(plan.n_tokens * topk, device=xf.device, dtype=torch.float32)
+        expert_wgrad = None
+
+    # the routing scores' gradient, back to the tokens' replica, ahead of the combine on the expert outer
+    # group; waited for where it is used
+    topk_scores_grad = dispatcher.scores_grad(topk_scores_grad.view(plan.n_tokens, topk), plan)
+    # the input gradient from the experts, back to the tokens; the expert weight gradients and the shared
+    # expert's backward run under it
+    xf_grad = dispatcher.combine(xu_grad, plan, overlap)
+    del xu_grad
+
+    if expert_wgrad is not None:
+        ew1_grad, ew2_grad, ew3_grad = expert_wgrad()
+        # the expert recompute is no longer needed
+        del expert_wgrad, y2_grad, xp, eh1, eh1s, eh3, eh, expert_hidden_noise
         ew1_grad = rearrange(ew1_grad, 'n s d -> (n s) d')
         ew2_grad = rearrange(ew2_grad, 'n s d -> (n s) d')
         ew3_grad = rearrange(ew3_grad, 'n s d -> (n s) d')
     else:
-        xu_grad = yu_grad
-        topk_scores_grad = torch.zeros(plan.n_tokens * topk, device=xf.device, dtype=torch.float32)
         # FSDP must reduce the same parameters even when this rank has no expert tokens.
         ew1_grad = torch.zeros_like(expert_w1)
         ew2_grad = torch.zeros_like(expert_w2)
         ew3_grad = torch.zeros_like(expert_w3)
-
-    xf_grad = dispatcher.combine(xu_grad, plan, overlap)
-    # the routing scores' gradient, back to the tokens' replica; waited after the shared experts' backward
-    topk_scores_grad = dispatcher.scores_grad(topk_scores_grad.view(plan.n_tokens, topk), plan)
 
     if fc1_w is not None:
         if handle_h is not None:
