@@ -38,9 +38,9 @@ def _query_key_reference(model, tokens=TOKENS):
     references = []
     for attention, xq, xk, freqs_cis in captured:
         heads, head_dim, rope = attention.n_heads, attention.head_dim, attention.rope_head_dim
-        num_query_sets = xq.shape[-1] // (heads * head_dim)  # 2 under softdelta: wq packs (head, set, dim)
-        q, *kq = xq.view(*xq.shape[:2], heads, num_query_sets, head_dim).unbind(dim=3)
-        k = xk.view(*xk.shape[:2], attention.n_kv_heads, head_dim)
+        q = xq.view(*xq.shape[:2], heads, head_dim)
+        # Under softdelta wk packs (kv head, [kq, k], dim); otherwise it holds k only.
+        *kq, k = xk.view(*xk.shape[:2], attention.n_kv_heads, -1, head_dim).unbind(dim=3)
         if rope > 0:
             q_rope, k_rope = apply_rotary_embeddings(q[..., :rope], k[..., :rope], freqs_cis=freqs_cis, backward=False)
             q, k = torch.cat([q_rope, q[..., rope:]], -1), torch.cat([k_rope, k[..., rope:]], -1)
@@ -61,17 +61,17 @@ ATTENTION = ["softmax", "softdelta"]
 
 
 def _set_scaled_projections(model):
-    # One head per 4 features. Under softdelta wq packs (head, query set, dim): 4 q rows then 4 kq rows per head.
+    # One head per 4 features. Under softdelta wk packs (kv head, [kq, k], dim): 4 kq rows then 4 k rows per head.
     with torch.no_grad():
         for layer in model.layers:
-            layer.attention.wk.weight.copy_(SCALES["k"] * torch.eye(8))
-            wq = layer.attention.wq.weight
-            query_sets = ("q", "kq")[:wq.shape[0] // 8]
+            layer.attention.wq.weight.copy_(SCALES["q"] * torch.eye(8))
+            wk = layer.attention.wk.weight
+            key_sets = ("kq", "k")[-(wk.shape[0] // 8):]
             for head in range(2):
                 rows = torch.eye(8)[head * 4:(head + 1) * 4]
-                for index, name in enumerate(query_sets):
-                    start = (head * len(query_sets) + index) * 4
-                    wq[start:start + 4] = SCALES[name] * rows
+                for index, name in enumerate(key_sets):
+                    start = (head * len(key_sets) + index) * 4
+                    wk[start:start + 4] = SCALES[name] * rows
 
 
 def _hand_computed_model(num_layers, rows, attn_act_func):
@@ -101,6 +101,7 @@ REAL_WEIGHT_CONFIGS = [
     {"num_heads": 4, "num_kv_heads": 2},  # GQA
     {"qknorm": True},
     {"attn_act_func": "softdelta"},  # two query sets: q and kq
+    {"attn_act_func": "softdelta", "num_heads": 4, "num_kv_heads": 2},  # kq has one head per KV head
 ]
 
 
