@@ -92,7 +92,7 @@ def check(tp: int, cp: int, ep: int) -> list:
     if e_out > 1:
         # a layout whose replicas are not in the outer group's rank order is refused
         try:
-            NodeDispatcher(ExpertLayout(N_EXPERTS, tp, e_out, k, (o + 1) % e_out), 2, 'torch')
+            NodeDispatcher(ExpertLayout(N_EXPERTS, tp, e_out, k, (o + 1) % e_out), 2, 'torch').check_outer_group()
             errors.append("NodeDispatcher accepted a layout out of the outer group's order")
         except RuntimeError:
             pass

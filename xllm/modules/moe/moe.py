@@ -64,6 +64,7 @@ class NormalizedMoE(nn.Module):
         self.init_std = init_std
 
         self.layout = ExpertLayout.from_process_groups(num_experts)
+        # with EP > TP, a collective over the expert outer group (see build_dispatcher)
         self.dispatcher = build_dispatcher(self.layout, self.topk, permutation_backend)
         self.n_local_experts = self.layout.n_local
         self.expert_start_idx = self.layout.start

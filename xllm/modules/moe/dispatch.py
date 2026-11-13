@@ -209,10 +209,14 @@ class NodeDispatcher:
     group in each dispatch and combine, S the (token, other replica) pairs plus the token's own replica,
     S x K int32 indices once per plan and S x K scores once per local_scores and scores_grad, and one
     all-to-all of E_out counts per plan.
+
+    Building one does not communicate. check_outer_group does: it is a collective over the expert outer
+    group, which build_dispatcher runs once per dispatcher it builds.
     """
 
     def __init__(self, layout: ExpertLayout, topk: int, backend: str):
         assert layout.e_out > 1
+        self.layout = layout
         self.topk = topk
         self.backend = backend
         self.n_local = layout.n_local
@@ -222,11 +226,15 @@ class NodeDispatcher:
         self.e_out = layout.e_out
         self.n_node = layout.tp * layout.n_local
         self.tp = TPDispatcher(self.n_node, self.n_local, topk, backend, masked=True)
-        self._check_outer_group(layout)
 
-    def _check_outer_group(self, layout: ExpertLayout):
+    def check_outer_group(self):
         """The tokens of replica o's experts go to rank o of the expert outer group: check that this rank
-        owns them. One all-gather, when the layer is built."""
+        owns them, and raise RuntimeError if not.
+
+        A collective: one all-gather of a long over the expert outer group, which every rank of the group
+        must run for the same dispatchers in the same order.
+        """
+        layout = self.layout
         world_size = torch.distributed.get_world_size(group=self.group)
         start = torch.tensor([layout.start], dtype=torch.long, device=torch.cuda.current_device())
         starts = torch.empty(world_size, dtype=torch.long, device=start.device)
@@ -383,10 +391,16 @@ class _LocalScores(torch.autograd.Function):
 
 
 def build_dispatcher(layout: ExpertLayout, topk: int, backend: str):
-    """The dispatcher of the calling rank's expert layout."""
+    """The dispatcher of the calling rank's expert layout.
+
+    With E_out > 1 this is a collective over the expert outer group (NodeDispatcher.check_outer_group): every
+    rank of the group must build the same MoE layers in the same order, as building the same model does.
+    """
     if layout.e_out == 1:
         return TPDispatcher(layout.n_experts, layout.n_local, topk, backend)
-    return NodeDispatcher(layout, topk, backend)
+    dispatcher = NodeDispatcher(layout, topk, backend)
+    dispatcher.check_outer_group()
+    return dispatcher
 
 
 class _DispatchRows(torch.autograd.Function):
