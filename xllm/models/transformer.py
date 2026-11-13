@@ -271,7 +271,8 @@ class TransformerMoEBlock(nn.Module):
     ) -> Tuple[Tensor, Optional[Tensor], Optional[Any]]:
         if self.fused_block and self.training:
             fn = TransformerMoEBlockFunction
-            return fn.apply(
+            # the experts run inside the fused block: run it as their forward, for their FSDP unit
+            return self.moe.experts.run_fused(lambda x, expert_w1, expert_w2, expert_w3: fn.apply(
                 self.layer_id,
                 x,
                 freqs_cis,
@@ -310,9 +311,9 @@ class TransformerMoEBlock(nn.Module):
                 self.moe.router.bias_update_rate,
                 self.moe.router.scaling_factor,
                 moe_router_load_balancing_type,
-                self.moe.experts.weight1,
-                self.moe.experts.weight2,
-                self.moe.experts.weight3,
+                expert_w1,
+                expert_w2,
+                expert_w3,
                 self.moe.experts.backend,
                 self.dropout,
                 self.attention.attention_dropout,
@@ -331,7 +332,7 @@ class TransformerMoEBlock(nn.Module):
                 self.recompute_fc1_out,
                 self.recompute_fc3_out,
                 self.recompute_router,
-            )
+            ), x)
 
         y, cache = self.attention(
             x, freqs_cis, bos_mask, segments, attn_stability_control, deterministic, cache
@@ -439,7 +440,8 @@ class TransformerMoVABlock(nn.Module):
     ) -> Tuple[Tensor, Optional[Tensor], Optional[Any]]:
         if self.fused_block and self.training:
             fn = TransformerMoVABlockFunction
-            return fn.apply(
+            # the experts run inside the fused block: run it as their forward, for their FSDP unit
+            return self.moe.experts.run_fused(lambda x, expert_w1, expert_w2, expert_w3: fn.apply(
                 self.layer_id,
                 x,
                 freqs_cis,
@@ -483,9 +485,9 @@ class TransformerMoVABlock(nn.Module):
                 self.moe.router.bias_update_rate,
                 self.moe.router.scaling_factor,
                 moe_router_load_balancing_type,
-                self.moe.experts.weight1,
-                self.moe.experts.weight2,
-                self.moe.experts.weight3,
+                expert_w1,
+                expert_w2,
+                expert_w3,
                 self.moe.experts.backend,
                 self.dropout,
                 self.mova.attention_dropout,
@@ -504,7 +506,7 @@ class TransformerMoVABlock(nn.Module):
                 self.recompute_fc1_out,
                 self.recompute_fc3_out,
                 self.recompute_router,
-            )
+            ), x)
 
         y, aux_loss_mova, cache = self.mova(
             x, freqs_cis, bos_mask, segments, attn_stability_control, deterministic, cache, moe_router_load_balancing_type

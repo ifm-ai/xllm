@@ -1,4 +1,4 @@
-from typing import Optional, Callable, List
+from typing import Any, Optional, Callable, List
 
 import torch
 from torch import nn
@@ -98,6 +98,16 @@ class Expert(nn.Module):
         hidden = memory_efficient_dropout(h1 * h3, self.hidden_dropout, self.training)
         y = mgmm(hidden, w2, group_sizes, True, self.backend)
         return y
+
+    def run_fused(self, fn: Callable[..., Any], *args: Any) -> Any:
+        """Return fn(*args, weight1, weight2, weight3), run as this module's forward.
+
+        For a fused block that computes the experts inside: when the experts are their own FSDP unit,
+        this method is registered as a forward method, so FSDP gathers the weights before fn, gathers
+        them again before its backward (fn's output is this module's output), and reduces their
+        gradients after it (once the gradients of the tensors in args are computed).
+        """
+        return fn(*args, self.weight1, self.weight2, self.weight3)
 
     def extra_repr(self) -> str:
         return 'mdim={}, edim={}, expert={} ({}), backend={}, init={} ({})'.format(
