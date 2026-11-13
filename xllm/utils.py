@@ -353,19 +353,22 @@ def clip_grad_norm_(
 
 
 def get_model_state(model, full_state: bool = False, cpu_offload: bool = True) -> Dict[str, Any]:
+    from xllm.modules.moe.checkpoint import experts_to_checkpoint
     state_dict_options = StateDictOptions(
         full_state_dict=full_state,
         cpu_offload=cpu_offload,
     )
-    return get_model_state_dict(model, options=state_dict_options)
+    # with EP > TP, the routed experts are saved and loaded at their rows of the TP rank's experts
+    return experts_to_checkpoint(model, get_model_state_dict(model, options=state_dict_options))
 
 
 def set_model_state(model, model_state_dict, full_state: bool = False, cpu_offload: bool = True):
+    from xllm.modules.moe.checkpoint import experts_from_checkpoint
     state_dict_options = StateDictOptions(
         full_state_dict=full_state,
         cpu_offload=cpu_offload,
     )
-    set_model_state_dict(model, model_state_dict, options=state_dict_options)
+    set_model_state_dict(model, experts_from_checkpoint(model, model_state_dict), options=state_dict_options)
 
 
 def get_sharded_optimizer_state(model, optimizer, dcp: bool) -> Dict[str, Any]:
