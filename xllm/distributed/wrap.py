@@ -48,12 +48,27 @@ def wrap_experts(module: nn.Module) -> nn.Module:
     Call it before wrapping the layer that holds them. Their run_fused method
     is registered as a forward method, so the fused blocks that run through it
     gather and reduce the expert weights.
+
+    On an expert mesh smaller than the model's (EP > TP), their gradients are
+    divided by the size of the model's mesh, as the rest of the model's: each
+    GPU of the expert mesh holds the gradients of the tokens of E_out data
+    parallel replicas, and FSDP would divide their sum by its own size only.
+    FSDP then reduces with a plain sum and divides after: dividing in the
+    reduction (NCCL PreMulSum) gives 0 for a bf16 reduction in our build.
+    Without sharding (a shard group of one GPU), FSDP divides by hand and
+    reduces with a sum already: forcing the sum there would divide twice.
     """
     if not _ConfigAutoWrap.in_autowrap_context:
         return module
-    overrides = {} if _ConfigAutoWrap.expert_mesh is None else {"mesh": _ConfigAutoWrap.expert_mesh}
+    expert_mesh = _ConfigAutoWrap.expert_mesh
+    overrides = {} if expert_mesh is None else {"mesh": expert_mesh}
     module = wrap(module, **overrides)
     register_fsdp_forward_method(module, "run_fused")
+    mesh = _ConfigAutoWrap.kwargs.get("mesh")
+    if expert_mesh is not None and mesh is not None and expert_mesh.size() != mesh.size():
+        module.set_gradient_divide_factor(float(mesh.size()))
+        if expert_mesh.size(expert_mesh.ndim - 1) > 1:
+            module.set_force_sum_reduction_for_comms(True)
     return module
 
 
