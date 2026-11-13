@@ -354,6 +354,8 @@ def clip_grad_norm_(
 
 def get_model_state(model, full_state: bool = False, cpu_offload: bool = True) -> Dict[str, Any]:
     from xllm.modules.moe.checkpoint import experts_to_checkpoint
+    if full_state and get_expert_outer_world_size() > 1:
+        raise NotImplementedError("full model state dicts with EP > TP: the routed experts would not be gathered")
     state_dict_options = StateDictOptions(
         full_state_dict=full_state,
         cpu_offload=cpu_offload,
@@ -364,6 +366,8 @@ def get_model_state(model, full_state: bool = False, cpu_offload: bool = True) -
 
 def set_model_state(model, model_state_dict, full_state: bool = False, cpu_offload: bool = True):
     from xllm.modules.moe.checkpoint import experts_from_checkpoint
+    if full_state and get_expert_outer_world_size() > 1:
+        raise NotImplementedError("full model state dicts with EP > TP: the routed experts would not be gathered")
     state_dict_options = StateDictOptions(
         full_state_dict=full_state,
         cpu_offload=cpu_offload,
