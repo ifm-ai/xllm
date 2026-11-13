@@ -37,11 +37,6 @@ def moe_fwd(
     routing_logits = F.linear(xf, router_w).to(torch.float32)
     routing_logits, handle_router = all_reduce(routing_logits, parallel_region='model', async_op=True)
 
-    if fc1_w is not None:
-        h1, handle_h1 = all_reduce(F.linear(xf, fc1_w), parallel_region='model', async_op=True)
-    else:
-        h1, handle_h1 = None, None
-
     # Router indices
     if routing_score_func == 'softmax':
         routing_score_fn = partial(F.softmax, dim=-1, dtype=torch.float32)
@@ -91,17 +86,16 @@ def moe_fwd(
     overlap = moe_overlap()
     xu = dispatcher.dispatch(xf.view(bsz * seq_len, -1), plan, overlap)
 
+    # the shared expert's input GEMMs run under the dispatch
+    if fc1_w is not None:
+        h1, handle_h1 = all_reduce(F.linear(xf, fc1_w), parallel_region='model', async_op=True)
+    else:
+        h1, handle_h1 = None, None
+
     if fc3_w is not None:
         h3, handle_h3 = all_reduce(F.linear(xf, fc3_w), parallel_region='model', async_op=True)
     else:
         h3, handle_h3 = None, None
-
-    if h1 is not None:
-        if handle_h1 is not None:
-            handle_h1.wait()
-        h1s = F.silu(h1)
-    else:
-        h1s = None
 
     # B' x D: local tokens, rebuilt
     xu = xu.wait()
@@ -126,6 +120,13 @@ def moe_fwd(
         expert_hidden_rng_state = None
 
     y2 = dispatcher.combine(y2, plan, overlap)
+
+    if h1 is not None:
+        if handle_h1 is not None:
+            handle_h1.wait()
+        h1s = F.silu(h1)
+    else:
+        h1s = None
 
     if h3 is not None:
         assert h1s is not None
