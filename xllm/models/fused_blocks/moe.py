@@ -83,7 +83,7 @@ def moe_fwd(
     rank = get_model_parallel_rank()
     world_size = get_model_parallel_world_size()
     n_local_experts = dispatcher.n_local
-    plan = dispatcher.plan(routing_indices_flat, tokens_per_expert)
+    plan = dispatcher.plan(routing_indices_flat, tokens_per_expert, topk_scores)
     group_sizes = plan.group_sizes
 
     # each token's slice goes once to every rank holding one of its experts
@@ -246,7 +246,8 @@ def moe_bwd(
 
     # B' x D: local tokens, rebuilt
     xu = xu.wait()
-    # the routing scores of the tokens this TP group computes
+    # the routing scores of the tokens this TP group computes; EP > TP: those received in forward, kept in
+    # the plan state, which equal the recomputed ones bitwise
     scores = dispatcher.local_scores(scaled_topk_scores, plan)
     if plan.n_pairs > 0:
         ew1 = rearrange(expert_w1, '(n s) d -> n s d', n=n_local_experts)

@@ -167,7 +167,8 @@ class NormalizedMoE(nn.Module):
             )
         # B*L x D/TP
         x = x.view(bsz * slen, -1)
-        plan = self.dispatcher.plan(routing_indices.flatten(), tokens_per_expert)
+        # the routing scores go with the routing: local_scores below takes them from the plan
+        plan = self.dispatcher.plan(routing_indices.flatten(), tokens_per_expert, routing_scores.detach())
         backend = self.permutation_backend
 
         # routed experts: each token's slice goes once to every rank holding one of its experts

@@ -13,8 +13,9 @@ round-off at EP > TP and EP = TP, be finite, and be bitwise equal in two runs. V
   inference  the same under torch.inference_mode
   fused      moe_fwd / moe_bwd, with the aux loss
 
-The dispatch checks its plan (NodeDispatcher.check_plan): the counts sent with the routing against those read
-from it. Last, one plan, without this check, must block the host once at both EP.
+The dispatch checks its plan (NodeDispatcher.check_plan): the counts and the routing scores sent with the
+routing against those read from it and sent apart. Last, one plan, without these checks, must block the host
+once at both EP.
 
 Launch one process per rank, e.g.:
 
@@ -164,12 +165,12 @@ def plan_syncs(x: Tensor, weights, layout: ExpertLayout, topk: int, backend: str
     """The host syncs of one dispatcher.plan of the shard's tokens, after a first plan."""
     dispatcher = build_dispatcher(layout, topk, backend)
     logits = x.flatten(end_dim=-2).float() @ weights['router_w'].float().t()
-    _, indices = torch.sigmoid(logits).topk(topk, dim=-1)
+    scores, indices = torch.sigmoid(logits).topk(topk, dim=-1)
     tokens_per_expert = torch.bincount(indices.flatten(), minlength=layout.n_experts)
     check, NodeDispatcher.check_plan = NodeDispatcher.check_plan, False
     try:
-        dispatcher.plan(indices.flatten(), tokens_per_expert)
-        return count_syncs(lambda: dispatcher.plan(indices.flatten(), tokens_per_expert))
+        dispatcher.plan(indices.flatten(), tokens_per_expert, scores.to(x.dtype))
+        return count_syncs(lambda: dispatcher.plan(indices.flatten(), tokens_per_expert, scores.to(x.dtype)))
     finally:
         NodeDispatcher.check_plan = check
 

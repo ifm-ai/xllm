@@ -11,10 +11,12 @@ implementation of it:
 Token sets: T, the tokens of this replica (every TP rank holds a 1/TP slice of each); M, the tokens this
 replica's TP group computes experts for (M = T when EP = TP); n, the tokens this rank computes. Steps:
 
-    plan(routing_indices, tokens_per_expert)    who sends what where, and the rows of each local expert
+    plan(routing_indices, tokens_per_expert, scores)
+                                                who sends what where, and the rows of each local expert
     dispatch(x, plan).wait()                    T x D/TP -> n x D, the full rows of this rank's tokens
     combine(y, plan).wait()                     n x D -> T x D/TP, summed over the ranks that computed them
-    local_scores(scores, plan)                  T x K routing scores -> M x K, the scores of the M tokens
+    local_scores(scores, plan)                  T x K routing scores (those given to plan) -> M x K, the scores
+                                                of the M tokens
     scores_grad(grad, plan)                     M x K gradient of local_scores -> T x K
 
 dispatch and combine return a Pending: the communication is started and wait() finishes it, so the
@@ -87,6 +89,8 @@ class NodeState:
     # M*K int32: the experts of the received tokens, in the TP group's numbering (see NodeDispatcher)
     node_indices: Tensor
     tp: TPState
+    # M x K: the routing scores of the received tokens, received with their routing (local_scores)
+    scores: Tensor
 
 
 @dataclass
@@ -168,8 +172,11 @@ class TPDispatcher:
         counts = torch.cat([tokens_per_expert, self._hits(routing_indices).sum(dim=0)]).tolist()
         return counts[:self.n_experts], counts[self.n_experts:]
 
-    def plan(self, routing_indices: Tensor, tokens_per_expert: Tensor) -> DispatchPlan:
-        """routing_indices: M*K flat expert indices; tokens_per_expert: the n_experts counts of the indices."""
+    def plan(
+        self, routing_indices: Tensor, tokens_per_expert: Tensor, scores: Optional[Tensor] = None
+    ) -> DispatchPlan:
+        """routing_indices: M*K flat expert indices; tokens_per_expert: the n_experts counts of the indices.
+        scores is not used."""
         # M x TP
         hits = self._hits(routing_indices)
         # N + TP
@@ -217,12 +224,13 @@ class NodeDispatcher:
     each TP rank sending its 1/TP slice to the same TP rank there (the expert outer group); that replica runs
     TPDispatcher on the M tokens it received, numbering its experts k * n_local + i and every other expert
     TP * n_local (masked), and sums its experts' outputs per token before they go back. The routing indices
-    and scores of the sent tokens go along with them. Every TP rank of a replica sends and receives the same
-    tokens in the same order, so the replica's TP ranks agree on the M tokens and their routing.
+    and scores of the sent tokens go to it in plan, in one all-to-all. Every TP rank of a replica sends and
+    receives the same tokens in the same order, so the replica's TP ranks agree on the M tokens and their
+    routing.
 
     Per layer and rank, besides TPDispatcher's traffic on the M tokens: S x D/TP rows over the expert outer
     group in each dispatch and combine, S the (token, other replica) pairs plus the token's own replica,
-    S x K int32 indices once per plan and S x K scores once per local_scores and scores_grad, and one
+    S x K int32 indices and S x K fp32 scores once per plan, S x K scores once per scores_grad, and one
     all-to-all of E_out x (1 + TP x n_local + TP) counts per plan, its only host sync.
 
     Building one does not communicate. check_outer_group does: it is a collective over the expert outer
@@ -322,8 +330,9 @@ class NodeDispatcher:
         ], dim=1)
         return hits, counts
 
-    def plan(self, routing_indices: Tensor, tokens_per_expert: Tensor) -> DispatchPlan:
-        """routing_indices: T*K flat expert indices; tokens_per_expert: the n_experts counts of the indices.
+    def plan(self, routing_indices: Tensor, tokens_per_expert: Tensor, scores: Tensor) -> DispatchPlan:
+        """routing_indices: T*K flat expert indices; tokens_per_expert: the n_experts counts of the indices;
+        scores: T x K, their routing scores, which local_scores takes.
 
         One host sync: each replica sends the others, with the number of tokens it sends them, the counts their
         TP plan needs, so it is built without reading them back from the received routing."""
@@ -337,10 +346,16 @@ class NodeDispatcher:
         expert_counts, dest_counts = counts[2 * self.e_out:-self.tp_size], counts[-self.tp_size:]
         _, send_tokens, _, home_table = build_send_lists(hits, send_splits)
 
-        # the routing of the tokens each replica receives
+        # the routing of the tokens each replica receives: S x 2K int32, the indices, then the scores in fp32
+        # (exact for bf16 and fp16) seen as int32
         send_indices = routing_indices.view(-1, self.topk).index_select(0, send_tokens).int()
-        recv_indices, handle = all_to_all(send_indices, send_splits, recv_splits, self.group, self.e_out)
+        send_scores = scores.reshape(-1, self.topk).index_select(0, send_tokens).float().view(torch.int32)
+        send = torch.cat([send_indices, send_scores], dim=1)
+        recv, handle = all_to_all(send, send_splits, recv_splits, self.group, self.e_out)
         handle.wait()
+        recv_indices, recv_scores = recv.split(self.topk, dim=1)
+        # M x K
+        recv_scores = recv_scores.contiguous().view(torch.float32).to(scores.dtype)
         # M*K
         node_indices = self._node_indices(recv_indices.long()).flatten()
         if self.check_plan:
@@ -354,7 +369,7 @@ class NodeDispatcher:
         tp_plan = self.tp.plan_from_counts(node_indices, expert_counts, dest_counts)
 
         # int32: half the memory, kept until backward
-        state = NodeState(send_splits, recv_splits, node_indices.int(), tp_plan.state)
+        state = NodeState(send_splits, recv_splits, node_indices.int(), tp_plan.state, recv_scores)
         outer = OuterPlan(send_tokens, home_table, send_splits, recv_splits)
         return DispatchPlan(tp_plan.tp, tp_plan.group_sizes, tp_plan.n_tokens, state, outer)
 
@@ -387,7 +402,7 @@ class NodeDispatcher:
         return _LocalScores.apply(scores, self, plan)
 
     def send_scores(self, scores: Tensor, plan: DispatchPlan) -> Tensor:
-        """T x K -> M x K, the scores of the received tokens. Use local_scores for autograd."""
+        """T x K -> M x K, the scores of the received tokens, sent apart from the plan (check_plan)."""
         output, handle, _ = self._to_replicas(scores.reshape(-1, self.topk), plan)
         handle.wait()
         return output
@@ -437,12 +452,18 @@ def _saved_plan(ctx) -> DispatchPlan:
 
 
 class _LocalScores(torch.autograd.Function):
+    """T x K scores -> the M x K scores of the received tokens, which plan received with them."""
 
     @staticmethod
     def forward(ctx, scores: Tensor, dispatcher: NodeDispatcher, plan: DispatchPlan) -> Tensor:
+        if dispatcher.check_plan:
+            sent = dispatcher.send_scores(scores, plan)
+            if not torch.equal(sent.view(torch.uint8), plan.state.scores.view(torch.uint8)):
+                raise RuntimeError("the scores received with the routing are not those given to local_scores")
         _save_plan(ctx, dispatcher, plan)
         ctx.shape = scores.shape
-        return dispatcher.send_scores(scores, plan)
+        # a new tensor on the same storage: autograd sets its grad_fn, not that of the plan's
+        return plan.state.scores.detach()
 
     @staticmethod
     def backward(ctx, grad: Tensor):
