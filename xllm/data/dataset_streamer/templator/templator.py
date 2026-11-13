@@ -40,187 +40,15 @@ SYSTEM = (
     "You are K2, a helpful assistant created by Mohamed bin Zayed University of Artificial Intelligence "
     "(MBZUAI) Institute of Foundation Models (IFM)."
 )
-SEARCH_TOOL = [
-    {
-        "name": "search",
-        "description": "Semantic search over a document corpus. Returns relevant passages with document IDs.",
-        "parameters": {
-            "properties": {
-                "query": {
-                    "type": "string",
-                    "description": "The search query to find relevant documents",
-                },
-                "return_fulltext": {
-                    "type": "boolean",
-                    "description": "If true, return full document text instead of passages",
-                },
-            },
-            "required": ["query"],
-        },
-    }
-]
 
-GREETING_PHRASES = [
-    "Hello! How can I help you?",
-    "Hi! How can I help you today?",
-    "Hi there! How can I help you?",
-    "Hello! How can I assist you?",
-    "Hi! How can I assist you today?",
-    "Hi there! How can I assist?",
-    "Hello! How may I help you?",
-    "Hi! How may I help you today?",
-    "Hi there! How may I assist?",
-    "Hello! How may I assist you today?",
-    "Hi! What can I help you with?",
-    "Hi there! What can I help you with?",
-    "Hello! What can I help you with today?",
-    "Hi! What can I do for you?",
-    "Hi there! What can I do for you?",
-    "Hello! What can I do for you today?",
-    "Hello! What would you like help with?",
-    "Hi! What would you like help with?",
-    "Hi there! What would you like help with today?",
-    "Hello! What would you like to do?",
-    "Hi! What would you like to do?",
-    "Hello! What's on your mind?",
-    "Hi! What's on your mind?",
-    "Hi there! What's on your mind today?",
-    "Hello! Ready when you are.",
-    "Hi! Ready when you are.",
-    "Hi there! Ready when you are.",
-    "Hello! I'm here to help.",
-    "Hi! I'm here to help.",
-    "Hi there! I'm here to help.",
-    "Hello! I'm ready to help.",
-    "Hi! I'm ready to help.",
-    "Hi there! I'm ready to help.",
-    "Hello! Just let me know what you need.",
-    "Hi! Just let me know what you need.",
-    "Hi there! Just let me know what you need.",
-    "Hello! Let me know how I can help.",
-    "Hi! Let me know how I can help.",
-    "Hi there! Let me know how I can help.",
-    "Hello! Please go ahead.",
-    "Hi! Please go ahead.",
-    "Hello! Go ahead whenever you're ready.",
-    "Hi! Go ahead whenever you're ready.",
-    "Hello! Ask away.",
-    "Hi! Ask away.",
-    "Hi there! Ask away.",
-    "Hello! What's the question?",
-    "Hi! What's the question?",
-    "Hi there! What's the question?",
-    "Hello! What's the task?",
-    "Hi! What's the task?",
-    "Hi there! What's the task?",
-    "Hello! How may I be of help?",
-    "Hi! How may I be of help?",
-    "Hello! How may I be of assistance?",
-    "Hi! How may I be of assistance?",
-    "Hello! Happy to help.",
-    "Hi! Happy to help.",
-    "Hi there! Happy to help.",
-    "Hello! Glad to help.",
-    "Hi! Glad to help.",
-    "Hello! Pleased to help.",
-    "Hi! Pleased to help.",
-    "Hello! What brings you here today?",
-    "Hi! What brings you here today?",
-    "Hello! What would you like to know?",
-    "Hi! What would you like to know?",
-    "Hi there! What would you like to know?",
-    "Hello! Tell me how I can help.",
-    "Hi! Tell me how I can help.",
-    "Hello! Tell me what you need.",
-    "Hi! Tell me what you need.",
-    "Hello! Ready to help.",
-    "Hi! Ready to help.",
-    "Hi there! Ready to help.",
-    "Hello! Ready to assist.",
-    "Hi! Ready to assist.",
-    "Hello! Whenever you're ready.",
-    "Hi! Whenever you're ready.",
-    "Hello there!",
-    "Hi there!",
-    "Hey there!",
-    "Hey!",
-    "Hey! How can I help?",
-    "Hey! How can I help you?",
-    "Hey! What can I help you with?",
-    "Hey! What can I do for you?",
-    "Hey! What's the task?",
-    "Hey! What's the question?",
-    "Hey there! How can I help?",
-    "Hey there! What can I do for you?",
-    "Hey, what's up?",
-    "Hey! What's up?",
-    "Hey, what's going on?",
-    "Hey! Fire away.",
-    "Hey! Shoot.",
-    "Hi! Fire away.",
-    "Hello! Fire away.",
-    "Hi! Shoot.",
-    "Hi! Shoot — what do you need?",
-    "Greetings! How can I help you?",
-    "Greetings! How may I assist?",
-    "Welcome! How can I help?",
-    "Welcome! How can I assist you?",
-    "Welcome! What can I help you with?",
-    "Welcome! What would you like to do?",
-    "Good morning! How can I help?",
-    "Good morning! What can I help you with?",
-    "Good morning! What's on your mind?",
-    "Good morning! What would you like to work on?",
-    "Good afternoon! How can I help?",
-    "Good afternoon! What can I do for you?",
-    "Good afternoon! What's the task?",
-    "Good afternoon! What would you like to do?",
-    "Good evening! How can I help?",
-    "Good evening! What's on your mind?",
-    "Good evening! What would you like to work on?",
-    "Welcome back! What are we working on?",
-    "Welcome back! Where would you like to pick up?",
-    "Welcome back! What's next?",
-    "Welcome back! How can I help?",
-    "Hello again! How can I help?",
-    "Hello again! What can I do for you?",
-    "Hi again! What would you like to tackle?",
-    "Hi again! Where would you like to start?",
-    "Hi! What are we working on?",
-    "Hello! What are we working on today?",
-    "Hi there! What are we working on?",
-    "Hi! What are we tackling today?",
-    "Hello! What are we tackling today?",
-    "Hi! What are we building today?",
-    "Hello! What are we building today?",
-    "Hi! Where would you like to start?",
-    "Hello! Where would you like to start?",
-    "Hi! Where shall we begin?",
-    "Hello! Where shall we begin?",
-    "Hi! Where do you want to start?",
-    "Hi! What are you thinking about?",
-    "Hello! What are you curious about?",
-    "Hi! What would you like to explore?",
-    "Hello! What would you like to dig into?",
-    "Hi! What's the puzzle?",
-    "Hello! What's the puzzle?",
-    "Hi there! What's the problem?",
-    "Hi! What are you working through?",
-    "Hi.",
-    "Hello.",
-    "Hey.",
-    "Yes?",
-    "Go ahead.",
-    "I'm here.",
-    "What's up?",
-    "What's the question?",
-    "What's the task?",
-]
+def _require_env(name: str) -> str:
+    value = os.getenv(name)
+    if value is None:
+        raise RuntimeError(f"Environment variable {name} is not set")
+    return value
 
-TOOL_PRESENTATION_FORMATS = json.loads(
-    os.getenv("TOOL_PRESENTATION_FORMATS", '["json", "xml", "xml", "markdown", "markdown"]')
-)
-TOOL_CALL_FORMATS = json.loads(os.getenv("TOOL_CALL_FORMATS", '["json", "xml", "xml", "xml_typed"]'))
+TOOL_PRESENTATION_FORMATS = json.loads(_require_env("TOOL_PRESENTATION_FORMATS"))
+TOOL_CALL_FORMATS = json.loads(_require_env("TOOL_CALL_FORMATS"))
 
 
 def _field(obj: Any, name: str) -> Any:
@@ -299,10 +127,8 @@ def apply_chat_template_randomized(
         if any(not isinstance(tool, dict) for tool in tools):
             raise ChatTemplateError("every conversation tool must be an object")
 
-    do_insert_system_prompt = rng.random() < 0.0003
-    do_insert_search_tools = rng.random() < 0.0001
-    do_insert_greeting = rng.random() < 0.0001
-    tools_to_insert = list(SEARCH_TOOL) if do_insert_search_tools else []
+    do_insert_system_prompt = rng.random() < 0.0001
+    tools_to_insert = []
     do_insert_tools = len(tools_to_insert) > 0
 
     if conversation[0]["role"] == "system":
@@ -318,28 +144,9 @@ def apply_chat_template_randomized(
             new_system_message["tools"] = tools_to_insert
         conversation.insert(0, new_system_message)
 
-    if do_insert_greeting:
-        if conversation[0]["role"] == "user":
-            insert_at = 0
-        elif (
-            conversation[0]["role"] == "system"
-            and len(conversation) > 1
-            and conversation[1]["role"] == "user"
-        ):
-            insert_at = 1
-        else:
-            insert_at = None
-        if insert_at is not None:
-            think_key = _detect_think_key(conversation)
-            conversation.insert(insert_at, {
-                "role": "assistant",
-                "content": GREETING_PHRASES[rng.randint(len(GREETING_PHRASES))],
-                think_key: "",
-            })
-
     has_tools = bool(conversation[0].get("tools", False))
     if has_tools:
-        if rng.random() < 0.05:
+        if rng.random() < 0.0001:
             for i, tool in enumerate(conversation[0]["tools"]):
                 if not ("type" in tool and tool["type"] == "function"):
                     conversation[0]["tools"][i] = {"type": "function", "function": tool}
