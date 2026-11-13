@@ -373,21 +373,26 @@ def set_model_state(model, model_state_dict, full_state: bool = False, cpu_offlo
 
 def get_sharded_optimizer_state(model, optimizer, dcp: bool) -> Dict[str, Any]:
     if dcp:
+        from xllm.modules.moe.checkpoint import expert_states_to_checkpoint
         state_dict_options = StateDictOptions(
             full_state_dict=False,
             cpu_offload=True,
         )
-        return get_optimizer_state_dict(model, optimizer, options=state_dict_options)
+        # with EP > TP, the routed experts' states are saved and loaded at their rows of the TP rank's experts
+        optimizer_state_dict = get_optimizer_state_dict(model, optimizer, options=state_dict_options)
+        return expert_states_to_checkpoint(model, optimizer_state_dict)
     else:
         return optimizer.state_dict()
 
 
 def set_sharded_optimizer_state(model, optimizer, optimizer_state_dict, dcp: bool):
     if dcp:
+        from xllm.modules.moe.checkpoint import expert_states_from_checkpoint
         state_dict_options = StateDictOptions(
             full_state_dict=False,
             cpu_offload=True,
         )
+        optimizer_state_dict = expert_states_from_checkpoint(model, optimizer_state_dict)
         set_optimizer_state_dict(model, optimizer, optimizer_state_dict, options=state_dict_options)
     else:
         optimizer.load_state_dict(optimizer_state_dict)

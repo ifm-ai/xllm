@@ -114,3 +114,31 @@ def experts_from_checkpoint(model: nn.Module, model_state: Dict[str, Any]) -> Di
         model_state[key] = _from_checkpoint(model_state[key], model.get_parameter(key), key)
     return model_state
 
+
+def expert_states_to_checkpoint(model: nn.Module, optim_state: Dict[str, Any]) -> Dict[str, Any]:
+    """Place the optimizer states of the routed experts (e.g. AdamW's moments; the scalar step is the same on
+    every GPU) of a sharded optimizer state dict at their rows in the TP rank's experts (EP > TP)."""
+    if get_expert_outer_world_size() == 1:
+        return optim_state
+    meshes: Dict[int, DeviceMesh] = {}
+    states = optim_state["state"]
+    for key in routed_expert_fqns(model):
+        for name, value in states.get(key, {}).items():
+            if isinstance(value, DTensor):
+                states[key][name] = _to_checkpoint(value, meshes)
+            else:
+                assert not isinstance(value, torch.Tensor) or value.dim() == 0, (key, name, type(value))
+    return optim_state
+
+
+def expert_states_from_checkpoint(model: nn.Module, optim_state: Dict[str, Any]) -> Dict[str, Any]:
+    """Inverse of expert_states_to_checkpoint, after loading."""
+    if get_expert_outer_world_size() == 1:
+        return optim_state
+    states = optim_state["state"]
+    for key in routed_expert_fqns(model):
+        param = model.get_parameter(key)
+        for name, value in states.get(key, {}).items():
+            if isinstance(value, torch.Tensor) and value.dim() > 0:
+                states[key][name] = _from_checkpoint(value, param, f"{key}.{name}")
+    return optim_state
