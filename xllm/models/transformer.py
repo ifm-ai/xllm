@@ -616,9 +616,10 @@ class Transformer(XLLModel):
 
         if cfg.ddp_backend == 'fsdp1':
             from torch.distributed.fsdp.wrap import wrap
+            wrap_experts = lambda module: module
         else:
             assert cfg.ddp_backend == 'fsdp2'
-            from xllm.distributed.wrap import wrap
+            from xllm.distributed.wrap import wrap, wrap_experts
 
         init_fn = get_init_fn('gaussian', dim=self.model_dim, std=cfg.init_embed_std)
         self.embed = wrap(ParallelEmbedding(
@@ -638,6 +639,9 @@ class Transformer(XLLModel):
             block_cls = TransformerBlock if layer_id < self.num_dense_layers else \
                 (TransformerMoVABlock if self.num_values > 0 else TransformerMoEBlock)
             layer = block_cls(cfg, layer_id)
+            if hasattr(layer, 'moe'):
+                # the routed experts are their own FSDP unit, inside the layer's
+                wrap_experts(layer.moe.experts)
             self.layers.append(wrap(layer))
 
         self.output = wrap(TransformerOutputLayer(cfg))
