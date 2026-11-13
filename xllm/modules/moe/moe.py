@@ -1,20 +1,13 @@
 from typing import Optional, Tuple
 
-import torch
 from torch import nn, Tensor
 import torch.nn.functional as F
-from einops import rearrange
 
-from xllm.distributed import (
-    get_model_parallel_rank,
-    get_model_parallel_world_size,
-)
 from xllm.modules.model_parallel import (
     RowParallelLinear,
     ColumnParallelLinear,
     scatter_to_model_parallel_region,
 )
-from xllm.modules.moe import all_to_all_expert_parallel_region
 from xllm.modules.fused_ops import memory_efficient_dropout
 from xllm.modules.layer_norm import GroupLayerNorm
 from xllm.modules.rms_norm import GroupRMSNorm
@@ -24,7 +17,8 @@ from xllm.utils import get_init_fn
 from .router import TopKRouter
 from .expert import Expert
 from .layout import ExpertLayout
-from .dedup import token_rank_hits, build_dedup_plan, gather_rows, weighted_sum
+from .dedup import gather_rows, weighted_sum
+from .dispatch import build_dispatcher, dispatch_rows, combine_rows
 
 
 class NormalizedMoE(nn.Module):
@@ -70,8 +64,7 @@ class NormalizedMoE(nn.Module):
         self.init_std = init_std
 
         self.layout = ExpertLayout.from_process_groups(num_experts)
-        if self.layout.e_out > 1:
-            raise NotImplementedError("EP > TP is not supported yet")
+        self.dispatcher = build_dispatcher(self.layout, self.topk, permutation_backend)
         self.n_local_experts = self.layout.n_local
         self.expert_start_idx = self.layout.start
         self.expert_end_idx = self.layout.end
@@ -164,8 +157,6 @@ class NormalizedMoE(nn.Module):
         else:
             y1 = None
 
-        rank = get_model_parallel_rank()
-        world_size = get_model_parallel_world_size()
         # B x L x K
         routing_scores, routing_indices, tokens_per_expert, aux_loss = self.router(x, load_balancing_type)
         health_collector = get_active_health_collector()
@@ -175,38 +166,21 @@ class NormalizedMoE(nn.Module):
             )
         # B*L x D/TP
         x = x.view(bsz * slen, -1)
-        # B*L*K
-        routing_indices = routing_indices.flatten()
-        # B*L*K
-        sorted_indices = torch.argsort(routing_indices, stable=True)
-        # B*L x TP
-        hits = token_rank_hits(routing_indices, self.n_local_experts, self.topk, world_size)
-        # N + TP
-        counts = torch.cat([tokens_per_expert, hits.sum(dim=0)]).tolist()
-        expert_counts, dest_counts = counts[:self.n_experts], counts[self.n_experts:]
-        group_sizes = expert_counts[self.expert_start_idx:self.expert_end_idx]
-        pair_start = sum(expert_counts[:self.expert_start_idx])
-        plan = build_dedup_plan(
-            hits, sorted_indices, self.topk, rank, dest_counts, pair_start, sum(group_sizes)
-        )
+        plan = self.dispatcher.plan(routing_indices.flatten(), tokens_per_expert)
         backend = self.permutation_backend
 
         # routed experts: each token's slice goes once to every rank holding one of its experts
-        # S x D/TP
-        x = gather_rows(x, plan.send_tokens, plan.home_table, backend)
-        x = all_to_all_expert_parallel_region(x, plan.send_splits, plan.recv_splits)
-        # B' x D: local tokens, rebuilt
-        x = rearrange(x, '(w b) d -> b (w d)', w=world_size)
+        # B' x D: this rank's tokens, rebuilt
+        x = dispatch_rows(x, self.dispatcher, plan)
         # P x D: one row per local (token, expert) pair, in expert order
-        x = gather_rows(x, plan.pair_rows, plan.pair_table, backend)
-        y2 = self.experts(x, group_sizes)
+        x = gather_rows(x, plan.tp.pair_rows, plan.tp.pair_table, backend)
+        y2 = self.experts(x, plan.group_sizes)
         # B' x D: experts' outputs scaled by their routing scores and summed per token
-        weights = routing_scores.reshape(-1).index_select(0, plan.pair_slots.flatten()).view_as(plan.pair_slots)
-        y2 = weighted_sum(y2, plan.pair_table, weights, plan.pair_rows, plan.pair_cols, backend)
-        y2 = rearrange(y2, 'b (w d) -> (w b) d', w=world_size)
-        y2 = all_to_all_expert_parallel_region(y2, plan.recv_splits, plan.send_splits)
-        # B x L x D/TP: add up the parts returned by each rank
-        y2 = weighted_sum(y2, plan.home_table, None, plan.send_tokens, plan.send_ranks, backend)
+        scores = self.dispatcher.local_scores(routing_scores, plan)
+        weights = scores.reshape(-1).index_select(0, plan.tp.pair_slots.flatten()).view_as(plan.tp.pair_slots)
+        y2 = weighted_sum(y2, plan.tp.pair_table, weights, plan.tp.pair_rows, plan.tp.pair_cols, backend)
+        # B*L x D/TP: add up the parts returned by each rank
+        y2 = combine_rows(y2, self.dispatcher, plan)
         y2 = y2.view(bsz, slen, -1)
 
         # combine shared expert

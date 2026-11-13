@@ -20,8 +20,9 @@ fused blocks run other work in between. combine is the adjoint of dispatch, whic
 combine_rows use for autograd. The fused blocks keep plan.state between forward and backward and
 rebuild the plan with replan.
 """
+import dataclasses
 from dataclasses import dataclass
-from typing import Any, Callable, List, Optional
+from typing import Any, Callable, List, Optional, Tuple
 
 import torch
 from torch import Tensor
@@ -166,6 +167,45 @@ class TPDispatcher:
         return grad
 
 
+@dataclass
+class _Saved:
+    """Stands for a tensor of a plan saved for backward."""
+    index: int
+
+
+def _strip_tensors(obj, tensors: List[Tensor]):
+    """obj with each tensor in it (dataclasses, nested) moved to tensors and replaced by its _Saved index."""
+    if isinstance(obj, Tensor):
+        tensors.append(obj)
+        return _Saved(len(tensors) - 1)
+    if dataclasses.is_dataclass(obj) and not isinstance(obj, type):
+        fields = {f.name: _strip_tensors(getattr(obj, f.name), tensors) for f in dataclasses.fields(obj)}
+        return dataclasses.replace(obj, **fields)
+    return obj
+
+
+def _put_tensors(obj, tensors: Tuple[Tensor, ...]):
+    """The inverse of _strip_tensors."""
+    if isinstance(obj, _Saved):
+        return tensors[obj.index]
+    if dataclasses.is_dataclass(obj) and not isinstance(obj, type):
+        fields = {f.name: _put_tensors(getattr(obj, f.name), tensors) for f in dataclasses.fields(obj)}
+        return dataclasses.replace(obj, **fields)
+    return obj
+
+
+def _save_plan(ctx, dispatcher, plan: DispatchPlan):
+    """Keep the plan for backward with its tensors saved by save_for_backward, not as attributes of ctx: an
+    activation checkpoint frees them after forward and takes them from its recompute, which rebuilds the plan."""
+    tensors = []
+    ctx.dispatcher, ctx.plan = dispatcher, _strip_tensors(plan, tensors)
+    ctx.save_for_backward(*tensors)
+
+
+def _saved_plan(ctx) -> DispatchPlan:
+    return _put_tensors(ctx.plan, ctx.saved_tensors)
+
+
 def build_dispatcher(layout: ExpertLayout, topk: int, backend: str):
     """The dispatcher of the calling rank's expert layout."""
     if layout.e_out == 1:
@@ -177,24 +217,24 @@ class _DispatchRows(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, x: Tensor, dispatcher, plan: DispatchPlan) -> Tensor:
-        ctx.dispatcher, ctx.plan = dispatcher, plan
+        _save_plan(ctx, dispatcher, plan)
         return dispatcher.dispatch(x, plan).wait()
 
     @staticmethod
     def backward(ctx, grad: Tensor):
-        return ctx.dispatcher.combine(grad, ctx.plan).wait(), None, None
+        return ctx.dispatcher.combine(grad, _saved_plan(ctx)).wait(), None, None
 
 
 class _CombineRows(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, y: Tensor, dispatcher, plan: DispatchPlan) -> Tensor:
-        ctx.dispatcher, ctx.plan = dispatcher, plan
+        _save_plan(ctx, dispatcher, plan)
         return dispatcher.combine(y, plan).wait()
 
     @staticmethod
     def backward(ctx, grad: Tensor):
-        return ctx.dispatcher.dispatch(grad, ctx.plan).wait(), None, None
+        return ctx.dispatcher.dispatch(grad, _saved_plan(ctx)).wait(), None, None
 
 
 def dispatch_rows(x: Tensor, dispatcher, plan: DispatchPlan) -> Tensor:
