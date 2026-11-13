@@ -220,9 +220,13 @@ class NodeDispatcher:
         self.share = layout.n_experts // layout.tp
         self.outer_rank = layout.outer_rank
         self.e_out = layout.e_out
-        self.group = get_expert_outer_group()
         self.n_node = layout.tp * layout.n_local
         self.tp = TPDispatcher(self.n_node, self.n_local, topk, backend, masked=True)
+
+    @property
+    def group(self):
+        # looked up when used, not kept, as TPDispatcher's
+        return get_expert_outer_group()
 
     def _send_lists(self, routing_indices: Tensor, send_splits: List[int]) -> Tuple[Tensor, Tensor]:
         hits = self._hits(routing_indices)
