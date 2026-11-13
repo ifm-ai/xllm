@@ -33,6 +33,7 @@ from xllm.distributed import (
     get_data_parallel_world_size,
     get_model_parallel_world_size,
     get_context_parallel_world_size,
+    get_expert_outer_world_size,
 )
 from xllm.distributed.utils import (
     reduce_scalar,
@@ -181,7 +182,14 @@ def create_on_gpu():
 
 
 def num_parameters(model: nn.Module, cfg):
-    nparams: int = sum(params.nelement() for params in model.parameters())
+    from xllm.modules.moe.expert import routed_expert_parameters
+    # each GPU counts its (FSDP-unsharded) parameters. With EP > TP, the routed experts are on a mesh E_out times
+    # smaller than the model's, so each expert is counted by E_out times fewer GPUs than the rest of the model
+    expert_ids = {id(p) for p in routed_expert_parameters(model)}
+    expert_outer_size = get_expert_outer_world_size()
+    nparams: int = sum(
+        params.nelement() * (expert_outer_size if id(params) in expert_ids else 1) for params in model.parameters()
+    )
     nparams = int(reduce_scalar(nparams, op="sum"))
     replicated_size = cfg.context_parallel_size * cfg.data_parallel_size
     if cfg.model.ddp_backend == 'fsdp1':
