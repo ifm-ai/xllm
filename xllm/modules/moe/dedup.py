@@ -11,7 +11,7 @@ Routing is identical on every TP rank (the router logits are all-reduced), so
 every rank builds the same plan and no metadata travels.
 """
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import torch
 from torch import Tensor
@@ -50,15 +50,13 @@ def token_rank_hits(routing_indices: Tensor, n_local_experts: int, topk: int, wo
     return hits.scatter_(1, dest, True)
 
 
-def build_dedup_plan(
-    hits: Tensor,
-    sorted_indices: Tensor,
-    topk: int,
-    rank: int,
-    dest_counts: List[int],
-    pair_start: int,
-    n_pairs: int,
-) -> DedupPlan:
+def build_send_lists(hits: Tensor, dest_counts: List[int]) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
+    """The rows to send for T x W hits, with dest_counts the column sums of hits.
+
+    Returns (by_rank, send_tokens, send_ranks, home_table): W x T, each rank's tokens first, ascending;
+    the tokens to send grouped by destination rank; their destination ranks; and the T x W row of the
+    send buffer holding (token, rank), -1 if the token skips that rank.
+    """
     n_tokens, world_size = hits.shape
     device = hits.device
     tokens = torch.arange(n_tokens, device=device)
@@ -71,6 +69,21 @@ def build_dedup_plan(
     )
     home_table = torch.full((n_tokens, world_size), -1, dtype=torch.long, device=device)
     home_table[send_tokens, send_ranks] = torch.arange(send_tokens.numel(), device=device)
+    return by_rank, send_tokens, send_ranks, home_table
+
+
+def build_dedup_plan(
+    hits: Tensor,
+    sorted_indices: Tensor,
+    topk: int,
+    rank: int,
+    dest_counts: List[int],
+    pair_start: int,
+    n_pairs: int,
+) -> DedupPlan:
+    n_tokens, world_size = hits.shape
+    device = hits.device
+    by_rank, send_tokens, send_ranks, home_table = build_send_lists(hits, dest_counts)
 
     n_local = dest_counts[rank]
     local_tokens = by_rank[rank, :n_local]
