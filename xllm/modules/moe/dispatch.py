@@ -222,6 +222,23 @@ class NodeDispatcher:
         self.e_out = layout.e_out
         self.n_node = layout.tp * layout.n_local
         self.tp = TPDispatcher(self.n_node, self.n_local, topk, backend, masked=True)
+        self._check_outer_group(layout)
+
+    def _check_outer_group(self, layout: ExpertLayout):
+        """The tokens of replica o's experts go to rank o of the expert outer group: check that this rank
+        owns them. One all-gather, when the layer is built."""
+        world_size = torch.distributed.get_world_size(group=self.group)
+        start = torch.tensor([layout.start], dtype=torch.long, device=torch.cuda.current_device())
+        starts = torch.empty(world_size, dtype=torch.long, device=start.device)
+        torch.distributed.all_gather_into_tensor(starts, start, group=self.group)
+        starts = starts.tolist()
+        expected = [layout.tp_rank * self.share + o * self.n_local for o in range(self.e_out)]
+        if starts != expected:
+            raise RuntimeError(
+                f"the expert outer group (ranks {torch.distributed.get_process_group_ranks(self.group)}) does not "
+                f"follow the expert layout: its ranks own the experts starting at {starts}, the dispatch sends "
+                f"them those starting at {expected} ({layout})"
+            )
 
     @property
     def group(self):

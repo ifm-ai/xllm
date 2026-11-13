@@ -3,7 +3,8 @@
 E_out = EP / TP consecutive data parallel replicas form an expert group (per CP rank). The GPU at TP rank k in
 replica o of expert group g has:
 - expert outer group: the E_out GPUs at TP rank k in expert group g, with rank o,
-and owns the experts given by ExpertLayout. Launch one process per rank, e.g.:
+and owns the experts given by ExpertLayout, which the dispatcher checks against the outer group. Launch one
+process per rank, e.g.:
 
     torchrun --nproc_per_node 8 tests/moe/test_expert_groups.py
     torchrun --nproc_per_node 8 tests/moe/test_expert_groups.py --configs "[(2, 1, 8)]"
@@ -23,6 +24,7 @@ from xllm.distributed import (
     get_expert_outer_rank,
     get_expert_outer_world_size,
 )
+from xllm.modules.moe.dispatch import NodeDispatcher
 from xllm.modules.moe.layout import ExpertLayout
 from xllm.modules.moe.moe import NormalizedMoE
 
@@ -87,6 +89,13 @@ def check(tp: int, cp: int, ep: int) -> list:
 
     # every layout builds its MoE layer
     NormalizedMoE(0, 64, 16, N_EXPERTS, 2, 0)
+    if e_out > 1:
+        # a layout whose replicas are not in the outer group's rank order is refused
+        try:
+            NodeDispatcher(ExpertLayout(N_EXPERTS, tp, e_out, k, (o + 1) % e_out), 2, 'torch')
+            errors.append("NodeDispatcher accepted a layout out of the outer group's order")
+        except RuntimeError:
+            pass
     return errors
 
 
