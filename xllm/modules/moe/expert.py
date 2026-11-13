@@ -113,3 +113,9 @@ class Expert(nn.Module):
         return 'mdim={}, edim={}, expert={} ({}), backend={}, init={} ({})'.format(
             self.model_dim, self.inter_dim, self.n_experts, self.n_local_experts, self.backend, self.init_mode, self.init_std
         )
+
+
+def routed_expert_parameters(model: nn.Module) -> List[Parameter]:
+    """The parameters of the routed experts of a model. With FSDP2 they are on the expert mesh, which is not the
+    model's when EP > TP."""
+    return [p for module in model.modules() if isinstance(module, Expert) for p in module.parameters()]
