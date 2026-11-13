@@ -14,6 +14,7 @@ from xllm.modules.fused_ops import (
 )
 from xllm.modules.moe.router import calc_probs
 from xllm.modules.moe.dedup import masked_gather_sum
+from xllm.modules.moe.dispatch import moe_overlap
 from .utils import (
     grouped_experts_fwd,
     grouped_experts_bwd,
@@ -87,7 +88,8 @@ def moe_fwd(
     group_sizes = plan.group_sizes
 
     # each token's slice goes once to every rank holding one of its experts
-    xu = dispatcher.dispatch(xf.view(bsz * seq_len, -1), plan)
+    overlap = moe_overlap()
+    xu = dispatcher.dispatch(xf.view(bsz * seq_len, -1), plan, overlap)
 
     if fc3_w is not None:
         h3, handle_h3 = all_reduce(F.linear(xf, fc3_w), parallel_region='model', async_op=True)
@@ -123,7 +125,7 @@ def moe_fwd(
         y2 = xu
         expert_hidden_rng_state = None
 
-    y2 = dispatcher.combine(y2, plan)
+    y2 = dispatcher.combine(y2, plan, overlap)
 
     if h3 is not None:
         assert h1s is not None
@@ -201,10 +203,11 @@ def moe_bwd(
     group_sizes = plan.group_sizes
 
     # recompute xp: each token's slice goes once to every rank holding one of its experts
-    xu = dispatcher.dispatch(xf.view(bsz * seq_len, -1), plan)
+    overlap = moe_overlap()
+    xu = dispatcher.dispatch(xf.view(bsz * seq_len, -1), plan, overlap)
 
     # the output gradient goes the same way, unscaled; the owner applies the routing scores
-    yu_grad = dispatcher.dispatch(out_grad.reshape(bsz * seq_len, -1), plan)
+    yu_grad = dispatcher.dispatch(out_grad.reshape(bsz * seq_len, -1), plan, overlap)
 
     if original_scores is None:
         # Router indices
@@ -296,7 +299,7 @@ def moe_bwd(
         ew2_grad = torch.zeros_like(expert_w2)
         ew3_grad = torch.zeros_like(expert_w3)
 
-    xf_grad = dispatcher.combine(xu_grad, plan)
+    xf_grad = dispatcher.combine(xu_grad, plan, overlap)
     # the routing scores' gradient, back to the tokens' replica; waited after the shared experts' backward
     topk_scores_grad = dispatcher.scores_grad(topk_scores_grad.view(plan.n_tokens, topk), plan)
 

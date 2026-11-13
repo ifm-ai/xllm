@@ -20,9 +20,11 @@ replica's TP group computes experts for (M = T when EP = TP); n, the tokens this
     scores_grad(grad, plan).wait()              M x K gradient of local_scores -> T x K
 
 dispatch, combine and scores_grad return a Pending: the communication is started and wait() finishes it, so
-the fused blocks run other work in between. combine is the adjoint of dispatch, which dispatch_rows and
-combine_rows use for autograd. The fused blocks keep plan.state between forward and backward and
-rebuild the plan with replan.
+the fused blocks run other work in between. With overlap=True (the fused blocks, unless XLLM_MOE_SERIAL=1), a
+NodeDispatcher also starts its second hop without blocking the calling stream: it runs on the dispatchers'
+side stream (side_stream) as soon as the first hop ends, and wait() only makes the calling stream wait for
+it. combine is the adjoint of dispatch, which dispatch_rows and combine_rows use for autograd. The fused
+blocks keep plan.state between forward and backward and rebuild the plan with replan.
 """
 import dataclasses
 import os
@@ -54,22 +56,59 @@ def all_to_all(x: Tensor, input_splits: List[int], output_splits: List[int], gro
     return output, handle
 
 
+# XLLM_MOE_SERIAL=1: the fused MoE blocks run the token exchange in the serial order (the reference of the tests).
+# Read once, at import. It must be the same on all ranks: it changes the order in which the collectives of the
+# model parallel (TP) group are issued, e.g. the TP hop of a dispatch before or after the shared expert's all-reduces.
+MOE_OVERLAP = os.environ.get('XLLM_MOE_SERIAL', '0') != '1'
+
+
+def moe_overlap() -> bool:
+    """Whether the fused MoE blocks overlap the token exchange with their compute (MOE_OVERLAP)."""
+    return MOE_OVERLAP
+
+
+_SIDE_STREAMS = {}
+
+
+def side_stream() -> torch.cuda.Stream:
+    """The dispatchers' side stream on the current device, shared by all layers."""
+    device = torch.cuda.current_device()
+    stream = _SIDE_STREAMS.get(device)
+    if stream is None:
+        stream = _SIDE_STREAMS[device] = torch.cuda.Stream(device=device)
+    return stream
+
+
 class Pending:
     """A dispatch or a combine in flight. wait() returns its result."""
 
-    def __init__(self, output: Tensor, handle, finish: Callable[[Tensor], Tensor], keep: Optional[Tensor] = None):
+    def __init__(self, output: Tensor, handle, finish: Callable[[Tensor], Tensor], keep: Any = None,
+                 event: Optional[torch.cuda.Event] = None):
         self.output = output
         self.handle = handle
         self.finish = finish
-        # the send buffer, alive until the communication ends
+        # the tensors the communication reads or writes (send buffers, and on the side stream its inputs),
+        # alive until the calling stream waits for it
         self.keep = keep
+        # the end of the side stream's work, if the last hop was started there
+        self.event = event
 
     def wait(self) -> Tensor:
+        if self.event is not None:
+            torch.cuda.current_stream().wait_event(self.event)
         if self.handle is not None:
             self.handle.wait()
         output, finish = self.output, self.finish
-        self.output, self.handle, self.finish, self.keep = None, None, None, None
+        self.output, self.handle, self.finish, self.keep, self.event = None, None, None, None, None
         return finish(output)
+
+
+def _used_by(stream: torch.cuda.Stream, *tensors: Optional[Tensor]):
+    """Tensors allocated on the side stream: the allocator must not reuse them before stream (the caller's)
+    gets past the point where they are freed, which is after it waited for the side stream's work."""
+    for t in tensors:
+        if t is not None:
+            t.record_stream(stream)
 
 
 @dataclass
@@ -194,7 +233,8 @@ class TPDispatcher:
         """The plan for the same routing, rebuilt without communication or sync from its state."""
         return self._build(routing_indices, self._hits(routing_indices), state)
 
-    def dispatch(self, x: Tensor, plan: DispatchPlan) -> Pending:
+    def dispatch(self, x: Tensor, plan: DispatchPlan, overlap: bool = False) -> Pending:
+        # one hop: overlap changes nothing
         # S x D/TP: each token's slice once per rank holding one of its experts
         send = torch.index_select(x, 0, plan.tp.send_tokens)
         output, handle = all_to_all(send, plan.tp.send_splits, plan.tp.recv_splits, self.group, self.world_size)
@@ -202,7 +242,7 @@ class TPDispatcher:
         finish = lambda output: rearrange(output, '(w b) d -> b (w d)', w=self.world_size)
         return Pending(output, handle, finish, keep=send)
 
-    def combine(self, y: Tensor, plan: DispatchPlan) -> Pending:
+    def combine(self, y: Tensor, plan: DispatchPlan, overlap: bool = False) -> Pending:
         y = rearrange(y, 'b (w d) -> (w b) d', w=self.world_size)
         output, handle = all_to_all(y, plan.tp.recv_splits, plan.tp.send_splits, self.group, self.world_size)
         # T x D/TP: add up the parts returned by each rank
@@ -388,15 +428,38 @@ class NodeDispatcher:
         finish = lambda output: masked_gather_sum(output, plan.outer.home_table, None, self.backend)
         return Pending(output, handle, finish, keep=y)
 
-    def dispatch(self, x: Tensor, plan: DispatchPlan) -> Pending:
+    def dispatch(self, x: Tensor, plan: DispatchPlan, overlap: bool = False) -> Pending:
         output, handle, send = self._to_replicas(x, plan)
-        # M x D/TP received, then n x D inside the TP group
-        finish = lambda output: self.tp.dispatch(output, plan).wait()
-        return Pending(output, handle, finish, keep=send)
+        if not overlap:
+            # M x D/TP received, then n x D inside the TP group, both at wait()
+            finish = lambda output: self.tp.dispatch(output, plan).wait()
+            return Pending(output, handle, finish, keep=send)
+        # the TP hop on the side stream, as soon as the outer hop ends
+        stream, side = torch.cuda.current_stream(), side_stream()
+        # the plan, and the earlier uses of the receive buffer's memory
+        side.wait_stream(stream)
+        with torch.cuda.stream(side):
+            if handle is not None:
+                handle.wait()
+            tp = self.tp.dispatch(output, plan)
+            event = side.record_event()
+        _used_by(stream, tp.output, tp.keep)
+        return Pending(tp.output, tp.handle, tp.finish, keep=(send, output, tp.keep), event=event)
 
-    def combine(self, y: Tensor, plan: DispatchPlan) -> Pending:
-        # M x D/TP: summed over this replica's experts, then sent back
-        return self._from_replicas(self.tp.combine(y, plan).wait(), plan)
+    def combine(self, y: Tensor, plan: DispatchPlan, overlap: bool = False) -> Pending:
+        if not overlap:
+            # M x D/TP: summed over this replica's experts, then sent back
+            return self._from_replicas(self.tp.combine(y, plan).wait(), plan)
+        # both hops on the side stream, from where y is ready
+        stream, side = torch.cuda.current_stream(), side_stream()
+        side.wait_stream(stream)
+        with torch.cuda.stream(side):
+            # the side stream waits for the TP hop and sums: its buffers are reused only after that
+            summed = self.tp.combine(y, plan).wait()
+            outer = self._from_replicas(summed, plan)
+            event = side.record_event()
+        _used_by(stream, summed, outer.output)
+        return Pending(outer.output, outer.handle, outer.finish, keep=(y, summed), event=event)
 
     def local_scores(self, scores: Tensor, plan: DispatchPlan) -> Tensor:
         return _LocalScores.apply(scores, self, plan)

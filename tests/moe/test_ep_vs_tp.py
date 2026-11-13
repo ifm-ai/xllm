@@ -11,7 +11,11 @@ round-off at EP > TP and EP = TP, be finite, and be bitwise equal in two runs. V
              layer; bitwise equal to plain
   no_grad    NormalizedMoE forward under torch.no_grad (the output); bitwise equal to plain
   inference  the same under torch.inference_mode
-  fused      moe_fwd / moe_bwd, with the aux loss
+  fused      moe_fwd / moe_bwd, with the aux loss, run twice: in the first run the side stream sleeps --stall_ms
+             after each of its waits for the calling stream, in the second the calling stream sleeps at each use
+             of the side stream; neither is made to wait for the other, and the free memory of both streams is
+             first filled with NaN, so a missing wait (either way) or a buffer reused too early gives wrong values
+  fused_serial  the same in the serial order of XLLM_MOE_SERIAL=1 (one stream); bitwise equal to fused
 
 The dispatch checks its plan (NodeDispatcher.check_plan): the counts and the routing scores sent with the
 routing against those read from it and sent apart. Last, one plan, without these checks, must block the host
@@ -28,6 +32,7 @@ Launch one process per rank, e.g.:
 """
 import os
 import warnings
+from contextlib import contextmanager
 from typing import Dict
 
 import fire
@@ -44,6 +49,7 @@ from xllm.distributed import (
     get_model_parallel_world_size,
 )
 from xllm.models.fused_blocks.moe import moe_fwd, moe_bwd
+import xllm.modules.moe.dispatch as dispatch_module
 from xllm.modules.moe.dispatch import build_dispatcher, NodeDispatcher
 from xllm.modules.moe.layout import ExpertLayout
 from xllm.modules.moe.moe import NormalizedMoE
@@ -52,7 +58,7 @@ from tests.moe.test_ep_dispatch import local_weights
 
 AUX_COEFF = 0.01
 BIAS_UPDATE_RATE = 1e-3
-VARIANTS = ('plain', 'ckpt', 'no_grad', 'inference', 'fused')
+VARIANTS = ('plain', 'ckpt', 'no_grad', 'inference', 'fused', 'fused_serial')
 
 
 def tp_cols(x: Tensor) -> slice:
@@ -107,7 +113,68 @@ def run_unfused(variant: str, x: Tensor, out_grad: Tensor, weights, bias, layout
     return got
 
 
-def run_fused(x: Tensor, out_grad: Tensor, weights, bias, layout: ExpertLayout, topk, backend):
+def poison():
+    """Fill free memory of the caching allocator on the calling stream with NaN, in small and large blocks."""
+    sizes = [1 << 8] * 256 + [1 << 10] * 128 + [1 << 12] * 64 + [1 << 14] * 64 + [1 << 18] * 16 + [1 << 22] * 4
+    held = [torch.full((n,), float('nan'), device='cuda') for n in sizes]
+    del held
+
+
+@contextmanager
+def stalled_side_stream(ms: float, delay: str):
+    """Delay one of the dispatchers' two streams by ms at each use of the side stream, without ever making one
+    wait for the other (the code under test must). delay='side': the side stream sleeps right after each of its
+    waits for the calling stream, so a calling stream that does not wait for the side stream's work, or frees
+    its inputs too early, reads or overwrites them before the side stream is done with them. delay='main': the
+    calling stream sleeps when it asks for the side stream, and the inputs of its next uses are queued behind the
+    sleep, so a side stream that does not wait for the calling stream reads them before they are written. The
+    free memory of both streams is first filled with NaN, and that of the calling stream again before each
+    Pending.wait(), while the side stream may still be busy: an input of the side stream that the calling stream
+    freed too early is overwritten."""
+    assert delay in ('side', 'main'), delay
+    real = dispatch_module.side_stream
+    # about 2 GHz
+    cycles = int(ms * 2e6)
+
+    class SleepAfterWait(torch.cuda.ExternalStream):
+        """The side stream itself, sleeping after each wait_stream."""
+
+        def wait_stream(self, stream):
+            super().wait_stream(stream)
+            with torch.cuda.stream(self):
+                torch.cuda._sleep(cycles)
+
+    side = SleepAfterWait(real().cuda_stream, device=real().device)
+
+    def stalled() -> torch.cuda.Stream:
+        if delay == 'side':
+            return side
+        torch.cuda._sleep(cycles)
+        return real()
+
+    real_wait = dispatch_module.Pending.wait
+
+    def wait(self):
+        poison()
+        return real_wait(self)
+
+    poison()
+    with torch.cuda.stream(real()):
+        poison()
+    dispatch_module.side_stream = stalled
+    dispatch_module.Pending.wait = wait
+    try:
+        yield
+    finally:
+        dispatch_module.side_stream = real
+        dispatch_module.Pending.wait = real_wait
+
+
+def run_fused(x: Tensor, out_grad: Tensor, weights, bias, layout: ExpertLayout, topk, backend, stall_ms: float = 0.0,
+              delay: str = 'side'):
+    if stall_ms > 0:
+        with stalled_side_stream(stall_ms, delay):
+            return run_fused(x, out_grad, weights, bias, layout, topk, backend)
     cols = tp_cols(x)
     dim = cols.stop - cols.start
     w = local_weights(weights, layout, cols)
@@ -203,6 +270,7 @@ def main(
     router_bias: bool = True,
     seed: int = 0,
     tol: float = None,
+    stall_ms: float = 10.0,
 ):
     torch.cuda.set_device(int(os.environ['LOCAL_RANK']))
     dist.init_process_group(backend='nccl')
@@ -255,12 +323,22 @@ def main(
             layout = ExpertLayout.from_process_groups(n_experts)
             assert (layout.tp, layout.e_out) == (tp, size // tp)
             if variant == 'fused':
-                run = lambda: run_fused(x, out_grad, weights, bias, layout, topk, backend)
+                # the first run delays the side stream, the second the calling stream
+                run = lambda i: run_fused(x, out_grad, weights, bias, layout, topk, backend, stall_ms,
+                                          delay=('side', 'main')[i])
+            elif variant == 'fused_serial':
+                def run(i):
+                    # what XLLM_MOE_SERIAL=1 sets at import
+                    overlap, dispatch_module.MOE_OVERLAP = dispatch_module.MOE_OVERLAP, False
+                    try:
+                        return run_fused(x, out_grad, weights, bias, layout, topk, backend)
+                    finally:
+                        dispatch_module.MOE_OVERLAP = overlap
             else:
-                run = lambda: run_unfused(variant, x, out_grad, weights, bias, layout, topk, backend)
-            got = run()
-            if variant in ('plain', 'ckpt', 'fused'):
-                again = run()
+                run = lambda i: run_unfused(variant, x, out_grad, weights, bias, layout, topk, backend)
+            got = run(0)
+            if variant in ('plain', 'ckpt', 'fused', 'fused_serial'):
+                again = run(1)
                 errors += [f"{variant} ep={size} {k}: two runs differ" for k in got
                            if not torch.equal(got[k], again[k])]
             if 'w1' in got:
@@ -274,8 +352,9 @@ def main(
             worst[k] = rel_err(at_ep[k], at_tp[k]) if at_tp[k].numel() else 0.0
             if not worst[k] < tol:
                 errors.append(f"{variant} {k}: rel_err(ep={ep} vs ep={tp}) {worst[k]:.2e} >= {tol:.0e}")
-        # the checkpoint recomputes the same layer, and the forward does not depend on autograd
-        same_as = {'ckpt': 'plain', 'no_grad': 'plain', 'inference': 'plain'}.get(variant)
+        # the checkpoint recomputes the same layer, the forward does not depend on autograd, and the overlap of
+        # the fused blocks only changes the order of independent work
+        same_as = {'ckpt': 'plain', 'no_grad': 'plain', 'inference': 'plain', 'fused_serial': 'fused'}.get(variant)
         if same_as in variants:
             for size in (tp, ep):
                 errors += [f"{variant} ep={size} {k}: differs from {same_as}" for k in results[variant, size]
