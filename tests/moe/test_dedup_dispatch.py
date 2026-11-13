@@ -26,6 +26,8 @@ from xllm.distributed import (
     get_model_parallel_world_size,
 )
 from xllm.models.fused_blocks.moe import moe_fwd, moe_bwd
+from xllm.modules.moe.dispatch import build_dispatcher
+from xllm.modules.moe.layout import ExpertLayout
 from xllm.modules.moe.moe import NormalizedMoE
 
 SCALING_FACTOR = 2.5
@@ -106,14 +108,14 @@ def run_fused(x, weights, router_bias, out_grad, n_experts, topk, backend, gathe
     rank, world_size = get_model_parallel_rank(), get_model_parallel_world_size()
     dim = x.size(-1) // world_size
     cols = slice(rank * dim, (rank + 1) * dim)
-    n_local = n_experts // world_size
+    dispatcher = build_dispatcher(ExpertLayout.from_process_groups(n_experts), topk, backend)
     w = shard(weights, n_experts, rank, world_size, cols)
     xf = x[..., cols].contiguous()
     bias = None if router_bias is None else router_bias.clone()
 
-    out, _, routing_out, (h1, h3), routing_state, rng_states = moe_fwd(
+    out, _, routing_out, (h1, h3), dispatch_state, rng_states = moe_fwd(
         xf, w['router_w'], bias, 'sigmoid', SCALING_FACTOR, None, w['s1'], w['s2'], w['s3'],
-        n_experts, n_local, rank * n_local, (rank + 1) * n_local, topk,
+        n_experts, dispatcher, topk,
         w['w1'], w['w2'], w['w3'], 'sequential', backend, 0.0, recompute_shared, recompute_shared,
     )
     if recompute_shared:
@@ -124,8 +126,8 @@ def run_fused(x, weights, router_bias, out_grad, n_experts, topk, backend, gathe
         out_grad[..., cols].contiguous(), None, xf, xf.view(-1, dim),
         original_scores, routing_indices, org_topk_scores, tokens_per_expert,
         w['router_w'], bias, None if bias is None else 1e-3, 'sigmoid', SCALING_FACTOR, None,
-        h1, h3, w['s1'], w['s2'], w['s3'], n_experts, n_local, topk, w['w1'], w['w2'], w['w3'],
-        'sequential', backend, 0.0, *routing_state, *rng_states, gather_before_norm,
+        h1, h3, w['s1'], w['s2'], w['s3'], n_experts, dispatcher, topk, w['w1'], w['w2'], w['w3'],
+        'sequential', backend, 0.0, dispatch_state, *rng_states, gather_before_norm,
     )
     grads = dict(router_w=rw_grad, w1=ew1_grad, w2=ew2_grad, w3=ew3_grad, s1=s1_grad, s2=s2_grad, s3=s3_grad)
     return collect(grads, out, xf_grad, gather_before_norm), routing_indices
