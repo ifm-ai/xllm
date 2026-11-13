@@ -441,7 +441,11 @@ class TrainerConf(Config):
                 f"size ({data_parallel_size} = {world_size} GPUs / (model_parallel_size {tp} x context_parallel_size {cp}))"
             )
         if ep != tp:
-            raise NotImplementedError("EP > TP is not supported yet")
+            # the routed experts are sharded on their own FSDP2 mesh
+            assert self.model.ddp_backend == 'fsdp2', (
+                f"expert_parallel_size ({ep}) > model_parallel_size ({tp}) needs model.ddp_backend fsdp2, "
+                f"got {self.model.ddp_backend}"
+            )
 
     def __post_init__(self):
         # sanity check
