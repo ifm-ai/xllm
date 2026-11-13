@@ -385,7 +385,7 @@ def apply_chat_template_randomized(
 def tokenize_multiturn_template(
     sample: Dict[str, Any],
     tokenizer: Tokenizer,
-    text_format: Optional[str] = None,
+    text_format: str = None,
     conversation_key: str = "conversation",
     rng: Optional[Any] = None,
 ) -> Dict[str, Any]:
@@ -394,42 +394,23 @@ def tokenize_multiturn_template(
     if conversation_key not in sample:
         raise ChatTemplateError(f"Missing required conversation key {conversation_key!r}")
 
-    if text_format is None:
-        conversations = sample[conversation_key]
-        if "system" in sample and sample["system"] is not None:
-            conversations = [{"role": "system", "content": sample["system"]}] + conversations
-        tokenized_output = tokenizer.apply_chat_template(
-            conversations,
-            return_assistant_tokens_mask=True,
-            return_dict=True,
-        )
-        input_ids = _field(tokenized_output, "input_ids")
-        assistant_masks = _field(tokenized_output, "assistant_masks")
-        idx = 0
-        for idx in range(len(assistant_masks) - 1, -1, -1):
-            if assistant_masks[idx] == 0:
-                break
-        for j in range(idx):
-            assistant_masks[j] = 0
-    else:
-        conversations = sample[conversation_key]
-        tokenized_output = apply_chat_template_randomized(conversations, tokenizer, text_format, rng=rng)
-        input_ids = _field(tokenized_output, "input_ids")
-        assistant_masks = _field(tokenized_output, "assistant_masks")
+    conversations = sample[conversation_key]
+    tokenized_output = apply_chat_template_randomized(conversations, tokenizer, text_format, rng=rng)
+    input_ids = _field(tokenized_output, "input_ids")
+    assistant_masks = _field(tokenized_output, "assistant_masks")
 
-    labels = [
-        token if mask == 1 else IGNORE_INDEX
-        for token, mask in zip(input_ids, assistant_masks)
+    target_mask = [
+        True if mask == 1 else False for mask in assistant_masks
     ]
 
     # add BOS & EOS
     input_ids = list(input_ids) + [tokenizer.eos_id]
-    labels = labels + [tokenizer.eos_id]
+    target_mask = target_mask + [True]
     if tokenizer.use_bos:
         input_ids.insert(0, tokenizer.bos_id)
-        labels.insert(0, IGNORE_INDEX)
+        target_mask.insert(0, True)
 
     return {
         "input_ids": input_ids,
-        "labels": labels,
+        "target_mask": target_mask,
     }

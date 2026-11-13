@@ -8,7 +8,6 @@ from xllm.data.dataset_streamer.tokenizer import Tokenizer
 from xllm.data.dataset_streamer.templator.templator import SimpleJsonlTemplator
 from xllm.data.dataset_streamer.templator.templator import (
     ChatTemplateError,
-    IGNORE_INDEX,
     tokenize_multiturn_template,
 )
 
@@ -63,8 +62,7 @@ class ChatTemplateFeatureBuilder(FeatureBuilder):
             return None
 
         token_ids = list(result["input_ids"])
-        labels = list(result["labels"])
-        target_mask = [label != IGNORE_INDEX for label in labels]
+        target_mask = list(result["target_mask"])
         instance.tokens = token_ids
         instance.target_mask = None if all(target_mask) else target_mask
         return instance
