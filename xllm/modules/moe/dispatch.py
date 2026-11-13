@@ -105,9 +105,13 @@ class TPDispatcher:
         self.masked = masked
         self.rank = get_model_parallel_rank()
         self.world_size = get_model_parallel_world_size()
-        self.group = get_model_parallel_group()
         self.start = self.rank * n_local
         assert n_experts == n_local * self.world_size, f"{n_experts} != {n_local} x {self.world_size}"
+
+    @property
+    def group(self):
+        # looked up when used, not kept: a module holding the dispatcher can then be deep-copied
+        return get_model_parallel_group()
 
     def _hits(self, routing_indices: Tensor) -> Tensor:
         if not self.masked:
