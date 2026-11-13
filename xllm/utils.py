@@ -324,7 +324,8 @@ def clip_grad_norm_(
     fsdp_module: nn.Module,
     max_norm: Union[float, int],
     norm_type: Union[float, int] = 2.0,
-) -> float:
+    grad_scales: Optional[Dict[int, float]] = None,
+) -> Tuple[float, float]:
     """
     DUPLICATED FROM FAIRSCALE, ADDING THE REDUCTION FOR MODEL PARALLEL
 
@@ -337,11 +338,15 @@ def clip_grad_norm_(
         max_norm (float or int): max norm of the gradients
         norm_type (float or int): type of the used p-norm. Can be ``'inf'``
             for infinity norm.
+        grad_scales: id(param) -> factor on its gradient in the norm (roles, xllm/optim/roles.py).
 
     Returns:
-        Total norm of the parameters (viewed as a single vector).
+        (the norm clipping uses, the total norm of the gradients); they differ only with grad_scales.
     """
-    return fsdp_module.clip_grad_norm_(max_norm, norm_type)
+    if grad_scales is None:
+        norms = fsdp_module.clip_grad_norm_(max_norm, norm_type)
+        return norms if isinstance(norms, tuple) else (norms, norms)  # FSDP1's: the one norm
+    return fsdp_module.clip_grad_norm_(max_norm, norm_type, grad_scales=grad_scales)
 
 
 def get_model_state(model, full_state: bool = False, cpu_offload: bool = True) -> Dict[str, Any]:

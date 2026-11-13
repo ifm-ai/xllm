@@ -42,6 +42,7 @@ from xllm.models.fused_blocks import (
     GekkoOutputLayerFunction
 )
 from xllm.utils import get_init_fn
+from xllm.optim.roles import register_role
 
 
 class GekkoBlock(nn.Module):
@@ -222,6 +223,10 @@ class GekkoOutputLayer(nn.Module):
         init_fn = get_init_fn('gaussian', dim=self.model_dim, std=cfg.init_logits_std)
         self.output = ColumnParallelLinear(self.model_dim, self.output_size, bias=False,
                                            input_is_parallel=True, gather_output=False, init_method=init_fn)
+        # roles (xllm/optim/roles.py)
+        register_role(self.final_norm, "weight", "final_norm")
+        register_role(self.final_norm, "bias", "final_norm")
+        register_role(self.output, "weight", "readout")
 
         self.context_parallel_rank = get_context_parallel_rank()
 
@@ -336,9 +341,11 @@ class Gekko(XLLModel):
             from xllm.distributed.wrap import wrap
 
         init_fn = get_init_fn('gaussian', dim=self.model_dim, std=cfg.init_embed_std)
-        self.embed = wrap(ParallelEmbedding(
+        embed = ParallelEmbedding(
             self.vocab_size, self.model_dim, scale_emb=cfg.scale_emb, gather_output=False, init_method=init_fn
-        ))
+        )
+        register_role(embed, "weight", "embed")  # xllm/optim/roles.py
+        self.embed = wrap(embed)
         self.causal_conv_width = cfg.causal_conv_width
         self.apply_bias_term = cfg.apply_bias_term
 

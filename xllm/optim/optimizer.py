@@ -1,10 +1,11 @@
 from logging import getLogger
+from typing import Dict, List, Optional
 
 import torch
 from torch import nn
 from torch.optim import AdamW
 
-from xllm.config import OptimConf
+from xllm.config import OptimConf, RolesConf
 from .lr_scheduler import build_lr_scheduler
 
 
@@ -21,12 +22,21 @@ def rescale_grads(model: nn.Module, scale: float):
         p.grad /= scale
 
 
-def build_optimizer(model: nn.Module, cfg: OptimConf, total_steps: int, param_dtype: str):
+def build_optimizer(model: nn.Module, cfg: OptimConf, total_steps: int, param_dtype: str,
+                    roles: Optional[RolesConf] = None):
+    """roles: per-role hyperparameters (xllm/optim/roles.py); the plain param groups unless some role scales the lr,
+    eps or weight decay."""
+    from .roles import grouped, warn_untagged
     logger.info("Starting build of optimizer...")
+    if roles is not None:
+        warn_untagged(model, roles)
+        if not grouped(roles):
+            roles = None
     if cfg.optimizer == "muon":
         from .muon import build_muon
-        optimizer = build_muon(model, cfg)
+        optimizer = build_muon(model, cfg, roles)
     else:
+        assert roles is None, "roles require optim.optimizer=muon"
         optimizer = AdamW(
             model.parameters(),
             lr=cfg.lr,
@@ -42,20 +52,47 @@ def build_optimizer(model: nn.Module, cfg: OptimConf, total_steps: int, param_dt
     return optimizer, scheduler
 
 
-def restore_optimizer_config(optimizer, cfg: OptimConf):
+def restore_optimizer_config(optimizer, cfg: OptimConf, roles: Optional[RolesConf] = None):
     """Training resume policy: explicitly apply the configured Muon/AdamW hyperparameters.
 
     Loading the optimizer alone restores checkpoint values. Training calls this
     after loading state; the scheduler separately determines the current LRs.
     The standalone AdamW path retains upstream's existing resume behavior.
+    A role group gets its role's scaled values (xllm/optim/roles.py).
     """
     if cfg.optimizer != "muon":
         return
     from .muon import group_hparams
+    from .roles import role_hparams
     for group in optimizer.param_groups:
-        lr = cfg.muon_lr if group["algorithm"] == "muon" else cfg.lr
-        values = dict(group_hparams(cfg, group["algorithm"]), eps=cfg.epsilon, initial_lr=lr)
+        if "role" not in group:
+            lr = cfg.muon_lr if group["algorithm"] == "muon" else cfg.lr
+            values = dict(group_hparams(cfg, group["algorithm"]), eps=cfg.epsilon, initial_lr=lr)
+        else:
+            values = role_hparams(cfg, roles, group["role"])
+            values["initial_lr"] = values.pop("lr")
         changed = {key: (group.get(key), value) for key, value in values.items() if group.get(key) != value}
         if changed:
-            logger.info(f"Resume {group['algorithm']}: configured values replace checkpoint values (old, new): {changed}")
+            logger.info(f"Resume {group.get('role', group['algorithm'])}: configured values replace checkpoint values "
+                        f"(old, new): {changed}")
         group.update(values)
+
+
+def param_group_names(optimizer) -> List[str]:
+    """Saved with the training state, to check a resume against (check_param_groups). torch's AdamW
+    (optimizer=adamw) has no algorithm key: its one group is adamw."""
+    return [group.get("role") or group.get("algorithm", "adamw") for group in optimizer.param_groups]
+
+
+def check_param_groups(optimizer, training_state_dict: Dict, source: str):
+    """Optimizer state loads only into the param groups it was saved with; check before loading it."""
+    current = param_group_names(optimizer)
+    saved = training_state_dict.get("param_groups")
+    if saved is None:  # older checkpoints tell only the count, from the scheduler
+        saved, current = len(training_state_dict["scheduler"]["base_lrs"]), len(current)
+    if saved != current:
+        raise ValueError(
+            f"{source} has optimizer param groups {saved}, this run {current}. Use the --mup / --roles it was "
+            f"saved with (some role's lr, eps or weight_decay other than 1 makes per-role groups), or load only "
+            f"its weights (--base_model_dir without --reload_base_optim_state)."
+        )
