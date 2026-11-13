@@ -14,6 +14,7 @@ from xllm.distributed import (
     get_context_parallel_rank,
     get_model_parallel_rank
 )
+from xllm.distributed.slurm import get_world_size
 from xllm.utils import get_default_training_half
 
 
@@ -418,6 +419,30 @@ class TrainerConf(Config):
         assert rid == get_model_parallel_rank()
         return rid
 
+    def check_expert_parallel_size(self):
+        """expert_parallel_size (EP) splits the routed experts over TP x E_out GPUs: E_out = EP / TP consecutive
+        data parallel replicas form an expert group, and each GPU owns num_experts / EP experts. The data parallel
+        size is checked when the number of GPUs is known (a torchrun or Slurm launch)."""
+        ep, tp, cp = self.expert_parallel_size, self.model_parallel_size, self.context_parallel_size
+        n_experts = self.model.num_experts
+        assert ep > 0, f"expert_parallel_size must be positive, got {ep}"
+        assert ep % tp == 0, f"expert_parallel_size ({ep}) must be a multiple of model_parallel_size ({tp})"
+        if ep != tp:
+            assert n_experts > 0, (
+                f"expert_parallel_size ({ep}) != model_parallel_size ({tp}) needs routed experts (model.num_experts > 0)"
+            )
+        if n_experts > 0:
+            assert n_experts % ep == 0, f"model.num_experts ({n_experts}) must be divisible by expert_parallel_size ({ep})"
+        world_size = self.slurm.world_size if self.slurm is not None and self.slurm.world_size > 0 else get_world_size()
+        if world_size % (tp * cp) == 0:
+            data_parallel_size = world_size // (tp * cp)
+            assert data_parallel_size % (ep // tp) == 0, (
+                f"expert_parallel_size / model_parallel_size ({ep} / {tp} = {ep // tp}) must divide the data parallel "
+                f"size ({data_parallel_size} = {world_size} GPUs / (model_parallel_size {tp} x context_parallel_size {cp}))"
+            )
+        if ep != tp:
+            raise NotImplementedError("EP > TP is not supported yet")
+
     def __post_init__(self):
         # sanity check
         assert self.dtype in ["bf16", "fp16", "fp32"]
@@ -428,11 +453,7 @@ class TrainerConf(Config):
         if self.model.num_experts > 0:
             assert self.model.num_experts % self.model_parallel_size == 0, f"{self.model.num_experts}/{self.model_parallel_size}"
         if self.expert_parallel_size is not None:
-            assert self.expert_parallel_size % self.model_parallel_size == 0, f"{self.expert_parallel_size}/{self.model_parallel_size}"
-            if self.model.num_experts > 0:
-                assert self.model.num_experts % self.expert_parallel_size == 0, f"{self.model.num_experts}/{self.expert_parallel_size}"
-            if self.expert_parallel_size != self.model_parallel_size:
-                raise NotImplementedError("EP > TP is not supported yet")
+            self.check_expert_parallel_size()
         if self.moe_router_load_balancing_type is not None:
             assert self.moe_router_load_balancing_type in ['dot', 'entropy']
             assert self.moe_aux_loss_coeff >= 0.0
