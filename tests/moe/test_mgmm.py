@@ -8,8 +8,10 @@ from xllm.modules.fused_ops import (
     multi_group_matmul_bwd,
     multi_group_matmul_dgrad,
     multi_group_matmul_wgrad,
+    memory_efficient_dropout_bwd,
 )
 from xllm.modules.fused_ops.mgmm.multi_group_matmul import _multi_group_matmul
+from xllm.models.fused_blocks.utils import grouped_experts_fwd, grouped_experts_bwd, row_dots
 
 
 def manual_mgmm(
@@ -204,6 +206,77 @@ def check_mgmm_split(group_sizes, d_in: int, d_out: int, transpose: bool, pt_dty
     return ok
 
 
+def joint_grouped_experts_bwd(y_grad, x, w1, w2, w3, h1, h1s, h3, hidden, group_sizes, backend, memory_efficient,
+                              dropout, hidden_rng_state, hidden_noise, with_output_dots=False):
+    # grouped_experts_bwd as it was before defer_wgrad, on the backends' joint backward
+    def bwd(out_grad, w, inp):
+        return _multi_group_matmul(out_grad, w, inp, group_sizes, False, backend)
+
+    h_grad, w2_grad = bwd(y_grad, w2, hidden)
+    output_dots = row_dots(h_grad, hidden) if with_output_dots else None
+    h_grad = memory_efficient_dropout_bwd(h_grad, dropout, hidden_rng_state, hidden_noise)
+    h1s_grad = torch.mul(h_grad, h3, out=h3) if memory_efficient else h_grad * h3
+    h1_grad = torch.ops.aten.silu_backward(h1s_grad, h1)
+    x_grad, w1_grad = bwd(h1_grad, w1, x)
+    h3_grad = torch.mul(h_grad, h1s, out=h_grad)
+    x_grad_h3, w3_grad = bwd(h3_grad, w3, x)
+    x_grad = torch.add(x_grad, x_grad_h3, out=x_grad)
+    if with_output_dots:
+        return x_grad, w1_grad, w2_grad, w3_grad, output_dots
+    return x_grad, w1_grad, w2_grad, w3_grad
+
+
+def check_grouped_experts(group_sizes, dim: int, ffn: int, pt_dtype, backend: str, dropout: float,
+                          memory_efficient: bool, with_noise: bool, with_output_dots: bool) -> bool:
+    """grouped_experts_bwd with defer_wgrad=True (weight gradients computed after other work, once the caller's
+    references are gone) must be bitwise equal to defer_wgrad=False, and that to the joint backward."""
+    n, bsz = len(group_sizes), sum(group_sizes)
+    x = torch.randn(bsz, dim, dtype=pt_dtype, device="cuda")
+    w1 = torch.randn(n, ffn, dim, dtype=pt_dtype, device="cuda") / dim ** 0.5
+    w3 = torch.randn(n, ffn, dim, dtype=pt_dtype, device="cuda") / dim ** 0.5
+    w2 = torch.randn(n, dim, ffn, dtype=pt_dtype, device="cuda") / ffn ** 0.5
+    y_grad = torch.randn(bsz, dim, dtype=pt_dtype, device="cuda")
+    tag = (f"{backend} gs={group_sizes} d=({dim}, {ffn}) {pt_dtype} dropout={dropout} mem_eff={memory_efficient} "
+           f"noise={with_noise} dots={with_output_dots}")
+    try:
+        # as moe_fwd / moe_bwd: forward with a fresh dropout state, recompute without the output for the backward
+        _, _, _, _, _, rng_state = grouped_experts_fwd(x, w1, w2, w3, group_sizes, backend, False, dropout)
+        _, h1, h1s, h3, hidden, noise = grouped_experts_fwd(
+            x, w1, w2, w3, group_sizes, backend, False, dropout, rng_state, with_output=False)
+    except Exception as e:
+        print(f"skip {tag}: the forward raises {type(e).__name__}")
+        return True
+    noise = noise if with_noise else None
+
+    def run(fn, **kw):
+        # fresh copies of the buffers the backward writes in place
+        return fn(y_grad.clone(), x.clone(), w1, w2, w3, h1, h1s.clone(), h3.clone(), hidden.clone(),
+                  group_sizes, backend, memory_efficient, dropout, rng_state, noise,
+                  with_output_dots=with_output_dots, **kw)
+
+    ref = run(joint_grouped_experts_bwd)
+    now = run(grouped_experts_bwd)
+    deferred = run(grouped_experts_bwd, defer_wgrad=True)
+    x_grad, wgrad = deferred[:2]
+    busy_stream(x.device)
+    w1_grad, w2_grad, w3_grad = wgrad()
+    deferred = (x_grad, w1_grad, w2_grad, w3_grad) + tuple(deferred[2:])
+
+    ok = len(now) == len(ref) == len(deferred)
+    names = ['x_grad', 'w1_grad', 'w2_grad', 'w3_grad', 'output_dots']
+    for name, r, a, b in zip(names, ref, now, deferred):
+        ok &= equal(f"{tag}: default vs joint {name}", a, r)
+        ok &= equal(f"{tag}: deferred vs default {name}", b, a)
+    try:
+        wgrad()
+        print(f"FAIL {tag}: a second call of the deferred weight gradients did not raise")
+        ok = False
+    except AssertionError:
+        pass
+    torch.cuda.synchronize()
+    return ok
+
+
 def split(seed: int):
     """Bitwise checks of the split backward, in bf16 and fp32; exits with 1 if any fails."""
     torch.backends.cuda.matmul.allow_tf32 = False
@@ -216,6 +289,18 @@ def split(seed: int):
                     n_checks += 1
                     n_fail += not check_mgmm_split(group_sizes, d_in, d_out, transpose, pt_dtype, backend)
         print(f"mgmm split {pt_dtype}: {n_checks} cases, {n_fail} failed")
+        for group_sizes, dim, ffn in [([5, 0, 7, 0], 32, 48), ([0, 64, 0, 0, 33, 90], 128, 256),
+                                      ([512, 0, 1024, 300, 0, 0, 711, 400], 512, 1024)]:
+            for backend in ['te', 'torch', 'sequential']:
+                for dropout in [0.0, 0.1]:
+                    for memory_efficient in [False, True]:
+                        for with_noise in ([False, True] if dropout > 0 else [False]):
+                            for with_output_dots in [False, True]:
+                                n_checks += 1
+                                n_fail += not check_grouped_experts(
+                                    group_sizes, dim, ffn, pt_dtype, backend, dropout, memory_efficient,
+                                    with_noise, with_output_dots)
+        print(f"grouped experts {pt_dtype}: {n_checks} cases so far, {n_fail} failed")
     print(f"{'FAIL' if n_fail else 'PASS'}: {n_fail} of {n_checks} cases failed")
     if n_fail:
         raise SystemExit(1)
