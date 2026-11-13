@@ -185,7 +185,7 @@ class TransformerMoVABlockFunction(torch.autograd.Function):
                 "moe", layer_id, tokens_per_expert, org_topk_scores, moe_router_bias, aux_loss_moe,
             )
         h1, h3 = shared_hiddens
-        group_sizes, input_splits, output_splits, curr_bsz = routing_state
+        group_sizes, input_splits, output_splits, curr_bsz, dest_counts = routing_state
         expert_hidden_rng_state, shared_hidden_rng_state = rng_states
 
         out, out_rng_state = memory_efficient_dropout_fwd(out, dropout, True)
@@ -265,6 +265,7 @@ class TransformerMoVABlockFunction(torch.autograd.Function):
         ctx.input_splits = input_splits
         ctx.output_splits = output_splits
         ctx.curr_bsz = curr_bsz
+        ctx.dest_counts = dest_counts
         # misc
         ctx.layernorm_eps = layernorm_eps
         ctx.rmsnorm_eps = rmsnorm_eps
@@ -373,6 +374,7 @@ class TransformerMoVABlockFunction(torch.autograd.Function):
         input_splits = ctx.input_splits
         output_splits = ctx.output_splits
         curr_bsz = ctx.curr_bsz
+        dest_counts = ctx.dest_counts
 
         dropout = ctx.dropout
         attention_dropout = ctx.attention_dropout
@@ -445,7 +447,7 @@ class TransformerMoVABlockFunction(torch.autograd.Function):
             moe_router_w, moe_router_bias, router_bias_update_rate, routing_score_func, routing_scaling_factor, router_load_balancing_type,
             h1, h3, fc1_w, fc2_w, fc3_w, n_experts, n_local_experts, moe_topk, expert_w1, expert_w2, expert_w3,
             expert_backend, moe_permutation_backend, hidden_dropout, group_sizes, input_splits, output_splits, curr_bsz,
-            expert_hidden_rng_state, shared_hidden_rng_state, gather_before_norm,
+            dest_counts, expert_hidden_rng_state, shared_hidden_rng_state, gather_before_norm,
         )
 
         xo_grad, moe_norm_w_grad, moe_norm_b_grad = layer_or_rmsnorm_bwd(
