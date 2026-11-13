@@ -23,6 +23,7 @@ from xllm.config import (
 from xllm.checkpointing import (
     get_latest_checkpoint_paths_for_sharded_states,
     get_base_model_checkpoint_path,
+    check_optimizer_files_expert_parallel_size,
     get_last_restart_step,
     make_checkpointer,
 )
@@ -331,6 +332,7 @@ def main(cfg: TrainerConf):
             reloaded_optim_state_dict = get_sharded_optimizer_state(model, optimizer, cfg.dcp_for_optimizer)
             dist_ckpt.load(reloaded_optim_state_dict, checkpoint_id=optim_path, process_group=hsdp_group)
         else:
+            check_optimizer_files_expert_parallel_size(model_path.parent, cfg)
             reloaded_optim_state_dict = torch.load(optim_path, map_location="cpu", weights_only=False)
         set_sharded_optimizer_state(model, optimizer, reloaded_optim_state_dict, cfg.dcp_for_optimizer)
         del reloaded_optim_state_dict
@@ -360,6 +362,7 @@ def main(cfg: TrainerConf):
                 reloaded_optim_state_dict = get_sharded_optimizer_state(model, optimizer, cfg.dcp_for_optimizer)
                 dist_ckpt.load(reloaded_optim_state_dict, checkpoint_id=base_optim_path, process_group=hsdp_group)
             else:
+                check_optimizer_files_expert_parallel_size(Path(cfg.base_model_dir), cfg)
                 reloaded_optim_state_dict = torch.load(base_optim_path, map_location="cpu", weights_only=True)
             set_sharded_optimizer_state(model, optimizer, reloaded_optim_state_dict, cfg.dcp_for_optimizer)
             del reloaded_optim_state_dict
