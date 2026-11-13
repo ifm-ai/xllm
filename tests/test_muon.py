@@ -5,24 +5,31 @@
 Matrices are sharded on dim 0 like FSDP2 (uneven shards, empty shards, blocks that span
 several ranks, column blocks and block grids that cut every shard). After a few steps the
 sharded optimizer must match per-block Newton-Schulz on the full matrices; whole-matrix mode
-must match microsoft/dion, and the AdamW group must match torch.optim.AdamW.
+must match microsoft/dion, and the AdamW group must match torch.optim.AdamW. A run saved and reloaded the
+way train.py does it (DCP, or torch.save per rank) must continue bit for bit like an uninterrupted one.
 """
 import copy
 import math
 import os
+import shutil
+import tempfile
+from pathlib import Path
 
 import torch
 import torch.distributed as dist
+import torch.distributed.checkpoint as dist_ckpt
 from torch import nn
 from torch.distributed.device_mesh import init_device_mesh
+from torch.distributed.fsdp import fully_shard
 from torch.distributed.tensor import Replicate, Shard, distribute_tensor
 
 from xllm.config import OptimConf
 from xllm.distributed import initialize_model_parallel
 from xllm.distributed.wrap import enable_wrap, wrap
-from xllm.optim.muon import Muon, newton_schulz, split_muon_params
+from xllm.optim.muon import Muon, build_muon, newton_schulz, split_muon_params
 from xllm.optim.muon_spec import muon_spec, register_muon
 from xllm.optim import restore_optimizer_config
+from xllm.utils import get_model_state, get_sharded_optimizer_state, set_model_state, set_sharded_optimizer_state
 
 # (shape, how the test weight is cut into Newton-Schulz blocks)
 MATRICES = [
@@ -205,6 +212,106 @@ def check_resume_config_wins(mesh):
         print("resume: momentum and moments reloaded, configured weight decay and eps kept")
 
 
+class ResumeNet(nn.Module):
+    """A small FSDP2 model for the checkpoint test: per-head blocks, a matrix whose rows do not split evenly over
+    the ranks, and biases and a gain on AdamW."""
+
+    def __init__(self):
+        super().__init__()
+        self.wq = nn.Linear(64, 96, bias=False)
+        register_muon(self.wq, layout="(h d) m", fan_out="d", fan_in="m", d=32)
+        self.fc1 = nn.Linear(64, 100)
+        register_muon(self.fc1)
+        self.fc2 = nn.Linear(100, 64)
+        register_muon(self.fc2)
+        self.gain = nn.Parameter(torch.ones(64))
+
+    def forward(self, x):
+        return self.fc2(torch.nn.functional.gelu(self.fc1(x))) * self.gain + self.wq(x)[..., :64]
+
+
+def check_resume_checkpoint(mesh, dcp):
+    """Save and reload as train.py does (dcp_for_optimizer true: DCP; false: torch.save of each rank's state), into a
+    model and optimizer built from another seed: the next steps must equal an uninterrupted run bit for bit."""
+    cfg = OptimConf(optimizer="muon", lr=1e-3, muon_lr=0.02, weight_decay=0.1, beta1=0.9, beta2=0.95, epsilon=1e-8)
+    rank = dist.get_rank()
+
+    def build(seed):
+        torch.manual_seed(seed)
+        model = ResumeNet().cuda()
+        fully_shard(model, mesh=mesh)
+        return model, build_muon(model, cfg)
+
+    def train(model, opt, steps):
+        for step in steps:
+            torch.manual_seed(1000 * step + rank)  # each rank its own batch, the same at every run
+            model(torch.randn(8, 64, device="cuda")).square().mean().backward()
+            opt.step()
+            opt.zero_grad(set_to_none=True)
+
+    def flat_state(model, opt):
+        params = {n: p.detach().to_local().clone() for n, p in model.named_parameters()}
+        names = {id(p): n for n, p in model.named_parameters()}
+        state = {(names[id(p)], k): v.to_local().clone() if hasattr(v, "to_local") else v.clone()
+                 for p, st in opt.state.items() for k, v in st.items() if torch.is_tensor(v)}
+        return params, state
+
+    ref, ref_opt = build(0)
+    train(ref, ref_opt, range(6))
+    want_params, want_state = flat_state(ref, ref_opt)
+
+    obj = [tempfile.mkdtemp(prefix="muon_resume_", dir=os.environ.get("MUON_TEST_TMPDIR"))]
+    dist.broadcast_object_list(obj, src=0)
+    ckpt = Path(obj[0])
+    first, first_opt = build(0)
+    train(first, first_opt, range(3))
+    dist_ckpt.save(get_model_state(first), checkpoint_id=ckpt / "model")
+    if dcp:
+        dist_ckpt.save(get_sharded_optimizer_state(first, first_opt, True), checkpoint_id=ckpt / "optim")
+    else:
+        torch.save(get_sharded_optimizer_state(first, first_opt, False), ckpt / f"optim{rank:06d}.pt")
+    dist.barrier()
+
+    resumed, resumed_opt = build(1)  # another init: every weight and moment must come from the checkpoint
+    model_state = get_model_state(resumed)
+    dist_ckpt.load(model_state, checkpoint_id=ckpt / "model")
+    set_model_state(resumed, model_state)
+    if dcp:
+        optim_state = get_sharded_optimizer_state(resumed, resumed_opt, True)
+        dist_ckpt.load(optim_state, checkpoint_id=ckpt / "optim")
+    else:
+        optim_state = torch.load(ckpt / f"optim{rank:06d}.pt", map_location="cpu", weights_only=False)
+    set_sharded_optimizer_state(resumed, resumed_opt, optim_state, dcp)
+    restore_optimizer_config(resumed_opt, cfg)
+    train(resumed, resumed_opt, range(3, 6))
+    got_params, got_state = flat_state(resumed, resumed_opt)
+
+    assert got_state.keys() == want_state.keys(), (sorted(got_state), sorted(want_state))
+    for name, want in want_params.items():
+        assert torch.equal(got_params[name], want), f"dcp={dcp}: {name} differs from the uninterrupted run"
+    for key, want in want_state.items():
+        assert torch.equal(got_state[key], want), f"dcp={dcp}: optimizer state {key} differs from the uninterrupted run"
+
+    # negative control: the same weights with a fresh optimizer (momenta and moments lost) must not match
+    fresh, _ = build(1)
+    model_state = get_model_state(fresh)
+    dist_ckpt.load(model_state, checkpoint_id=ckpt / "model")
+    set_model_state(fresh, model_state)
+    fresh_opt = build_muon(fresh, cfg)
+    train(fresh, fresh_opt, range(3, 6))
+    lost, _ = flat_state(fresh, fresh_opt)
+    diff = torch.tensor([max((lost[n].float() - w.float()).abs().max().item() if w.numel() else 0.0
+                             for n, w in want_params.items())], device="cuda")
+    dist.all_reduce(diff, op=dist.ReduceOp.MAX)
+    assert diff.item() > 0, "a fresh optimizer gives the same weights: the test does not see the optimizer state"
+    dist.barrier()
+    if rank == 0:
+        shutil.rmtree(ckpt)
+        kinds = sorted({k for _, k in want_state})
+        print(f"resume ({'DCP' if dcp else 'torch.save per rank'}): 3 + 3 steps equal 6 uninterrupted steps bit for "
+              f"bit (weights and {kinds}); a fresh optimizer differs by {diff.item():.2e}")
+
+
 def check_tensor_parallel(rep=1, tp=2):
     """TP x FSDP (x replicas, as with context parallel): each TP rank holds its TP-local shard of every weight,
     sharded on dim 0 over its dp group and replicated over `rep` groups (the FSDP mesh's replicate dim, where
@@ -341,6 +448,8 @@ def main():
     initialize_model_parallel(1, 1, timeout=600)
     check_model_blocks()
     check_resume_config_wins(mesh)
+    check_resume_checkpoint(mesh, dcp=True)
+    check_resume_checkpoint(mesh, dcp=False)
     check_tensor_parallel()
     check_tensor_parallel(rep=2, tp=2)  # replicas (context parallel) x TP x FSDP
     check_tensor_parallel(rep=2, tp=1)  # replicas x FSDP
