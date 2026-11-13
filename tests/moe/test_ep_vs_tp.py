@@ -13,6 +13,9 @@ round-off at EP > TP and EP = TP, be finite, and be bitwise equal in two runs. V
   inference  the same under torch.inference_mode
   fused      moe_fwd / moe_bwd, with the aux loss
 
+The dispatch checks its plan (NodeDispatcher.check_plan): the counts sent with the routing against those read
+from it. Last, one plan, without this check, must block the host once at both EP.
+
 Launch one process per rank, e.g.:
 
     torchrun --nproc_per_node 8 tests/moe/test_ep_vs_tp.py --tp 2 --cp 2 --ep 4
@@ -23,6 +26,7 @@ Launch one process per rank, e.g.:
 (with topk <= N / EP), so the other GPUs, and the other replicas, receive no rows.
 """
 import os
+import warnings
 from typing import Dict
 
 import fire
@@ -39,7 +43,7 @@ from xllm.distributed import (
     get_model_parallel_world_size,
 )
 from xllm.models.fused_blocks.moe import moe_fwd, moe_bwd
-from xllm.modules.moe.dispatch import build_dispatcher
+from xllm.modules.moe.dispatch import build_dispatcher, NodeDispatcher
 from xllm.modules.moe.layout import ExpertLayout
 from xllm.modules.moe.moe import NormalizedMoE
 from tests.moe.test_dedup_dispatch import SCALING_FACTOR, EXPERT_KEYS, rel_err
@@ -142,6 +146,34 @@ def global_expert_grads(got: Dict[str, Tensor], layout: ExpertLayout) -> Dict[st
     return out
 
 
+def count_syncs(fn) -> int:
+    """The host syncs of fn() that torch.cuda.set_sync_debug_mode reports."""
+    torch.cuda.synchronize()
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter('always')
+        torch.cuda.set_sync_debug_mode('warn')
+        try:
+            fn()
+        finally:
+            torch.cuda.set_sync_debug_mode('default')
+    # not the warning that set_sync_debug_mode is a prototype
+    return sum('called a synchronizing' in str(w.message) for w in caught)
+
+
+def plan_syncs(x: Tensor, weights, layout: ExpertLayout, topk: int, backend: str) -> int:
+    """The host syncs of one dispatcher.plan of the shard's tokens, after a first plan."""
+    dispatcher = build_dispatcher(layout, topk, backend)
+    logits = x.flatten(end_dim=-2).float() @ weights['router_w'].float().t()
+    _, indices = torch.sigmoid(logits).topk(topk, dim=-1)
+    tokens_per_expert = torch.bincount(indices.flatten(), minlength=layout.n_experts)
+    check, NodeDispatcher.check_plan = NodeDispatcher.check_plan, False
+    try:
+        dispatcher.plan(indices.flatten(), tokens_per_expert)
+        return count_syncs(lambda: dispatcher.plan(indices.flatten(), tokens_per_expert))
+    finally:
+        NodeDispatcher.check_plan = check
+
+
 def destroy_groups():
     """Free the communicators before the next layout: there are too many to keep them all."""
     groups = {id(group): group for name in dir(parallel_state) if name.endswith('_GROUP')
@@ -173,6 +205,7 @@ def main(
 ):
     torch.cuda.set_device(int(os.environ['LOCAL_RANK']))
     dist.init_process_group(backend='nccl')
+    NodeDispatcher.check_plan = True
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False
     world, rank = dist.get_world_size(), dist.get_rank()
@@ -253,6 +286,18 @@ def main(
             print(f"{variant:9s} tp={tp} cp={cp} ep={ep} {dtype} vary={vary} skew={skew} topk={topk} N={n_experts}: "
                   f"max rel_err(ep vs tp) {flags[0].item():.2e} {'ok' if flags[1].item() == 0 else 'FAIL'}"
                   f"  rank 0: {', '.join(f'{k} {v:.1e}' for k, v in worst.items())}", flush=True)
+
+    # one host sync per plan, at both EP
+    for size in (tp, ep):
+        initialize_model_parallel(tp, cp, timeout=600, expert_parallel_size=size)
+        syncs = plan_syncs(x, weights, ExpertLayout.from_process_groups(n_experts), topk, backend)
+        if syncs != 1:
+            errors.append(f"plan ep={size}: {syncs} host syncs, not 1")
+        all_syncs = torch.tensor([syncs], device='cuda')
+        dist.all_reduce(all_syncs, op=dist.ReduceOp.MAX)
+        if rank == 0:
+            print(f"plan      ep={size}: at most {all_syncs.item()} host syncs per rank", flush=True)
+        destroy_groups()
 
     for line in errors:
         print(f"FAIL rank {rank}: {line}", flush=True)

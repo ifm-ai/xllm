@@ -23,6 +23,7 @@ combine_rows use for autograd. The fused blocks keep plan.state between forward 
 rebuild the plan with replan.
 """
 import dataclasses
+import os
 from dataclasses import dataclass
 from typing import Any, Callable, List, Optional, Tuple
 
@@ -154,6 +155,19 @@ class TPDispatcher:
         )
         return DispatchPlan(plan, state.group_sizes, hits.size(0), state)
 
+    def _state(self, expert_counts: List[int], dest_counts: List[int]) -> TPState:
+        return TPState(
+            group_sizes=expert_counts[self.start:self.start + self.n_local],
+            pair_start=sum(expert_counts[:self.start]),
+            dest_counts=dest_counts,
+        )
+
+    def counts(self, routing_indices: Tensor, tokens_per_expert: Tensor) -> Tuple[List[int], List[int]]:
+        """The counts plan builds from: the n_experts tokens_per_expert, and the tokens of each TP rank (a
+        token counted once per rank holding one of its experts). One host sync."""
+        counts = torch.cat([tokens_per_expert, self._hits(routing_indices).sum(dim=0)]).tolist()
+        return counts[:self.n_experts], counts[self.n_experts:]
+
     def plan(self, routing_indices: Tensor, tokens_per_expert: Tensor) -> DispatchPlan:
         """routing_indices: M*K flat expert indices; tokens_per_expert: the n_experts counts of the indices."""
         # M x TP
@@ -161,12 +175,13 @@ class TPDispatcher:
         # N + TP
         counts = torch.cat([tokens_per_expert, hits.sum(dim=0)]).tolist()
         expert_counts, dest_counts = counts[:self.n_experts], counts[self.n_experts:]
-        state = TPState(
-            group_sizes=expert_counts[self.start:self.start + self.n_local],
-            pair_start=sum(expert_counts[:self.start]),
-            dest_counts=dest_counts,
-        )
-        return self._build(routing_indices, hits, state)
+        return self._build(routing_indices, hits, self._state(expert_counts, dest_counts))
+
+    def plan_from_counts(
+        self, routing_indices: Tensor, expert_counts: List[int], dest_counts: List[int]
+    ) -> DispatchPlan:
+        """plan, given the counts it would read (see counts) instead of reading them: no host sync."""
+        return self._build(routing_indices, self._hits(routing_indices), self._state(expert_counts, dest_counts))
 
     def replan(self, routing_indices: Tensor, state: TPState) -> DispatchPlan:
         """The plan for the same routing, rebuilt without communication or sync from its state."""
@@ -208,11 +223,14 @@ class NodeDispatcher:
     Per layer and rank, besides TPDispatcher's traffic on the M tokens: S x D/TP rows over the expert outer
     group in each dispatch and combine, S the (token, other replica) pairs plus the token's own replica,
     S x K int32 indices once per plan and S x K scores once per local_scores and scores_grad, and one
-    all-to-all of E_out counts per plan.
+    all-to-all of E_out x (1 + TP x n_local + TP) counts per plan, its only host sync.
 
     Building one does not communicate. check_outer_group does: it is a collective over the expert outer
     group, which build_dispatcher runs once per dispatcher it builds.
     """
+
+    # check the counts sent with the tokens against those TPDispatcher.plan reads from their routing (tests)
+    check_plan = os.environ.get('XLLM_CHECK_DISPATCH', '0') == '1'
 
     def __init__(self, layout: ExpertLayout, topk: int, backend: str):
         assert layout.e_out > 1
@@ -224,7 +242,17 @@ class NodeDispatcher:
         self.share = layout.n_experts // layout.tp
         self.outer_rank = layout.outer_rank
         self.e_out = layout.e_out
+        self.tp_size = layout.tp
         self.n_node = layout.tp * layout.n_local
+        # E_out x n_node: the global index of expert k * n_local + i of replica o (see _node_indices)
+        o, k, i = torch.meshgrid(
+            torch.arange(self.e_out), torch.arange(layout.tp), torch.arange(self.n_local), indexing='ij'
+        )
+        self.node_experts = (k * self.share + o * self.n_local + i).flatten().to(torch.cuda.current_device())
+        # N: replica o and TP rank k owning each expert, as o * TP + k (one lookup in plan, not five kernels)
+        slots = torch.arange(self.node_experts.numel(), device=self.node_experts.device)
+        self.expert_owner = torch.empty_like(self.node_experts)
+        self.expert_owner[self.node_experts] = slots // self.n_local
         self.tp = TPDispatcher(self.n_node, self.n_local, topk, backend, masked=True)
 
     def check_outer_group(self):
@@ -275,15 +303,38 @@ class NodeDispatcher:
         outer = OuterPlan(send_tokens, home_table, state.send_splits, state.recv_splits)
         return DispatchPlan(tp_plan.tp, tp_plan.group_sizes, tp_plan.n_tokens, state, outer)
 
+    def _counts(self, routing_indices: Tensor, tokens_per_expert: Tensor) -> Tuple[Tensor, Tensor]:
+        """T x E_out hits (see _hits), and E_out x (1 + n_node + TP) counts: for the tokens sent to each replica,
+        their number, then what that replica's TPDispatcher.counts reads from them: the tokens of each of its
+        n_node experts, numbered as in _node_indices, and the tokens of each of its TP ranks."""
+        indices = routing_indices.view(-1, self.topk)
+        # T x K: replica o, TP rank k owning each slot's expert, as o * TP + k
+        owner = self.expert_owner[indices]
+        # T x (E_out x TP): whether a token picked an expert of each GPU of the expert group
+        rank_hits = torch.zeros(indices.size(0), self.e_out * self.tp_size, dtype=torch.bool, device=indices.device)
+        rank_hits.scatter_(1, owner, True)
+        hits = rank_hits.view(-1, self.e_out, self.tp_size).any(dim=2)
+        counts = torch.cat([
+            hits.sum(dim=0).unsqueeze(1),
+            # every slot of an expert goes to its replica: its tokens there are its tokens here
+            tokens_per_expert[self.node_experts].view(self.e_out, self.n_node),
+            rank_hits.sum(dim=0).view(self.e_out, self.tp_size),
+        ], dim=1)
+        return hits, counts
+
     def plan(self, routing_indices: Tensor, tokens_per_expert: Tensor) -> DispatchPlan:
-        """routing_indices: T*K flat expert indices. tokens_per_expert is not used."""
-        hits = self._hits(routing_indices)
-        send_counts = hits.sum(dim=0)
+        """routing_indices: T*K flat expert indices; tokens_per_expert: the n_experts counts of the indices.
+
+        One host sync: each replica sends the others, with the number of tokens it sends them, the counts their
+        TP plan needs, so it is built without reading them back from the received routing."""
+        hits, send_counts = self._counts(routing_indices, tokens_per_expert)
         ones = [1] * self.e_out
+        # E_out x (1 + n_node + TP): row o from replica o
         recv_counts, handle = all_to_all(send_counts, ones, ones, self.group, self.e_out)
         handle.wait()
-        counts = torch.cat([send_counts, recv_counts]).tolist()
-        send_splits, recv_splits = counts[:self.e_out], counts[self.e_out:]
+        counts = torch.cat([send_counts[:, 0], recv_counts[:, 0], recv_counts[:, 1:].sum(dim=0)]).tolist()
+        send_splits, recv_splits = counts[:self.e_out], counts[self.e_out:2 * self.e_out]
+        expert_counts, dest_counts = counts[2 * self.e_out:-self.tp_size], counts[-self.tp_size:]
         _, send_tokens, _, home_table = build_send_lists(hits, send_splits)
 
         # the routing of the tokens each replica receives
@@ -292,7 +343,15 @@ class NodeDispatcher:
         handle.wait()
         # M*K
         node_indices = self._node_indices(recv_indices.long()).flatten()
-        tp_plan = self.tp.plan(node_indices, torch.bincount(node_indices, minlength=self.n_node + 1)[:self.n_node])
+        if self.check_plan:
+            tokens_per_expert = torch.bincount(node_indices, minlength=self.n_node + 1)[:self.n_node]
+            expected = self.tp.counts(node_indices, tokens_per_expert)
+            if (expert_counts, dest_counts) != expected:
+                raise RuntimeError(
+                    f"the counts sent with the tokens {(expert_counts, dest_counts)} are not those of their routing "
+                    f"{expected}"
+                )
+        tp_plan = self.tp.plan_from_counts(node_indices, expert_counts, dest_counts)
 
         # int32: half the memory, kept until backward
         state = NodeState(send_splits, recv_splits, node_indices.int(), tp_plan.state)

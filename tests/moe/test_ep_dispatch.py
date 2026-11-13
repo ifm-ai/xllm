@@ -10,7 +10,7 @@ routed experts' gradients gathered by global expert index, with:
          replicas of the expert group.
 
 It also checks that two runs are bitwise equal, the routing is the same at both EP, and every result is
-finite. Launch one process per rank, e.g.:
+finite, and the dispatch checks its plan (NodeDispatcher.check_plan). Launch one process per rank, e.g.:
 
     torchrun --nproc_per_node 8 tests/moe/test_ep_dispatch.py --tp 2 --ep 4
     torchrun --nproc_per_node 8 tests/moe/test_ep_dispatch.py --tp 2 --ep 8 --dtype fp32
@@ -34,7 +34,7 @@ from xllm.distributed import (
     get_model_parallel_world_size,
 )
 from xllm.models.fused_blocks.moe import moe_fwd, moe_bwd
-from xllm.modules.moe.dispatch import build_dispatcher
+from xllm.modules.moe.dispatch import build_dispatcher, NodeDispatcher
 from xllm.modules.moe.layout import ExpertLayout
 from xllm.modules.moe.moe import NormalizedMoE
 from tests.moe.test_dedup_dispatch import reference, rel_err, SCALING_FACTOR, EXPERT_KEYS
@@ -190,6 +190,7 @@ def main(
 ):
     torch.cuda.set_device(int(os.environ['LOCAL_RANK']))
     torch.distributed.init_process_group(backend='nccl')
+    NodeDispatcher.check_plan = True
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False
     world = torch.distributed.get_world_size()
