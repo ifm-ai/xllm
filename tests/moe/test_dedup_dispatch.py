@@ -167,7 +167,6 @@ def run_unfused(x, weights, router_bias, out_grad, n_experts, topk, backend, *_)
     og = out_grad[..., cols].contiguous()
     out.backward(og)
     grads = {'router_w': moe.router.weight.grad}
-    # a rank that receives no tokens never runs its experts, so their grads stay None
     grads.update({k: _grad(getattr(moe.experts, f'weight{i}')) for i, k in enumerate(EXPERT_KEYS, 1)})
     if shared:
         grads.update(s1=moe.fc1.weight.grad, s2=moe.fc2.weight.grad, s3=moe.fc3.weight.grad)

@@ -198,7 +198,7 @@ class NormalizedMoE(nn.Module):
         x = rearrange(x, '(w b) d -> b (w d)', w=world_size)
         # P x D: one row per local (token, expert) pair, in expert order
         x = gather_rows(x, plan.pair_rows, plan.pair_table, backend)
-        y2 = self.experts(x, group_sizes) if x.size(0) > 0 else x
+        y2 = self.experts(x, group_sizes)
         # B' x D: experts' outputs scaled by their routing scores and summed per token
         weights = routing_scores.reshape(-1).index_select(0, plan.pair_slots.flatten()).view_as(plan.pair_slots)
         y2 = weighted_sum(y2, plan.pair_table, weights, plan.pair_rows, plan.pair_cols, backend)
