@@ -480,6 +480,8 @@ def main(cfg: TrainerConf):
 
         if overflow:
             logger.warning('Overflow detected, setting loss scale to: ' + str(state.scale))
+            # drop the overflowed gradients: the next backward would add to them
+            optimizer.zero_grad()
             continue
 
         # update step
