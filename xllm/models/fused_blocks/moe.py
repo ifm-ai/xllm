@@ -297,7 +297,7 @@ def moe_bwd(
         ew3_grad = torch.zeros_like(expert_w3)
 
     xf_grad = dispatcher.combine(xu_grad, plan)
-    # the routing scores' gradient, back to the tokens' replica
+    # the routing scores' gradient, back to the tokens' replica; waited after the shared experts' backward
     topk_scores_grad = dispatcher.scores_grad(topk_scores_grad.view(plan.n_tokens, topk), plan)
 
     if fc1_w is not None:
@@ -316,8 +316,6 @@ def moe_bwd(
         fc1_w_grad, fc3_w_grad = None, None
 
     # router grad
-    topk_scores_grad = topk_scores_grad.view(bsz, seq_len, topk)
-
     if router_load_balancing_type is None:
         assert aux_loss_grad is None
         original_scores_grad_aux = None
@@ -348,7 +346,8 @@ def moe_bwd(
     else:
         handle_bias = None
 
-    topk_scores_grad = topk_scores_grad.float()
+    # B x L x K
+    topk_scores_grad = topk_scores_grad.wait().view(bsz, seq_len, topk).float()
     if routing_scaling_factor is not None:
         topk_scores_grad = topk_scores_grad * routing_scaling_factor
 

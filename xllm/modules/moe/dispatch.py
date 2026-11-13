@@ -17,10 +17,10 @@ replica's TP group computes experts for (M = T when EP = TP); n, the tokens this
     combine(y, plan).wait()                     n x D -> T x D/TP, summed over the ranks that computed them
     local_scores(scores, plan)                  T x K routing scores (those given to plan) -> M x K, the scores
                                                 of the M tokens
-    scores_grad(grad, plan)                     M x K gradient of local_scores -> T x K
+    scores_grad(grad, plan).wait()              M x K gradient of local_scores -> T x K
 
-dispatch and combine return a Pending: the communication is started and wait() finishes it, so the
-fused blocks run other work in between. combine is the adjoint of dispatch, which dispatch_rows and
+dispatch, combine and scores_grad return a Pending: the communication is started and wait() finishes it, so
+the fused blocks run other work in between. combine is the adjoint of dispatch, which dispatch_rows and
 combine_rows use for autograd. The fused blocks keep plan.state between forward and backward and
 rebuild the plan with replan.
 """
@@ -212,8 +212,8 @@ class TPDispatcher:
     def local_scores(self, scores: Tensor, plan: DispatchPlan) -> Tensor:
         return scores
 
-    def scores_grad(self, grad: Tensor, plan: DispatchPlan) -> Tensor:
-        return grad
+    def scores_grad(self, grad: Tensor, plan: DispatchPlan) -> Pending:
+        return Pending(grad, None, lambda grad: grad)
 
 
 class NodeDispatcher:
@@ -386,7 +386,7 @@ class NodeDispatcher:
         output, handle = all_to_all(y, plan.outer.recv_splits, plan.outer.send_splits, self.group, self.e_out)
         # T rows: add up the parts returned by each replica
         finish = lambda output: masked_gather_sum(output, plan.outer.home_table, None, self.backend)
-        return Pending(output, handle, finish)
+        return Pending(output, handle, finish, keep=y)
 
     def dispatch(self, x: Tensor, plan: DispatchPlan) -> Pending:
         output, handle, send = self._to_replicas(x, plan)
@@ -407,9 +407,9 @@ class NodeDispatcher:
         handle.wait()
         return output
 
-    def scores_grad(self, grad: Tensor, plan: DispatchPlan) -> Tensor:
+    def scores_grad(self, grad: Tensor, plan: DispatchPlan) -> Pending:
         """M x K -> T x K: each slot's gradient comes from the replica that computed it, the others add 0."""
-        return self._from_replicas(grad.reshape(-1, self.topk).contiguous(), plan).wait()
+        return self._from_replicas(grad.reshape(-1, self.topk).contiguous(), plan)
 
 
 @dataclass
@@ -467,7 +467,7 @@ class _LocalScores(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad: Tensor):
-        return ctx.dispatcher.scores_grad(grad, _saved_plan(ctx)).view(ctx.shape), None, None
+        return ctx.dispatcher.scores_grad(grad, _saved_plan(ctx)).wait().view(ctx.shape), None, None
 
 
 def build_dispatcher(layout: ExpertLayout, topk: int, backend: str):
