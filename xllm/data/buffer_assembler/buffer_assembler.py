@@ -7,10 +7,13 @@ from typing import Any, Dict, List, Optional, Tuple
 import copy
 import threading
 import numpy as np
+from logging import getLogger
 
 from xllm.data.dataset_streamer.dataset_streamer import DatasetStreamer
 from xllm.data.buffer_assembler.packer.packer import Packer
 from xllm.data.data_types import Instance, PackedSeq
+
+logger = getLogger()
 
 
 class BufferAssembler:
@@ -326,8 +329,39 @@ class BufferAssembler:
                 "popping_idx": self._idxs[self._active],
             })
 
+    def _drop_removed_datasets(self, state: Dict[str, Any]) -> Dict[str, Any]:
+        """Remove from a checkpoint every trace of a dataset that is no longer in the mix.
+
+        A dataset dropped from --data since the checkpoint leaves three things in the saved state:
+        its streamer position, its tokenized chunks pending in the packer (best-fit pending_chunks,
+        simple-concat leftover_chunks) and its token credit. Restoring any of them would keep
+        feeding or budgeting the dropped data, so all three are filtered to self.streamers.
+        """
+        start_state = state.get("active_start_state", {})
+        dropped = sorted(ds for ds in start_state if ds not in self.streamers)
+        if dropped:
+            logger.warning(
+                f"resume: datasets {dropped} are in the checkpoint but not in the current data mix "
+                f"{sorted(self.streamers)}; their saved position and pending chunks are discarded"
+            )
+        packer_state = {
+            key: [chunk for chunk in value if chunk[2].dataset in self.streamers]
+            if key in ("pending_chunks", "leftover_chunks") else value
+            for key, value in state.get("active_packer_state", {}).items()
+        }
+        return {
+            **state,
+            "active_start_state": {ds: st for ds, st in start_state.items() if ds in self.streamers},
+            "active_packer_state": packer_state,
+            "active_token_credits_state": {
+                ds: credit for ds, credit in state.get("active_token_credits_state", {}).items()
+                if ds in self.streamers
+            },
+        }
+
     def set_state(self, state: Dict[str, Any]) -> None:
         self._wait_prefetch()
+        state = self._drop_removed_datasets(state)
 
         # 1. Restore streamers to the start of the active slot's data.
         for ds, st_state in state.get("active_start_state", {}).items():
