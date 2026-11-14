@@ -22,7 +22,7 @@ from xllm.modules.rms_norm import GroupRMSNorm
 from xllm.modules.residual import build_residual
 from xllm.health_metrics import get_active_health_collector
 from xllm.utils import get_init_fn
-from .router import TopKRouter
+from .router import build_router, dynamic_qb_combine
 from .expert import Expert
 from .permute import fused_permute_y
 
@@ -36,12 +36,18 @@ class NormalizedMoE(nn.Module):
         num_experts: int,
         num_activated_experts: int,
         num_shared_experts: int,
+        latent_dim: Optional[int] = None,
+        latent_post_rmsnorm: bool = False,
         expert_backend: str = 'sequential',
         permutation_backend: str = 'torch',
         router_score_func: str = 'sigmoid',
         router_bias: bool = False,
         router_bias_update_rate: Optional[float] = None,
         router_scaling_factor: Optional[float] = None,
+        router_type: str = 'topk',
+        router_dynamic_qb_update_method: str = 'average',
+        router_dynamic_qb_decay: float = 0.3,
+        router_dynamic_qb_globalnorm: bool = True,
         dropout: float = 0.0,
         hidden_dropout: float = 0.0,
         norm_num_groups: int = 1,
@@ -59,6 +65,8 @@ class NormalizedMoE(nn.Module):
         self.layer_id = layer_id
 
         self.model_dim = model_dim
+        self.latent_dim = latent_dim
+        self.routed_dim = latent_dim if latent_dim is not None else model_dim
         self.inter_dim = expert_inter_dim
         self.n_experts = num_experts
         self.topk = num_activated_experts
@@ -68,6 +76,11 @@ class NormalizedMoE(nn.Module):
         self.permutation_backend = permutation_backend
         self.init_mode = init_mode
         self.init_std = init_std
+
+        if latent_dim is not None:
+            assert 0 < latent_dim < model_dim and model_dim % latent_dim == 0
+        else:
+            assert not latent_post_rmsnorm, "The latent post-RMSNorm requires a latent dimension."
 
         rank = get_model_parallel_rank()
         world_size = get_model_parallel_world_size()
@@ -87,19 +100,51 @@ class NormalizedMoE(nn.Module):
         )
         init_fn = get_init_fn(init_mode, dim=model_dim, std=init_std)
         # router
-        self.router = TopKRouter(
+        self.router = build_router(
+            router_type,
             model_dim,
             self.n_experts,
             self.topk,
             bias=router_bias,
             bias_update_rate=router_bias_update_rate,
+            dynamic_qb_update_method=router_dynamic_qb_update_method,
+            dynamic_qb_decay=router_dynamic_qb_decay,
+            dynamic_qb_globalnorm=router_dynamic_qb_globalnorm,
             score_func=router_score_func,
             scaling_factor=router_scaling_factor,
             init_method=init_fn
         )
+        # latent projections of the routed experts
+        self.w_down = RowParallelLinear(
+            model_dim,
+            latent_dim,
+            bias=False,
+            input_is_parallel=True,
+            parallel_output=True,
+            init_method=init_fn
+        ) if latent_dim is not None else None
+
+        self.latent_norm = GroupRMSNorm(
+            latent_dim,
+            num_groups=1,
+            elementwise_affine=norm_affine,
+            eps=rmsnorm_eps,
+            memory_efficient=memory_efficient_norm,
+            disable_input_reduce=True
+        ) if latent_post_rmsnorm else None
+
+        self.w_up = RowParallelLinear(
+            latent_dim,
+            model_dim,
+            bias=False,
+            input_is_parallel=True,
+            parallel_output=True,
+            init_method=get_init_fn(init_mode, dim=latent_dim, std=init_std)
+        ) if latent_dim is not None else None
+
         # routed experts
         self.experts = Expert(
-            model_dim,
+            self.routed_dim,
             expert_inter_dim,
             num_experts,
             backend=expert_backend,
@@ -165,20 +210,27 @@ class NormalizedMoE(nn.Module):
 
         rank = get_model_parallel_rank()
         world_size = get_model_parallel_world_size()
-        # B x L x K
+        # B x L x K for top-k, or routes for dynamic QB
         routing_scores, routing_indices, tokens_per_expert, aux_loss = self.router(x, load_balancing_type)
         health_collector = get_active_health_collector()
         if health_collector is not None:
             health_collector.record_router_stats(
                 "moe", self.layer_id, tokens_per_expert, routing_scores, self.router.bias, aux_loss,
             )
-        # B*L x D/TP
+        if self.w_down is not None:
+            # B x L x latent_dim/TP
+            x = self.w_down(x)
+        # B*L x routed_dim/TP
         x = x.view(bsz * slen, -1)
-        # B*L*K
-        routing_indices = routing_indices.flatten()
-        # B*L*K
-        sorted_indices = torch.argsort(routing_indices, stable=True)
-        permute_indices = sorted_indices // self.topk
+        if self.router.routing_type == 'dynamic_qb':
+            # routes are grouped by expert, and the indices are their tokens
+            permute_indices = routing_indices
+        else:
+            # B*L*K
+            routing_indices = routing_indices.flatten()
+            # B*L*K
+            sorted_indices = torch.argsort(routing_indices, stable=True)
+            permute_indices = sorted_indices // self.topk
         # N
         group_sizes = tokens_per_expert[self.expert_start_idx:self.expert_end_idx].tolist()
         input_splits = tokens_per_expert.view(-1, self.n_local_experts).sum(dim=1).tolist()
@@ -186,10 +238,10 @@ class NormalizedMoE(nn.Module):
         output_splits = [curr_bsz for _ in range(world_size)]
 
         # routed experts
-        # B*L*K x D/TP
+        # B*L*K x routed_dim/TP
         permuted_x = torch.index_select(x, 0, permute_indices)
         x = all_to_all_expert_parallel_region(permuted_x, input_splits, output_splits)
-        # B' x D
+        # B' x routed_dim
         if curr_bsz > 0:
             x = rearrange(x, '(w b) d -> b (w d)', w=world_size)
             y2 = self.experts(x, group_sizes)
@@ -198,7 +250,17 @@ class NormalizedMoE(nn.Module):
             y2 = x
         y2 = all_to_all_expert_parallel_region(y2, output_splits, input_splits)
         # permute y2
-        y2 = fused_permute_y(sorted_indices, y2, routing_scores, bsz, slen, self.topk, self.permutation_backend)
+        if self.router.routing_type == 'dynamic_qb':
+            y2 = dynamic_qb_combine(y2, permute_indices, bsz * slen, routing_scores).view(bsz, slen, -1)
+        else:
+            y2 = fused_permute_y(sorted_indices, y2, routing_scores, bsz, slen, self.topk, self.permutation_backend)
+        if self.latent_norm is not None:
+            y2 = self.latent_norm(y2)
+            if self.latent_norm.gather_input:
+                y2 = scatter_to_model_parallel_region(y2)
+        if self.w_up is not None:
+            # B x L x D/TP
+            y2 = self.w_up(y2)
 
         # combine shared expert
         y = y1 + y2 if y1 is not None else y2
@@ -208,8 +270,8 @@ class NormalizedMoE(nn.Module):
         return out, aux_loss
 
     def extra_repr(self) -> str:
-        return 'mdim={}, edim={}, experts={} ({}, {}), init={} ({})'.format(
-            self.model_dim, self.inter_dim, self.n_experts, self.topk,
+        return 'mdim={}, ldim={}, edim={}, experts={} ({}, {}), init={} ({})'.format(
+            self.model_dim, self.latent_dim, self.inter_dim, self.n_experts, self.topk,
             self.n_shared_experts, self.init_mode, self.init_std
         )
 

@@ -1,42 +1,17 @@
 from typing import Callable, Optional, Tuple
 from functools import partial
-import math
 
 import torch
 import torch.nn.functional as F
 import torch.nn.init as init
-from torch.nn.parameter import Parameter
 
 from xllm.distributed import (
     get_model_parallel_group,
-    get_model_parallel_rank,
     get_model_parallel_world_size,
     get_hybrid_shard_data_parallel_group,
     get_hybrid_shard_data_parallel_world_size
 )
-from xllm.distributed.utils import divide_and_check_no_remainder
-
-
-def all_reduce(x: torch.Tensor, world_size: int, group: torch.distributed.ProcessGroup, async_op: bool = False):
-    if world_size == 1:
-        return x, None
-    # All-reduce.
-    handle = torch.distributed.all_reduce(x, group=group, async_op=async_op)
-    return x, handle
-
-
-def calc_probs(scores: torch.Tensor, score_func: str):
-    # B x L x N
-    if score_func == 'softmax':
-        denom = None
-        probs = scores
-    elif score_func == 'sigmoid':
-        denom = scores.sum(dim=-1, keepdim=True)
-        probs = scores / denom
-    else:
-        raise ValueError(f"Unknown score function: {score_func}.")
-
-    return probs, denom
+from .base import all_reduce, calc_probs, BaseRouter
 
 
 class TopKRouting(torch.autograd.Function):
@@ -212,7 +187,7 @@ class TopKRouting(torch.autograd.Function):
 topk_routing = TopKRouting.apply
 
 
-class TopKRouter(torch.nn.Module):
+class TopKRouter(BaseRouter):
     """TopK router.
     Similar to RowParallelLinear, with specific communication control.
 
@@ -223,6 +198,8 @@ class TopKRouter(torch.nn.Module):
         init_method: method to initialize weights. Note that bias is always set
                      to zero.
     """
+
+    routing_type = 'topk'
 
     def __init__(
         self,
@@ -235,21 +212,8 @@ class TopKRouter(torch.nn.Module):
         scaling_factor: Optional[float] = None,
         init_method: Callable[[torch.Tensor], torch.Tensor] = init.xavier_normal_,
     ) -> None:
-        super(TopKRouter, self).__init__()
+        super(TopKRouter, self).__init__(in_features, num_experts, topk, score_func, scaling_factor)
 
-        # Keep input parameters
-        self.in_features = in_features
-        self.num_experts = num_experts
-        self.topk = topk
-        self.score_func = score_func
-        self.scaling_factor = scaling_factor
-
-        # Divide the weight matrix along the last dimension.
-        rank = get_model_parallel_rank()
-        world_size = get_model_parallel_world_size()
-
-        self.input_size_per_partition = divide_and_check_no_remainder(in_features, world_size)
-        self.weight = Parameter(torch.empty(self.num_experts, self.input_size_per_partition))
         if bias:
             assert bias_update_rate is not None and bias_update_rate > 0.0, f"Invalid bias update rate: {bias_update_rate}"
             self.register_buffer('bias', torch.zeros(self.num_experts))
@@ -258,15 +222,7 @@ class TopKRouter(torch.nn.Module):
         self.bias_update_rate = bias_update_rate
 
         # Initialize weight.
-        master_weight = torch.empty(num_experts, in_features, dtype=self.weight.dtype, requires_grad=False)
-        init_method(master_weight)
-        weight_list = torch.split(master_weight, self.input_size_per_partition, dim=1)
-        my_weight = weight_list[rank]
-        with torch.no_grad():
-            self.weight.copy_(my_weight)
-        # clear master weight
-        del master_weight
-        del weight_list
+        self.init_weight(init_method)
 
     def forward(
         self, x: torch.Tensor, load_balancing_type: Optional[str] = None
