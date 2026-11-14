@@ -2,6 +2,7 @@ import contextlib
 from typing import Any, Generator
 import torch.nn as nn
 from torch.distributed.fsdp import fully_shard
+from torch.distributed.tensor import DTensor
 
 
 @contextlib.contextmanager
@@ -32,6 +33,12 @@ def enable_wrap(
 def wrap(module: nn.Module, **wrap_overrides: Any) -> nn.Module:
     if _ConfigAutoWrap.in_autowrap_context:
         wrap_overrides = {**_ConfigAutoWrap.kwargs, **wrap_overrides}
+        storage_dtype = wrap_overrides.pop("storage_dtype", None)
+        if storage_dtype is not None:
+            # params of submodules wrapped earlier are already sharded DTensors in that dtype
+            for p in module.parameters():
+                if not isinstance(p, DTensor):
+                    p.data = p.data.to(storage_dtype)
         return fully_shard(module, **wrap_overrides)
     return module
 
