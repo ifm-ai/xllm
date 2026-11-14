@@ -46,6 +46,20 @@ def _init_affine_weight(
     del my_weight_list
 
 
+class _NoRows(torch.autograd.Function):
+    """The experts' output when they receive no rows. The weights get zero gradients, so that FSDP reduces
+    the same parameters on this rank as on the ranks whose experts received rows."""
+
+    @staticmethod
+    def forward(ctx, x: torch.Tensor, *weights: torch.Tensor) -> torch.Tensor:
+        ctx.weight_specs = [(w.shape, w.dtype, w.device) for w in weights]
+        return x.new_empty(x.shape)
+
+    @staticmethod
+    def backward(ctx, grad: torch.Tensor):
+        return (grad, *(torch.zeros(shape, dtype=dtype, device=device) for shape, dtype, device in ctx.weight_specs))
+
+
 class Expert(nn.Module):
     def __init__(
         self,
@@ -82,6 +96,8 @@ class Expert(nn.Module):
         _init_affine_weight(self.weight2, num_experts, self.model_dim, self.inter_dim, init_fn)
 
     def forward(self, x: torch.Tensor, group_sizes: List[int]) -> torch.Tensor:
+        if x.size(0) == 0:
+            return _NoRows.apply(x, self.weight1, self.weight2, self.weight3)
         w1 = rearrange(self.weight1, '(n s) d -> n s d', n=self.n_local_experts)
         w2 = rearrange(self.weight2, '(n s) d -> n s d', n=self.n_local_experts)
         w3 = rearrange(self.weight3, '(n s) d -> n s d', n=self.n_local_experts)
