@@ -49,6 +49,14 @@ def _to_replica(tensor_or_obj: Any, is_tensor: bool) -> Any:
     return _broadcast_from_first(tensor_or_obj, get_model_parallel_group(), get_model_parallel_world_size(), is_tensor)
 
 
+def _without_active_seqs(state: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    # MultiSourceDataLoader state without the assembler's active sequences (a reload without them rebuilds them)
+    if state is None or "active_seqs" not in state.get("assembler", {}):
+        return state
+    assembler = {k: v for k, v in state["assembler"].items() if k != "active_seqs"}
+    return {**state, "assembler": assembler}
+
+
 class ReplicaBatchIterator:
     """The batches of a MultiSourceDataLoader built on the replica's first rank only (loader None elsewhere).
 
@@ -56,7 +64,8 @@ class ReplicaBatchIterator:
     bool, batch_size x seq_len (MultiSourceDataLoader always gives a mask), and ratios the batch's float64
     (padding_ratio, truncation_ratio). Nothing is read back to the host, so the next step's kernels can be launched
     ahead as before. One broadcast per group and batch, of 3 x batch_size x seq_len + 2 int64. get_state is the
-    reader's on every rank (one object broadcast), so the saved data state does not depend on which rank reads;
+    reader's on every rank (one object broadcast), so the saved data state does not depend on which rank reads,
+    except for the active sequences of the fast restore (BufferAssembler), which only the reader keeps and loads;
     set_state restores it on the reader only.
     """
 
@@ -94,7 +103,9 @@ class ReplicaBatchIterator:
         return x, y, mask, buf[3 * n:].view(torch.float64)
 
     def get_state(self) -> Dict[str, Any]:
-        return _to_replica(self.loader.get_state() if self.loader is not None else None, is_tensor=False)
+        state = self.loader.get_state() if self.loader is not None else None
+        shared = _to_replica(_without_active_seqs(state), is_tensor=False)
+        return state if self.loader is not None else shared
 
     def set_state(self, state: Dict[str, Any]) -> None:
         if self.loader is not None:
