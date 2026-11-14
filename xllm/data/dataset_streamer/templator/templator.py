@@ -406,6 +406,10 @@ def tokenize_multiturn_template(
     target_mask = target_mask + [True]
     if tokenizer.use_bos:
         input_ids.insert(0, tokenizer.bos_id)
+        # The mask value at a document's first position is never used as a target:
+        # the packer builds targets from positions 1..seq_len (y = tokens[1:], masks =
+        # target_mask[1:]), and for documents packed after the first one it forces
+        # target_mask[0] = False so EOS of the previous document never predicts BOS.
         target_mask.insert(0, True)
 
     return {
