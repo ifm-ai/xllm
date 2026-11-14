@@ -12,6 +12,53 @@ from xllm.data.dataset_streamer.dataset_streamer import DatasetStreamer
 from xllm.data.buffer_assembler.packer.packer import Packer
 from xllm.data.data_types import Instance, PackedSeq
 
+_INT32 = np.iinfo(np.int32)
+
+
+def _compact(a: np.ndarray) -> np.ndarray:
+    # int64 tokens as int32 when they fit (any vocabulary below 2**31): half the bytes, decoded back exactly
+    if a.dtype == np.int64 and a.size and _INT32.min <= a.min() and a.max() <= _INT32.max:
+        return a.astype(np.int32)
+    return a
+
+
+def encode_packed_seqs(seqs: List[PackedSeq]) -> Dict[str, Any]:
+    """Packed sequences as a few arrays (and their source infos), for a checkpoint."""
+    lengths = np.array([len(s.x) for s in seqs], dtype=np.int64)
+    has_mask = np.array([s.mask is not None for s in seqs], dtype=bool)
+    cat = lambda arrays, dtype: np.concatenate(arrays) if arrays else np.zeros(0, dtype=dtype)
+    x = cat([s.x for s in seqs], np.int64)
+    y = cat([s.y for s in seqs], np.int64)
+    return {
+        "lengths": lengths,
+        "y_lengths": np.array([len(s.y) for s in seqs], dtype=np.int64),
+        "x": _compact(x), "x_dtype": x.dtype.str,
+        "y": _compact(y), "y_dtype": y.dtype.str,
+        "has_mask": has_mask,
+        "mask": cat([s.mask for s in seqs if s.mask is not None], bool),
+        "padding_count": np.array([s.padding_count for s in seqs], dtype=np.int64),
+        "has_truncation": np.array([s.has_truncation for s in seqs], dtype=bool),
+        "src_infos": [s.src_infos for s in seqs],
+    }
+
+
+def decode_packed_seqs(enc: Dict[str, Any]) -> List[PackedSeq]:
+    """The inverse of encode_packed_seqs."""
+    x = enc["x"].astype(np.dtype(enc["x_dtype"]))
+    y = enc["y"].astype(np.dtype(enc["y_dtype"]))
+    xs = np.split(x, np.cumsum(enc["lengths"])[:-1]) if len(enc["lengths"]) else []
+    ys = np.split(y, np.cumsum(enc["y_lengths"])[:-1]) if len(enc["y_lengths"]) else []
+    mask_lengths = enc["lengths"][enc["has_mask"]]
+    masks = iter(np.split(enc["mask"], np.cumsum(mask_lengths)[:-1]) if len(mask_lengths) else [])
+    return [
+        PackedSeq(
+            x=xs[i].copy(), y=ys[i].copy(), mask=next(masks).copy() if enc["has_mask"][i] else None,
+            src_infos=enc["src_infos"][i], padding_count=int(enc["padding_count"][i]),
+            has_truncation=bool(enc["has_truncation"][i]),
+        )
+        for i in range(len(xs))
+    ]
+
 
 class BufferAssembler:
     """
@@ -33,6 +80,15 @@ class BufferAssembler:
       - popping_idx         : how far into the active slot we've consumed.
       On reload we re-run one prefill+pack+shuffle synchronously (using the
       saved RNG state) to rebuild the active slot, then restore popping_idx.
+
+    The state also holds, once a refill was started (fast restore, which skips that rebuild):
+      - active_seqs         : the active slot's packed sequences from popping_idx on
+                              (encode_packed_seqs)
+      - next_refill_state   : the streamer, packer, token-credit and RNG states the next
+                              refill starts from, captured when it was started
+      A reload with both puts these back instead of re-reading and re-tokenizing the
+      active slot's data; it reaches the same state, so the batches that follow are the
+      same. A state without them (older checkpoints) is reloaded by the rebuild.
     """
 
     def __init__(
@@ -97,6 +153,8 @@ class BufferAssembler:
         self._inactive_packer_state: Dict[str, Any] = {}
         self._active_token_credits_state: Dict[str, float] = {}
         self._inactive_token_credits_state: Dict[str, float] = {}
+        # RNG state the pending refill starts from, captured when it is started (fast restore); None before
+        self._next_rng_state: Optional[Tuple] = None
 
         self._timing_enabled = os.environ.get("XLLM_LOG_DATALOADER_TIMING", "0").lower() in {
             "1", "true", "yes", "on",
@@ -263,6 +321,8 @@ class BufferAssembler:
         self._inactive_packer_state = self.packer.get_state()
         self._inactive_start_state = {ds: st.get_state() for ds, st in self.streamers.items()}
         self._inactive_token_credits_state = dict(self._token_credits)
+        # the refill sets _inactive_rng_state to this when it starts, possibly after a get_state
+        self._next_rng_state = self._rng.get_state()
         self._prefetch_pending = True
         if self._sync_refill:
             self._do_refill()
@@ -318,16 +378,29 @@ class BufferAssembler:
         # Checkpoint only describes the active slot.  The inactive prefetch slot
         # is a performance cache and is intentionally discarded on resume.
         with self._state_lock:
-            return copy.deepcopy({
+            state = copy.deepcopy({
                 "active_start_state": self._active_start_state,
                 "active_rng_state": self._active_rng_state,
                 "active_packer_state": self._active_packer_state,
                 "active_token_credits_state": self._active_token_credits_state,
                 "popping_idx": self._idxs[self._active],
             })
+            if self._next_rng_state is not None:
+                # the states _kick_prefetch captured for the pending refill (the refill does not change them)
+                state["next_refill_state"] = copy.deepcopy({
+                    "start_state": self._inactive_start_state,
+                    "packer_state": self._inactive_packer_state,
+                    "token_credits_state": self._inactive_token_credits_state,
+                    "rng_state": self._next_rng_state,
+                })
+                state["active_seqs"] = encode_packed_seqs(self._buffers[self._active][state["popping_idx"]:])
+            return state
 
     def set_state(self, state: Dict[str, Any]) -> None:
         self._wait_prefetch()
+        if "active_seqs" in state and "next_refill_state" in state:
+            self._set_state_fast(state)
+            return
 
         # 1. Restore streamers to the start of the active slot's data.
         for ds, st_state in state.get("active_start_state", {}).items():
@@ -354,6 +427,33 @@ class BufferAssembler:
             self._idxs[self._active] = state.get("popping_idx", 0)
 
         # 5. Kick prefetch for the next slot.
+        self._kick_prefetch()
+
+    def _set_state_fast(self, state: Dict[str, Any]) -> None:
+        """set_state from the saved active sequences: the states after the rebuild set_state would run."""
+        nxt = state["next_refill_state"]
+        # 1. Streamers, pending chunks, credits and RNG as the next refill starts from them.
+        for ds, st_state in nxt["start_state"].items():
+            self.streamers[ds].set_state(st_state)
+        self.streamer_iters = {ds: st.iter_raw() for ds, st in self.streamers.items()}
+        self.packer.set_state(nxt["packer_state"])
+        self._token_credits = {ds: float(nxt["token_credits_state"].get(ds, 0.0)) for ds in self.streamers}
+        self._rng.set_state(nxt["rng_state"])
+
+        # 2. The active slot: the sequences not popped yet, at their place in the slot.
+        popping_idx = state.get("popping_idx", 0)
+        seqs = [None] * popping_idx + decode_packed_seqs(state["active_seqs"])
+        with self._state_lock:
+            inactive = 1 - self._active
+            self._buffers[inactive] = seqs
+            self._active = inactive
+            self._active_start_state = state.get("active_start_state", {})
+            self._active_rng_state = state.get("active_rng_state")
+            self._active_packer_state = state.get("active_packer_state", {})
+            self._active_token_credits_state = state.get("active_token_credits_state", {})
+            self._idxs[self._active] = popping_idx
+
+        # 3. Kick prefetch for the next slot, from the states of step 1.
         self._kick_prefetch()
 
     def close(self) -> None:
