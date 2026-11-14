@@ -12,7 +12,9 @@ from xllm.modules import (
     RotaryEmbedding,
     TimestepDecayNorm,
 )
-from xllm.modules.residual import num_params_in_residual
+from xllm.modules.residual import (
+    num_params_in_residual, flops_in_residual, expand_streams, sum_streams, StreamSlot, controller_tensors,
+)
 from xllm.modules.fused_ops import memory_efficient_dropout
 from xllm.modules.model_parallel import (
     ParallelEmbedding,
@@ -37,6 +39,7 @@ from xllm.modules.utils import (
     get_segment_idx_from_bos_mask
 )
 from xllm.models.xllm import XLLModel
+from xllm.models.fused_blocks.hyper_connection import FusedStreams
 from xllm.models.fused_blocks import (
     GekkoBlockFunction,
     GekkoOutputLayerFunction
@@ -61,6 +64,8 @@ class GekkoBlock(nn.Module):
         self.timenorm_eps = cfg.timenorm_eps
         self.layernorm_eps = cfg.layernorm_eps
         self.rmsnorm_eps = cfg.rmsnorm_eps
+        self.is_last_layer = layer_id == cfg.num_layers - 1
+        self.stream_slot = None  # hyper-connection fused block: set by the model, shared by its layers
 
         self.gda = GatedDeltaAttention(
             layer_id=layer_id,
@@ -130,8 +135,11 @@ class GekkoBlock(nn.Module):
                               Tensor]] = None,
     ) -> Tuple[Tensor, Optional[Tensor], Optional[Any]]:
         if self.fused_block and self.training:
-            fn = GekkoBlockFunction
-            return fn.apply(
+            # hyper-connections: the sublayers' residual modules are the controllers (None for a plain residual)
+            hc1, hc2 = (self.gda.residual, self.nffn.residual) if self.stream_slot is not None else (None, None)
+            streams = None if hc1 is None else FusedStreams(type(hc1), self.stream_slot, self.layer_id, self.is_last_layer,
+                                                            hc1.eps)
+            return GekkoBlockFunction.apply(
                 self.layer_id,
                 x,
                 freqs_cis,
@@ -170,14 +178,14 @@ class GekkoBlock(nn.Module):
                 self.gda.attn_gate_fn,
                 self.gda.sca_backend,
                 self.gda.awm_orthogonal_update,
-                None,
+                *controller_tensors(hc1),
                 self.nffn.norm.weight,
                 self.nffn.norm.bias,
                 self.nffn.norm.groups_per_partition,
                 self.nffn.fc1.weight,
                 self.nffn.fc2.weight,
                 self.nffn.fc3.weight if self.nffn.swiglu else None,
-                None,
+                *controller_tensors(hc2),
                 self.gda.dropout,
                 self.gda.attention_dropout,
                 self.gda.hidden_dropout,
@@ -188,6 +196,7 @@ class GekkoBlock(nn.Module):
                 self.apply_rmsnorm,
                 self.residual_func,
                 self.residual_heads,
+                streams,
                 attn_stability_control,
                 deterministic,
                 self.recompute_q,
@@ -348,8 +357,10 @@ class Gekko(XLLModel):
             self.rope = None
 
         self.layers = nn.ModuleList()
+        stream_slot = StreamSlot() if cfg.fused_block and self.residual_streams > 1 else None
         for layer_id in range(self.num_layers):
             layer = GekkoBlock(cfg, layer_id)
+            layer.stream_slot = stream_slot
             self.layers.append(wrap(layer))
 
         self.output = wrap(GekkoOutputLayer(cfg))
@@ -423,6 +434,7 @@ class Gekko(XLLModel):
         # embeddings
         emb = self.embed(tokens)
         x = memory_efficient_dropout(emb, self.dropout, self.training)
+        x = expand_streams(x, self.residual_streams)  # hyper-connections: N copies of the embedding (N = 1: x itself)
         # rope frequencies
         freq_cis = None if self.rope is None else self.rope.get_freqs_cis(start, end, x.device)
 
@@ -443,7 +455,8 @@ class Gekko(XLLModel):
                 )
 
             if health_collector is not None:
-                health_collector.record_activation(i, x)
+                with torch.no_grad():  # the residual the output reads; no graph for the stream sum
+                    health_collector.record_activation(i, sum_streams(x, self.residual_streams))
 
             if aux_loss is not None:
                 aux_loss_sum = aux_loss if aux_loss_sum is None else aux_loss_sum + aux_loss
@@ -451,6 +464,7 @@ class Gekko(XLLModel):
             if cache is not None:
                 cache_layers[i] = layer_cache
 
+        x = sum_streams(x, self.residual_streams)  # hyper-connections: the output reads the sum of the streams
         logits_or_loss, cache_output = self.output(x, targets, token_mask, bos_mask, cache_output)
         if targets is not None and self.context_parallel_size > 1:
             logits_or_loss = gather_from_context_parallel_region(logits_or_loss)
@@ -526,8 +540,7 @@ class Gekko(XLLModel):
         norm_flops += (q_dim + k_dim) * 2
         timestep_norm_flops = self.model_dim * 8
         # residual flops
-        # TODO
-        res_flops = 0.0
+        res_flops = 2 * flops_in_residual(self.residual_func, self.model_dim)  # two residuals per layer (0 but for hyper-connections)
         conv_flops = self.causal_conv_width * (q_dim + k_dim + v_dim) * 2
         sca_flops = self.model_dim * (q_dim + k_dim + v_dim + h_dim)
         sca_flops += (q_dim + h_dim) * self.chunk_size * 1.5

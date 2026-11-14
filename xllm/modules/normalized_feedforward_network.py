@@ -100,6 +100,7 @@ class NormalizedFeedForwardNetwork(nn.Module):
     ) -> Tensor:
         # B x L x D
         residual = x
+        x, rc = self.residual.read(residual)  # hyper-connections: h = sum_n a_n X_n and the write's (R, b); else x, None
         x = self.norm(x)
         if not self.norm.gather_input:
             x = gather_copy_model_parallel_region(x)
@@ -116,7 +117,7 @@ class NormalizedFeedForwardNetwork(nn.Module):
         y = self.fc2(hidden)
         y = memory_efficient_dropout(y, self.dropout, self.training)
         # residual
-        out = self.residual(y, residual, c=hidden)
+        out = self.residual(y, residual, c=hidden, state=rc)
         return out
 
     def extra_repr(self) -> str:

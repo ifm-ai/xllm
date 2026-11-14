@@ -16,7 +16,9 @@ from xllm.modules import (
     GroupLayerNorm,
     GroupRMSNorm,
 )
-from xllm.modules.residual import num_params_in_residual
+from xllm.modules.residual import (
+    num_params_in_residual, flops_in_residual, expand_streams, sum_streams, StreamSlot, controller_tensors,
+)
 from xllm.modules.fused_ops import memory_efficient_dropout
 from xllm.modules.model_parallel import (
     ParallelEmbedding,
@@ -36,6 +38,7 @@ from xllm.distributed import (
     get_context_parallel_world_size,
     get_context_parallel_rank,
 )
+from xllm.models.fused_blocks.hyper_connection import FusedStreams
 from xllm.models.fused_blocks import (
     TransformerBlockFunction,
     TransformerMoEBlockFunction,
@@ -62,6 +65,8 @@ class TransformerBlock(nn.Module):
         self.apply_rmsnorm = cfg.apply_rmsnorm
         self.layernorm_eps = cfg.layernorm_eps
         self.rmsnorm_eps = cfg.rmsnorm_eps
+        self.is_last_layer = layer_id == cfg.num_layers - 1
+        self.stream_slot = None  # hyper-connection fused block: set by the model, shared by its layers
 
         if self.fused_block:
             assert cfg.causal_attn_backend in ['flash', 'xattn'], f"flash or xattn attention backend is required for fused block."
@@ -124,8 +129,11 @@ class TransformerBlock(nn.Module):
         cache: Optional[Tuple[Tensor, Tensor, int]] = None,
     ) -> Tuple[Tensor, Optional[Tensor], Optional[Any]]:
         if self.fused_block and self.training:
-            fn = TransformerBlockFunction
-            return fn.apply(
+            # hyper-connections: the sublayers' residual modules are the controllers (None for a plain residual)
+            hc1, hc2 = (self.attention.residual, self.nffn.residual) if self.stream_slot is not None else (None, None)
+            streams = None if hc1 is None else FusedStreams(type(hc1), self.stream_slot, self.layer_id, self.is_last_layer,
+                                                            hc1.eps)
+            return TransformerBlockFunction.apply(
                 self.layer_id,
                 x,
                 freqs_cis,
@@ -146,14 +154,14 @@ class TransformerBlock(nn.Module):
                 self.attention.rope_head_dim,
                 self.attention.attn_gate_fn,
                 self.attention.causal_attn_backend,
-                None,
+                *controller_tensors(hc1),
                 self.nffn.norm.weight,
                 self.nffn.norm.bias,
                 self.nffn.norm.groups_per_partition,
                 self.nffn.fc1.weight,
                 self.nffn.fc2.weight,
                 self.nffn.fc3.weight if self.nffn.swiglu else None,
-                None,
+                *controller_tensors(hc2),
                 self.dropout,
                 self.attention.attention_dropout,
                 self.attention.hidden_dropout,
@@ -164,6 +172,7 @@ class TransformerBlock(nn.Module):
                 self.attention.norm.gather_input,
                 self.residual_func,
                 self.residual_heads,
+                streams,
                 attn_stability_control,
                 deterministic,
                 self.recompute_q,
@@ -636,10 +645,15 @@ class Transformer(XLLModel):
         self.apply_attn_gate = cfg.apply_attn_gate
 
         self.layers = nn.ModuleList()
+        # hyper-connection fused block: passes stream data between adjacent layers (None otherwise; the config
+        # asserts the layers are all dense)
+        stream_slot = StreamSlot() if cfg.fused_block and self.residual_streams > 1 else None
         for layer_id in range(self.num_layers):
             block_cls = TransformerBlock if layer_id < self.num_dense_layers else \
                 (TransformerMoVABlock if self.num_values > 0 else TransformerMoEBlock)
             layer = block_cls(cfg, layer_id)
+            if stream_slot is not None:
+                layer.stream_slot = stream_slot
             self.layers.append(wrap(layer))
 
         self.output = wrap(TransformerOutputLayer(cfg))
@@ -689,6 +703,7 @@ class Transformer(XLLModel):
         # embeddings
         emb = self.embed(tokens)
         x = memory_efficient_dropout(emb, self.dropout, self.training)
+        x = expand_streams(x, self.residual_streams)  # hyper-connections: N copies of the embedding (N = 1: x itself)
         # rope frequencies
         freq_cis = None if self.rope is None else self.rope.get_freqs_cis(cache_len, cache_len + seq_len, x.device)
 
@@ -709,7 +724,8 @@ class Transformer(XLLModel):
                 )
 
             if health_collector is not None:
-                health_collector.record_activation(i, x)
+                with torch.no_grad():  # the residual the output reads; no graph for the stream sum
+                    health_collector.record_activation(i, sum_streams(x, self.residual_streams))
 
             if aux_loss is not None:
                 aux_loss_sum = aux_loss if aux_loss_sum is None else aux_loss_sum + aux_loss
@@ -717,6 +733,7 @@ class Transformer(XLLModel):
             if cache is not None:
                 cache[i] = layer_cache
 
+        x = sum_streams(x, self.residual_streams)  # hyper-connections: the output reads the sum of the streams
         logits_or_loss = self.output(x, targets, token_mask)
         if targets is not None and self.context_parallel_size > 1:
             logits_or_loss = gather_from_context_parallel_region(logits_or_loss)
@@ -821,7 +838,7 @@ class Transformer(XLLModel):
             router_params = self.model_dim * self.num_experts
             residual_params = num_params_in_residual(self.residual_func, self.model_dim, self.residual_heads, self.model_dim)
             activated_params += (shared_expert_params + activated_expert_params + router_params + residual_params) * (self.num_layers - self.num_dense_layers)
-            total_params += (shared_expert_params + routed_expert_params + router_params) * (self.num_layers - self.num_dense_layers)
+            total_params += (shared_expert_params + routed_expert_params + router_params + residual_params) * (self.num_layers - self.num_dense_layers)
         # final norm
         activated_params += self.model_dim * (1 if self.apply_rmsnorm else 2)
         total_params += self.model_dim * (1 if self.apply_rmsnorm else 2)
@@ -839,9 +856,8 @@ class Transformer(XLLModel):
         # FFN
         ffn_flops = self.model_dim * self.ffn_hidden_dim * (3 if self.swiglu else 2)
 
-        # residual
-        # TODO
-        res_flops = 0.0
+        # residual: two per layer (0 but for hyper-connections)
+        res_flops = 2 * flops_in_residual(self.residual_func, self.model_dim)
 
         # MoVA
         mova_flops = self.model_dim * (self.num_heads * 2 + self.num_kv_heads) * self.head_dim

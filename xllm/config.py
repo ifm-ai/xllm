@@ -113,6 +113,10 @@ class OptimConf(Config):
             assert self.wsd_decay_duration_steps is not None, 'decay duration steps is required for WSD.'
 
 
+HYPER_CONNECTION_FUNCS = ('ihc', 'mhc', 'ohc')  # residual_func values of xllm.modules.residual.HYPER_CONNECTIONS
+FUSED_BLOCK_RESIDUALS = ('base', 'add', 'ihc', 'ohc')  # residuals the fused blocks implement (mhc's transport is not invertible)
+
+
 @dataclass
 class ModelConf(Config):
     arch: str = "transformer"  # Architecture: transformer or gekko
@@ -173,7 +177,9 @@ class ModelConf(Config):
     layernorm_eps: float = 1e-5
     rmsnorm_eps: float = 1e-6
     apply_rmsnorm: bool = False  # True = RMSNorm, False = LayerNorm
-    residual_func: str = "base"  # Residual connection type: base/add means standard addition, ortho for orthogonal residuals.
+    # Residual connection type: base/add means standard addition, ortho for orthogonal residuals, ihc/mhc/ohc for
+    # hyper-connections (4 residual streams with identity / Sinkhorn / SO(4) transport, xllm/modules/residual/README.md).
+    residual_func: str = "base"
     residual_heads: Optional[int] = None  # Num of feature groups for orthogonal residuals. Required when using residual_func='ortho'.
     # Rope base
     rope_base: float = 100000  # RoPE frequency base
@@ -219,7 +225,13 @@ class ModelConf(Config):
 
         assert self.attn_act_func in ['softmax', 'softdelta']
         assert self.attn_gate_func in ['silu', 'softplus']
-        assert self.residual_func in ['base', 'add', 'ortho']
+        assert self.residual_func in ('base', 'add', 'ortho') + HYPER_CONNECTION_FUNCS
+        if self.fused_block:
+            assert self.residual_func in FUSED_BLOCK_RESIDUALS, \
+                f"the fused blocks implement the residuals {FUSED_BLOCK_RESIDUALS}, not {self.residual_func}"
+            if self.residual_func in HYPER_CONNECTION_FUNCS:
+                assert self.num_experts == 0, \
+                    "hyper-connections have a fused block only for dense transformer and Gekko layers"
 
         if self.num_values > 0:
             assert 0 < self.num_activated_values <= self.num_values

@@ -18,6 +18,7 @@ from xllm.modules.fused_ops import (
     adaptive_working_memory_accum_fwd,
     adaptive_working_memory_bwd,
 )
+from xllm.models.fused_blocks.hyper_connection import FusedStreams
 from xllm.models.fused_blocks.utils import (
     layer_or_rmsnorm_fwd,
     rmsnorm_fwd,
@@ -68,9 +69,11 @@ from xllm.models.fused_blocks.distributed import (
 
 
 class GekkoBlockFunction(torch.autograd.Function):
-    """
-
-    """
+    """One Gekko layer (timestep norm, gated delta attention, residual, norm, FFN, residual) as one autograd Function,
+    saving the two sublayer inputs and a few attention tensors and recomputing the rest in the backward. With
+    hyper-connections (`residual_func` ihc / ohc) the layer's state is N = 4 streams X [B, L, N, D] and the two residual
+    adds are the stream path of xllm/models/fused_blocks/hyper_connection.py (`FusedStreams`); the timestep norm is then
+    recomputed after the FFN backward, where its input x = read(X0, a1) is back."""
 
     @staticmethod
     def forward(
@@ -113,14 +116,18 @@ class GekkoBlockFunction(torch.autograd.Function):
         attn_gate_func: str,
         sca_backend: str,
         awm_orthogonal_update: bool,
-        attn_res_w: Optional[torch.Tensor],  # (d/MP, c)
+        hc1_w: Optional[torch.Tensor],  # hyper-connections: the attention sublayer's controller, (N * d, n_logits)
+        hc1_b: Optional[torch.Tensor],  # (n_logits)
+        hc1_s: Optional[torch.Tensor],  # (2)
         ffn_norm_w: torch.Tensor,  # (d)
         ffn_norm_b: torch.Tensor,  # (d)
         ffn_norm_local_groups: int,
         fc1_w: torch.Tensor,
         fc2_w: torch.Tensor,
         fc3_w: Optional[torch.Tensor],
-        ffn_res_w: Optional[torch.Tensor],  # (d/MP, c)
+        hc2_w: Optional[torch.Tensor],  # hyper-connections: the FFN sublayer's controller
+        hc2_b: Optional[torch.Tensor],  # (n_logits)
+        hc2_s: Optional[torch.Tensor],  # (2)
         dropout: float,
         attention_dropout: float,
         hidden_dropout: float,
@@ -131,6 +138,7 @@ class GekkoBlockFunction(torch.autograd.Function):
         apply_rmsnorm: bool,
         residual_func: str,
         residual_heads: Optional[int],
+        streams: Optional[FusedStreams],  # hyper-connections: the layer's stream path; None: plain residual
         attn_stability_control: int,
         deterministic: bool,
         recompute_q: bool,
@@ -145,9 +153,13 @@ class GekkoBlockFunction(torch.autograd.Function):
         attn_gate_fn = {"silu": F.silu, "softplus": partial(F.softplus, beta=math.log(2))}[attn_gate_func]
         assert attn_gate_fn is not None
 
+        hc = streams is not None
+        if hc:
+            x = streams.read1(x, hc1_w, hc1_b, hc1_s, hc2_w, hc2_b, hc2_s)  # x is the streams; the attention branch reads them
+        else:
+            residual = x
         bsz, seq_len, _ = x.size()
         width = q_conv_w.shape[1]
-        residual = x
         recv_from_prev = should_recv_from_prev()
         send_to_next = should_send_to_next()
         sca_scale = 1.0 / math.sqrt(head_dim)
@@ -379,8 +391,11 @@ class GekkoBlockFunction(torch.autograd.Function):
         xh, xh_rng_state = memory_efficient_dropout_fwd(xh, dropout, True)
 
         # residual
-        xo = torch.add(xh, residual, out=xh)
-        residual = xo
+        if hc:
+            xo = streams.write1(xh)  # the attention output into the streams; the FFN branch reads the result
+        else:
+            xo = torch.add(xh, residual, out=xh)
+            residual = xo
 
         if send_to_next:
             handle1.wait()
@@ -405,10 +420,13 @@ class GekkoBlockFunction(torch.autograd.Function):
         out, _ = reduce_scatter(out, parallel_region='model', async_op=False)
         out, out_rng_state = memory_efficient_dropout_fwd(out, dropout, True)
         # residual
-        out = torch.add(out, residual)
+        if hc:
+            out = streams.write2(out)  # the FFN output into the streams, in place over X1
+        else:
+            out = torch.add(out, residual)
+        rc_saved = streams.saved() if hc else (x, xo)  # the residual's tensors
 
         ctx.save_for_backward(
-            x,  # (bsz, slen, d/MP)
             freqs_cis,  # (slen, s)
             bos_mask,  # (bsz, slen)
             segment_idx,  # (bsz, slen)
@@ -427,13 +445,11 @@ class GekkoBlockFunction(torch.autograd.Function):
             k_conv_w,  # (w, d/MP)
             v_conv_w,  # (w, v/MP)
             qnorm_w,  # (s/MP)
-            attn_res_w,  # (d/MP, c)
             ffn_norm_w,  # (d)
             ffn_norm_b,  # (d)
             fc1_w,
             fc2_w,
             fc3_w,
-            ffn_res_w,  # (d/MP, c)
             prev_count,  # (bsz)
             prev_mean,  # (bsz, n_groups/MP)
             prev_var,  # (bsz, n_groups/MP)
@@ -450,9 +466,9 @@ class GekkoBlockFunction(torch.autograd.Function):
             awk_out if not recompute_awk else None,  # (bsz, slen, v/MP)
             memory,  # (bsz, h/MP, s/(h*MP), v/(h*MP))
             log_norm_term,  # (bsz, h/MP, s/MP)
-            xo,  # (bsz, slen, d/MP)
             h1 if not recompute_fc1_out else None,  # (bsz*slen, v/MP)
             h3 if not recompute_fc3_out else None,  # (bsz*slen, v/MP)
+            *rc_saved,
         )
         ctx.local_heads = local_heads
         ctx.local_kv_heads = local_kv_heads
@@ -474,6 +490,7 @@ class GekkoBlockFunction(torch.autograd.Function):
         ctx.apply_rmsnorm = apply_rmsnorm
         ctx.residual_func = residual_func
         ctx.residual_heads = residual_heads
+        ctx.streams = streams
         ctx.sca_backend = sca_backend
         ctx.deterministic = deterministic
         ctx.attn_stability_control = attn_stability_control
@@ -498,7 +515,6 @@ class GekkoBlockFunction(torch.autograd.Function):
         assert cache is None and aux_loss_grad is None
 
         (
-            x,  # (bsz, slen, d/MP)
             freqs_cis,  # (slen, s)
             bos_mask,  # (bsz, slen)
             segment_idx,  # (bsz, slen)
@@ -517,13 +533,11 @@ class GekkoBlockFunction(torch.autograd.Function):
             k_conv_w,  # (w, d/MP)
             v_conv_w,  # (w, v/MP)
             qnorm_w,  # (s/MP)
-            attn_res_w,  # (d/MP, c)
             ffn_norm_w,  # (d)
             ffn_norm_b,  # (d)
             fc1_w,
             fc2_w,
             fc3_w,
-            ffn_res_w,  # (d/MP, c)
             prev_count,  # (bsz)
             prev_mean,  # (bsz, n_groups/MP)
             prev_var,  # (bsz, n_groups/MP)
@@ -540,14 +554,23 @@ class GekkoBlockFunction(torch.autograd.Function):
             awk_out,  # (bsz, slen, v/MP)
             memory,  # (bsz, h/MP, s/(h*MP), v/(h*MP))
             log_norm_term,  # (bsz, h/MP, s/MP)
-            xo,  # (bsz, slen, d/MP)
             h1,  # (bsz*slen, v/MP)
             h3,  # (bsz*slen, v/MP)
+            *rc,  # the residual's tensors
         ) = ctx.saved_tensors
 
-        bsz, seq_len, _ = x.size()
+        streams = ctx.streams
+        hc = streams is not None
+        if hc:
+            # hyper-connections: X1 and xo = read(X1, a2) back, with the second write's backward; dy2 is the FFN output's
+            # gradient. x is read from X0 after the FFN backward, where the timestep norm is recomputed
+            xo, out_grad = streams.restore(rc, out_grad)
+            x = None
+        else:
+            x, xo = rc
+            residual_grad = out_grad
+        bsz, seq_len, _ = xo.size()
         width = q_conv_w.shape[1]
-        residual_grad = out_grad
 
         recv_from_prev = ctx.recv_from_prev
         send_to_next = ctx.send_to_next
@@ -611,10 +634,11 @@ class GekkoBlockFunction(torch.autograd.Function):
 
         # recompute mx
         # B x L x D
-        mx, tsn_count, tsn_mean, tsn_var, cummean, cumrstd = timenorm_fwd(
-            x, bos_mask_curr, prev_count, prev_mean, prev_var, timenorm_w, timenorm_b,
-            timenorm_local_groups, timenorm_beta1, timenorm_beta2, timenorm_eps, timenorm_backend
-        )
+        if not hc:
+            mx, tsn_count, tsn_mean, tsn_var, cummean, cumrstd = timenorm_fwd(
+                x, bos_mask_curr, prev_count, prev_mean, prev_var, timenorm_w, timenorm_b,
+                timenorm_local_groups, timenorm_beta1, timenorm_beta2, timenorm_eps, timenorm_backend
+            )
 
         if handle_xf is not None:
             handle_xf.wait()
@@ -633,7 +657,8 @@ class GekkoBlockFunction(torch.autograd.Function):
             out_grad = reshape_gathered_tensor_along_specific_dim(out_grad, gather_dim=2)
 
         # gather mx
-        mx, handle_mx = all_gather(mx, parallel_region='model', async_op=True)
+        if not hc:
+            mx, handle_mx = all_gather(mx, parallel_region='model', async_op=True)
 
         out_grad = rearrange(out_grad, 'b l d -> (b l) d')
         xo_grad, fc1_w_grad, fc2_w_grad, fc3_w_grad, ffn_norm_w_grad, ffn_norm_b_grad = swiglu_backward(
@@ -641,8 +666,20 @@ class GekkoBlockFunction(torch.autograd.Function):
             xo, xo_mean, xo_invvar, ffn_norm_w, ffn_norm_b, ffn_norm_local_groups, apply_rmsnorm, False,
         )
 
-        residual_grad = torch.add(xo_grad, residual_grad, out=xo_grad)
-        xh_grad = residual_grad
+        if hc:
+            del xf, h1, h3, xo, xo_mean, xo_invvar, out_grad
+            # the FFN controller's backward and dX1, then X0 and x = read(X0, a1); dy1 is the attention output's gradient
+            x, xh_grad = streams.after_ffn(xo_grad)
+            del xo_grad
+            # recompute mx, from the x just read back
+            mx, tsn_count, tsn_mean, tsn_var, cummean, cumrstd = timenorm_fwd(
+                x, bos_mask_curr, prev_count, prev_mean, prev_var, timenorm_w, timenorm_b,
+                timenorm_local_groups, timenorm_beta1, timenorm_beta2, timenorm_eps, timenorm_backend
+            )
+            mx, handle_mx = all_gather(mx, parallel_region='model', async_op=True)
+        else:
+            residual_grad = torch.add(xo_grad, residual_grad, out=xo_grad)
+            xh_grad = residual_grad
         xh_grad = memory_efficient_dropout_bwd(xh_grad, dropout, xh_rng_state)
         xh_grad, handle_xh = all_gather(xh_grad, parallel_region='model', async_op=True)
 
@@ -989,11 +1026,18 @@ class GekkoBlockFunction(torch.autograd.Function):
         else:
             handle1 = None
 
-        # residual connection
-        x_grad = torch.add(x_grad, residual_grad, out=x_grad)
         wr_grad = torch.mm(rmx_grad.t(), mx_flat)
         br_grad = None if br is None else rmx_grad.sum(dim=0)
         wq_grad = torch.mm(xq_grad.t(), mx_flat)
+
+        # residual connection
+        if hc:
+            del x, mx, mx_flat, rmx_grad, xq_grad
+            # the attention controller's backward, then the whole dX0 in one pass
+            x_grad, (hc1_w_grad, hc1_b_grad, hc1_s_grad, hc2_w_grad, hc2_b_grad, hc2_s_grad) = streams.after_branch(x_grad)
+        else:
+            x_grad = torch.add(x_grad, residual_grad, out=x_grad)
+            hc1_w_grad = hc1_b_grad = hc1_s_grad = hc2_w_grad = hc2_b_grad = hc2_s_grad = None
 
         if recv_from_prev:
             handle8.wait()
@@ -1044,14 +1088,18 @@ class GekkoBlockFunction(torch.autograd.Function):
             None,  # attn gate func
             None,  # sca backend
             None,  # awm_orthogonal_update
-            None,  # attn_res_w
+            hc1_w_grad,
+            hc1_b_grad,
+            hc1_s_grad,
             ffn_norm_w_grad,
             ffn_norm_b_grad,
             None,  # ffn_norm local groups
             fc1_w_grad,
             fc2_w_grad,
             fc3_w_grad,
-            None,  # ffn_res_w
+            hc2_w_grad,
+            hc2_b_grad,
+            hc2_s_grad,
             None,  # dropout
             None,  # attention dropout
             None,  # hidden dropout
@@ -1062,6 +1110,7 @@ class GekkoBlockFunction(torch.autograd.Function):
             None,  # apply_rmsnorm
             None,  # residual_func
             None,  # residual_heads
+            None,  # streams
             None,  # attn_stability_control
             None,  # deterministic
             None,  # recompute_q
