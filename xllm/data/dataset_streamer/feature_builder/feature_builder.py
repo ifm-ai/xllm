@@ -1,4 +1,6 @@
 import hashlib
+import threading
+from logging import getLogger
 from typing import Optional
 
 import numpy as np
@@ -10,6 +12,28 @@ from xllm.data.dataset_streamer.templator.templator import (
     ChatTemplateError,
     tokenize_multiturn_template,
 )
+
+
+logger = getLogger()
+
+# Skipped chat samples are logged (rate-limited per process) so that skips are never silent.
+_SKIP_LOG_LOCK = threading.Lock()
+_SKIP_COUNT = 0
+_SKIP_LOG_FIRST = 20
+_SKIP_LOG_EVERY = 1000
+
+
+def _log_skipped_sample(instance: Instance, error: Exception) -> None:
+    global _SKIP_COUNT
+    with _SKIP_LOG_LOCK:
+        _SKIP_COUNT += 1
+        n = _SKIP_COUNT
+    if n <= _SKIP_LOG_FIRST or n % _SKIP_LOG_EVERY == 0:
+        root = error.__cause__ or error
+        logger.warning(
+            f"Skipped chat sample #{n} in this process: {instance.filename}:{instance.line_num} "
+            f"({type(root).__name__}: {str(root)[:300]})"
+        )
 
 
 class FeatureBuilder:
@@ -58,7 +82,8 @@ class ChatTemplateFeatureBuilder(FeatureBuilder):
                 conversation_key=self.conversation_key,
                 rng=self._rng_for_instance(instance),
             )
-        except ChatTemplateError:
+        except ChatTemplateError as error:
+            _log_skipped_sample(instance, error)
             return None
 
         token_ids = list(result["input_ids"])

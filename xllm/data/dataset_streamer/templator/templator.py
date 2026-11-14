@@ -5,6 +5,20 @@ from typing import Any, Dict, List, Optional
 
 from xllm.data.dataset_streamer.tokenizer import Tokenizer
 
+try:
+    from jinja2.exceptions import TemplateError as _JinjaTemplateError
+except ImportError:  # jinja2 is only needed for chat templates
+    class _JinjaTemplateError(Exception):
+        pass
+
+# Errors that mean "this sample cannot be rendered by the chat template" (bad or unusual
+# data): jinja errors (including the template's own raise_exception) and malformed fields.
+# They are deterministic, so every rank skips the same samples.
+# Anything else (e.g. ValueError / AttributeError from transformers internals, such as the
+# AssistantTracker thread-safety bug) is NOT a data problem and must propagate: silently
+# skipping it made the skipped samples depend on thread timing and desynchronized TP ranks.
+_EXPECTED_TEMPLATE_ERRORS = (_JinjaTemplateError, TypeError, KeyError)
+
 
 class Templator:
     def render(self, raw_record: Any) -> str:
@@ -169,7 +183,7 @@ def apply_chat_template_randomized(
             chat_template=text_format,
             **kwargs,
         )
-    except Exception as initial_error:
+    except _EXPECTED_TEMPLATE_ERRORS as initial_error:
         if not has_tools:
             raise ChatTemplateError(f"chat template rendering failed: {initial_error}") from initial_error
         _repair_tool_schema(conversation)
@@ -183,7 +197,7 @@ def apply_chat_template_randomized(
                 chat_template=text_format,
                 **kwargs,
             )
-        except Exception as retry_error:
+        except _EXPECTED_TEMPLATE_ERRORS as retry_error:
             raise ChatTemplateError(
                 f"chat template rendering failed after tool-schema repair: {initial_error}"
             ) from retry_error
