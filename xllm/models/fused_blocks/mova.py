@@ -7,6 +7,7 @@ from einops import rearrange
 from xllm.distributed import (
     get_context_parallel_rank,
     get_context_parallel_world_size,
+    get_model_parallel_world_size,
 )
 from xllm.distributed.utils import reshape_gathered_tensor_along_specific_dim
 from xllm.health_metrics import get_active_health_collector
@@ -348,6 +349,8 @@ def mova_bwd(
             original_scores_grad_aux = (probs_grad - (probs_grad * probs).sum(dim=-1, keepdim=True)) / org_scores_denom
         else:
             raise ValueError(f"Unknown score function: {routing_score_func}.")
+        # every TP rank adds this whole term and the logits-gradient all-reduce sums the ranks: add a 1/TP share
+        original_scores_grad_aux = original_scores_grad_aux / get_model_parallel_world_size()
 
     # reduce tokens/expert for router bias updating
     if router_bias is not None:
