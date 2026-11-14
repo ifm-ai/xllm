@@ -1,4 +1,5 @@
 import abc
+import json
 import os
 import re
 import shutil
@@ -304,6 +305,31 @@ def get_base_model_checkpoint_path(
         optim_path = optim_path / sharded_optim_name(master_rank)
 
     return model_path, optim_path
+
+
+def check_optimizer_files_expert_parallel_size(checkpoint_dir: Path, cfg: Config) -> None:
+    """
+    The non-DCP optimizer files hold the states of each rank's own shards, and with EP > TP its own routed
+    experts: they only load at the expert parallel size they were saved at. Raise if the checkpoint's config
+    has another one, or if it has none and EP > TP. The DCP model and optimizer states load at any EP.
+    """
+    current = cfg.expert_parallel_size or cfg.model_parallel_size
+    config_path = Path(checkpoint_dir) / "config.json"
+    if not config_path.exists():
+        if current != cfg.model_parallel_size:
+            raise RuntimeError(
+                f"No config in {checkpoint_dir} to check that its non-DCP optimizer files were saved at EP "
+                f"{current}: they load at the EP they were saved at only. Use dcp_for_optimizer to change EP."
+            )
+        return
+    with config_path.open("r") as fp:
+        saved_cfg = json.load(fp)
+    saved = saved_cfg.get("expert_parallel_size") or saved_cfg["model_parallel_size"]
+    if saved != current:
+        raise RuntimeError(
+            f"The non-DCP optimizer files in {checkpoint_dir} were saved at EP {saved} and load at the EP they "
+            f"were saved at only, not at EP {current}. Use dcp_for_optimizer to change EP."
+        )
 
 
 def get_latest_checkpoint_path(dump_dir: str, global_rank: int, strict: bool) -> Optional[str]:

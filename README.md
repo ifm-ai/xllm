@@ -169,6 +169,26 @@ When changing these values, keep the constraints checked in
 - With `keep_eval_checkpoints true` (the default), a positive `eval_freq` must
   also be divisible by `dump_freq`.
 
+### Expert parallelism
+
+`expert_parallel_size` (EP) is the number of GPUs that split the routed experts
+of each MoE layer. By default it equals `model_parallel_size` (TP): the TP ranks
+of a model replica split the experts. With EP = TP x E_out, E_out consecutive
+data-parallel replicas form an expert group and split each TP rank's experts
+again, so each GPU holds `model.num_experts / EP` experts, and a token goes once
+to each replica holding one of its experts.
+
+- EP > TP needs `model.ddp_backend fsdp2`: the routed experts are sharded on
+  their own FSDP2 mesh.
+- EP must be a multiple of TP, `model.num_experts` must be divisible by EP, and
+  EP / TP must divide the data-parallel size (GPUs / (TP x CP)).
+- The model checkpoints and the DCP optimizer states (`dcp_for_optimizer true`)
+  have the same keys and shapes at every EP with the same TP, so they load at
+  another EP. The non-DCP optimizer files hold each GPU's own experts and load
+  only at the EP they were saved at: changing EP on resume needs
+  `dcp_for_optimizer true`.
+- Full (unsharded) model state dicts are refused with EP > TP.
+
 ## Checkpoint Conversion & Serving
 Conversion and serving checkpoints of xLLM is supported by [xBridges](https://github.com/ifm-ai/xbridges).
 

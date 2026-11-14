@@ -1,21 +1,13 @@
 from typing import Optional, Tuple
 
-import torch
 from torch import nn, Tensor
 import torch.nn.functional as F
-from einops import rearrange
 
-from xllm.distributed import (
-    get_model_parallel_rank,
-    get_model_parallel_world_size,
-)
 from xllm.modules.model_parallel import (
     RowParallelLinear,
     ColumnParallelLinear,
     scatter_to_model_parallel_region,
 )
-from xllm.modules.moe import all_to_all_expert_parallel_region
-from xllm.distributed.utils import divide_and_check_no_remainder
 from xllm.modules.fused_ops import memory_efficient_dropout
 from xllm.modules.layer_norm import GroupLayerNorm
 from xllm.modules.rms_norm import GroupRMSNorm
@@ -24,7 +16,9 @@ from xllm.health_metrics import get_active_health_collector
 from xllm.utils import get_init_fn
 from .router import TopKRouter
 from .expert import Expert
-from .permute import fused_permute_y
+from .layout import ExpertLayout
+from .dedup import gather_rows, weighted_sum
+from .dispatch import build_dispatcher, dispatch_rows, combine_rows
 
 
 class NormalizedMoE(nn.Module):
@@ -69,11 +63,12 @@ class NormalizedMoE(nn.Module):
         self.init_mode = init_mode
         self.init_std = init_std
 
-        rank = get_model_parallel_rank()
-        world_size = get_model_parallel_world_size()
-        self.n_local_experts = divide_and_check_no_remainder(num_experts, world_size)
-        self.expert_start_idx = rank * self.n_local_experts
-        self.expert_end_idx = (rank + 1) * self.n_local_experts
+        self.layout = ExpertLayout.from_process_groups(num_experts)
+        # with EP > TP, a collective over the expert outer group (see build_dispatcher)
+        self.dispatcher = build_dispatcher(self.layout, self.topk, permutation_backend)
+        self.n_local_experts = self.layout.n_local
+        self.expert_start_idx = self.layout.start
+        self.expert_end_idx = self.layout.end
 
         norm_cls = GroupRMSNorm if apply_rmsnorm else GroupLayerNorm
         norm_eps = rmsnorm_eps if apply_rmsnorm else layernorm_eps
@@ -163,8 +158,6 @@ class NormalizedMoE(nn.Module):
         else:
             y1 = None
 
-        rank = get_model_parallel_rank()
-        world_size = get_model_parallel_world_size()
         # B x L x K
         routing_scores, routing_indices, tokens_per_expert, aux_loss = self.router(x, load_balancing_type)
         health_collector = get_active_health_collector()
@@ -174,31 +167,23 @@ class NormalizedMoE(nn.Module):
             )
         # B*L x D/TP
         x = x.view(bsz * slen, -1)
-        # B*L*K
-        routing_indices = routing_indices.flatten()
-        # B*L*K
-        sorted_indices = torch.argsort(routing_indices, stable=True)
-        permute_indices = sorted_indices // self.topk
-        # N
-        group_sizes = tokens_per_expert[self.expert_start_idx:self.expert_end_idx].tolist()
-        input_splits = tokens_per_expert.view(-1, self.n_local_experts).sum(dim=1).tolist()
-        curr_bsz = input_splits[rank]
-        output_splits = [curr_bsz for _ in range(world_size)]
+        # the routing scores go with the routing: local_scores below takes them from the plan
+        plan = self.dispatcher.plan(routing_indices.flatten(), tokens_per_expert, routing_scores.detach())
+        backend = self.permutation_backend
 
-        # routed experts
-        # B*L*K x D/TP
-        permuted_x = torch.index_select(x, 0, permute_indices)
-        x = all_to_all_expert_parallel_region(permuted_x, input_splits, output_splits)
-        # B' x D
-        if curr_bsz > 0:
-            x = rearrange(x, '(w b) d -> b (w d)', w=world_size)
-            y2 = self.experts(x, group_sizes)
-            y2 = rearrange(y2, 'b (w d) -> (w b) d', w=world_size)
-        else:
-            y2 = x
-        y2 = all_to_all_expert_parallel_region(y2, output_splits, input_splits)
-        # permute y2
-        y2 = fused_permute_y(sorted_indices, y2, routing_scores, bsz, slen, self.topk, self.permutation_backend)
+        # routed experts: each token's slice goes once to every rank holding one of its experts
+        # B' x D: this rank's tokens, rebuilt
+        x = dispatch_rows(x, self.dispatcher, plan)
+        # P x D: one row per local (token, expert) pair, in expert order
+        x = gather_rows(x, plan.tp.pair_rows, plan.tp.pair_table, backend)
+        y2 = self.experts(x, plan.group_sizes)
+        # B' x D: experts' outputs scaled by their routing scores and summed per token
+        scores = self.dispatcher.local_scores(routing_scores, plan)
+        weights = scores.reshape(-1).index_select(0, plan.tp.pair_slots.flatten()).view_as(plan.tp.pair_slots)
+        y2 = weighted_sum(y2, plan.tp.pair_table, weights, plan.tp.pair_rows, plan.tp.pair_cols, backend)
+        # B*L x D/TP: add up the parts returned by each rank
+        y2 = combine_rows(y2, self.dispatcher, plan)
+        y2 = y2.view(bsz, slen, -1)
 
         # combine shared expert
         y = y1 + y2 if y1 is not None else y2

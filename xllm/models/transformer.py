@@ -42,6 +42,7 @@ from xllm.models.fused_blocks import (
     TransformerMoVABlockFunction,
     TransformerOutputLayerFunction,
 )
+from xllm.models.fused_blocks.moe import DispatchPrefetch
 from xllm.utils import get_init_fn
 
 
@@ -196,6 +197,7 @@ class TransformerMoEBlock(nn.Module):
         self.recompute_fc1_out = cfg.recompute_fc1_out
         self.recompute_fc3_out = cfg.recompute_fc3_out
         self.recompute_router = cfg.recompute_router
+        self.moe_keep_dispatched = cfg.moe_keep_dispatched
         self.dropout = cfg.dropout
         self.apply_rmsnorm = cfg.apply_rmsnorm
         self.layernorm_eps = cfg.layernorm_eps
@@ -268,10 +270,12 @@ class TransformerMoEBlock(nn.Module):
         attn_stability_control: int = 0,
         deterministic: bool = True,
         cache: Optional[Tuple[Tensor, Tensor, int]] = None,
+        experts_gathered: bool = False,
+        prefetch: Optional[DispatchPrefetch] = None,
     ) -> Tuple[Tensor, Optional[Tensor], Optional[Any]]:
         if self.fused_block and self.training:
             fn = TransformerMoEBlockFunction
-            return fn.apply(
+            block = lambda x, expert_w1, expert_w2, expert_w3: fn.apply(
                 self.layer_id,
                 x,
                 freqs_cis,
@@ -302,9 +306,7 @@ class TransformerMoEBlock(nn.Module):
                 self.moe.fc3.weight if self.moe.fc3 is not None else None,
                 self.moe.router.weight,
                 self.moe.n_experts,
-                self.moe.n_local_experts,
-                self.moe.expert_start_idx,
-                self.moe.expert_end_idx,
+                self.moe.dispatcher,
                 self.moe.topk,
                 self.moe.permutation_backend,
                 self.moe.router.score_func,
@@ -312,9 +314,9 @@ class TransformerMoEBlock(nn.Module):
                 self.moe.router.bias_update_rate,
                 self.moe.router.scaling_factor,
                 moe_router_load_balancing_type,
-                self.moe.experts.weight1,
-                self.moe.experts.weight2,
-                self.moe.experts.weight3,
+                expert_w1,
+                expert_w2,
+                expert_w3,
                 self.moe.experts.backend,
                 self.dropout,
                 self.attention.attention_dropout,
@@ -333,7 +335,14 @@ class TransformerMoEBlock(nn.Module):
                 self.recompute_fc1_out,
                 self.recompute_fc3_out,
                 self.recompute_router,
+                self.moe_keep_dispatched,
+                prefetch.slot() if prefetch is not None else None,
             )
+            if experts_gathered:
+                # the caller runs this layer as the experts' forward (see Transformer.run_layer)
+                return block(x, self.moe.experts.weight1, self.moe.experts.weight2, self.moe.experts.weight3)
+            # the experts run inside the fused block: run it as their forward, for their FSDP unit
+            return self.moe.experts.run_fused(block, x)
 
         y, cache = self.attention(
             x, freqs_cis, bos_mask, segments, attn_stability_control, deterministic, cache
@@ -358,6 +367,7 @@ class TransformerMoVABlock(nn.Module):
         self.recompute_fc1_out = cfg.recompute_fc1_out
         self.recompute_fc3_out = cfg.recompute_fc3_out
         self.recompute_router = cfg.recompute_router
+        self.moe_keep_dispatched = cfg.moe_keep_dispatched
         self.dropout = cfg.dropout
         self.apply_rmsnorm = cfg.apply_rmsnorm
         self.layernorm_eps = cfg.layernorm_eps
@@ -438,10 +448,12 @@ class TransformerMoVABlock(nn.Module):
         attn_stability_control: int = 0,
         deterministic: bool = True,
         cache: Optional[Tuple[Tensor, Tensor, int]] = None,
+        experts_gathered: bool = False,
+        prefetch: Optional[DispatchPrefetch] = None,
     ) -> Tuple[Tensor, Optional[Tensor], Optional[Any]]:
         if self.fused_block and self.training:
             fn = TransformerMoVABlockFunction
-            return fn.apply(
+            block = lambda x, expert_w1, expert_w2, expert_w3: fn.apply(
                 self.layer_id,
                 x,
                 freqs_cis,
@@ -477,9 +489,7 @@ class TransformerMoVABlock(nn.Module):
                 self.moe.fc3.weight if self.moe.fc3 is not None else None,
                 self.moe.router.weight,
                 self.moe.n_experts,
-                self.moe.n_local_experts,
-                self.moe.expert_start_idx,
-                self.moe.expert_end_idx,
+                self.moe.dispatcher,
                 self.moe.topk,
                 self.moe.permutation_backend,
                 self.moe.router.score_func,
@@ -487,9 +497,9 @@ class TransformerMoVABlock(nn.Module):
                 self.moe.router.bias_update_rate,
                 self.moe.router.scaling_factor,
                 moe_router_load_balancing_type,
-                self.moe.experts.weight1,
-                self.moe.experts.weight2,
-                self.moe.experts.weight3,
+                expert_w1,
+                expert_w2,
+                expert_w3,
                 self.moe.experts.backend,
                 self.dropout,
                 self.mova.attention_dropout,
@@ -508,7 +518,14 @@ class TransformerMoVABlock(nn.Module):
                 self.recompute_fc1_out,
                 self.recompute_fc3_out,
                 self.recompute_router,
+                self.moe_keep_dispatched,
+                prefetch.slot() if prefetch is not None else None,
             )
+            if experts_gathered:
+                # the caller runs this layer as the experts' forward (see Transformer.run_layer)
+                return block(x, self.moe.experts.weight1, self.moe.experts.weight2, self.moe.experts.weight3)
+            # the experts run inside the fused block: run it as their forward, for their FSDP unit
+            return self.moe.experts.run_fused(block, x)
 
         y, aux_loss_mova, cache = self.mova(
             x, freqs_cis, bos_mask, segments, attn_stability_control, deterministic, cache, moe_router_load_balancing_type
@@ -613,14 +630,16 @@ class Transformer(XLLModel):
     def __init__(self, cfg: ModelConf, tokenizer: Tokenizer):
         super().__init__(cfg, tokenizer)
         self.chunk_size = cfg.chunk_size
+        self.moe_prefetch_dispatch = cfg.moe_prefetch_dispatch and cfg.fused_block
         self.context_parallel_size = get_context_parallel_world_size()
         self.context_parallel_rank = get_context_parallel_rank()
 
         if cfg.ddp_backend == 'fsdp1':
             from torch.distributed.fsdp.wrap import wrap
+            wrap_experts = lambda module: module
         else:
             assert cfg.ddp_backend == 'fsdp2'
-            from xllm.distributed.wrap import wrap
+            from xllm.distributed.wrap import wrap, wrap_experts, prefetch_experts_in_backward
 
         init_fn = get_init_fn('gaussian', dim=self.model_dim, std=cfg.init_embed_std)
         self.embed = wrap(ParallelEmbedding(
@@ -640,9 +659,30 @@ class Transformer(XLLModel):
             block_cls = TransformerBlock if layer_id < self.num_dense_layers else \
                 (TransformerMoVABlock if self.num_values > 0 else TransformerMoEBlock)
             layer = block_cls(cfg, layer_id)
+            if hasattr(layer, 'moe'):
+                # the routed experts are their own FSDP unit, inside the layer's
+                wrap_experts(layer.moe.experts)
             self.layers.append(wrap(layer))
 
         self.output = wrap(TransformerOutputLayer(cfg))
+        if cfg.ddp_backend == 'fsdp2':
+            prefetch_experts_in_backward(list(self.layers) + [self.output])
+
+    def run_layer(
+        self, layer: nn.Module, x: Tensor, *args: Any, prefetch: Optional[DispatchPrefetch] = None
+    ) -> Tuple[Tensor, Optional[Tensor], Optional[Any]]:
+        """Return layer(x, *args); a fused MoE layer in training runs as the forward of its experts, with its
+        slot of prefetch (moe_prefetch_dispatch)."""
+        if isinstance(layer, (TransformerMoEBlock, TransformerMoVABlock)) and layer.fused_block and self.training:
+            # The fused block computes the experts. With the layer inside the experts' call rather than the
+            # experts inside the layer's, FSDP reduce-scatters the layer's other gradients before the experts'
+            # (it waits for one reduce-scatter to end before the next), so the experts' one overlaps the
+            # backward of the layer below instead of holding up the start of it.
+            # The layer reads the gathered weights from the experts module.
+            return layer.moe.experts.run_fused(
+                lambda x, *_: layer(x, *args, experts_gathered=True, prefetch=prefetch), x
+            )
+        return layer(x, *args)
 
     def forward(
         self,
@@ -694,18 +734,22 @@ class Transformer(XLLModel):
 
         aux_loss_sum = None
         health_collector = get_active_health_collector()
+        # the fused MoE layers' backward prefetch links the layers of this pass; only when a backward follows
+        prefetch = None
+        if self.moe_prefetch_dispatch and self.training and torch.is_grad_enabled() and not self.layerwise_ckpt:
+            prefetch = DispatchPrefetch()
         for i, layer in enumerate(self.layers):
             layer_cache = cache[i] if cache is not None else None
             if self.layerwise_ckpt:
                 x, aux_loss, layer_cache = checkpoint(
-                    layer, x, freq_cis, bos_mask, segments, moe_router_load_balancing_type,
+                    self.run_layer, layer, x, freq_cis, bos_mask, segments, moe_router_load_balancing_type,
                     attn_stability_control, deterministic, layer_cache,
                     use_reentrant=False, preserve_rng_state=True
                 )
             else:
-                x, aux_loss, layer_cache = layer(
-                    x, freq_cis, bos_mask, segments, moe_router_load_balancing_type,
-                    attn_stability_control, deterministic, layer_cache
+                x, aux_loss, layer_cache = self.run_layer(
+                    layer, x, freq_cis, bos_mask, segments, moe_router_load_balancing_type,
+                    attn_stability_control, deterministic, layer_cache, prefetch=prefetch,
                 )
 
             if health_collector is not None:

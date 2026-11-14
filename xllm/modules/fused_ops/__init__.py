@@ -54,5 +54,7 @@ from .memory_efficient_dropout import (
 from xllm.modules.fused_ops.mgmm.multi_group_matmul import (
     mgmm,
     multi_group_matmul_fwd,
-    multi_group_matmul_bwd
+    multi_group_matmul_bwd,
+    multi_group_matmul_dgrad,
+    multi_group_matmul_wgrad,
 )

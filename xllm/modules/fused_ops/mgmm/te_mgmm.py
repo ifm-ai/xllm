@@ -111,55 +111,47 @@ def _te_multi_group_matmul(inp1, inp2, inp3, group_sizes: List[int], transpose: 
         sm_count - margin_sm,       # available_sm_count
     )
     
-    # Handle second output if needed using TE grouped GEMM
-    out2 = None
-    if inp3 is not None:
-        # inp3 is [bsz, d']
-        inp3_te = list(torch.split(inp3, group_sizes, dim=0))
-
-        # out2 is same shape as inp2
-        out2 = torch.empty_like(inp2)
-        if transpose:
-            # inp3.T @ inp1 -> [d', d]
-            te.general_grouped_gemm(
-                inp1_te,                    # A matrices
-                False,                      # transa
-                inp3_te,                    # B matrices
-                True,                       # transb
-                [out2],                     # output matrices
-                TE_DType[activation_dtype], # output dtype
-                group_sizes,                # m_splits
-                bias_empty,                 # bias (unused)
-                TE_DType[torch.bfloat16],   # bias_dtype
-                True,                       # single_output = False
-                pre_gelu_empty,             # pre_gelu_out
-                False,                      # grad
-                workspaces,                 # workspaces
-                workspaces[0].shape[0],     # workspace_size
-                False,                      # accumulate
-                False,                      # use_split_accumulator
-                sm_count - margin_sm,       # available_sm_count
-            )
-        else:
-            # inp1.T @ inp3 -> [d, d']
-            te.general_grouped_gemm(
-                inp3_te,                    # A matrices
-                False,                      # transa
-                inp1_te,                    # B matrices
-                True,                       # transb
-                [out2],                     # output matrices
-                TE_DType[activation_dtype], # output dtype
-                group_sizes,                # m_splits
-                bias_empty,                 # bias (unused)
-                TE_DType[torch.bfloat16],   # bias_dtype
-                True,                       # single_output = False
-                pre_gelu_empty,             # pre_gelu_out
-                False,                      # grad
-                workspaces,                 # workspaces
-                workspaces[0].shape[0],     # workspace_size
-                False,                      # accumulate
-                False,                      # use_split_accumulator
-                sm_count - margin_sm,       # available_sm_count
-            )
-    
+    out2 = None if inp3 is None else _te_multi_group_matmul_wgrad(inp1, inp2, inp3, group_sizes, transpose)
     return out1, out2
+
+
+def _te_multi_group_matmul_wgrad(inp1, inp2, inp3, group_sizes: List[int], transpose: bool):
+    # the second output of _te_multi_group_matmul (inp3 given), in one grouped GEMM
+    n_groups = inp2.shape[0]
+    assert len(group_sizes) == n_groups
+    activation_dtype = inp1.dtype
+
+    # inp1 is [bsz, d], inp3 is [bsz, d']
+    inp1_te = list(torch.split(inp1, group_sizes, dim=0))
+    inp3_te = list(torch.split(inp3, group_sizes, dim=0))
+    # out2 is same shape as inp2
+    out2 = torch.empty_like(inp2)
+
+    workspaces = get_workspace(inp1.device)
+    bias_empty = _empty_tensors(n_groups, inp1.device, torch.bfloat16)
+    pre_gelu_empty = _empty_tensors(n_groups, inp1.device, torch.bfloat16)
+    sm_count = get_sm_count()
+    margin_sm = int(os.getenv("NVTE_EXT_MARGIN_SM", "0"))
+
+    # transpose: inp3.T @ inp1 -> [d', d], otherwise inp1.T @ inp3 -> [d, d']
+    a_te, b_te = (inp1_te, inp3_te) if transpose else (inp3_te, inp1_te)
+    te.general_grouped_gemm(
+        a_te,                       # A matrices
+        False,                      # transa
+        b_te,                       # B matrices
+        True,                       # transb
+        [out2],                     # output matrices
+        TE_DType[activation_dtype], # output dtype
+        group_sizes,                # m_splits
+        bias_empty,                 # bias (unused)
+        TE_DType[torch.bfloat16],   # bias_dtype
+        True,                       # single_output
+        pre_gelu_empty,             # pre_gelu_out
+        False,                      # grad
+        workspaces,                 # workspaces
+        workspaces[0].shape[0],     # workspace_size
+        False,                      # accumulate
+        False,                      # use_split_accumulator
+        sm_count - margin_sm,       # available_sm_count
+    )
+    return out2
