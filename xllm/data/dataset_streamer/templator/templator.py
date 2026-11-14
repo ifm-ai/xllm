@@ -399,9 +399,7 @@ def tokenize_multiturn_template(
     input_ids = _field(tokenized_output, "input_ids")
     assistant_masks = _field(tokenized_output, "assistant_masks")
 
-    target_mask = [
-        True if mask == 1 else False for mask in assistant_masks
-    ]
+    target_mask = [mask == 1 for mask in assistant_masks]
 
     # add BOS & EOS
     input_ids = list(input_ids) + [tokenizer.eos_id]
