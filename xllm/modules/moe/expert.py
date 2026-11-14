@@ -12,6 +12,7 @@ from xllm.distributed import (
 )
 from xllm.distributed.utils import divide_and_check_no_remainder
 from xllm.utils import get_init_fn
+from xllm.optim.muon_spec import register_muon
 from xllm.modules.fused_ops import memory_efficient_dropout
 from xllm.modules.fused_ops import mgmm
 
@@ -80,6 +81,12 @@ class Expert(nn.Module):
         # init w2
         init_fn = get_init_fn(init_mode, dim=expert_inter_dim, std=init_std)
         _init_affine_weight(self.weight2, num_experts, self.model_dim, self.inter_dim, init_fn)
+
+        # Muon (xllm/optim/muon.py): one Newton-Schulz block per expert, named as forward rearranges them
+        # (experts are split over the tensor-parallel group along dim 0)
+        register_muon(self, "weight1", "(n s) d", fan_out="s", fan_in="d", s=self.inter_dim, tp_dim=0)
+        register_muon(self, "weight3", "(n s) d", fan_out="s", fan_in="d", s=self.inter_dim, tp_dim=0)
+        register_muon(self, "weight2", "(n s) d", fan_out="s", fan_in="d", s=self.model_dim, tp_dim=0)  # s = model dim here
 
     def forward(self, x: torch.Tensor, group_sizes: List[int]) -> torch.Tensor:
         w1 = rearrange(self.weight1, '(n s) d -> n s d', n=self.n_local_experts)
