@@ -385,7 +385,7 @@ def apply_chat_template_randomized(
 def tokenize_multiturn_template(
     sample: Dict[str, Any],
     tokenizer: Tokenizer,
-    text_format: str = None,
+    text_format: str,
     conversation_key: str = "conversation",
     rng: Optional[Any] = None,
 ) -> Dict[str, Any]:
