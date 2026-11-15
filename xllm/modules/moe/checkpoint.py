@@ -28,6 +28,8 @@ from xllm.distributed import (
     get_expert_outer_rank,
     get_expert_outer_world_size,
 )
+from xllm.distributed.utils import get_expert_shard_size
+from xllm.utils import get_parallel_ranks
 from .expert import Expert
 
 OUTER_DIM = "expert_outer"
@@ -142,3 +144,31 @@ def expert_states_from_checkpoint(model: nn.Module, optim_state: Dict[str, Any])
             if isinstance(value, torch.Tensor) and value.dim() > 0:
                 states[key][name] = _from_checkpoint(value, param, f"{key}.{name}")
     return optim_state
+
+
+def master_rank_with_expert_replicas(
+    global_rank: int,
+    data_parallel_size: int,
+    context_parallel_size: int,
+    model_parallel_size: int,
+    fully_sharded_size: int,
+    expert_outer_size: int,
+) -> int:
+    """
+    With EP > TP, the first rank holding the same model shard as global_rank and the same routed experts and
+    expert shard. The data parallel replicas of a model shard hold different experts (those of their place o in
+    their expert group), so each o needs its own master. The experts are sharded over
+    get_expert_shard_size(fully_sharded_size, DP / E_out) blocks of consecutive expert groups (see
+    get_expert_device_mesh).
+    """
+    data_rank, _, model_rank = get_parallel_ranks(global_rank, model_parallel_size, context_parallel_size)
+    n_expert_groups = data_parallel_size // expert_outer_size
+    expert_block = n_expert_groups // get_expert_shard_size(fully_sharded_size, n_expert_groups)
+    model_block = data_parallel_size // fully_sharded_size
+
+    def same_states(d: int) -> bool:
+        return (d // model_block == data_rank // model_block and d % expert_outer_size == data_rank % expert_outer_size
+                and d // expert_outer_size // expert_block == data_rank // expert_outer_size // expert_block)
+
+    master_data_rank = min(d for d in range(data_parallel_size) if same_states(d))
+    return master_data_rank * context_parallel_size * model_parallel_size + model_rank
