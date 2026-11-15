@@ -188,9 +188,13 @@ class ModelConf(Config):
     recompute_router: bool = False  # Whether to recompute router scores for MoE/MoVA in fused block.
 
     recompute_logits: bool = False  # Whether to recompute logits in output layer. Independent of fused_block. True = recompute logits and compute grad_X/grad_W during backward, False = precompute grad_X/grad_W during forward.
+    mtp_depth: int = 0  # Multi-token prediction (xllm/modules/mtp.py): number of extra tokens predicted in training, 0 = off. Adds one Transformer block per token; the loss weight is mtp_loss_weight.
 
     def __post_init__(self):
         assert self.arch in ['transformer', 'gekko']
+        assert self.mtp_depth >= 0, f"mtp_depth must be >= 0, got {self.mtp_depth}"
+        if self.mtp_depth > 0:
+            assert self.arch == 'transformer', f"multi-token prediction needs arch transformer, got {self.arch}"
         assert self.ddp_backend in ['fsdp1', 'fsdp2']
 
         assert self.causal_attn_backend in [None, "swift", "flash", 'xattn']
@@ -357,6 +361,7 @@ class TrainerConf(Config):
     moe_router_load_balancing_type: Optional[str] = None  # Router load balancing aux loss: dot or entropy. None disables it.
     moe_aux_loss_coeff: float = 0.0  # Coeff of router load balancing aux loss in the total training loss.
     moe_z_loss_coeff: float = 0.0  # Coeff for router z-loss.
+    mtp_loss_weight: float = 0.3  # Weight of the multi-token prediction loss in the training loss (model.mtp_depth > 0): loss + mtp_loss_weight / mtp_depth x the sum of the extra tokens' losses.
 
     # FSDP parameters
     fp32_reduce_scatter: bool = True  # Whether to use fp32 for FSDP gradient reduction. Otherwise uses the training compute dtype.
@@ -451,6 +456,10 @@ class TrainerConf(Config):
             assert self.model.num_values > 0, "MoVA statistics require model.num_values > 0"
         if self.health_logits_stats:
             assert self.health_metrics, "Logit statistics require health_metrics=true"
+            # the MTP rows go through the same output layer and would be counted in the logit statistics
+            assert self.model.mtp_depth == 0, "Logit statistics are not supported with multi-token prediction"
+        if self.model.mtp_depth > 0:
+            assert self.mtp_loss_weight > 0, f"mtp_loss_weight must be positive, got {self.mtp_loss_weight}"
         if self.health_weight_norms or self.health_gradient_norms:
             assert self.health_metrics, "Matrix norms require health_metrics=true"
             # Dense Gekko is enforced by the health_metrics gate above.
