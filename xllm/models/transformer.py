@@ -1,4 +1,4 @@
-from typing import Optional, Sequence, Tuple, List, Any
+from typing import Optional, Tuple, List, Any, Callable
 import torch
 from torch import Tensor
 from torch import nn
@@ -580,22 +580,26 @@ class TransformerOutputLayer(nn.Module):
             self.recompute_logits,
         )
 
+    def mtp_loss(self, k: int, x: Tensor, y: Tensor, mask: Tensor) -> Tensor:
+        """The token losses of multi-token prediction module k, with its final norm: one more call of the fused
+        loss, so that each loss gets its own (uniform) gradient scale in backward."""
+        return self._loss(self.mtp_norms[k - 1], x, y, mask)
+
     def forward(
         self,
         x: Tensor,
         y: Optional[Tensor],
         mask: Optional[Tensor] = None,
-        mtp: Sequence[Tuple[Tensor, Tensor, Tensor]] = (),
+        mtp: Optional[Callable[[nn.Module], List[Tensor]]] = None,
     ):
-        """mtp: (hidden states, targets, mask) of each multi-token prediction module, in training only; then the
-        token losses are returned as (main, [one per module])."""
+        """mtp: in training only, runs the multi-token prediction modules inside this forward, where the norms are
+        gathered, and returns their token losses; then the token losses are returned as (main, mtp(self))."""
         if self.training:
             assert y is not None
             loss = self._loss(self.final_norm, x, y, mask)
-            if not mtp:
+            if mtp is None:
                 return loss
-            # a call per loss: each gets its own (uniform) gradient scale in backward
-            return loss, [self._loss(norm, *rows) for norm, rows in zip(self.mtp_norms, mtp)]
+            return loss, mtp(self)
 
         x = self.final_norm(x)
         if not self.final_norm.gather_input:

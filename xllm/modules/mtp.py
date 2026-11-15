@@ -1,11 +1,12 @@
 """Multi-token prediction (MTP), as in DeepSeek-V3: at every position j, mtp_depth extra modules also learn the
 tokens j+2, ..., j+1+mtp_depth.
 
-Module k (1-based) takes the hidden state at j of the module before it (for k = 1, the main model's last hidden state,
-before the final norm) and the embedding of the real token j+k, normalizes both, joins them and projects them back to
-the model width (h'), runs one Transformer block, of the same kind as the main model's last layer, over the sequence
-of h', and passes the result to the output layer, which predicts token j+1+k with the module's own final norm
-(TransformerOutputLayer.mtp_norms[k - 1]) and the shared output weight.
+Module k (1-based) takes the hidden state at j of the module before it after that module's final norm (for k = 1,
+the main model's last hidden state after its final norm) and the embedding of the real token j+k, normalizes both,
+joins them and projects them back to the model width (h'), runs one Transformer block, of the same kind as the main
+model's last layer, over the sequence of h', and passes the result to the output layer, which predicts token j+1+k
+with the module's own final norm (TransformerOutputLayer.mtp_norms[k - 1]) and the shared output weight. This is the
+convention of DeepSeek-V3's MTP weights in vLLM and SGLang, which give the MTP layers the final-normed hidden states.
 Training only: the main model is unchanged, and eval, generation and inference never run the modules.
 
 Under context parallelism the embedding of token j+k at the last k positions of a CP rank's slice is on the next rank;
@@ -21,7 +22,11 @@ from torch.utils.checkpoint import checkpoint
 from xllm.distributed import get_context_parallel_world_size
 from xllm.modules.context_parallel import gather_from_context_parallel_region
 from xllm.modules.layer_norm import GroupLayerNorm
-from xllm.modules.model_parallel import ColumnParallelLinear, gather_copy_model_parallel_region
+from xllm.modules.model_parallel import (
+    ColumnParallelLinear,
+    gather_copy_model_parallel_region,
+    scatter_to_model_parallel_region,
+)
 from xllm.modules.rms_norm import GroupRMSNorm
 from xllm.utils import get_init_fn
 
@@ -88,9 +93,9 @@ class MTPLayer(nn.Module):
         return x
 
     def forward(self, hidden: Tensor, embeddings: Tensor, block_args: Tuple, layerwise_ckpt: bool):
-        """hidden: the previous module's (or the main model's last) hidden states (B x L x D/TP); embeddings: the
-        main model's token embeddings (B x L x D/TP, before dropout); block_args: the main layers' arguments after
-        x, without the cache. Returns the block's output (B x L x D/TP) and its aux loss (or None)."""
+        """hidden: the previous module's (or the main model's last) hidden states after its final norm (B x L x D/TP);
+        embeddings: the main model's token embeddings (B x L x D/TP, before dropout); block_args: the main layers'
+        arguments after x, without the cache. Returns the block's output (B x L x D/TP) and its aux loss (or None)."""
         # the embedding of token j+k at position j; zero at the last k positions, which get no target
         nxt = torch.zeros_like(embeddings)
         nxt[:, :-self.k] = embeddings[:, self.k:]
@@ -127,17 +132,30 @@ class MultiTokenPrediction(nn.Module):
         block_args: Tuple,
         layerwise_ckpt: bool,
     ) -> Tensor:
-        """Runs the modules after the main model's last layer, in training, and calls the output layer for all
-        losses. Returns the main token losses as the output layer does; the MTP ones are kept for take_outputs."""
-        rows, aux_loss_sum = [], None
-        hidden = x
-        for k, layer in enumerate(self.layers, start=1):
-            hidden, aux_loss = layer(hidden, embeddings, block_args, layerwise_ckpt)
-            rows.append((hidden, *mtp_targets(targets, token_mask, eos_id, k)))
-            if aux_loss is not None:
-                aux_loss_sum = aux_loss if aux_loss_sum is None else aux_loss_sum + aux_loss
-        loss, mtp_losses = output(x, targets, token_mask, mtp=rows)
-        masks = [mask for _, _, mask in rows]
+        """Calls the output layer for the main token losses, after the main model's last layer, in training; the
+        output layer runs the modules (run_in_output) inside its forward, where its norms are gathered. Returns the
+        main token losses as the output layer does; the MTP ones are kept for take_outputs."""
+        aux_losses = []
+
+        def run_in_output(output: nn.Module) -> List[Tensor]:
+            # module k's input: the previous hidden state after its final norm (the main model's, then module k-1's)
+            norms = [output.final_norm, *output.mtp_norms]
+            hidden, losses = x, []
+            for k, layer in enumerate(self.layers, start=1):
+                normed = norms[k - 1](hidden)
+                if norms[k - 1].gather_input:
+                    normed = scatter_to_model_parallel_region(normed)
+                hidden, aux_loss = layer(normed, embeddings, block_args, layerwise_ckpt)
+                y, mask = mtp_targets(targets, token_mask, eos_id, k)
+                losses.append(output.mtp_loss(k, hidden, y, mask))
+                masks.append(mask)
+                if aux_loss is not None:
+                    aux_losses.append(aux_loss)
+            return losses
+
+        masks = []
+        loss, mtp_losses = output(x, targets, token_mask, mtp=run_in_output)
+        aux_loss_sum = sum(aux_losses[1:], aux_losses[0]) if aux_losses else None
         if get_context_parallel_world_size() > 1:
             mtp_losses = [gather_from_context_parallel_region(t) for t in mtp_losses]
             masks = [gather_from_context_parallel_region(t) for t in masks]
