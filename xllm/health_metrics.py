@@ -60,13 +60,14 @@ _GEKKO_OPTIONAL_MATRIX_PARAMETER_PATHS = (
 )
 
 _MatrixParameterPaths = Tuple[Tuple[str, str], ...]
-_MatrixNormBlock = Tuple[Tuple[str, ...], torch.Tensor]
+_MatrixNormBlock = Tuple[Tuple[str, ...], torch.Tensor, Optional[str]]
 
 
 class _MatrixNormLayout(NamedTuple):
     """What one parameter's norms look like; built on the first sampled step, it never changes."""
     selections: list  # the logical matrices it holds (MatrixSlice)
     names: Dict[str, Tuple[str, ...]]  # family -> one metric name per logical matrix
+    prefixes: Dict[str, Optional[str]]  # family -> dashboard prefix for routed experts / MoVA values
     partitions: dict  # packed-slice boundaries, keyed by shard layout
 
 
@@ -228,7 +229,7 @@ class HealthMetricCollector:
         self.decoder_layer_activation_records: Dict[int, _LocalStats] = {}
         self.query_key_stats_records: Dict[int, Dict[str, _LocalStats]] = {}
         self.gekko_stats_records: Dict[int, Dict[str, _LocalStats]] = {}
-        # One block per parameter: (metric names, squared l2 of each logical matrix in it).
+        # One block per parameter: (metric names, squared l2 of each logical matrix in it, dashboard prefix).
         self.matrix_norm_blocks: List[_MatrixNormBlock] = []
         self.expected_matrix_norm_records: Optional[int] = None
         self.matrix_norm_layouts: Dict[Tuple[int, str], _MatrixNormLayout] = {}
@@ -413,10 +414,14 @@ class HealthMetricCollector:
         key = (layer_idx, fqn)
         if key not in self.matrix_norm_layouts:
             selections = _layer_matrix_selections(layer, layer_idx, fqn, shape, paths)
+            parts = selections[0].path.split("/") if selections else []
+            # Dashboards get statistics over the routed experts or MoVA values, not one curve each.
+            routed = len(selections) > 1 and parts[-3] in ("experts", "values")
             families = ("weight_norms", "gradient_norms")
             self.matrix_norm_layouts[key] = _MatrixNormLayout(
                 selections,
                 {f: tuple(f"{f}/{selection.path}/l2" for selection in selections) for f in families},
+                {f: "/".join([f] + parts[:-2] + parts[-1:]) if routed else None for f in families},
                 {},
             )
         return self.matrix_norm_layouts[key]
@@ -424,10 +429,10 @@ class HealthMetricCollector:
     def _add_matrix_norms(self, family: str, layout: _MatrixNormLayout, squares: torch.Tensor) -> None:
         """Record one parameter's squared l2 contributions, one per logical matrix it holds."""
         names = layout.names[family]
-        self.matrix_norm_blocks.append((names, squares.reshape(len(names))))
+        self.matrix_norm_blocks.append((names, squares.reshape(len(names)), layout.prefixes[family]))
 
     def _num_matrix_norm_records(self) -> int:
-        return sum(len(names) for names, _ in self.matrix_norm_blocks)
+        return sum(len(names) for names, _, _ in self.matrix_norm_blocks)
 
     def _check_matrix_norm_records(self, num_matrices: int) -> None:
         num_enabled_norms = (
@@ -435,7 +440,7 @@ class HealthMetricCollector:
         )
         expected_records = num_matrices * num_enabled_norms
         if not self.matrix_norm_names_checked:  # names never change, so the first step settles it
-            names = [name for block_names, _ in self.matrix_norm_blocks for name in block_names]
+            names = [name for block_names, _, _ in self.matrix_norm_blocks for name in block_names]
             if len(set(names)) != len(names):
                 raise RuntimeError("Duplicate matrix norm metrics")
             self.matrix_norm_names_checked = True
@@ -691,6 +696,27 @@ class HealthMetricCollector:
         self.logits_stats_record = None
         self.router_stats_records = {}
 
+    @staticmethod
+    def _packed_norm_summaries(
+        blocks: list[Tuple[Tuple[str, ...], Optional[str]]], norms: torch.Tensor,
+    ) -> Dict[str, float]:
+        """Mean/min/max/std over the experts or values of each packed parameter, in one transfer."""
+        stats, prefixes, offset = [], [], 0
+        for names, prefix in blocks:
+            if prefix is not None:
+                block = norms[offset:offset + len(names)]
+                stats.append(torch.stack((block.mean(), block.min(), block.max(), block.std())))
+                prefixes.append(prefix)
+            offset += len(names)
+        if not stats:
+            return {}
+        values = torch.stack(stats).cpu().tolist()
+        return {
+            f"{prefix}/l2_{name}": value
+            for prefix, row in zip(prefixes, values)
+            for name, value in zip(("mean", "min", "max", "std"), row)
+        }
+
     def flush(self, mlogger: "MetricLogger", step: int) -> None:
         if not self.recording:
             return
@@ -812,11 +838,11 @@ class HealthMetricCollector:
             counts = torch.cat((counts, logits_count.reshape(1)))
             logits_extrema = logits_minimum, logits_maximum
         # Every rank records the same parameters in the same order, so blocks pack identically.
-        matrix_metric_names = [name for names, _ in self.matrix_norm_blocks for name in names]
+        matrix_blocks = [(names, prefix) for names, _, prefix in self.matrix_norm_blocks]
         matrix_squared_l2_start = sums.numel()
-        if matrix_metric_names:
+        if matrix_blocks:
             matrix_squared_l2_values = torch.cat(
-                [squares for _, squares in self.matrix_norm_blocks]
+                [squares for _, squares, _ in self.matrix_norm_blocks]
             ).double()
             sums = torch.cat((sums, matrix_squared_l2_values))
         router_start = sums.numel()
@@ -898,15 +924,18 @@ class HealthMetricCollector:
             metrics["logits_stats/mean"] = logit_sum / logit_count
             metrics["logits_stats/min"] = logit_minimum
             metrics["logits_stats/max"] = logit_maximum
-        if matrix_metric_names:
-            matrix_norm_values = (
-                reduced_sums[matrix_squared_l2_start:router_start]
-                .clamp_min(0)
-                .sqrt()
-                .cpu()
-                .tolist()
-            )
-            metrics.update(dict(zip(matrix_metric_names, matrix_norm_values)))
+        dashboard_metrics = None
+        if matrix_blocks:
+            norms = reduced_sums[matrix_squared_l2_start:router_start].clamp_min(0).sqrt()
+            metrics.update(zip(
+                (name for names, _ in matrix_blocks for name in names), norms.cpu().tolist(),
+            ))
+            summaries = self._packed_norm_summaries(matrix_blocks, norms)
+            if summaries:
+                # Per-expert / per-value norms go to the jsonl only; dashboards get their statistics.
+                packed = {name for names, prefix in matrix_blocks if prefix is not None for name in names}
+                dashboard_metrics = {k: v for k, v in metrics.items() if k not in packed}
+                dashboard_metrics.update(summaries)
         if router_records:
             router_metrics = {}
             offset = router_start
@@ -918,4 +947,9 @@ class HealthMetricCollector:
                 offset = end
             values = torch.stack(list(router_metrics.values())).cpu().tolist()
             metrics.update(zip(router_metrics, values))
-        mlogger.log(metrics, step)
+            if dashboard_metrics is not None:
+                dashboard_metrics.update(zip(router_metrics, values))
+        if dashboard_metrics is None:
+            mlogger.log(metrics, step)
+        else:
+            mlogger.log(metrics, step, dashboard_metrics=dashboard_metrics)

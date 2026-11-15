@@ -147,7 +147,7 @@ def test_expert_ids_and_norms_survive_fsdp_tp_cp_and_replication(mova):
                 collector = HealthMetricCollector(True, 1, 1, enable_weight_norms=True, enable_gradient_norms=True)
                 collector.begin_step(1)
                 collector.record_matrix_norms(model, gradient_scale=2)
-                for names, squares in collector.matrix_norm_blocks:
+                for names, squares, _ in collector.matrix_norm_blocks:
                     for name, value in zip(names, squares):
                         actual[name] = actual.get(name, 0) + value
     for family in ("weight_norms", "gradient_norms"):
