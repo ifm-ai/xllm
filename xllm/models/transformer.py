@@ -43,6 +43,7 @@ from xllm.models.fused_blocks import (
     TransformerOutputLayerFunction,
 )
 from xllm.utils import get_init_fn
+from xllm.modules.mtp import MultiTokenPrediction
 
 
 class TransformerBlock(nn.Module):
@@ -664,6 +665,10 @@ class Transformer(XLLModel):
 
         self.output = wrap(TransformerOutputLayer(cfg))
 
+        # multi-token prediction (xllm/modules/mtp.py): a block of the last layer's kind per module, training only.
+        # Built last, so that the main model's weights are initialized as without it.
+        self.mtp = MultiTokenPrediction(cfg, block_cls, wrap) if cfg.mtp_depth > 0 else None
+
     def forward(
         self,
         tokens: Tensor,
@@ -737,7 +742,14 @@ class Transformer(XLLModel):
             if cache is not None:
                 cache[i] = layer_cache
 
-        logits_or_loss = self.output(x, targets, token_mask)
+        if self.mtp is not None and self.training and targets is not None:
+            # multi-token prediction: its losses are kept for self.mtp.take_outputs()
+            block_args = (freq_cis, bos_mask, segments, moe_router_load_balancing_type, attn_stability_control,
+                          deterministic)
+            logits_or_loss = self.mtp(self.output, x, emb, targets, token_mask, self.eos_id, block_args,
+                                      self.layerwise_ckpt)
+        else:
+            logits_or_loss = self.output(x, targets, token_mask)
         if targets is not None and self.context_parallel_size > 1:
             logits_or_loss = gather_from_context_parallel_region(logits_or_loss)
 
@@ -800,6 +812,9 @@ class Transformer(XLLModel):
             return seg_mask
 
     def num_parameters(self):
+        return self._num_parameters() if self.mtp is None else self.mtp.num_parameters(self)
+
+    def _num_parameters(self):
         embed_params = self.model_dim * self.vocab_size * 2
         nk = {"softmax": 1, "softdelta": 2}[self.attn_act_func]
         attn_params_per_block = self.model_dim * (self.num_heads * 2 + self.num_kv_heads * (nk + 1)) * self.head_dim
@@ -849,6 +864,9 @@ class Transformer(XLLModel):
         return total_params, activated_params, embed_params
 
     def tflops_per_token(self, seq_len: int):
+        return self._tflops_per_token(seq_len) if self.mtp is None else self.mtp.tflops_per_token(self, seq_len)
+
+    def _tflops_per_token(self, seq_len: int):
         expansion_factor = 6
         embed_flops = self.model_dim + self.vocab_size
         logits_flops = self.model_dim * self.vocab_size
