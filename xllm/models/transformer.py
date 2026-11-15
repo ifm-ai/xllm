@@ -1,4 +1,4 @@
-from typing import Optional, Tuple, List, Any
+from typing import Optional, Sequence, Tuple, List, Any
 import torch
 from torch import Tensor
 from torch import nn
@@ -551,30 +551,50 @@ class TransformerOutputLayer(nn.Module):
             gather_output=False,
             init_method=init_fn
         )
+        # multi-token prediction (xllm/modules/mtp.py): a final norm per module, next to the shared output weight so
+        # that they are gathered with this layer; empty without it
+        self.mtp_norms = nn.ModuleList(
+            norm_cls(
+                cfg.model_dim,
+                num_groups=cfg.layernorm_num_groups,
+                elementwise_affine=cfg.norm_affine,
+                eps=norm_eps,
+                memory_efficient=cfg.memory_efficient_norm
+            ) for _ in range(cfg.mtp_depth)
+        )
+
+    def _loss(self, norm: nn.Module, x: Tensor, y: Tensor, mask: Optional[Tensor]) -> Tensor:
+        return TransformerOutputLayerFunction.apply(
+            x,
+            y,
+            mask,
+            norm.weight,
+            norm.bias,
+            norm.groups_per_partition,
+            self.output.weight,
+            self.layernorm_eps,
+            self.rmsnorm_eps,
+            self.apply_rmsnorm,
+            norm.gather_input,
+            self.recompute_logits,
+        )
 
     def forward(
         self,
         x: Tensor,
         y: Optional[Tensor],
         mask: Optional[Tensor] = None,
+        mtp: Sequence[Tuple[Tensor, Tensor, Tensor]] = (),
     ):
+        """mtp: (hidden states, targets, mask) of each multi-token prediction module, in training only; then the
+        token losses are returned as (main, [one per module])."""
         if self.training:
             assert y is not None
-            fn = TransformerOutputLayerFunction
-            return fn.apply(
-                x,
-                y,
-                mask,
-                self.final_norm.weight,
-                self.final_norm.bias,
-                self.final_norm.groups_per_partition,
-                self.output.weight,
-                self.layernorm_eps,
-                self.rmsnorm_eps,
-                self.apply_rmsnorm,
-                self.final_norm.gather_input,
-                self.recompute_logits,
-            )
+            loss = self._loss(self.final_norm, x, y, mask)
+            if not mtp:
+                return loss
+            # a call per loss: each gets its own (uniform) gradient scale in backward
+            return loss, [self._loss(norm, *rows) for norm, rows in zip(self.mtp_norms, mtp)]
 
         x = self.final_norm(x)
         if not self.final_norm.gather_input:
