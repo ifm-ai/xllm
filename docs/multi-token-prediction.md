@@ -2,8 +2,9 @@
 
 Multi-token prediction (MTP), as in DeepSeek-V3, trains the model to also predict the tokens after next. With depth D,
 at every position j, D extra modules predict the tokens j+2, ..., j+1+D, with the shared output weight. Module k takes
-the hidden state of the module before it (for k = 1, the main model's last hidden state) and the embedding of the
-real token j+k. The main model is unchanged; the modules are used in training only.
+the hidden state of the module before it after that module's final norm (for k = 1, the main model's last hidden
+state after its final norm) and the embedding of the real token j+k. The main model is unchanged; the modules are used
+in training only.
 
 ## Usage
 
@@ -19,12 +20,14 @@ losses; with D > 1 also `avg_mtp_loss_<k>` for each module. Compare runs on `avg
 
 Code: [xllm/modules/mtp.py](../xllm/modules/mtp.py). For each module k = 1, ..., D:
 
-1. Normalize the previous hidden state h (for k = 1, the main model's last hidden state before its final norm) and
-   the embedding of token j+k.
+1. Take the previous hidden state after its final norm (for k = 1, the main model's last hidden state after the
+   main final norm; after, module k-1's output after module k-1's final norm), and normalize it and the embedding of
+   token j+k. This is the convention of DeepSeek-V3's MTP weights in vLLM and SGLang, which give the MTP layers the
+   final-normed hidden states. The modules run inside the output layer's forward, where these norms are gathered.
 2. Concatenate them (2 × model_dim) and project back to model_dim: h′. This happens at every position.
 3. Run one Transformer block over the sequence of h′. The block is built like the main model's last layer (dense,
    MoE or MoVA, fused or not), so all parallelism (TP, CP, FSDP, expert parallelism) applies to it as to any layer.
-   Its output is the next module's h.
+   Its output, after the module's final norm, is the next module's input.
 4. The output layer applies the module's final norm and the shared output weight, and computes the cross-entropy on
    token j+1+k (one more call of its fused loss per module).
 
