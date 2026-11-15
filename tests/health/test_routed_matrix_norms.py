@@ -147,8 +147,9 @@ def test_expert_ids_and_norms_survive_fsdp_tp_cp_and_replication(mova):
                 collector = HealthMetricCollector(True, 1, 1, enable_weight_norms=True, enable_gradient_norms=True)
                 collector.begin_step(1)
                 collector.record_matrix_norms(model, gradient_scale=2)
-                for name, value in collector.matrix_squared_l2_records.items():
-                    actual[name] = actual.get(name, 0) + value
+                for names, squares in collector.matrix_norm_blocks:
+                    for name, value in zip(names, squares):
+                        actual[name] = actual.get(name, 0) + value
     for family in ("weight_norms", "gradient_norms"):
         for path, value in expected.items():
             torch.testing.assert_close(actual[f"{family}/{path}/l2"], value)
@@ -182,10 +183,6 @@ def routed_group(single_process_group, monkeypatch):
     monkeypatch.setattr(parallel_state, "_HYBRID_SHARD_DATA_PARALLEL_WORLD_SIZE", 1)
 
 
-def _chunks(matrix, count, dim):
-    return matrix.chunk(count, dim=dim)
-
-
 def reference_matrices(layer, layer_idx, use_grad):
     """Every logged matrix of one unsharded layer, sliced by hand (independently of matrix_slices)."""
     get = (lambda p: p.grad) if use_grad else (lambda p: p.detach())
@@ -197,7 +194,7 @@ def reference_matrices(layer, layer_idx, use_grad):
     if attention.wr is not None:
         out[f"{prefix}/attention/output_gate"] = get(attention.wr.weight)
     if hasattr(layer, "mova"):
-        for i, value in enumerate(_chunks(get(attention.wv.weight), attention.n_values, 0)):
+        for i, value in enumerate(get(attention.wv.weight).chunk(attention.n_values, 0)):
             out[f"{prefix}/mova/values/value_{i:03d}/v_proj"] = value
         out[f"{prefix}/mova/router"] = get(attention.router.weight)
     else:
@@ -210,12 +207,12 @@ def reference_matrices(layer, layer_idx, use_grad):
     out[f"{prefix}/moe/router"] = get(moe.router.weight)
     for weight, name in (("weight1", "gate_proj"), ("weight2", "down_proj"), ("weight3", "up_proj")):
         packed = get(getattr(moe.experts, weight))
-        for e, expert in enumerate(_chunks(packed, moe.n_experts, 0)):
+        for e, expert in enumerate(packed.chunk(moe.n_experts, 0)):
             out[f"{prefix}/moe/experts/expert_{e:03d}/{name}"] = expert
     if moe.n_shared_experts:
         for fc, name, dim in (("fc1", "gate_proj", 0), ("fc3", "up_proj", 0), ("fc2", "down_proj", 1)):
             packed = get(getattr(moe, fc).weight)
-            for e, expert in enumerate(_chunks(packed, moe.n_shared_experts, dim)):
+            for e, expert in enumerate(packed.chunk(moe.n_shared_experts, dim)):
                 out[f"{prefix}/moe/shared_experts/expert_{e:03d}/{name}"] = expert
     return out
 
@@ -245,17 +242,21 @@ def test_routed_weight_norms_match_unsharded_matrices(backend, config):
 
     logged = only(logged_metrics(shard(model, backend), enable_weight_norms=True), "weight_norms")
 
+    # approx on a dict also requires the same keys: exactly the decoder-layer matrices, no embedding or LM head.
     assert logged == pytest.approx(expected, rel=1e-5)
-    assert all(name.startswith("weight_norms/layer_") for name in logged)  # no embedding or LM head
 
 
 SCALES = {"unscaled": (1.0, 1.0), "loss_scaled_and_unscaled": (4.0, 4.0), "fraction": (1.0, 0.5)}
+# Every config unscaled; the scale handling is shared code (also covered by test_gradient_norms.py), so the
+# other scales run on one config.
+CONFIG_SCALES = [(config, "unscaled") for config in CONFIGS] + [
+    ("mova_shared_gate", scales) for scales in SCALES if scales != "unscaled"
+]
 
 
 @pytest.mark.usefixtures("routed_group")
 @pytest.mark.parametrize("backend", ["fsdp1", "fsdp2"])
-@pytest.mark.parametrize("config", CONFIGS)
-@pytest.mark.parametrize("scales", SCALES)
+@pytest.mark.parametrize("config,scales", CONFIG_SCALES)
 def test_routed_gradient_norms_match_unsharded_gradients(backend, config, scales):
     loss_scale, gradient_scale = SCALES[scales]
     model = tiny_transformer(3, ddp_backend=backend, **CONFIGS[config])

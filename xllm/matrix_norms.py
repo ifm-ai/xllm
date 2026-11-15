@@ -124,19 +124,6 @@ def flat_slice_squared_l2(local_values, param_offset, shape, selection):
     return result
 
 
-def dtensor_slice(x, selection):
-    local = x.to_local()
-    if selection.dim is None:
-        return local
-    local_shape, offsets = compute_local_shape_and_global_offset(x.shape, x.device_mesh, x.placements)
-    if tuple(local.shape) != local_shape:
-        raise RuntimeError("DTensor local shape does not match its shard metadata")
-    dim = selection.dim
-    start = min(max(selection.start - offsets[dim], 0), local.shape[dim])
-    stop = min(max(selection.stop - offsets[dim], 0), local.shape[dim])
-    return local.narrow(dim, start, max(stop - start, 0))
-
-
 def _partition_offsets(local, selections, offsets):
     dim = selections[0].dim
     boundaries = [0]
