@@ -49,3 +49,6 @@ output weight is a large share of the per-token compute. Each further module sho
 - Under context parallelism the last k positions of each rank's slice get no target of module k.
 - Not compatible with `health_logits_stats` (the MTP rows would be counted in the logit statistics).
 - A checkpoint saved without MTP, or with another depth, has other weights: an MTP run starts from scratch.
+- The MTP weights (`mtp.*`, `output.mtp_norms.*`) are in the checkpoints. The xBridges Hugging Face export does not
+  convert them yet and refuses a checkpoint with unconverted weights.
+- The logged parameter count includes the MTP modules.
