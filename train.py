@@ -63,6 +63,7 @@ from xllm.metrics import MetricLogger, build_mlogger
 from xllm.health_metrics import HealthMetricCollector
 from xllm.modules.moe.moe import moe_layer_ids
 from xllm.modules.moe.mova import mova_layer_ids
+from xllm.modules.mtp import mtp_log_values, mtp_train_loss
 from xllm.configuration import cfg_from_cli
 try:
     import wandb
@@ -444,6 +445,16 @@ def main(cfg: TrainerConf):
             aux_loss = aux_loss / num_aux_loss
             train_loss = train_loss + cfg.moe_aux_loss_coeff * aux_loss
 
+        mtp_losses = None
+        if cfg.model.mtp_depth > 0:
+            # multi-token prediction (xllm/modules/mtp.py)
+            mtp_loss, mtp_losses = mtp_train_loss(
+                model.mtp.take_outputs(), cfg.mtp_loss_weight, cfg.moe_aux_loss_coeff,
+                model.num_layers - model.num_dense_layers, get_data_parallel_group(), cfg.data_parallel_size,
+                cfg.context_parallel_size,
+            )
+            train_loss = train_loss + mtp_loss
+
         if cfg.loss_rescaling:
             train_loss = state.scale * train_loss
 
@@ -527,6 +538,8 @@ def main(cfg: TrainerConf):
                 "avg_aux_loss": reduce_scalar(aux_loss, op='mean'),
                 "max_aux_loss": reduce_scalar(aux_loss, op='max'),
             })
+        if mtp_losses is not None:
+            optim_metrics.update({k: reduce_scalar(v, op='mean') for k, v in mtp_log_values(mtp_losses).items()})
         optim_metrics.update({
             "g_norm": grad_norm / state.scale,
             "clip_cumulative": state.clip_cumulative,
