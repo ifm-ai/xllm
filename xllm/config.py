@@ -453,9 +453,10 @@ class TrainerConf(Config):
             assert self.health_metrics, "Logit statistics require health_metrics=true"
         if self.health_weight_norms or self.health_gradient_norms:
             assert self.health_metrics, "Matrix norms require health_metrics=true"
-            # Dense Gekko is enforced by the health_metrics gate above.
-            assert self.model.num_experts == 0 and self.model.arch in ("transformer", "gekko"), (
-                "Matrix norms currently require a dense Transformer or Gekko"
+            # Transformer layers may be dense, MoE or MoVA (experts and values are logged one by one).
+            # Gekko must be dense; the health_metrics gate above enforces it.
+            assert self.model.arch in ("transformer", "gekko"), (
+                "Matrix norms currently require a Transformer or Gekko"
             )
             assert self.model.swiglu, "Matrix norms require SwiGLU"
 
