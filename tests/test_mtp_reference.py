@@ -1,8 +1,8 @@
 """Multi-token prediction against a plain PyTorch reference, on one GPU.
 
 A small Transformer with two MTP modules (plain attention, fp32, no FSDP) runs one training forward. Each module's
-input is checked against one built by hand from the module before it (or the main model's last layer) and the
-embedding of the token k ahead. The token losses it returns (through the fused output layer) are compared with a
+input is checked against one built by hand from the hidden state of the module before it (or of the main model's last
+layer) after that one's final norm, and the embedding of the token k ahead. The token losses it returns (through the fused output layer) are compared with a
 reference built from each module's block output: its own final norm, the shared output weight and torch's
 cross-entropy on the token k+1 ahead. Then the gradients of both w.r.t. the MTP and shared weights and the main
 model's weights. Packed sequences with an EOS check the masking. With --moe the model's layers after the first,
@@ -82,12 +82,14 @@ def main():
     refs = []
     hidden = captured["main"]
     for k, layer in enumerate(model.mtp.layers, start=1):
-        # the module's input: [norm(previous hidden state); norm(embedding of token j+k)], projected
+        # the module's input: [norm(previous hidden state after its final norm); norm(embedding of token j+k)],
+        # projected; the previous final norm is the main model's for k = 1, module k-1's after
         nxt = torch.zeros_like(captured["emb"])
         nxt[:, :-k] = captured["emb"][:, k:]
-        ref_in = layer.proj(torch.cat([layer.hidden_norm(hidden), layer.embed_norm(nxt)], dim=-1))
+        prev_norm = model.output.final_norm if k == 1 else model.output.mtp_norms[k - 2]
+        ref_in = layer.proj(torch.cat([layer.hidden_norm(prev_norm(hidden)), layer.embed_norm(nxt)], dim=-1))
         if not torch.allclose(captured[f"in{k}"], ref_in, rtol=tol[0][0], atol=tol[0][1]):
-            errors.append(f"module {k}: input differs from the previous hidden state and token j+{k}")
+            errors.append(f"module {k}: input differs from the previous final-normed hidden state and token j+{k}")
         hidden = captured[f"out{k}"]
 
         # reference loss: the module's final norm, shared output weight, torch cross-entropy on token j+1+k
@@ -112,6 +114,7 @@ def main():
               f"valid targets {int(valid.sum())} of {valid.numel()}")
 
     params = {"output.weight (shared)": model.output.output.weight, "embed (shared)": model.embed.weight,
+              "final norm (main)": model.output.final_norm.weight,
               "layer 0 (main model)": model.layers[0].attention.wq.weight}
     for k, layer in enumerate(model.mtp.layers, start=1):
         params.update({f"mtp {k} proj": layer.proj.weight, f"mtp {k} hidden_norm": layer.hidden_norm.weight,
