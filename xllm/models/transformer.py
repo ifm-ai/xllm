@@ -35,6 +35,7 @@ from xllm.models.xllm import XLLModel
 from xllm.distributed import (
     get_context_parallel_world_size,
     get_context_parallel_rank,
+    get_expert_outer_world_size,
 )
 from xllm.models.fused_blocks import (
     TransformerBlockFunction,
@@ -630,13 +631,15 @@ class Transformer(XLLModel):
     def __init__(self, cfg: ModelConf, tokenizer: Tokenizer):
         super().__init__(cfg, tokenizer)
         self.chunk_size = cfg.chunk_size
-        self.moe_prefetch_dispatch = cfg.moe_prefetch_dispatch and cfg.fused_block
         self.context_parallel_size = get_context_parallel_world_size()
         self.context_parallel_rank = get_context_parallel_rank()
+        # With EP > TP, the routed experts are their own FSDP2 unit, on the expert mesh, and the fused MoE layers
+        # run as their forward (run_layer). With EP = TP, the experts stay in their layer's unit, as before.
+        self.experts_own_unit = cfg.ddp_backend == 'fsdp2' and get_expert_outer_world_size() > 1
+        self.moe_prefetch_dispatch = cfg.moe_prefetch_dispatch and cfg.fused_block and self.experts_own_unit
 
         if cfg.ddp_backend == 'fsdp1':
             from torch.distributed.fsdp.wrap import wrap
-            wrap_experts = lambda module: module
         else:
             assert cfg.ddp_backend == 'fsdp2'
             from xllm.distributed.wrap import wrap, wrap_experts, prefetch_experts_in_backward
@@ -659,21 +662,22 @@ class Transformer(XLLModel):
             block_cls = TransformerBlock if layer_id < self.num_dense_layers else \
                 (TransformerMoVABlock if self.num_values > 0 else TransformerMoEBlock)
             layer = block_cls(cfg, layer_id)
-            if hasattr(layer, 'moe'):
+            if self.experts_own_unit and hasattr(layer, 'moe'):
                 # the routed experts are their own FSDP unit, inside the layer's
                 wrap_experts(layer.moe.experts)
             self.layers.append(wrap(layer))
 
         self.output = wrap(TransformerOutputLayer(cfg))
-        if cfg.ddp_backend == 'fsdp2':
+        if self.experts_own_unit:
             prefetch_experts_in_backward(list(self.layers) + [self.output])
 
     def run_layer(
         self, layer: nn.Module, x: Tensor, *args: Any, prefetch: Optional[DispatchPrefetch] = None
     ) -> Tuple[Tensor, Optional[Tensor], Optional[Any]]:
-        """Return layer(x, *args); a fused MoE layer in training runs as the forward of its experts, with its
-        slot of prefetch (moe_prefetch_dispatch)."""
-        if isinstance(layer, (TransformerMoEBlock, TransformerMoVABlock)) and layer.fused_block and self.training:
+        """Return layer(x, *args); with EP > TP, a fused MoE layer in training runs as the forward of its experts,
+        with its slot of prefetch (moe_prefetch_dispatch)."""
+        if (self.experts_own_unit and isinstance(layer, (TransformerMoEBlock, TransformerMoVABlock))
+                and layer.fused_block and self.training):
             # The fused block computes the experts. With the layer inside the experts' call rather than the
             # experts inside the layer's, FSDP reduce-scatters the layer's other gradients before the experts'
             # (it waits for one reduce-scatter to end before the next), so the experts' one overlaps the
