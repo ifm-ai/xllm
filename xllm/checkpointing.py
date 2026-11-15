@@ -161,6 +161,15 @@ def save_latest_checkpoint(
 
     logger.info("All ranks to begin checkpointing...")
 
+    rewind = False
+    if cfg.ft.enabled:  # a memory restore can re-reach existing checkpoints: xllm/ft/save_rule.py
+        from xllm.ft.save_rule import FT_SKIP, ft_save_decision
+
+        action, rewind = ft_save_decision(dump_dir_, checkpoint_dir, step, global_rank)
+        if action == FT_SKIP:
+            logger.info(f"ft: checkpoint {checkpoint_dir} already complete; save skipped")
+            return None
+
     if global_rank == 0:
         if checkpoint_dir.exists():
             raise RuntimeError(
@@ -236,6 +245,10 @@ def save_latest_checkpoint(
 
     # keep all previous checkpoints
     if keep_last < 0:
+        return None
+
+    # ft rewind save: newer checkpoints exist, which the retention below assumes cannot happen
+    if rewind:
         return None
 
     sorted_checkpoints = _get_sorted_checkpoints(ckpt_folder=dump_dir_ / CHECKPOINT_FOLDER_NAME)
