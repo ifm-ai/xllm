@@ -48,7 +48,8 @@ class MetricLogger:
         fpath = outdir / fname
         self.jsonl_writer = open(fpath, "a")
 
-    def log(self, metrics: Dict[str, Any], step: int):
+    def log(self, metrics: Dict[str, Any], step: int, dashboard_metrics: Optional[Dict[str, Any]] = None):
+        """Write ``metrics`` to the jsonl, and ``dashboard_metrics`` (default: ``metrics``) to TensorBoard / W&B."""
         if not self.enable:
             return
 
@@ -56,7 +57,7 @@ class MetricLogger:
         assert all(type(k) is str for k in metrics.keys())
 
         prefixed_metrics = {}
-        for k, v in metrics.items():
+        for k, v in (metrics if dashboard_metrics is None else dashboard_metrics).items():
             assert not isinstance(v, dict), f"{k} {v}"
             key = k if self.tag is None or not self.enable_prefix_keys else f"{self.tag}/{k}"
             prefixed_metrics[key] = v

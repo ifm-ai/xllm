@@ -101,7 +101,7 @@ def logged_metrics(model, tokens=TOKENS, targets=None, token_mask=None, train=Fa
     if flags.get("enable_weight_norms") or flags.get("enable_gradient_norms"):
         collector.record_matrix_norms(model, gradient_scale=gradient_scale)
     logged = {}
-    collector.flush(SimpleNamespace(log=lambda metrics, step: logged.update(metrics)), 1)
+    collector.flush(SimpleNamespace(log=lambda metrics, step, **_: logged.update(metrics)), 1)
     return logged
 
 

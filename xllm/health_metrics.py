@@ -1,12 +1,20 @@
 import math
 from logging import getLogger
-from typing import Any, Dict, NamedTuple, Optional, Tuple, TYPE_CHECKING
+from typing import Any, Dict, List, NamedTuple, Optional, Tuple, TYPE_CHECKING
 
 import torch
 import torch.distributed as dist
 from torch.distributed.tensor import DTensor, Replicate, Shard
 
 from xllm.distributed.initialize import get_model_parallel_rank
+from xllm.matrix_norms import (
+    MatrixSlice,
+    dtensor_squared_l2,
+    flat_slice_squared_l2,
+    matrix_counts,
+    matrix_slices,
+    squared_l2,
+)
 
 if TYPE_CHECKING:
     from xllm.metrics import MetricLogger
@@ -52,6 +60,15 @@ _GEKKO_OPTIONAL_MATRIX_PARAMETER_PATHS = (
 )
 
 _MatrixParameterPaths = Tuple[Tuple[str, str], ...]
+_MatrixNormBlock = Tuple[Tuple[str, ...], torch.Tensor, Optional[str]]
+
+
+class _MatrixNormLayout(NamedTuple):
+    """What one parameter's norms look like; built on the first sampled step, it never changes."""
+    selections: list  # the logical matrices it holds (MatrixSlice)
+    names: Dict[str, Tuple[str, ...]]  # family -> one metric name per logical matrix
+    prefixes: Dict[str, Optional[str]]  # family -> dashboard prefix for routed experts / MoVA values
+    partitions: dict  # packed-slice boundaries, keyed by shard layout
 
 
 class _RouterFamily(NamedTuple):
@@ -121,23 +138,41 @@ def _matrix_norm_replica_count(model: Any) -> int:
     return replica_count
 
 
-def _local_squared_l2(x: torch.Tensor) -> torch.Tensor:
-    return torch.linalg.vector_norm(
-        x.detach().reshape(-1), ord=2, dtype=torch.float32
-    ).square()
-
-
-def _dtensor_squared_l2_contribution(x: DTensor) -> torch.Tensor:
+def _dtensor_squared_l2_contributions(
+    x: DTensor, selections: list[MatrixSlice], partitions: dict,
+) -> torch.Tensor:
+    """Squared l2 of this rank's part of each logical matrix in ``selections``."""
     replica_count = 1
     for mesh_dim, placement in enumerate(x.placements):
         if isinstance(placement, Replicate):
             replica_count *= x.device_mesh.size(mesh_dim)
-        elif not isinstance(placement, Shard):
+        elif not isinstance(placement, Shard) or (
+            # Slicing a packed matrix needs plain Shard offsets, not strided or custom shards.
+            selections[0].dim is not None and type(placement) is not Shard
+        ):
             raise RuntimeError(
                 f"Unsupported DTensor placement for matrix norms: {placement}"
             )
-    squared_l2 = _local_squared_l2(x.to_local())
-    return squared_l2 if replica_count == 1 else squared_l2 / replica_count
+    values = dtensor_squared_l2(x, selections, partitions)
+    return values if replica_count == 1 else values / replica_count
+
+
+def _layer_matrix_selections(
+    layer: Any, layer_idx: int, fqn: str, shape: Any, paths: _MatrixParameterPaths,
+) -> list[MatrixSlice]:
+    """Logical matrices stored in one parameter: one for a dense matrix, one per expert/value for packed ones."""
+    dense_path = _matrix_metric_path(layer_idx, fqn, paths)
+    if hasattr(layer, "gda"):
+        # Gekko layers are dense (enforced in config); their paths already include the output gate.
+        return [] if dense_path is None else [MatrixSlice(dense_path)]
+    return matrix_slices(layer, layer_idx, fqn, shape, dense_path)
+
+
+def _layer_matrix_counts(layer: Any, paths: _MatrixParameterPaths) -> Tuple[int, int]:
+    """(parameters that hold logged matrices, logical matrices logged) for one decoder layer."""
+    if hasattr(layer, "gda"):
+        return len(paths), len(paths)
+    return matrix_counts(layer, len(_MATRIX_PARAMETER_PATHS))
 
 
 def get_active_health_collector() -> Optional["HealthMetricCollector"]:
@@ -194,8 +229,11 @@ class HealthMetricCollector:
         self.decoder_layer_activation_records: Dict[int, _LocalStats] = {}
         self.query_key_stats_records: Dict[int, Dict[str, _LocalStats]] = {}
         self.gekko_stats_records: Dict[int, Dict[str, _LocalStats]] = {}
-        self.matrix_squared_l2_records: Dict[str, torch.Tensor] = {}
+        # One block per parameter: (metric names, squared l2 of each logical matrix in it, dashboard prefix).
+        self.matrix_norm_blocks: List[_MatrixNormBlock] = []
         self.expected_matrix_norm_records: Optional[int] = None
+        self.matrix_norm_layouts: Dict[Tuple[int, str], _MatrixNormLayout] = {}
+        self.matrix_norm_names_checked = False
         self.logits_stats_record: Optional[Tuple[
             torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor,
         ]] = None
@@ -207,7 +245,7 @@ class HealthMetricCollector:
         self.decoder_layer_activation_records = {}
         self.query_key_stats_records = {}
         self.gekko_stats_records = {}
-        self.matrix_squared_l2_records = {}
+        self.matrix_norm_blocks = []
         self.expected_matrix_norm_records = None
         self.logits_stats_record = None
         self.router_stats_records = {}
@@ -304,9 +342,9 @@ class HealthMetricCollector:
             raise RuntimeError(f"Duplicate Gekko branches for layer {layer_idx}")
         # Reduce squared coordinates globally before deriving branch RMS/energy share.
         for name, branch in (("sca_squared", sca), ("awk_squared", awk)):
-            squared_l2 = _local_squared_l2(branch)
+            branch_squared_l2 = squared_l2(branch)
             # Only sum/count are used; avoid a full FP32 activation copy for RMS.
-            layer_stats[name] = (squared_l2, squared_l2, squared_l2, branch.numel())
+            layer_stats[name] = (branch_squared_l2, branch_squared_l2, branch_squared_l2, branch.numel())
         layer_stats["output_gate"] = self._local_stats(output_gate)
         for name, mask in (
             ("gate_near_zero", output_gate.detach().abs().lt(1e-3)),
@@ -328,11 +366,14 @@ class HealthMetricCollector:
         for layer_idx, layer in enumerate(layers):
             named_parameters = list(layer.named_parameters())
             paths = _matrix_parameter_paths(layer, [fqn for fqn, _ in named_parameters])
-            num_matrices += len(paths)
+            num_parameters, num_logical_matrices = _layer_matrix_counts(layer, paths)
+            num_matrices += num_logical_matrices
             num_layer_matrices = 0
             for fqn, weight in named_parameters:
-                metric_path = _matrix_metric_path(layer_idx, fqn, paths)
-                if metric_path is None:
+                layout = self._matrix_norm_layout(
+                    layer, layer_idx, fqn, getattr(weight, "shape", None), paths,
+                )
+                if not layout.selections:
                     continue
                 num_layer_matrices += 1
                 if not isinstance(weight, DTensor):
@@ -341,12 +382,10 @@ class HealthMetricCollector:
                     )
 
                 if self.enable_weight_norms:
-                    metric_name = f"weight_norms/{metric_path}/l2"
-                    if metric_name in self.matrix_squared_l2_records:
-                        raise RuntimeError(f"Duplicate matrix norm metric: {metric_name}")
-                    self.matrix_squared_l2_records[metric_name] = (
-                        _dtensor_squared_l2_contribution(weight)
+                    squares = _dtensor_squared_l2_contributions(
+                        weight, layout.selections, layout.partitions,
                     )
+                    self._add_matrix_norms("weight_norms", layout, squares)
                 if self.enable_gradient_norms:
                     gradient = weight.grad
                     if not isinstance(gradient, DTensor):
@@ -354,31 +393,61 @@ class HealthMetricCollector:
                             "FSDP2 gradient is unavailable or is not a DTensor: "
                             f"layer {layer_idx}, {fqn}"
                         )
-                    metric_name = f"gradient_norms/{metric_path}/l2"
-                    if metric_name in self.matrix_squared_l2_records:
-                        raise RuntimeError(f"Duplicate matrix norm metric: {metric_name}")
-                    squared_l2 = _dtensor_squared_l2_contribution(gradient)
-                    self.matrix_squared_l2_records[metric_name] = (
-                        squared_l2 if gradient_scale == 1 else squared_l2 / gradient_scale ** 2
+                    squares = _dtensor_squared_l2_contributions(
+                        gradient, layout.selections, layout.partitions,
                     )
+                    if gradient_scale != 1:
+                        squares = squares / gradient_scale ** 2
+                    self._add_matrix_norms("gradient_norms", layout, squares)
 
-            if num_layer_matrices != len(paths):
+            if num_layer_matrices != num_parameters:
                 raise RuntimeError(
-                    f"Expected {len(paths)} matrix parameters for layer "
+                    f"Expected {num_parameters} matrix parameters for layer "
                     f"{layer_idx}, found {num_layer_matrices}"
                 )
 
         self._check_matrix_norm_records(num_matrices)
+
+    def _matrix_norm_layout(
+        self, layer: Any, layer_idx: int, fqn: str, shape: Any, paths: _MatrixParameterPaths,
+    ) -> _MatrixNormLayout:
+        key = (layer_idx, fqn)
+        if key not in self.matrix_norm_layouts:
+            selections = _layer_matrix_selections(layer, layer_idx, fqn, shape, paths)
+            parts = selections[0].path.split("/") if selections else []
+            # Dashboards get statistics over the routed experts or MoVA values, not one curve each.
+            routed = len(selections) > 1 and parts[-3] in ("experts", "values")
+            families = ("weight_norms", "gradient_norms")
+            self.matrix_norm_layouts[key] = _MatrixNormLayout(
+                selections,
+                {f: tuple(f"{f}/{selection.path}/l2" for selection in selections) for f in families},
+                {f: "/".join([f] + parts[:-2] + parts[-1:]) if routed else None for f in families},
+                {},
+            )
+        return self.matrix_norm_layouts[key]
+
+    def _add_matrix_norms(self, family: str, layout: _MatrixNormLayout, squares: torch.Tensor) -> None:
+        """Record one parameter's squared l2 contributions, one per logical matrix it holds."""
+        names = layout.names[family]
+        self.matrix_norm_blocks.append((names, squares.reshape(len(names)), layout.prefixes[family]))
+
+    def _num_matrix_norm_records(self) -> int:
+        return sum(len(names) for names, _, _ in self.matrix_norm_blocks)
 
     def _check_matrix_norm_records(self, num_matrices: int) -> None:
         num_enabled_norms = (
             int(self.enable_weight_norms) + int(self.enable_gradient_norms)
         )
         expected_records = num_matrices * num_enabled_norms
-        if len(self.matrix_squared_l2_records) != expected_records:
+        if not self.matrix_norm_names_checked:  # names never change, so the first step settles it
+            names = [name for block_names, _, _ in self.matrix_norm_blocks for name in block_names]
+            if len(set(names)) != len(names):
+                raise RuntimeError("Duplicate matrix norm metrics")
+            self.matrix_norm_names_checked = True
+        num_records = self._num_matrix_norm_records()
+        if num_records != expected_records:
             raise RuntimeError(
-                f"Expected {expected_records} matrix norm records, "
-                f"found {len(self.matrix_squared_l2_records)}"
+                f"Expected {expected_records} matrix norm records, found {num_records}"
             )
         self.expected_matrix_norm_records = expected_records
 
@@ -501,7 +570,7 @@ class HealthMetricCollector:
             gradient_scale <= 0.0 or not math.isfinite(gradient_scale)
         ):
             raise ValueError(f"gradient_scale must be finite and positive, got {gradient_scale}")
-        if self.matrix_squared_l2_records:
+        if self.matrix_norm_blocks:
             raise RuntimeError("Duplicate matrix norm records")
 
         handles = getattr(model, "_all_handles", None)
@@ -531,7 +600,13 @@ class HealthMetricCollector:
                     f"FSDP1 parameter shard metadata is unavailable for layer {layer_idx}"
                 )
             paths = _matrix_parameter_paths(module, list(fqns))
-            num_matrices += len(paths)
+            num_parameters, num_logical_matrices = _layer_matrix_counts(module, paths)
+            num_matrices += num_logical_matrices
+            shapes = getattr(flat_param, "_shapes", None)
+            if shapes is None or len(shapes) != len(fqns):
+                raise RuntimeError(
+                    f"FSDP1 parameter shape metadata is unavailable for layer {layer_idx}"
+                )
             weight_shard = getattr(flat_param, "_local_shard", None)
             if self.enable_weight_norms and weight_shard is None:
                 raise RuntimeError(
@@ -552,6 +627,8 @@ class HealthMetricCollector:
             def local_squared_l2(
                 shard: torch.Tensor,
                 shard_info: Any,
+                shape: Any,
+                selection: MatrixSlice,
             ) -> torch.Tensor:
                 if not shard_info.in_shard:
                     return shard.new_zeros((), dtype=torch.float32)
@@ -562,38 +639,44 @@ class HealthMetricCollector:
                         f"FSDP1 shard metadata points outside layer {layer_idx}: "
                         f"[{start}, {end}) vs {shard.numel()}"
                     )
-                return _local_squared_l2(shard[start:end])
+                # A packed slice is located by where this fragment starts inside its parameter.
+                param_offset = (
+                    int(shard_info.intra_param_start_idx) if selection.dim is not None else 0
+                )
+                return flat_slice_squared_l2(shard[start:end], param_offset, shape, selection)
 
             num_layer_matrices = 0
-            for fqn, shard_info in zip(fqns, shard_infos):
-                metric_path = _matrix_metric_path(layer_idx, fqn, paths)
-                if metric_path is None:
+            for fqn, shard_info, shape in zip(fqns, shard_infos, shapes):
+                layout = self._matrix_norm_layout(module, layer_idx, fqn, shape, paths)
+                if not layout.selections:
                     continue
                 num_layer_matrices += 1
 
                 if self.enable_weight_norms:
                     assert weight_shard is not None
-                    metric_name = f"weight_norms/{metric_path}/l2"
-                    if metric_name in self.matrix_squared_l2_records:
-                        raise RuntimeError(f"Duplicate matrix norm metric: {metric_name}")
-                    squared_l2 = local_squared_l2(weight_shard, shard_info)
-                    self.matrix_squared_l2_records[metric_name] = (
-                        squared_l2 if replica_count == 1 else squared_l2 / replica_count
+                    squares = torch.stack([
+                        local_squared_l2(weight_shard, shard_info, shape, selection)
+                        for selection in layout.selections
+                    ])
+                    self._add_matrix_norms(
+                        "weight_norms", layout,
+                        squares if replica_count == 1 else squares / replica_count,
                     )
                 if self.enable_gradient_norms:
                     assert gradient_shard is not None
-                    metric_name = f"gradient_norms/{metric_path}/l2"
-                    if metric_name in self.matrix_squared_l2_records:
-                        raise RuntimeError(f"Duplicate matrix norm metric: {metric_name}")
-                    squared_l2 = local_squared_l2(gradient_shard, shard_info)
-                    self.matrix_squared_l2_records[metric_name] = (
-                        squared_l2 if gradient_squared_l2_divisor == 1
-                        else squared_l2 / gradient_squared_l2_divisor
+                    squares = torch.stack([
+                        local_squared_l2(gradient_shard, shard_info, shape, selection)
+                        for selection in layout.selections
+                    ])
+                    self._add_matrix_norms(
+                        "gradient_norms", layout,
+                        squares if gradient_squared_l2_divisor == 1
+                        else squares / gradient_squared_l2_divisor,
                     )
 
-            if num_layer_matrices != len(paths):
+            if num_layer_matrices != num_parameters:
                 raise RuntimeError(
-                    f"Expected {len(paths)} matrix parameters for layer "
+                    f"Expected {num_parameters} matrix parameters for layer "
                     f"{layer_idx}, found {num_layer_matrices}"
                 )
 
@@ -608,10 +691,31 @@ class HealthMetricCollector:
         self.decoder_layer_activation_records = {}
         self.query_key_stats_records = {}
         self.gekko_stats_records = {}
-        self.matrix_squared_l2_records = {}
+        self.matrix_norm_blocks = []
         self.expected_matrix_norm_records = None
         self.logits_stats_record = None
         self.router_stats_records = {}
+
+    @staticmethod
+    def _packed_norm_summaries(
+        blocks: list[Tuple[Tuple[str, ...], Optional[str]]], norms: torch.Tensor,
+    ) -> Dict[str, float]:
+        """Mean/min/max/std over the experts or values of each packed parameter, in one transfer."""
+        stats, prefixes, offset = [], [], 0
+        for names, prefix in blocks:
+            if prefix is not None:
+                block = norms[offset:offset + len(names)]
+                stats.append(torch.stack((block.mean(), block.min(), block.max(), block.std())))
+                prefixes.append(prefix)
+            offset += len(names)
+        if not stats:
+            return {}
+        values = torch.stack(stats).cpu().tolist()
+        return {
+            f"{prefix}/l2_{name}": value
+            for prefix, row in zip(prefixes, values)
+            for name, value in zip(("mean", "min", "max", "std"), row)
+        }
 
     def flush(self, mlogger: "MetricLogger", step: int) -> None:
         if not self.recording:
@@ -641,12 +745,12 @@ class HealthMetricCollector:
             problems.append(f"Missing logit statistics at step {step}")
         if (self.enable_weight_norms or self.enable_gradient_norms) and (
             self.expected_matrix_norm_records is None
-            or len(self.matrix_squared_l2_records) != self.expected_matrix_norm_records
+            or self._num_matrix_norm_records() != self.expected_matrix_norm_records
         ):
             problems.append(
                 f"Expected {self.expected_matrix_norm_records} matrix norm records "
                 f"at step {self.step}, "
-                f"got {len(self.matrix_squared_l2_records)} records at step {step}"
+                f"got {self._num_matrix_norm_records()} records at step {step}"
             )
         if self.enable_gekko_stats:
             if sorted(self.gekko_stats_records) != layers:
@@ -733,12 +837,13 @@ class HealthMetricCollector:
             sums = torch.cat((sums, logits_sum.reshape(1).double()))
             counts = torch.cat((counts, logits_count.reshape(1)))
             logits_extrema = logits_minimum, logits_maximum
-        matrix_metric_names = sorted(self.matrix_squared_l2_records)
+        # Every rank records the same parameters in the same order, so blocks pack identically.
+        matrix_blocks = [(names, prefix) for names, _, prefix in self.matrix_norm_blocks]
         matrix_squared_l2_start = sums.numel()
-        if matrix_metric_names:
-            matrix_squared_l2_values = torch.stack([
-                self.matrix_squared_l2_records[name] for name in matrix_metric_names
-            ]).double()
+        if matrix_blocks:
+            matrix_squared_l2_values = torch.cat(
+                [squares for _, squares, _ in self.matrix_norm_blocks]
+            ).double()
             sums = torch.cat((sums, matrix_squared_l2_values))
         router_start = sums.numel()
         router_records = [
@@ -819,15 +924,18 @@ class HealthMetricCollector:
             metrics["logits_stats/mean"] = logit_sum / logit_count
             metrics["logits_stats/min"] = logit_minimum
             metrics["logits_stats/max"] = logit_maximum
-        if matrix_metric_names:
-            matrix_norm_values = (
-                reduced_sums[matrix_squared_l2_start:router_start]
-                .clamp_min(0)
-                .sqrt()
-                .cpu()
-                .tolist()
-            )
-            metrics.update(dict(zip(matrix_metric_names, matrix_norm_values)))
+        dashboard_metrics = None
+        if matrix_blocks:
+            norms = reduced_sums[matrix_squared_l2_start:router_start].clamp_min(0).sqrt()
+            metrics.update(zip(
+                (name for names, _ in matrix_blocks for name in names), norms.cpu().tolist(),
+            ))
+            summaries = self._packed_norm_summaries(matrix_blocks, norms)
+            if summaries:
+                # Per-expert / per-value norms go to the jsonl only; dashboards get their statistics.
+                packed = {name for names, prefix in matrix_blocks if prefix is not None for name in names}
+                dashboard_metrics = {k: v for k, v in metrics.items() if k not in packed}
+                dashboard_metrics.update(summaries)
         if router_records:
             router_metrics = {}
             offset = router_start
@@ -839,4 +947,9 @@ class HealthMetricCollector:
                 offset = end
             values = torch.stack(list(router_metrics.values())).cpu().tolist()
             metrics.update(zip(router_metrics, values))
-        mlogger.log(metrics, step)
+            if dashboard_metrics is not None:
+                dashboard_metrics.update(zip(router_metrics, values))
+        if dashboard_metrics is None:
+            mlogger.log(metrics, step)
+        else:
+            mlogger.log(metrics, step, dashboard_metrics=dashboard_metrics)
