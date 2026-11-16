@@ -264,8 +264,6 @@ class MovingAverageGatedAttention(nn.Module):
         prev_mean, prev_var, hx, prev_sk, prev_aqk, prev_akk, prev_v, mem, lnt = torch.split(
             prev_tensor, [n_groups, n_groups, 2 * dim * ndim, zsize, zsize, zsize, vsize, msize, lntsize], dim=-1
         )
-        prev_mean = prev_mean.to(x)
-        prev_var = prev_var.to(x)
         hx = _r2c(hx.view(bsz, dim, ndim, 2))
         prev_sk = prev_sk.view(bsz, csize, n_heads, zdim).to(x)
         prev_aqk = prev_aqk.view(bsz, n_heads, csize, zdim).to(x)

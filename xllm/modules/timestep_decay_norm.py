@@ -9,8 +9,10 @@ from torch.nn.parameter import Parameter
 from xllm_extension.ops import (
     group_timestep_decay_norm_fwd,
     group_timestep_decay_norm_cub_fwd,
+    group_timestep_decay_norm_lookback_fwd,
     group_timestep_decay_norm_bwd,
     group_timestep_decay_norm_cub_bwd,
+    group_timestep_decay_norm_lookback_bwd,
 )
 
 from xllm.distributed import get_model_parallel_world_size
@@ -43,7 +45,8 @@ class TimestepDecayNormFunc(torch.autograd.Function):
             )
             ctx.save_for_backward(x, bos_mask, prev_count, cummean, cumrstd, gamma, beta, padding_mask)
         else:
-            y, count, mean, var, cummean, cumrstd = group_timestep_decay_norm_fwd(
+            fwd = group_timestep_decay_norm_lookback_fwd if backend == 'lookback' else group_timestep_decay_norm_fwd
+            y, count, mean, var, cummean, cumrstd = fwd(
                 x, bos_mask, prev_count, prev_mean, prev_var, gamma, beta, padding_mask, num_groups, beta1, beta2, eps,
             )
             ctx.save_for_backward(x if not memory_efficient else y, bos_mask, prev_count, cummean, cumrstd, gamma, beta, padding_mask)
@@ -77,7 +80,8 @@ class TimestepDecayNormFunc(torch.autograd.Function):
                 padding_mask, num_groups, beta1, beta2
             )
         else:
-            x_grad, prev_mean_grad, prev_var_grad, gamma_grad, beta_grad = group_timestep_decay_norm_bwd(
+            bwd = group_timestep_decay_norm_lookback_bwd if backend == 'lookback' else group_timestep_decay_norm_bwd
+            x_grad, prev_mean_grad, prev_var_grad, gamma_grad, beta_grad = bwd(
                 y_grad, mean_grad, var_grad, x_or_y, prev_count, bos_mask, cummean, cumrstd, gamma, beta,
                 padding_mask, num_groups, beta1, beta2, eps, memory_efficient
             )
@@ -140,10 +144,11 @@ class TimestepDecayNorm(nn.Module):
         batch_size = x.size(0)
         if prev_count is None:
             prev_count = self.prior_count.expand(batch_size).contiguous()
+        # Initialize the running mean/variance in fp32.
         if prev_mean is None:
-            prev_mean = self.prior_mean.type_as(x).expand(batch_size, -1).contiguous()
+            prev_mean = self.prior_mean.float().expand(batch_size, -1).contiguous()
         if prev_var is None:
-            prev_var = self.prior_var.type_as(x).expand(batch_size, -1).contiguous()
+            prev_var = self.prior_var.float().expand(batch_size, -1).contiguous()
 
         output = timestep_decay_norm(
             x, bos_mask, prev_count, prev_mean, prev_var, self.weight + 1.0, self.bias,

@@ -237,7 +237,9 @@ class GekkoOutputLayer(nn.Module):
     def _receive_prev_tensors(self, x):
         bsz, seq_len, _ = x.size()
         n_groups = self.final_norm.groups_per_partition
-        prev_tensor = torch.empty((bsz, n_groups * 2), dtype=x.dtype, device=x.device, requires_grad=self.training)
+        # The timestep norm state is in the accumulate type of x, see TimestepDecayNorm.
+        dtype = torch.promote_types(x.dtype, torch.float32)
+        prev_tensor = torch.empty((bsz, n_groups * 2), dtype=dtype, device=x.device, requires_grad=self.training)
         prev_tensor = recv_from_prev_context_parallel_region(prev_tensor)
         return prev_tensor
 

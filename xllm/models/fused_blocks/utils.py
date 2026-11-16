@@ -50,7 +50,12 @@ def timenorm_fwd(
     backend: str,
 ):
     gamma = gamma + 1.0
-    timestep_norm_fwd = xllm_ops.group_timestep_decay_norm_cub_fwd if backend == 'cub' else xllm_ops.group_timestep_decay_norm_fwd
+    if backend == 'cub':
+        timestep_norm_fwd = xllm_ops.group_timestep_decay_norm_cub_fwd
+    elif backend == 'lookback':
+        timestep_norm_fwd = xllm_ops.group_timestep_decay_norm_lookback_fwd
+    else:
+        timestep_norm_fwd = xllm_ops.group_timestep_decay_norm_fwd
     y, count, mean, var, cummean, cumrstd = timestep_norm_fwd(
         x, bos_mask, prev_count, prev_mean, prev_var, gamma, beta, None, num_groups, beta1, beta2, eps,
     )
@@ -84,7 +89,11 @@ def timenorm_bwd(
             gamma, None, num_groups, beta1, beta2
         )
     else:
-        x_grad, prev_mean_grad, prev_var_grad, gamma_grad, beta_grad = xllm_ops.group_timestep_decay_norm_bwd(
+        if backend == 'lookback':
+            timestep_norm_bwd = xllm_ops.group_timestep_decay_norm_lookback_bwd
+        else:
+            timestep_norm_bwd = xllm_ops.group_timestep_decay_norm_bwd
+        x_grad, prev_mean_grad, prev_var_grad, gamma_grad, beta_grad = timestep_norm_bwd(
             y_grad, mean_grad, var_grad, x_or_y, prev_count, bos_mask, cummean, cumrstd,
             gamma, beta, None, num_groups, beta1, beta2, eps, memory_efficient
         )

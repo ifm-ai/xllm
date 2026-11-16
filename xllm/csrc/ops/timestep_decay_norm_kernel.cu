@@ -95,10 +95,10 @@ template <typename T, typename T_ACC>
 __global__ void ColwiseCumMomentsSmallKernel(
     int64_t L, int64_t num_groups,
     const bool* __restrict__ bos_mask, const int64_t* __restrict__ prev_count,
-    const T* __restrict__ prev_mean, const T* __restrict__ prev_var,
+    const T_ACC* __restrict__ prev_mean, const T_ACC* __restrict__ prev_var,
     const T_ACC* __restrict__ group_mean, const T_ACC* __restrict__ group_var,
     const bool* __restrict__ padding_mask, T_ACC beta1, T_ACC beta2, T_ACC eps,
-    int64_t* __restrict__ count, T* __restrict__ mean, T* __restrict__ var,
+    int64_t* __restrict__ count, T_ACC* __restrict__ mean, T_ACC* __restrict__ var,
     T_ACC* __restrict__ cummean, T_ACC* __restrict__ cumrstd) {
   const int64_t b = blockIdx.y;
   const int64_t g = blockIdx.x * blockDim.x + threadIdx.x;
@@ -113,8 +113,8 @@ __global__ void ColwiseCumMomentsSmallKernel(
   T_ACC* cumrstd_ptr = cumrstd + b * L * num_groups;
 
   const int64_t m0 = prev_count[b];
-  const T_ACC m1 = static_cast<T_ACC>(prev_mean[b * num_groups + g]);
-  const T_ACC m2 = static_cast<T_ACC>(prev_var[b * num_groups + g]);
+  const T_ACC m1 = prev_mean[b * num_groups + g];
+  const T_ACC m2 = prev_var[b * num_groups + g];
   utils::KahanWrapper<utils::WelfordDecayData<T_ACC>> m(utils::WelfordDecayData<T_ACC>{
       m0, pow(beta1, static_cast<T_ACC>(m0)), pow(beta2, static_cast<T_ACC>(m0)), m1, m2, false});
 
@@ -135,18 +135,18 @@ __global__ void ColwiseCumMomentsSmallKernel(
   if (g == 0) {
     count[b] = m->count;
   }
-  mean[b * num_groups + g] = static_cast<T>(m->mean);
-  var[b * num_groups + g] = static_cast<T>(m->var);
+  mean[b * num_groups + g] = m->mean;
+  var[b * num_groups + g] = m->var;
 }
 
 template <typename T, typename T_ACC>
 __global__ void ColwiseCumMomentsLargeKernel(
     int64_t L, int64_t num_groups, int64_t chunk_size,
     const bool* __restrict__ bos_mask, const int64_t* __restrict__ prev_count,
-    const T* __restrict__ prev_mean, const T* __restrict__ prev_var,
+    const T_ACC* __restrict__ prev_mean, const T_ACC* __restrict__ prev_var,
     const T_ACC* __restrict__ group_mean, const T_ACC* __restrict__ group_var,
     const bool* __restrict__ padding_mask, T_ACC beta1, T_ACC beta2, T_ACC eps,
-    int64_t* __restrict__ count, T* __restrict__ mean, T* __restrict__ var,
+    int64_t* __restrict__ count, T_ACC* __restrict__ mean, T_ACC* __restrict__ var,
     T_ACC* __restrict__ cummean, T_ACC* __restrict__ cumrstd) {
   using AlignedWelfordData =
       typename std::aligned_storage<sizeof(utils::WelfordDecayData<T_ACC>),
@@ -200,8 +200,8 @@ __global__ void ColwiseCumMomentsLargeKernel(
     shm_ptr[(cuda_utils::kWarpSize - 1) * cuda_utils::kWarpSize + threadIdx.x] =
         utils::WelfordDecayData<T_ACC>{prev_count[b], pow(beta1, static_cast<T_ACC>(prev_count[b])),
                                        pow(beta2, static_cast<T_ACC>(prev_count[b])),
-                                       static_cast<T_ACC>(prev_mean[b * num_groups + g]),
-                                       static_cast<T_ACC>(prev_var[b * num_groups + g]),
+                                       prev_mean[b * num_groups + g],
+                                       prev_var[b * num_groups + g],
                                        false};
   }
   __syncthreads();
@@ -240,8 +240,8 @@ __global__ void ColwiseCumMomentsLargeKernel(
     if (g == 0) {
       count[b] = m->count;
     }
-    mean[b * num_groups + g] = static_cast<T>(m->mean);
-    var[b * num_groups + g] = static_cast<T>(m->var);
+    mean[b * num_groups + g] = m->mean;
+    var[b * num_groups + g] = m->var;
   }
 }
 
@@ -366,26 +366,26 @@ __global__ void RowwiseInternalGradientsKernel(
 
 template <typename T, typename T_ACC>
 __global__ void ColwiseInternalGradientsSmallKernel(
-    int64_t L, int64_t num_groups, double beta1, double beta2, const T* __restrict__ mean_grad,
-    const T* __restrict__ var_grad, const int64_t* __restrict__ prev_count,
+    int64_t L, int64_t num_groups, double beta1, double beta2, const T_ACC* __restrict__ mean_grad,
+    const T_ACC* __restrict__ var_grad, const int64_t* __restrict__ prev_count,
     const bool* __restrict__ bos_mask, const T_ACC* __restrict__ cumrstd,
     const bool* __restrict__ padding_mask, const T_ACC* ds, const T_ACC* db,
-    T* __restrict__ prev_mean_grad, T* __restrict__ prev_var_grad, T_ACC* du, T_ACC* dv) {
+    T_ACC* __restrict__ prev_mean_grad, T_ACC* __restrict__ prev_var_grad, T_ACC* du, T_ACC* dv) {
   const int64_t b = blockIdx.y;
   const int64_t g = blockIdx.x * blockDim.x + threadIdx.x;
   if (g >= num_groups) {
     return;
   }
 
-  const T* mean_grad_ptr = mean_grad + b * num_groups;
-  const T* var_grad_ptr = var_grad + b * num_groups;
+  const T_ACC* mean_grad_ptr = mean_grad + b * num_groups;
+  const T_ACC* var_grad_ptr = var_grad + b * num_groups;
   const T_ACC* rstd_ptr = cumrstd + b * L * num_groups;
   const bool* mask_ptr = padding_mask == nullptr ? nullptr : padding_mask + b * L;
   const T_ACC* ds_ptr = ds + b * L * num_groups;
   const T_ACC* db_ptr = db + b * L * num_groups;
 
-  T* m1_grad_ptr = prev_mean_grad + b * num_groups;
-  T* m2_grad_ptr = prev_var_grad + b * num_groups;
+  T_ACC* m1_grad_ptr = prev_mean_grad + b * num_groups;
+  T_ACC* m2_grad_ptr = prev_var_grad + b * num_groups;
   T_ACC* du_ptr = du + b * L * num_groups;
   T_ACC* dv_ptr = dv + b * L * num_groups;
 
@@ -401,8 +401,8 @@ __global__ void ColwiseInternalGradientsSmallKernel(
   }
   __syncthreads();
 
-  T_ACC u_grad = static_cast<T_ACC>(mean_grad_ptr[g]);
-  T_ACC v_grad = static_cast<T_ACC>(var_grad_ptr[g]);
+  T_ACC u_grad = mean_grad_ptr[g];
+  T_ACC v_grad = var_grad_ptr[g];
 
   // TODO: Improve this.
   double log_beta1 = log(beta1);
@@ -426,17 +426,17 @@ __global__ void ColwiseInternalGradientsSmallKernel(
     }
   }
 
-  m1_grad_ptr[g] = static_cast<T>(u_grad);
-  m2_grad_ptr[g] = static_cast<T>(v_grad);
+  m1_grad_ptr[g] = u_grad;
+  m2_grad_ptr[g] = v_grad;
 }
 
 template <typename T, typename T_ACC>
 __global__ void ColwiseInternalGradientsLargeKernel(
     int64_t L, int64_t num_groups, double beta1, double beta2, int64_t chunk_size,
-    const T* __restrict__ mean_grad, const T* __restrict__ var_grad,
+    const T_ACC* __restrict__ mean_grad, const T_ACC* __restrict__ var_grad,
     const int64_t* __restrict__ prev_count, const bool* __restrict__ bos_mask,
     const T_ACC* __restrict__ cumrstd, const bool* __restrict__ padding_mask, const T_ACC* ds,
-    const T_ACC* db, T* __restrict__ prev_mean_grad, T* __restrict__ prev_var_grad, T_ACC* du,
+    const T_ACC* db, T_ACC* __restrict__ prev_mean_grad, T_ACC* __restrict__ prev_var_grad, T_ACC* du,
     T_ACC* dv) {
   const int64_t kNumMicroChunk = 256;
   __shared__ int32_t count_shared[cuda_utils::kWarpSize / 2][kNumMicroChunk];
@@ -494,15 +494,15 @@ __global__ void ColwiseInternalGradientsLargeKernel(
   }
   __syncthreads();
 
-  const T* mean_grad_ptr = mean_grad + b * num_groups;
-  const T* var_grad_ptr = var_grad + b * num_groups;
+  const T_ACC* mean_grad_ptr = mean_grad + b * num_groups;
+  const T_ACC* var_grad_ptr = var_grad + b * num_groups;
   const T_ACC* rstd_ptr = cumrstd + b * L * num_groups;
   const bool* mask_ptr = padding_mask == nullptr ? nullptr : padding_mask + b * L;
   const T_ACC* ds_ptr = ds + b * L * num_groups;
   const T_ACC* db_ptr = db + b * L * num_groups;
 
-  T* m1_grad_ptr = prev_mean_grad + b * num_groups;
-  T* m2_grad_ptr = prev_var_grad + b * num_groups;
+  T_ACC* m1_grad_ptr = prev_mean_grad + b * num_groups;
+  T_ACC* m2_grad_ptr = prev_var_grad + b * num_groups;
   T_ACC* du_ptr = du + b * L * num_groups;
   T_ACC* dv_ptr = dv + b * L * num_groups;
 
@@ -542,8 +542,8 @@ __global__ void ColwiseInternalGradientsLargeKernel(
   __syncthreads();
 
   if (threadIdx.y == 0) {
-    u_grad = static_cast<T_ACC>(mean_grad_ptr[g]);
-    v_grad = static_cast<T_ACC>(var_grad_ptr[g]);
+    u_grad = mean_grad_ptr[g];
+    v_grad = var_grad_ptr[g];
 #pragma unroll
     for (int64_t i = cuda_utils::kWarpSize / 2 - 1; i >= 0; --i) {
       const T_ACC dux = du_shared[i][threadIdx.x];
@@ -588,8 +588,8 @@ __global__ void ColwiseInternalGradientsLargeKernel(
     }
   }
   if (threadIdx.y == 0) {
-    m1_grad_ptr[g] = static_cast<T>(u_grad);
-    m2_grad_ptr[g] = static_cast<T>(v_grad);
+    m1_grad_ptr[g] = u_grad;
+    m2_grad_ptr[g] = v_grad;
   }
 }
 
@@ -813,16 +813,16 @@ void GroupTimestepDecayNormCUDAFwdImpl(const torch::Tensor& x,
   const T* x_data = x.data_ptr<T>();
   const bool* bos_mask_data = bos_mask.defined() ? bos_mask.data_ptr<bool>() : nullptr;
   const int64_t* prev_count_data = prev_count.data_ptr<int64_t>();
-  const T* prev_mean_data = prev_mean.data_ptr<T>();
-  const T* prev_var_data = prev_var.data_ptr<T>();
+  const T_ACC* prev_mean_data = prev_mean.data_ptr<T_ACC>();
+  const T_ACC* prev_var_data = prev_var.data_ptr<T_ACC>();
   const T* gamma_data = gamma.data_ptr<T>();
   const T* beta_data = beta.data_ptr<T>();
   const bool* padding_mask_data = padding_mask.defined() ? padding_mask.data_ptr<bool>() : nullptr;
 
   T* y_data = y.data_ptr<T>();
   int64_t* count_data = count.data_ptr<int64_t>();
-  T* mean_data = mean.data_ptr<T>();
-  T* var_data = var.data_ptr<T>();
+  T_ACC* mean_data = mean.data_ptr<T_ACC>();
+  T_ACC* var_data = var.data_ptr<T_ACC>();
   T_ACC* group_mean_data = group_mean.data_ptr<T_ACC>();
   T_ACC* group_var_data = group_var.data_ptr<T_ACC>();
   T_ACC* cummean_data = cummean.data_ptr<T_ACC>();
@@ -891,8 +891,8 @@ void GroupTimestepDecayNormCUDABwdImpl(const torch::Tensor& y_grad, const torch:
   torch::Tensor db = torch::empty({B, L, num_groups}, x_or_y.options().dtype(c10::CppTypeToScalarType<T_ACC>::value));
 
   const T* y_grad_data = y_grad.data_ptr<T>();
-  const T* mean_grad_data = mean_grad.data_ptr<T>();
-  const T* var_grad_data = var_grad.data_ptr<T>();
+  const T_ACC* mean_grad_data = mean_grad.data_ptr<T_ACC>();
+  const T_ACC* var_grad_data = var_grad.data_ptr<T_ACC>();
   const T* x_or_y_data = x_or_y.data_ptr<T>();
   const int64_t* prev_count_data = prev_count.data_ptr<int64_t>();
   const bool* bos_mask_data = bos_mask.defined() ? bos_mask.data_ptr<bool>() : nullptr;
@@ -903,8 +903,8 @@ void GroupTimestepDecayNormCUDABwdImpl(const torch::Tensor& y_grad, const torch:
   const bool* padding_mask_data = padding_mask.defined() ? padding_mask.data_ptr<bool>() : nullptr;
 
   T* x_grad_data = x_grad.data_ptr<T>();
-  T* prev_mean_grad_data = prev_mean_grad.data_ptr<T>();
-  T* prev_var_grad_data = prev_var_grad.data_ptr<T>();
+  T_ACC* prev_mean_grad_data = prev_mean_grad.data_ptr<T_ACC>();
+  T_ACC* prev_var_grad_data = prev_var_grad.data_ptr<T_ACC>();
   T* gamma_grad_data = gamma_grad.data_ptr<T>();
   T* beta_grad_data = beta_grad.data_ptr<T>();
   T_ACC* group_mean_data = group_mean.data_ptr<T_ACC>();
@@ -993,12 +993,16 @@ GroupTimestepDecayNormCUDAFwd(const torch::Tensor& x, const c10::optional<torch:
   c10::MaybeOwned<torch::Tensor> bos_mask_maybe_owned = at::borrow_from_optional_tensor(bos_mask);
   c10::MaybeOwned<torch::Tensor> padding_mask_maybe_owned = at::borrow_from_optional_tensor(padding_mask);
 
+  // Running mean/variance use the input accumulation dtype across calls.
+  const auto acc_type = at::toAccumulateType(x.scalar_type(), true);
+  const torch::Tensor prev_mean_acc = prev_mean.to(acc_type);
+  const torch::Tensor prev_var_acc = prev_var.to(acc_type);
+
   torch::Tensor y = torch::empty_like(x, x.options().memory_format(at::MemoryFormat::Contiguous));
   torch::Tensor count = torch::empty_like(prev_count, prev_count.options().memory_format(at::MemoryFormat::Contiguous));
-  torch::Tensor mean = torch::empty_like(prev_mean, prev_mean.options().memory_format(at::MemoryFormat::Contiguous));
-  torch::Tensor var = torch::empty_like(prev_var, prev_var.options().memory_format(at::MemoryFormat::Contiguous));
+  torch::Tensor mean = torch::empty_like(prev_mean_acc, prev_mean_acc.options().memory_format(at::MemoryFormat::Contiguous));
+  torch::Tensor var = torch::empty_like(prev_var_acc, prev_var_acc.options().memory_format(at::MemoryFormat::Contiguous));
 
-  const auto acc_type = at::toAccumulateType(x.scalar_type(), true);
   torch::Tensor group_mean = torch::empty({B, L, num_groups}, x.options().dtype(acc_type).memory_format(at::MemoryFormat::Contiguous));
   torch::Tensor group_var = torch::empty({B, L, num_groups}, x.options().dtype(acc_type).memory_format(at::MemoryFormat::Contiguous));
   torch::Tensor cummean = torch::empty({B, L, num_groups}, x.options().dtype(acc_type).memory_format(at::MemoryFormat::Contiguous));
@@ -1009,7 +1013,7 @@ GroupTimestepDecayNormCUDAFwd(const torch::Tensor& x, const c10::optional<torch:
         GroupTimestepDecayNormCUDAFwdImpl<scalar_t>(
             *(x.expect_contiguous()), *(bos_mask_maybe_owned->expect_contiguous()),
             *(prev_count.expect_contiguous()),
-            *(prev_mean.expect_contiguous()), *(prev_var.expect_contiguous()),
+            *(prev_mean_acc.expect_contiguous()), *(prev_var_acc.expect_contiguous()),
             *(gamma.expect_contiguous()), *(beta.expect_contiguous()),
             *(padding_mask_maybe_owned->expect_contiguous()), num_groups, beta1, beta2, eps, y,
             count, mean, var, group_mean, group_var, cummean, cumrstd);
@@ -1029,17 +1033,22 @@ GroupTimestepDecayNormCUDABwd(const torch::Tensor& y_grad, const torch::Tensor& 
   c10::MaybeOwned<torch::Tensor> bos_mask_maybe_owned = at::borrow_from_optional_tensor(bos_mask);
   c10::MaybeOwned<torch::Tensor> padding_mask_maybe_owned = at::borrow_from_optional_tensor(padding_mask);
 
+  // The state and its gradients are in the accumulate type, see GroupTimestepDecayNormCUDAFwd.
+  const auto acc_type = at::toAccumulateType(x_or_y.scalar_type(), true);
+  const torch::Tensor mean_grad_acc = mean_grad.to(acc_type);
+  const torch::Tensor var_grad_acc = var_grad.to(acc_type);
+
   torch::Tensor x_grad = torch::empty_like(x_or_y, x_or_y.options().memory_format(at::MemoryFormat::Contiguous));
-  torch::Tensor prev_mean_grad = torch::empty_like(mean_grad, mean_grad.options().memory_format(at::MemoryFormat::Contiguous));
-  torch::Tensor prev_var_grad = torch::empty_like(var_grad, var_grad.options().memory_format(at::MemoryFormat::Contiguous));
+  torch::Tensor prev_mean_grad = torch::empty_like(mean_grad_acc, mean_grad_acc.options().memory_format(at::MemoryFormat::Contiguous));
+  torch::Tensor prev_var_grad = torch::empty_like(var_grad_acc, var_grad_acc.options().memory_format(at::MemoryFormat::Contiguous));
   torch::Tensor gamma_grad = torch::empty_like(gamma, gamma.options().memory_format(at::MemoryFormat::Contiguous));
   torch::Tensor beta_grad = torch::empty_like(gamma, gamma.options().memory_format(at::MemoryFormat::Contiguous));
 
   AT_DISPATCH_FLOATING_TYPES_AND2(
       at::kHalf, at::kBFloat16, x_or_y.scalar_type(), "GroupTimestepDecayNormCUDABwd", [&]() {
         GroupTimestepDecayNormCUDABwdImpl<scalar_t>(
-            *(y_grad.expect_contiguous()), *(mean_grad.expect_contiguous()),
-            *(var_grad.expect_contiguous()), *(x_or_y.expect_contiguous()),
+            *(y_grad.expect_contiguous()), *(mean_grad_acc.expect_contiguous()),
+            *(var_grad_acc.expect_contiguous()), *(x_or_y.expect_contiguous()),
             *(prev_count.expect_contiguous()), *(bos_mask_maybe_owned->expect_contiguous()),
             *(cummean.expect_contiguous()), *(cumrstd.expect_contiguous()),
             *(gamma.expect_contiguous()), *(beta.expect_contiguous()),

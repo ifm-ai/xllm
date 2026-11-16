@@ -339,8 +339,6 @@ class GatedDeltaAttention(nn.Module):
             [n_groups, n_groups, conv_q_size, conv_k_size, conv_v_size, ksize, ksize, ksize, vsize, agsize, msize, lntsize],
             dim=-1
         )
-        prev_mean = prev_mean.to(x)
-        prev_var = prev_var.to(x)
         conv_q = conv_q.view(bsz, width, n_heads * kdim).to(x)
         conv_k = conv_k.view(bsz, width, n_kv_heads * kdim * nk).to(x)
         conv_v = conv_v.view(bsz, width, n_kv_heads * vdim).to(x)

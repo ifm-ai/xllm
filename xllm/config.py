@@ -155,7 +155,7 @@ class ModelConf(Config):
     timenorm_num_groups: int = 32  # Num of groups of features used in timestep decay normalization in Gekko.
     timenorm_beta1: float = 0.999  # Used in timestep decay normalization.
     timenorm_beta2: float = 0.9999  # Used in timestep decay normalization.
-    timenorm_backend: str = 'cub'  # cub or chunkwise
+    timenorm_backend: str = 'cub'  # cub, lookback or chunkwise
     layernorm_num_groups: int = 1  # Num of groups of features in LayerNorm/RMSNorm.
     memory_efficient_norm: bool = False  # Whether to use norm output for backward to save activation memory. Unsupported by 'cub' timestep norm backend.
     norm_affine: bool = True  # Enable learnable scaling in attention/FFN input norms (plus bias for LayerNorm).
@@ -198,7 +198,7 @@ class ModelConf(Config):
         assert self.mova_backend in ['sequential', 'nested', 'torch', 'te']
         assert self.moe_expert_backend in ['sequential', 'nested', 'torch', 'te']
         assert self.moe_permutation_backend in ['torch', 'triton']
-        assert self.timenorm_backend in ['cub', 'chunkwise']
+        assert self.timenorm_backend in ['cub', 'lookback', 'chunkwise']
         assert self.causal_conv_backend in ['fla', 'triton']
 
         if self.fused_block:

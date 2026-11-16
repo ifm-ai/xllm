@@ -7,6 +7,8 @@ import xllm_extension.ops as xllm_ops
 
 
 def benchmark_timestep_decay_norm(
+    backend,
+    memory_efficient,
     x,
     bos_mask,
     prev_count,
@@ -25,9 +27,13 @@ def benchmark_timestep_decay_norm(
     warmup,
     epochs,
 ):
+    # The chunkwise and lookback ops take the same arguments.
+    prefix = "group_timestep_decay_norm_lookback" if backend == "lookback" else "group_timestep_decay_norm"
+    fwd_op = getattr(xllm_ops, f"{prefix}_fwd")
+    bwd_op = getattr(xllm_ops, f"{prefix}_bwd")
     with torch.no_grad():
         for _ in range(warmup):
-            y, count, mean, var, cummean, cumrstd = xllm_ops.group_timestep_decay_norm_fwd(
+            y, count, mean, var, cummean, cumrstd = fwd_op(
                 x,
                 bos_mask,
                 prev_count,
@@ -41,11 +47,11 @@ def benchmark_timestep_decay_norm(
                 beta2,
                 eps,
             )
-            xllm_ops.group_timestep_decay_norm_bwd(
+            bwd_op(
                 y_grad,
                 mean_grad,
                 var_grad,
-                x,
+                y if memory_efficient else x,
                 prev_count,
                 bos_mask,
                 cummean,
@@ -57,14 +63,14 @@ def benchmark_timestep_decay_norm(
                 beta1,
                 beta2,
                 eps,
-                False,
+                memory_efficient,
             )
 
         torch.cuda.synchronize()
 
         start = timer()
         for _ in range(epochs):
-            y, count, mean, var, cummean, cumrstd = xllm_ops.group_timestep_decay_norm_fwd(
+            y, count, mean, var, cummean, cumrstd = fwd_op(
                 x,
                 bos_mask,
                 prev_count,
@@ -83,11 +89,11 @@ def benchmark_timestep_decay_norm(
 
         start = timer()
         for _ in range(epochs):
-            xllm_ops.group_timestep_decay_norm_bwd(
+            bwd_op(
                 y_grad,
                 mean_grad,
                 var_grad,
-                x,
+                y if memory_efficient else x,
                 prev_count,
                 bos_mask,
                 cummean,
@@ -99,7 +105,7 @@ def benchmark_timestep_decay_norm(
                 beta1,
                 beta2,
                 eps,
-                False,
+                memory_efficient,
             )
         torch.cuda.synchronize()
         bwd_delta = timer() - start
@@ -254,6 +260,8 @@ def test(
         f"padding_ratio={padding_ratio}:"
     )
     baseline = benchmark_timestep_decay_norm(
+        "chunkwise",
+        False,
         x,
         bos_mask,
         prev_count,
@@ -294,6 +302,31 @@ def test(
     print_benchmark("timestep_decay_norm", baseline, epochs)
     print_benchmark("timestep_decay_norm_cub", candidate, epochs)
     print_speedup(baseline, candidate)
+    for memory_efficient in [False, True]:
+        candidate = benchmark_timestep_decay_norm(
+            "lookback",
+            memory_efficient,
+            x,
+            bos_mask,
+            prev_count,
+            prev_mean,
+            prev_var,
+            weight,
+            bias,
+            y_grad,
+            mean_grad,
+            var_grad,
+            padding_mask,
+            num_groups,
+            0.999,
+            0.9999,
+            1e-5,
+            warmup,
+            epochs,
+        )
+        name = "timestep_decay_norm_lookback" + (" (memory efficient)" if memory_efficient else "")
+        print_benchmark(name, candidate, epochs)
+        print_speedup(baseline, candidate)
     print("*" * 70)
 
 

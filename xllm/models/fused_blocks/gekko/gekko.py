@@ -163,8 +163,8 @@ class GekkoBlockFunction(torch.autograd.Function):
         else:
             bos_mask_curr = bos_mask
             prev_count = timenorm_prior_count.expand(bsz).contiguous()
-            prev_mean = timenorm_prior_mean.type_as(x).expand(bsz, -1).contiguous()
-            prev_var = timenorm_prior_logv_or_var.type_as(x).expand(bsz, -1).contiguous()
+            prev_mean = timenorm_prior_mean.float().expand(bsz, -1).contiguous()
+            prev_var = timenorm_prior_logv_or_var.float().expand(bsz, -1).contiguous()
 
         # Timestep Normalization
         # start to recv tensors for conv_kv & sca
@@ -1106,8 +1106,8 @@ class GekkoOutputLayerFunction(torch.autograd.Function):
                 handle2.wait()
         else:
             prev_count = timenorm_prior_count.expand(bsz).contiguous()
-            prev_mean = timenorm_prior_mean.type_as(x).expand(bsz, -1).contiguous()
-            prev_var = timenorm_prior_logv_or_var.type_as(x).expand(bsz, -1).contiguous()
+            prev_mean = timenorm_prior_mean.float().expand(bsz, -1).contiguous()
+            prev_var = timenorm_prior_logv_or_var.float().expand(bsz, -1).contiguous()
 
         # Final Timestep Normalization
         # B x L x D
