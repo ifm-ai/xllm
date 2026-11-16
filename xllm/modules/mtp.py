@@ -21,13 +21,14 @@ from torch.utils.checkpoint import checkpoint
 
 from xllm.distributed import get_context_parallel_world_size
 from xllm.modules.context_parallel import gather_from_context_parallel_region
-from xllm.modules.layer_norm import GroupLayerNorm
+from xllm.modules.layer_norm import GroupLayerNorm, group_layer_norm
 from xllm.modules.model_parallel import (
     ColumnParallelLinear,
     gather_copy_model_parallel_region,
+    gather_from_model_parallel_region,
     scatter_to_model_parallel_region,
 )
-from xllm.modules.rms_norm import GroupRMSNorm
+from xllm.modules.rms_norm import GroupRMSNorm, group_rms_norm
 from xllm.utils import get_init_fn
 
 IGNORE_INDEX = -100
@@ -57,6 +58,28 @@ def mtp_targets(targets: Tensor, token_mask: Optional[Tensor], eos_id: int, k: i
         nxt_mask[:, :-k] = token_mask[:, k:].to(torch.bool)
         valid &= nxt_mask
     return nxt.masked_fill(~valid, IGNORE_INDEX), valid
+
+
+def final_norm_slice(norm: nn.Module, x: Tensor) -> Tensor:
+    """norm(x) (x: B x L x D/TP) as this TP rank's slice of the model dim, the input of an MTP module.
+
+    A norm with one group under TP gathers x and its weights before normalizing. In its forward their backward is a
+    reduce-scatter, which sums the partial gradients that a column-parallel consumer leaves on each rank. Here the
+    consumer is the scatter back to the slice, whose backward gathers the gradient: it is complete and the same on
+    every rank, and a reduce-scatter would add TP copies of it. So this computes the norm's forward with gather_from
+    instead (backward: keep this rank's slice), the same values; it does not depend on the norm's state, so a
+    recomputation (activation checkpointing) gives the same graph."""
+    if not norm.gather_input:
+        return norm(x)
+    affine = norm.elementwise_affine
+    x = gather_from_model_parallel_region(x)
+    weight = gather_from_model_parallel_region(norm.weight + 1.0) if affine else None
+    if isinstance(norm, GroupRMSNorm):
+        normed = group_rms_norm(x, weight, norm.groups_per_partition, norm.eps, norm.memory_efficient)
+    else:
+        bias = gather_from_model_parallel_region(norm.bias) if affine else None
+        normed = group_layer_norm(x, weight, bias, norm.groups_per_partition, norm.eps, norm.memory_efficient)
+    return scatter_to_model_parallel_region(normed)
 
 
 class MTPLayer(nn.Module):
@@ -142,10 +165,7 @@ class MultiTokenPrediction(nn.Module):
             norms = [output.final_norm, *output.mtp_norms]
             hidden, losses = x, []
             for k, layer in enumerate(self.layers, start=1):
-                normed = norms[k - 1](hidden)
-                if norms[k - 1].gather_input:
-                    normed = scatter_to_model_parallel_region(normed)
-                hidden, aux_loss = layer(normed, embeddings, block_args, layerwise_ckpt)
+                hidden, aux_loss = layer(final_norm_slice(norms[k - 1], hidden), embeddings, block_args, layerwise_ckpt)
                 y, mask = mtp_targets(targets, token_mask, eos_id, k)
                 losses.append(output.mtp_loss(k, hidden, y, mask))
                 masks.append(mask)
