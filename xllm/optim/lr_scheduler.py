@@ -15,7 +15,8 @@ def lr_linear(
     if step < warmup:
         lr = init_ratio + float(step) * (1.0 - init_ratio) / warmup
     elif step <= total_steps:
-        s = float(step - warmup) / (total_steps - warmup)
+        # max(..., 1): no decay steps when warmup == total_steps
+        s = float(step - warmup) / max(total_steps - warmup, 1)
         lr = s * end_ratio + (1 - s)
     else:
         lr = end_ratio
@@ -33,7 +34,8 @@ def lr_cosine(
     if step < warmup:
         lr = init_ratio + float(step) * (1.0 - init_ratio) / warmup
     elif step <= total_steps:
-        s = float(step - warmup) / (total_steps - warmup)
+        # max(..., 1): no decay steps when warmup == total_steps
+        s = float(step - warmup) / max(total_steps - warmup, 1)
         lr = end_ratio + 0.5 * (1 - end_ratio) * (math.cos(math.pi * s * cycles) + 1)
     else:
         lr = end_ratio
