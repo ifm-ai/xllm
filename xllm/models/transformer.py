@@ -580,23 +580,7 @@ class TransformerOutputLayer(nn.Module):
         if not self.final_norm.gather_input:
             x = gather_copy_model_parallel_region(x)
         logits = self.output(x).float()
-        if health.logits_stats_enabled() and y is not None:
-            # Diagnostics must not change tensors saved for checkpoint recomputation.
-            detached_logits = logits.detach()
-            valid_tokens = y.ne(-100)
-            if mask is not None:
-                valid_tokens.logical_and_(mask.to(torch.bool))
-            token_sums = detached_logits.sum(dim=-1)
-            logits_sum = token_sums.masked_fill(~valid_tokens, 0.0).sum()
-            logits_count = valid_tokens.sum() * logits.shape[-1]
-            token_logit_minimums, token_logit_maximums = torch.aminmax(detached_logits, dim=-1)
-            logits_minimum = token_logit_minimums.masked_fill(
-                ~valid_tokens, float("inf")
-            ).min()
-            logits_maximum = token_logit_maximums.masked_fill(
-                ~valid_tokens, -float("inf")
-            ).max()
-            health.record_logits_stats(logits_sum, logits_count, logits_minimum, logits_maximum)
+        health.record_logits(logits, y, mask)
         if y is None:
             return logits
         else:

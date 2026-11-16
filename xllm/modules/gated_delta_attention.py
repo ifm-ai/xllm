@@ -10,7 +10,7 @@ from xllm.distributed import (
     get_context_parallel_rank,
 )
 from xllm.distributed.utils import divide_and_check_no_remainder
-from xllm.metrics.health import get_active_health_collector
+from xllm.metrics import health
 from xllm.modules.rms_norm import GroupRMSNorm
 from xllm.modules.timestep_decay_norm import TimestepDecayNorm
 from xllm.modules.causal_conv import CausalConv1d
@@ -441,7 +441,7 @@ class GatedDeltaAttention(nn.Module):
         else:
             raise ValueError(f"Unknown attention gate function {self.attn_gate_fn}")
 
-        health_collector = get_active_health_collector()
+        health_collector = health.active_collector()
         if health_collector is not None:
             sca_key_l2 = None
             if health_collector.enable_gekko_stats:

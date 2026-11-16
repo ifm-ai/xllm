@@ -242,7 +242,7 @@ class GekkoBlockFunction(torch.autograd.Function):
 
         sk, _ = rmsnorm_fwd(xk_, knorm_w, local_kv_heads, rmsnorm_eps)
         sk = rearrange(sk, 'b l (k s) -> b l k s', k=local_kv_heads)
-        health_collector = health.get_active_health_collector()
+        health_collector = health.active_collector()
         # Partial RoPE mutates sk; reduce its pre-RoPE vectors before that update.
         health_sca_key_l2 = None
         if health_collector is not None and health_collector.enable_gekko_stats:

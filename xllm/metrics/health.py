@@ -175,7 +175,7 @@ def _layer_matrix_counts(layer: Any, paths: _MatrixParameterPaths) -> Tuple[int,
     return matrix_counts(layer, len(_MATRIX_PARAMETER_PATHS))
 
 
-def get_active_health_collector() -> Optional["HealthMetricCollector"]:
+def active_collector() -> Optional["HealthMetricCollector"]:
     return _ACTIVE_COLLECTOR
 
 
@@ -201,6 +201,24 @@ def record_router_stats(
 
 def logits_stats_enabled() -> bool:
     return _ACTIVE_COLLECTOR is not None and _ACTIVE_COLLECTOR.enable_logits_stats
+
+
+def record_logits(logits: torch.Tensor, targets: Optional[torch.Tensor], mask: Optional[torch.Tensor]) -> None:
+    """Record logit statistics over tokens that have a target and are not masked out."""
+    if not logits_stats_enabled() or targets is None:
+        return
+    # Diagnostics must not change tensors saved for checkpoint recomputation.
+    logits = logits.detach()
+    valid = targets.ne(-100)
+    if mask is not None:
+        valid.logical_and_(mask.to(torch.bool))
+    minimums, maximums = torch.aminmax(logits, dim=-1)
+    record_logits_stats(
+        logits.sum(dim=-1).masked_fill(~valid, 0.0).sum(),
+        valid.sum() * logits.shape[-1],
+        minimums.masked_fill(~valid, float("inf")).min(),
+        maximums.masked_fill(~valid, -float("inf")).max(),
+    )
 
 
 def record_logits_stats(

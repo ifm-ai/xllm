@@ -7,7 +7,7 @@ import torch
 import torch.distributed as dist
 
 import xllm.distributed.initialize as parallel_state
-import xllm.metrics.health as health_metrics
+from xllm.metrics import health
 from xllm.metrics.health import HealthMetricCollector
 
 pytestmark = pytest.mark.usefixtures("single_process_group")
@@ -161,7 +161,7 @@ def test_router_stats_ride_in_the_existing_sum_packet(monkeypatch):
     calls = []
     for name in ("all_reduce", "reduce"):
         original = getattr(dist, name)
-        monkeypatch.setattr(health_metrics.dist, name, lambda tensor, *a, _f=original, _n=name, **kw: (
+        monkeypatch.setattr(health.dist, name, lambda tensor, *a, _f=original, _n=name, **kw: (
             calls.append((_n, kw.get("op"), tensor.numel())), _f(tensor, *a, **kw))[1])
 
     flush([("moe", 1, BASE | dict(aux_loss=torch.tensor(0.3)))])

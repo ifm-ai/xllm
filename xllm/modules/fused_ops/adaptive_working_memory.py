@@ -6,7 +6,7 @@ from torch import Tensor
 from torch.autograd.function import FunctionCtx
 import torch.nn.functional as F
 from einops import rearrange, repeat
-from xllm.metrics.health import get_active_health_collector
+from xllm.metrics import health
 
 from xllm_extension.ops import (
     group_rms_norm_fwd,
@@ -123,7 +123,7 @@ def _adaptive_working_memory_fwd(
     eps: float,
     health_layer_id: Optional[int],
 ):
-    health_collector = get_active_health_collector() if health_layer_id is not None else None
+    health_collector = health.active_collector() if health_layer_id is not None else None
     bsz, n_heads, seq_len, qk_head_dim = query.shape
     _, n_kv_heads, _, v_head_dim = value.shape
     assert seq_len % chunk_size == 0
