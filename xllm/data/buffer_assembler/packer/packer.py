@@ -1,6 +1,7 @@
 from typing import Any, Dict, List, Optional, Tuple
 from abc import abstractmethod
 from collections import defaultdict, deque
+import heapq
 from copy import deepcopy
 import numpy as np
 
@@ -252,6 +253,22 @@ class BestFitPacker(Packer):
             return bin_id, self.bin_capacity
         return None, None
 
+    def _assign_pending_to_bins(self) -> List[_Chunk]:
+        """Place length-sorted pending chunks into bins; return the unplaced ones."""
+        unpacked: List[_Chunk] = []
+        for tokens, mask, info in self.pending_chunks:
+            bin_id, old_space = self._find_best_fit_bin(len(tokens))
+            if bin_id is not None:
+                self.bins[bin_id].append((tokens, mask, info))
+                self.bin_lengths[bin_id] += len(tokens)
+                new_space = old_space - len(tokens)
+                if new_space > 0:
+                    self.space2bin[new_space].append(bin_id)
+                    self._tree_update(new_space, new_space)
+            else:
+                unpacked.append((tokens, mask, info))
+        return unpacked
+
     def prefill(self, ds: str, ex: Instance) -> None:
         self.prefill_buffer.append((ds, ex))
 
@@ -280,20 +297,7 @@ class BestFitPacker(Packer):
         self.prefill_buffer = []
 
         self.pending_chunks.sort(key=lambda c: len(c[0]), reverse=True)
-
-        unpacked: List[_Chunk] = []
-        for tokens, mask, info in self.pending_chunks:
-            bin_id, old_space = self._find_best_fit_bin(len(tokens))
-            if bin_id is not None:
-                self.bins[bin_id].append((tokens, mask, info))
-                self.bin_lengths[bin_id] += len(tokens)
-                new_space = old_space - len(tokens)
-                if new_space > 0:
-                    self.space2bin[new_space].append(bin_id)
-                    self._tree_update(new_space, new_space)
-            else:
-                unpacked.append((tokens, mask, info))
-        self.pending_chunks = unpacked
+        self.pending_chunks = self._assign_pending_to_bins()
 
         seqs: List[PackedSeq] = []
         recycled: List[_Chunk] = []
@@ -356,3 +360,38 @@ class BestFitPacker(Packer):
         if not state:
             return
         self.pending_chunks = deepcopy(state.get("pending_chunks", []))
+
+
+class BestFitTransversalPacker(BestFitPacker):
+    """Worst-Fit Decreasing variant of BestFitPacker.
+
+    Identical to BestFitPacker except for chunk placement: each chunk (in
+    decreasing length order) goes into the bin with the MOST remaining space
+    instead of the least. This spreads long documents across bins so each
+    packed sequence mixes long and short segments, balancing per-sequence
+    attention cost.
+
+    Because the emptiest bin is always a fresh one, bins are opened up front:
+    as many as the pending tokens can fill (capped at max_active_bins), so the
+    load is spread over bins that can actually reach min_fill_ratio.
+    """
+
+    def _assign_pending_to_bins(self) -> List[_Chunk]:
+        total_tokens = sum(len(c[0]) for c in self.pending_chunks)
+        num_bins = min(self.max_active_bins, max(1, total_tokens // self.bin_capacity))
+        # Max-heap on remaining space; ties broken by lowest bin id.
+        heap: List[Tuple[int, int]] = [(-self.bin_capacity, bin_id) for bin_id in range(num_bins)]
+        self.next_bin_id = num_bins
+
+        unpacked: List[_Chunk] = []
+        for tokens, mask, info in self.pending_chunks:
+            n = len(tokens)
+            neg_space, bin_id = heap[0]
+            space = -neg_space
+            if n > space:
+                unpacked.append((tokens, mask, info))
+                continue
+            self.bins[bin_id].append((tokens, mask, info))
+            self.bin_lengths[bin_id] += n
+            heapq.heapreplace(heap, (-(space - n), bin_id))
+        return unpacked

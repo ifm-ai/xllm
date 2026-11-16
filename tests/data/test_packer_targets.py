@@ -2,6 +2,7 @@ import numpy as np
 
 from xllm.data.buffer_assembler.packer.packer import (
     BestFitPacker,
+    BestFitTransversalPacker,
     IGNORE_INDEX,
     SimpleConcatPacker,
     _apply_ignore_index_to_targets,
@@ -139,3 +140,47 @@ def test_simple_checkpoint_stores_tokenized_leftover_chunks():
     restored = SimpleConcatPacker(seq_len=4, pad_id=99)
     restored.set_state(state)
     assert restored._leftover_chunks == packer._leftover_chunks
+
+
+
+def _pack_lengths(packer_cls, seq_len, lengths, **kwargs):
+    packer = packer_cls(seq_len=seq_len, pad_id=0, min_fill_ratio=0.0, **kwargs)
+    for line_num, n in enumerate(lengths, start=1):
+        packer.prefill("ds", _instance(range(100 * line_num, 100 * line_num + n), line_num=line_num))
+    seqs = packer.pack()
+    bins = sorted(tuple(info.line_num for info in seq.src_infos) for seq in seqs)
+    return packer, bins
+
+
+def test_best_fit_transversal_places_chunks_in_emptiest_bin():
+    # Capacity 10, 20 tokens -> two bins opened up front.
+    lengths = [5, 4, 4, 3, 2, 2]
+
+    # Best-fit: 5,4 -> A; 4,3,2 -> B; last 2 opens a third bin.
+    _, best = _pack_lengths(BestFitPacker, 9, lengths)
+    assert best == [(1, 2), (3, 4, 5), (6,)]
+
+    # Worst-fit: 5 -> A, 4 -> B, 4 -> B, 3 -> A, 2 -> A (tie, lowest id), 2 -> B.
+    packer, transversal = _pack_lengths(BestFitTransversalPacker, 9, lengths)
+    assert transversal == [(1, 4, 5), (2, 3, 6)]
+    assert packer.pending_chunks == []
+
+
+def test_best_fit_transversal_spreads_long_chunks():
+    # Three long and three short chunks over three bins: one long per bin.
+    packer, bins = _pack_lengths(BestFitTransversalPacker, 9, [8, 8, 8, 2, 2, 2])
+    assert bins == [(1, 4), (2, 5), (3, 6)]
+    assert packer.pending_chunks == []
+
+
+def test_best_fit_transversal_carries_chunks_that_do_not_fit():
+    # Capacity 5, 13 tokens -> two bins: {5}, {4}; the 4-chunk no longer fits.
+    packer, bins = _pack_lengths(BestFitTransversalPacker, 4, [5, 4, 4])
+    assert bins == [(1,), (2,)]
+    assert [len(c[0]) for c in packer.pending_chunks] == [4]
+
+
+def test_best_fit_transversal_caps_bins_at_max_active_bins():
+    packer, bins = _pack_lengths(BestFitTransversalPacker, 9, [5, 5, 5, 5], max_active_bins=1)
+    assert bins == [(1, 2)]
+    assert len(packer.pending_chunks) == 2
