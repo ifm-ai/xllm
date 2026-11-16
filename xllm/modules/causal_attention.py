@@ -22,7 +22,7 @@ from xllm.modules.rotary_positional_embedding import (
     apply_rotary_embedding,
     apply_rotary_embeddings
 )
-from xllm.health_metrics import get_active_health_collector
+from xllm.metrics.health import get_active_health_collector
 
 
 def repeat_kv(x: Tensor, n_rep: int) -> Tensor:

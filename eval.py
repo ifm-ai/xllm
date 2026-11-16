@@ -12,7 +12,7 @@ from xllm.config import ValidConf
 from xllm.checkpointing import ckpt_path_to_step
 from xllm.eval.execute import execute_evals
 from xllm.logger import initialize_logger
-from xllm.metrics import MetricLogger
+from xllm.metrics.metric_logger import MetricLogger
 from xllm.configuration import Config, cfg_from_cli
 from xllm.reloading import reload_model
 from xllm.distributed.slurm import is_master, get_global_rank

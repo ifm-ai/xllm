@@ -4,7 +4,7 @@ import torch
 from einops import rearrange
 
 from xllm.distributed.utils import reshape_gathered_tensor_along_specific_dim
-from xllm.health_metrics import get_active_health_collector
+from xllm.metrics.health import get_active_health_collector
 from xllm.modules.fused_ops import (
     memory_efficient_dropout_fwd,
     memory_efficient_dropout_bwd,

@@ -20,7 +20,7 @@ from xllm.modules.fused_ops import memory_efficient_dropout
 from xllm.modules.layer_norm import GroupLayerNorm
 from xllm.modules.rms_norm import GroupRMSNorm
 from xllm.modules.residual import build_residual
-from xllm.health_metrics import get_active_health_collector
+from xllm.metrics.health import get_active_health_collector
 from xllm.utils import get_init_fn
 from .router import TopKRouter
 from .expert import Expert

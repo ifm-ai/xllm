@@ -6,7 +6,7 @@ from torch import Tensor
 from torch.autograd.function import FunctionCtx
 import torch.nn.functional as F
 from einops import rearrange, repeat
-from xllm.health_metrics import get_active_health_collector
+from xllm.metrics.health import get_active_health_collector
 
 from xllm_extension.ops import (
     group_rms_norm_fwd,

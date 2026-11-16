@@ -7,8 +7,8 @@ import torch
 import torch.distributed as dist
 
 import xllm.distributed.initialize as parallel_state
-import xllm.health_metrics as health_metrics
-from xllm.health_metrics import HealthMetricCollector
+import xllm.metrics.health as health_metrics
+from xllm.metrics.health import HealthMetricCollector
 
 pytestmark = pytest.mark.usefixtures("single_process_group")
 

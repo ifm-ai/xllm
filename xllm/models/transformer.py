@@ -30,7 +30,7 @@ from xllm.modules.utils import (
     get_segment_idx_from_bos_mask,
 )
 from xllm.config import ModelConf
-from xllm.health_metrics import get_active_health_collector
+from xllm.metrics.health import get_active_health_collector
 from xllm.models.xllm import XLLModel
 from xllm.distributed import (
     get_context_parallel_world_size,

@@ -6,7 +6,7 @@ from torch.nn import functional as F
 from einops import rearrange
 
 from xllm.distributed.utils import reshape_gathered_tensor_along_specific_dim
-from xllm.health_metrics import get_active_health_collector
+from xllm.metrics.health import get_active_health_collector
 from xllm.modules.context_parallel import (
     should_send_to_next,
     should_recv_from_prev,

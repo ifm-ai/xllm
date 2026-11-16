@@ -7,7 +7,7 @@ import torch.distributed as dist
 from torch.distributed.tensor import DTensor, Replicate, Shard
 
 from xllm.distributed.initialize import get_model_parallel_rank
-from xllm.matrix_norms import (
+from xllm.metrics.matrix_norms import (
     MatrixSlice,
     dtensor_squared_l2,
     flat_slice_squared_l2,
@@ -17,7 +17,7 @@ from xllm.matrix_norms import (
 )
 
 if TYPE_CHECKING:
-    from xllm.metrics import MetricLogger
+    from xllm.metrics.metric_logger import MetricLogger
 
 logger = getLogger()
 

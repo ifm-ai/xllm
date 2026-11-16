@@ -10,7 +10,7 @@ from xllm.distributed import (
     get_context_parallel_rank,
 )
 from xllm.distributed.utils import divide_and_check_no_remainder
-from xllm.health_metrics import get_active_health_collector
+from xllm.metrics.health import get_active_health_collector
 from xllm.modules.rms_norm import GroupRMSNorm
 from xllm.modules.timestep_decay_norm import TimestepDecayNorm
 from xllm.modules.causal_conv import CausalConv1d

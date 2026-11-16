@@ -5,7 +5,7 @@ from torch import nn, Tensor
 import torch.nn.functional as F
 from einops import rearrange
 
-from xllm.health_metrics import get_active_health_collector
+from xllm.metrics.health import get_active_health_collector
 from xllm.utils import get_init_fn
 from xllm.distributed.utils import divide_and_check_no_remainder
 from xllm.distributed import (

@@ -10,10 +10,10 @@ import torch.multiprocessing as mp
 
 import tests.health.helpers as helpers
 import xllm.distributed.initialize as parallel_state
-import xllm.health_metrics as health_metrics
+import xllm.metrics.health as health_metrics
 from tests.health.helpers import MASK, MATRICES, TARGETS, TOKENS, logged_metrics, shard, tiny_transformer
-from xllm.health_metrics import HealthMetricCollector, get_active_health_collector
-from xllm.metrics import MetricLogger
+from xllm.metrics.health import HealthMetricCollector, get_active_health_collector
+from xllm.metrics.metric_logger import MetricLogger
 from xllm.modules.rms_norm import GroupRMSNorm
 
 STATS = ("mean", "min", "max")

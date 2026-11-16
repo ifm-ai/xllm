@@ -58,9 +58,9 @@ from xllm.utils import (
 )
 from xllm.models import build_model
 from xllm.optim import build_optimizer, rescale_grads
-from xllm.monitor import GPUMonitor, Timings
-from xllm.metrics import MetricLogger, build_mlogger
-from xllm.health_metrics import HealthMetricCollector
+from xllm.metrics.monitor import GPUMonitor, Timings
+from xllm.metrics.metric_logger import MetricLogger, build_mlogger
+from xllm.metrics.health import HealthMetricCollector
 from xllm.modules.moe.moe import moe_layer_ids
 from xllm.modules.moe.mova import mova_layer_ids
 from xllm.configuration import cfg_from_cli

@@ -20,7 +20,7 @@ from xllm.modules.model_parallel import (
     vocab_parallel_cross_entropy,
 )
 from xllm.config import ModelConf
-from xllm.health_metrics import get_active_health_collector
+from xllm.metrics.health import get_active_health_collector
 from xllm.distributed import (
     get_context_parallel_world_size,
     get_context_parallel_rank,
