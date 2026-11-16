@@ -82,7 +82,7 @@ DATA_CFGS=(
 | `global_batch_size` | Alternative to `batch_size`: total batch size across data-parallel ranks; must be divisible by the data-parallel size. |
 | `buffer_size` | Controls the shuffle window: approximately `buffer_size * seq_len` tokens per rank per refill. |
 | `num_workers` | Threads reading and tokenizing different sources; one source is not split across workers. |
-| `packing_type` | `simple` concatenates tokens; `bestfit` uses length-aware packing to reduce padding, keeping documents intact when they fit in one sequence. `bestfit-transversal` is the same but places each chunk in the emptiest sequence (see below). |
+| `packing_type` | `simple` concatenates tokens; `bestfit` uses length-aware packing to reduce padding, keeping documents intact when they fit in one sequence. `bestfit-transversal` is the same but places each chunk in the emptiest sequence; `bestfit-hybrid` does the same except that nearly-full sequences are finished best-fit (see below). |
 | `skip_long_docs` | With `bestfit`, `true` skips overlong chat records; text records are still split. |
 | `min_doc_tokens` | Skips records with fewer tokens (including BOS/EOS) while filling the buffer; `0` keeps all. Skipped records do not count toward source token budgets, so mix ratios and refill size apply to kept documents, and they count toward `max_consecutive_skips`. Many tiny documents in one sequence inflate the segment count seen by varlen attention kernels. |
 
@@ -110,6 +110,12 @@ sequences and topped up with short ones, rather than grouped with documents of
 similar length, which balances per-sequence attention cost. Since a new sequence
 is always the emptiest, the packer opens as many sequences as the pending tokens
 can fill (up to the bin limit) before placing chunks.
+
+`bestfit-hybrid` uses the same pre-opened sequences, but if a chunk fits in a
+sequence with less than max(2000, 5% of `seq_len`) tokens left, it goes into the
+fullest such sequence (best-fit) instead. Long and short segments are still
+mixed across sequences, while the last gaps are closed tightly to keep padding
+at bestfit levels.
 
 This trades buffer memory and refill work for less padding and a wider shuffle
 window, without a full-dataset packing pass. With `log_wandb=true`, training

@@ -20,7 +20,7 @@ from xllm.data.dataset_streamer.feature_builder.feature_builder import (
 )
 from xllm.data.dataset_streamer.templator.templator import SimpleJsonlTemplator
 from xllm.data.buffer_assembler.buffer_assembler import BufferAssembler
-from xllm.data.buffer_assembler.packer.packer import SimpleConcatPacker, BestFitPacker, BestFitTransversalPacker
+from xllm.data.buffer_assembler.packer.packer import SimpleConcatPacker, BestFitHybridPacker, BestFitPacker, BestFitTransversalPacker
 from xllm.data.data_types import PackedSeq, Batch
 from xllm.data.dataset_streamer.tokenizer import Tokenizer
 
@@ -47,7 +47,8 @@ class MultiSourceDataLoader:
     - world_rank: Rank of current GPU process.
     - world_size: Total number of ranks.
     - packing_type: "simple" concatenation, "bestfit" bin packing, or
-      "bestfit-transversal" (bestfit placing each chunk in the emptiest bin).
+      "bestfit-transversal" (bestfit placing each chunk in the emptiest bin), or
+      "bestfit-hybrid" (emptiest bin, but best-fit into nearly-full bins).
     - num_workers: Number of tokenizer worker threads used during buffer refill.
     - max_consecutive_skips: Fail a source after this many consecutive records
       fail to produce tokenized features.
@@ -97,8 +98,13 @@ class MultiSourceDataLoader:
         self.pad_id = eos_id
 
         _packing_type = packing_type.lower()
-        if _packing_type in ("bestfit", "bestfit-transversal"):
-            packer_cls = BestFitTransversalPacker if _packing_type == "bestfit-transversal" else BestFitPacker
+        bestfit_packers = {
+            "bestfit": BestFitPacker,
+            "bestfit-transversal": BestFitTransversalPacker,
+            "bestfit-hybrid": BestFitHybridPacker,
+        }
+        if _packing_type in bestfit_packers:
+            packer_cls = bestfit_packers[_packing_type]
             self.packer = packer_cls(
                 seq_len=seq_len,
                 max_active_bins=max(1, int(num_buffered_seq * 1.02)),
@@ -109,7 +115,7 @@ class MultiSourceDataLoader:
         elif _packing_type == "simple":
             self.packer = SimpleConcatPacker(seq_len=seq_len, pad_id=self.pad_id)
         else:
-            raise ValueError(f"Unknown packing_type: {packing_type!r}. Supported: 'simple', 'bestfit', 'bestfit-transversal'")
+            raise ValueError(f"Unknown packing_type: {packing_type!r}. Supported: 'simple', 'bestfit', 'bestfit-transversal', 'bestfit-hybrid'")
 
         # build streamers
         self.streamers: Dict[str, DatasetStreamer] = {}  # keyed by dataset_dir

@@ -10,6 +10,7 @@ import pytest
 from xllm.config import DataLoaderConfig
 from xllm.data.build import build_data_loader
 from xllm.data.buffer_assembler.packer.packer import (
+    BestFitHybridPacker,
     BestFitPacker,
     BestFitTransversalPacker,
     SimpleConcatPacker,
@@ -52,6 +53,7 @@ def _build_loader(data_dir, packing_type="bestfit"):
     ("simple", SimpleConcatPacker),
     ("bestfit", BestFitPacker),
     ("bestfit-transversal", BestFitTransversalPacker),
+    ("bestfit-hybrid", BestFitHybridPacker),
 ])
 def test_build_data_loader_selects_packing_type(tmp_path, packing_type, packer_class):
     (tmp_path / "data.chunk0.jsonl").write_text(

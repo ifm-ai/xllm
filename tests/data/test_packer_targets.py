@@ -1,6 +1,7 @@
 import numpy as np
 
 from xllm.data.buffer_assembler.packer.packer import (
+    BestFitHybridPacker,
     BestFitPacker,
     BestFitTransversalPacker,
     IGNORE_INDEX,
@@ -143,8 +144,10 @@ def test_simple_checkpoint_stores_tokenized_leftover_chunks():
 
 
 
-def _pack_lengths(packer_cls, seq_len, lengths, **kwargs):
+def _pack_lengths(packer_cls, seq_len, lengths, finish_threshold=None, **kwargs):
     packer = packer_cls(seq_len=seq_len, pad_id=0, min_fill_ratio=0.0, **kwargs)
+    if finish_threshold is not None:
+        packer.finish_threshold = finish_threshold
     for line_num, n in enumerate(lengths, start=1):
         packer.prefill("ds", _instance(range(100 * line_num, 100 * line_num + n), line_num=line_num))
     seqs = packer.pack()
@@ -184,3 +187,34 @@ def test_best_fit_transversal_caps_bins_at_max_active_bins():
     packer, bins = _pack_lengths(BestFitTransversalPacker, 9, [5, 5, 5, 5], max_active_bins=1)
     assert bins == [(1, 2)]
     assert len(packer.pending_chunks) == 2
+
+
+def test_best_fit_hybrid_finish_threshold_is_5_percent_with_2000_floor():
+    assert BestFitHybridPacker(seq_len=4096).finish_threshold == 2000
+    assert BestFitHybridPacker(seq_len=131072).finish_threshold == 6553
+
+
+def test_best_fit_hybrid_spreads_then_finishes_nearly_full_bins_best_fit():
+    # Capacity 10, 20 tokens -> two bins; bins with < 3 tokens left are finished best-fit.
+    # 5 -> A (5 left), 4 -> B (6 left), 4 -> B (2 left, finishing), 3 -> A (2 left, finishing),
+    # 2 -> B (finishing, earliest of equal space), 2 -> A.
+    packer, bins = _pack_lengths(BestFitHybridPacker, 9, [5, 4, 4, 3, 2, 2], finish_threshold=3)
+    assert bins == [(1, 4, 6), (2, 3, 5)]
+    assert packer.pending_chunks == []
+
+
+def test_best_fit_hybrid_prefers_fullest_finishing_bin_over_emptiest_bin():
+    # Capacity 10, three bins; bins with < 4 tokens left are finished best-fit.
+    # 8 -> A (2 left), 7 -> B (3 left), 6 -> C (4 left, still open).
+    # Hybrid: 3 -> B and 2 -> A close the finishing bins, then 2, 2 -> C.
+    _, hybrid = _pack_lengths(BestFitHybridPacker, 9, [8, 7, 6, 3, 2, 2, 2], finish_threshold=4)
+    assert hybrid == [(1, 5), (2, 4), (3, 6, 7)]
+    # Worst-fit sends 3 to the emptiest bin C instead, leaving the last 2 unplaced.
+    _, worst = _pack_lengths(BestFitTransversalPacker, 9, [8, 7, 6, 3, 2, 2, 2])
+    assert worst == [(1, 6), (2, 5), (3, 4)]
+
+
+def test_best_fit_hybrid_carries_chunks_that_fit_nowhere():
+    packer, bins = _pack_lengths(BestFitHybridPacker, 4, [5, 4, 4], finish_threshold=2)
+    assert bins == [(1,), (2,)]
+    assert [len(c[0]) for c in packer.pending_chunks] == [4]

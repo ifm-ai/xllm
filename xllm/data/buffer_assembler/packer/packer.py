@@ -1,6 +1,7 @@
 from typing import Any, Dict, List, Optional, Tuple
 from abc import abstractmethod
 from collections import defaultdict, deque
+import bisect
 import heapq
 from copy import deepcopy
 import numpy as np
@@ -394,4 +395,64 @@ class BestFitTransversalPacker(BestFitPacker):
             self.bins[bin_id].append((tokens, mask, info))
             self.bin_lengths[bin_id] += n
             heapq.heapreplace(heap, (-(space - n), bin_id))
+        return unpacked
+
+
+class BestFitHybridPacker(BestFitPacker):
+    """Worst-fit placement that switches to best-fit to finish nearly-full bins.
+
+    Chunks are taken in decreasing length order, as in BestFitPacker. For each
+    chunk:
+
+    * if some bin has less than ``finish_threshold`` tokens left and can hold
+      the chunk, it goes into the one of those bins with the least space left
+      (best-fit), to close the remaining gap as tightly as possible;
+    * otherwise it goes into the bin with the most space left (worst-fit), so
+      long segments are spread across sequences and a bin is not filled with
+      a run of similar-length segments.
+
+    ``finish_threshold`` is max(2000, 5% of seq_len). Bins are opened up front,
+    as many as the pending tokens can fill (capped at max_active_bins); chunks
+    that fit nowhere stay pending for the next refill.
+    """
+
+    MIN_FINISH_TOKENS = 2000
+    FINISH_FRACTION = 0.05
+
+    def __init__(self, seq_len: int, *args: Any, **kwargs: Any):
+        super().__init__(seq_len, *args, **kwargs)
+        self.finish_threshold = max(self.MIN_FINISH_TOKENS, int(self.FINISH_FRACTION * seq_len))
+
+    def _assign_pending_to_bins(self) -> List[_Chunk]:
+        total_tokens = sum(len(c[0]) for c in self.pending_chunks)
+        num_bins = min(self.max_active_bins, max(1, total_tokens // self.bin_capacity))
+        self.next_bin_id = num_bins
+        # Bins still being spread over: max-heap on remaining space, ties -> lowest bin id.
+        open_heap: List[Tuple[int, int]] = [(-self.bin_capacity, bin_id) for bin_id in range(num_bins)]
+        # Bins being finished: sorted by (remaining space, arrival order) for best-fit lookup.
+        finishing: List[Tuple[int, int, int]] = []
+        arrival = 0
+
+        unpacked: List[_Chunk] = []
+        for tokens, mask, info in self.pending_chunks:
+            n = len(tokens)
+            i = bisect.bisect_left(finishing, (n, -1, -1))
+            if i < len(finishing):
+                space, _, bin_id = finishing.pop(i)
+            elif open_heap and -open_heap[0][0] >= n:
+                neg_space, bin_id = heapq.heappop(open_heap)
+                space = -neg_space
+            else:
+                unpacked.append((tokens, mask, info))
+                continue
+            self.bins[bin_id].append((tokens, mask, info))
+            self.bin_lengths[bin_id] += n
+            space -= n
+            if space <= 0:
+                continue
+            if space < self.finish_threshold:
+                bisect.insort(finishing, (space, arrival, bin_id))
+                arrival += 1
+            else:
+                heapq.heappush(open_heap, (-space, bin_id))
         return unpacked
