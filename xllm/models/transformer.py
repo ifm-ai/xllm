@@ -30,7 +30,7 @@ from xllm.modules.utils import (
     get_segment_idx_from_bos_mask,
 )
 from xllm.config import ModelConf
-from xllm.metrics.health import get_active_health_collector
+from xllm.metrics import health
 from xllm.models.xllm import XLLModel
 from xllm.distributed import (
     get_context_parallel_world_size,
@@ -580,8 +580,7 @@ class TransformerOutputLayer(nn.Module):
         if not self.final_norm.gather_input:
             x = gather_copy_model_parallel_region(x)
         logits = self.output(x).float()
-        collector = get_active_health_collector()
-        if collector is not None and collector.enable_logits_stats and y is not None:
+        if health.logits_stats_enabled() and y is not None:
             # Diagnostics must not change tensors saved for checkpoint recomputation.
             detached_logits = logits.detach()
             valid_tokens = y.ne(-100)
@@ -597,9 +596,7 @@ class TransformerOutputLayer(nn.Module):
             logits_maximum = token_logit_maximums.masked_fill(
                 ~valid_tokens, -float("inf")
             ).max()
-            collector.record_logits_stats(
-                logits_sum, logits_count, logits_minimum, logits_maximum,
-            )
+            health.record_logits_stats(logits_sum, logits_count, logits_minimum, logits_maximum)
         if y is None:
             return logits
         else:
@@ -693,7 +690,6 @@ class Transformer(XLLModel):
         freq_cis = None if self.rope is None else self.rope.get_freqs_cis(cache_len, cache_len + seq_len, x.device)
 
         aux_loss_sum = None
-        health_collector = get_active_health_collector()
         for i, layer in enumerate(self.layers):
             layer_cache = cache[i] if cache is not None else None
             if self.layerwise_ckpt:
@@ -708,8 +704,7 @@ class Transformer(XLLModel):
                     attn_stability_control, deterministic, layer_cache
                 )
 
-            if health_collector is not None:
-                health_collector.record_activation(i, x)
+            health.record_activation(i, x)
 
             if aux_loss is not None:
                 aux_loss_sum = aux_loss if aux_loss_sum is None else aux_loss_sum + aux_loss

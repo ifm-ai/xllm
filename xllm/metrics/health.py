@@ -179,6 +179,38 @@ def get_active_health_collector() -> Optional["HealthMetricCollector"]:
     return _ACTIVE_COLLECTOR
 
 
+def record_activation(layer_idx: int, x: torch.Tensor) -> None:
+    if _ACTIVE_COLLECTOR is not None:
+        _ACTIVE_COLLECTOR.record_activation(layer_idx, x)
+
+
+def record_query_key_stats(
+    layer_idx: Optional[int], q: torch.Tensor, k: torch.Tensor, kq: Optional[torch.Tensor] = None,
+) -> None:
+    if _ACTIVE_COLLECTOR is not None and layer_idx is not None:
+        _ACTIVE_COLLECTOR.record_query_key_stats(layer_idx, q, k, kq=kq)
+
+
+def record_router_stats(
+    family: str, layer_idx: int, tokens_per_route: torch.Tensor, topk_scores: torch.Tensor,
+    router_bias: Optional[torch.Tensor] = None, aux_loss: Optional[torch.Tensor] = None,
+) -> None:
+    if _ACTIVE_COLLECTOR is not None:
+        _ACTIVE_COLLECTOR.record_router_stats(family, layer_idx, tokens_per_route, topk_scores, router_bias, aux_loss)
+
+
+def logits_stats_enabled() -> bool:
+    return _ACTIVE_COLLECTOR is not None and _ACTIVE_COLLECTOR.enable_logits_stats
+
+
+def record_logits_stats(
+    logits_sum: torch.Tensor, logits_count: torch.Tensor,
+    logits_minimum: torch.Tensor, logits_maximum: torch.Tensor,
+) -> None:
+    if _ACTIVE_COLLECTOR is not None:
+        _ACTIVE_COLLECTOR.record_logits_stats(logits_sum, logits_count, logits_minimum, logits_maximum)
+
+
 def _pack_extrema(values: list[torch.Tensor]) -> torch.Tensor:
     by_dtype = {}
     for index, value in enumerate(values):
