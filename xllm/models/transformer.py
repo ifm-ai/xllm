@@ -663,7 +663,9 @@ class Transformer(XLLModel):
         if multi_segments:
             assert cache is None
             bos_mask = get_bos_mask(tokens, self.eos_id, use_eos=True)
-            segments = self.get_segment_arg(bos_mask)
+            segments = self.get_segment_arg(
+                bos_mask, self.causal_attn_backend, self.context_parallel_rank, self.context_parallel_size
+            )
         else:
             bos_mask = None
             segments = None
@@ -727,13 +729,14 @@ class Transformer(XLLModel):
         # TODO: causal attn w. xattn backend supports it.
         return False
 
-    def get_segment_arg(self, bos_mask):
+    @staticmethod
+    def get_segment_arg(bos_mask, causal_attn_backend, cp_rank, cp_size):
         bsz, seq_len = bos_mask.shape
-        seq_len = seq_len // self.context_parallel_size
-        start = self.context_parallel_rank * seq_len
-        end = (self.context_parallel_rank + 1) * seq_len
-        if self.causal_attn_backend == 'flash':
-            if self.context_parallel_size > 1:
+        seq_len = seq_len // cp_size
+        start = cp_rank * seq_len
+        end = (cp_rank + 1) * seq_len
+        if causal_attn_backend == 'flash':
+            if cp_size > 1:
                 assert bsz == 1, f"Flash attention does not support context parallel w. bsz {bsz} > 1"
             # query seqlens
             bos_idx_q = torch.nonzero(F.pad(bos_mask[:, (start + 1):end], (1, 0), value=1))
@@ -751,14 +754,14 @@ class Transformer(XLLModel):
             max_seqlen_k = (cu_seqlens_k[1:] - cu_seqlens_k[:-1]).max().item()
             total_seqlen_k = cu_seqlens_k[-1].item()
             return cu_seqlens_q.int(), cu_seqlens_k.int(), max_seqlen_q, max_seqlen_k, total_seqlen_k
-        elif self.causal_attn_backend == 'swift':
+        elif causal_attn_backend == 'swift':
             segment_idx = get_segment_idx_from_bos_mask(bos_mask)
             # B x L1
             q_segment_idx = segment_idx[:, start:end]
             # B x L2
             k_segment_idx = segment_idx[:, :end]
             return q_segment_idx, k_segment_idx
-        elif self.causal_attn_backend == 'xattn':
+        elif causal_attn_backend == 'xattn':
             segment_idx = get_segment_idx_from_bos_mask(bos_mask)
             # B x L1
             q_segment_idx = segment_idx[:, start:end]
@@ -769,7 +772,7 @@ class Transformer(XLLModel):
             total_seqlen_k = torch.sum(segment_idx >= last_qidx, dim=1).max().item()
             return segment_idx, total_seqlen_k
         else:
-            assert self.causal_attn_backend is None
+            assert causal_attn_backend is None
             segment_idx = get_segment_idx_from_bos_mask(bos_mask)
             # B x L1
             q_segment_idx = segment_idx[:, start:end]

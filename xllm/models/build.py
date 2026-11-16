@@ -157,6 +157,8 @@ def init_cache(model: nn.Module):
         return init_transformer_cache(model)
     elif model.arch == 'gekko':
         return init_gekko_cache(model)
+    elif model.arch == 'hybrid':
+        return init_hybrid_cache(model)
     else:
         raise ValueError(f"Unknown model architecture: {model.arch}")
 
@@ -168,6 +170,19 @@ def init_transformer_cache(model):
 
 def init_gekko_cache(model):
     cache_layers = [((None, None, 0), (None, None, None, None, None), (None, None, None), (None, None, None)) for _ in range(model.num_layers)]
+    cache_norm = (None, None, None)
+    cache_segment = (None, None, None)
+    cache = (cache_layers, cache_norm, cache_segment)
+    return cache
+
+
+def init_hybrid_cache(model):
+    def get_layer_cache(layer_id):
+        return full_attn_layer if layer_id in model.full_attention_layers else gekko_layer
+
+    full_attn_layer = (None, None, 0)
+    gekko_layer = ((None, None, 0), (None, None, None, None, None), (None, None, None), (None, None, None))
+    cache_layers = [get_layer_cache(i) for i in range(model.num_layers)]
     cache_norm = (None, None, None)
     cache_segment = (None, None, None)
     cache = (cache_layers, cache_norm, cache_segment)

@@ -62,6 +62,8 @@ class XLLModel(nn.Module):
             self.num_dense_layers = 0 if cfg.num_dense_layers is None else cfg.num_dense_layers
         self.expert_inter_dim = cfg.expert_inter_dim
 
+        self.full_attention_layers = cfg.full_attention_layers
+
         self.apply_rmsnorm = cfg.apply_rmsnorm
 
         self.dropout = cfg.dropout
