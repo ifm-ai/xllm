@@ -231,7 +231,7 @@ def main():
         batch_tokens  = args.batch_size * args.seq_len
         last_tokens  += batch_tokens
         total_tokens += batch_tokens
-        if args.packing_type == "bestfit":
+        if args.packing_type.lower().startswith("bestfit"):
             padding_ratios.append(batch.padding_ratio)
             truncation_ratios.append(batch.truncation_ratio)
 
@@ -240,7 +240,7 @@ def main():
             wps   = last_tokens * world_size / delta
             n_gb  = float(global_batch_size) * args.seq_len / 1e9 * step
             pinfo = ""
-            if args.packing_type == "bestfit" and padding_ratios:
+            if args.packing_type.lower().startswith("bestfit") and padding_ratios:
                 pinfo = (f"  pad={np.mean(padding_ratios)*100:.2f}%"
                          f"  trunc={np.mean(truncation_ratios)*100:.2f}%")
             log(rank, f"step={step:6d}  tokens={n_gb:.3f}B  "

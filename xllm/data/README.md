@@ -82,7 +82,7 @@ DATA_CFGS=(
 | `global_batch_size` | Alternative to `batch_size`: total batch size across data-parallel ranks; must be divisible by the data-parallel size. |
 | `buffer_size` | Controls the shuffle window: approximately `buffer_size * seq_len` tokens per rank per refill. |
 | `num_workers` | Threads reading and tokenizing different sources; one source is not split across workers. |
-| `packing_type` | `simple` concatenates tokens; `bestfit` uses length-aware packing to reduce padding, keeping documents intact when they fit in one sequence. |
+| `packing_type` | `simple` concatenates tokens; `bestfit` uses length-aware packing to reduce padding, keeping documents intact when they fit in one sequence. `bestfit-transversal` is the same but places each chunk in the emptiest sequence (see below). |
 | `skip_long_docs` | With `bestfit`, `true` skips overlong chat records; text records are still split. |
 | `min_doc_tokens` | Skips records with fewer tokens (including BOS/EOS) while filling the buffer; `0` keeps all. Skipped records do not count toward source token budgets, so mix ratios and refill size apply to kept documents, and they count toward `max_consecutive_skips`. Many tiny documents in one sequence inflate the segment count seen by varlen attention kernels. |
 
@@ -102,6 +102,14 @@ documents are split, or skipped for chat when `skip_long_docs=true`; split chunk
 overlap by one token to preserve next-token prediction. Chunks that cannot yet be
 emitted are retained for the next refill. Packed sequences are shuffled before
 training.
+
+`bestfit-transversal` keeps everything above except placement: chunks are
+still taken longest first, but each goes into the sequence with the **most**
+remaining space (worst-fit decreasing). Long documents are thus spread across
+sequences and topped up with short ones, rather than grouped with documents of
+similar length, which balances per-sequence attention cost. Since a new sequence
+is always the emptiest, the packer opens as many sequences as the pending tokens
+can fill (up to the bin limit) before placing chunks.
 
 This trades buffer memory and refill work for less padding and a wider shuffle
 window, without a full-dataset packing pass. With `log_wandb=true`, training

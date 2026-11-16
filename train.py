@@ -413,7 +413,7 @@ def main(cfg: TrainerConf):
         x = torch.from_numpy(batch.x).cuda()
         y = torch.from_numpy(batch.y).cuda()
         mask = None if batch.mask is None else torch.from_numpy(batch.mask).cuda()
-        if cfg.dataloader.packing_type == "bestfit":
+        if cfg.dataloader.packing_type.lower().startswith("bestfit"):
             padding_ratios.append(batch.padding_ratio)
             truncation_ratios.append(batch.truncation_ratio)
 
@@ -601,7 +601,7 @@ def main(cfg: TrainerConf):
                 f"{global_aux_info}"
                 f"mem_retries: {int(agg_gpu_info['gpus/num_alloc_retries_MAX'])}"
             )
-            if cfg.dataloader.packing_type == "bestfit":
+            if cfg.dataloader.packing_type.lower().startswith("bestfit"):
                 padding_ratio = reduce_scalar(np.mean(padding_ratios).item(), op='mean')
                 truncation_ratio = reduce_scalar(np.mean(truncation_ratios).item(), op='mean')
                 logging_info += (
@@ -622,7 +622,7 @@ def main(cfg: TrainerConf):
                 "gnorm": avg_gnorm,
                 "gnorm (max)": max_gnorm,
             }
-            if cfg.dataloader.packing_type == "bestfit":
+            if cfg.dataloader.packing_type.lower().startswith("bestfit"):
                 metrics.update({
                     "padding ratio": padding_ratio,
                     "truncation ratio": truncation_ratio,
