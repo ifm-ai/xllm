@@ -73,11 +73,7 @@ def mega_normalize_fwd(
     backend: str,
 ):
     """"""
-    if backend == 'chunkwise':
-        y, count, mean, var, cummean, cumrstd = xllm_ops.group_timestep_decay_norm_fwd(
-            x, bos_mask, prev_count, prev_mean, prev_var, weight, bias, None, num_groups, beta1, beta2, eps,
-        )
-    elif backend in ('cub', 'lookback'):
+    if backend in ('cub', 'lookback'):
         y, count, mean, var, cummean, cumrstd = getattr(xllm_ops, f"group_timestep_decay_norm_{backend}_fwd")(
             x, bos_mask, prev_count, prev_mean, prev_var, weight, bias, None, num_groups, beta1, beta2, eps,
         )
@@ -104,9 +100,8 @@ def mega_normalize_bwd(
     memory_efficient: bool,
     backend: str,
 ):
-    if backend in ('chunkwise', 'lookback'):
-        bwd = xllm_ops.group_timestep_decay_norm_bwd if backend == 'chunkwise' else xllm_ops.group_timestep_decay_norm_lookback_bwd
-        x_grad, prev_mean_grad, prev_var_grad, gamma_grad, beta_grad =  bwd(
+    if backend == 'lookback':
+        x_grad, prev_mean_grad, prev_var_grad, gamma_grad, beta_grad = xllm_ops.group_timestep_decay_norm_lookback_bwd(
             y_grad, mean_grad, var_grad, x_or_y, prev_count, bos_mask, cummean, cumrstd, weight, bias,
             None, num_groups, beta1, beta2, eps, memory_efficient,
         )
@@ -159,7 +154,7 @@ def test(B: int, L: int, H: int, num_groups: int, dtype: torch.dtype):
     beta_grad = beta.grad
 
     with torch.no_grad():
-        for backend in ['chunkwise', 'cub', 'lookback']:
+        for backend in ['cub', 'lookback']:
             mean_grad = torch.zeros(B, num_groups, dtype=dtype).to("cuda")
             var_grad = torch.zeros(B, num_groups, dtype=dtype).to("cuda")
 
@@ -174,12 +169,8 @@ def test(B: int, L: int, H: int, num_groups: int, dtype: torch.dtype):
             torch.testing.assert_close(y_mega, y_manual.to(dtype), rtol=rtol, atol=atol)
             torch.testing.assert_close(mean_mega, mean.to(dtype), rtol=rtol, atol=atol)
             torch.testing.assert_close(var_mega, var.to(dtype), rtol=rtol, atol=atol)
-            if backend == 'chunkwise':
-                torch.testing.assert_close(cummean_mega, cummean.to(dtype), rtol=rtol, atol=atol)
-                torch.testing.assert_close(cumrstd_mega, cumrstd.to(dtype), rtol=rtol, atol=atol)
-            else:
-                torch.testing.assert_close(cummean_mega.transpose(1, 2), cummean.to(dtype), rtol=rtol, atol=atol)
-                torch.testing.assert_close(cumrstd_mega.transpose(1, 2), cumrstd.to(dtype), rtol=rtol, atol=atol)
+            torch.testing.assert_close(cummean_mega.transpose(1, 2), cummean.to(dtype), rtol=rtol, atol=atol)
+            torch.testing.assert_close(cumrstd_mega.transpose(1, 2), cumrstd.to(dtype), rtol=rtol, atol=atol)
             print(f"B={B}, L={L}, H={H}, num_groups={num_groups}, backend={backend}, dtype={dtype}: pass fwd test")
 
             # single segment bwd
@@ -224,10 +215,9 @@ def test(B: int, L: int, H: int, num_groups: int, dtype: torch.dtype):
 
             atol = 1e-3
             rtol = 1e-2
-            cat_dim = 1 if backend == 'chunkwise' else 2
             torch.testing.assert_close(y_mega, torch.cat([y1_mega, y2_mega], dim=1), rtol=rtol, atol=atol)
-            torch.testing.assert_close(cummean_mega, torch.cat([cummean1_mega, cummean2_mega], dim=cat_dim), rtol=rtol, atol=atol)
-            torch.testing.assert_close(cumrstd_mega, torch.cat([cumrstd1_mega, cumrstd2_mega], dim=cat_dim), rtol=rtol, atol=atol)
+            torch.testing.assert_close(cummean_mega, torch.cat([cummean1_mega, cummean2_mega], dim=2), rtol=rtol, atol=atol)
+            torch.testing.assert_close(cumrstd_mega, torch.cat([cumrstd1_mega, cumrstd2_mega], dim=2), rtol=rtol, atol=atol)
             torch.testing.assert_close(count_mega, count2_mega, rtol=rtol, atol=atol)
             torch.testing.assert_close(mean_mega, mean2_mega, rtol=rtol, atol=atol)
             torch.testing.assert_close(var_mega, var2_mega, rtol=rtol, atol=atol)
@@ -293,7 +283,7 @@ def test_streaming(B: int, L: int, H: int, num_groups: int, prefill: int, dtype:
         prev_mean = torch.zeros(B, num_groups, dtype=dtype, device="cuda")
         prev_var = torch.zeros(B, num_groups, dtype=dtype, device="cuda")
 
-        for backend in ['chunkwise', 'cub', 'lookback']:
+        for backend in ['cub', 'lookback']:
             y, count, mean, var, cummean, cumrstd = mega_normalize_fwd(
                 x, bos_mask, prev_count, prev_mean, prev_var, gamma, beta,
                 num_groups=num_groups, beta1=beta1, beta2=beta2, eps=eps, backend=backend
@@ -311,9 +301,8 @@ def test_streaming(B: int, L: int, H: int, num_groups: int, prefill: int, dtype:
                 cummeans.append(cummean_t)
                 cumrstds.append(cumrstd_t)
 
-            time_dim = 1 if backend == 'chunkwise' else 2
-            torch.testing.assert_close(torch.cat(cumrstds, dim=time_dim), cumrstd, rtol=1e-4, atol=1e-6)
-            torch.testing.assert_close(torch.cat(cummeans, dim=time_dim), cummean, rtol=1e-4, atol=1e-5)
+            torch.testing.assert_close(torch.cat(cumrstds, dim=2), cumrstd, rtol=1e-4, atol=1e-6)
+            torch.testing.assert_close(torch.cat(cummeans, dim=2), cummean, rtol=1e-4, atol=1e-5)
             torch.testing.assert_close(count_t, count)
             torch.testing.assert_close(mean_t, mean, rtol=1e-4, atol=1e-6)
             torch.testing.assert_close(var_t, var, rtol=1e-4, atol=1e-6)

@@ -43,7 +43,6 @@ CSRCS = [
     os.path.join(PATH, "xllm/csrc/ops/sequence_norm_kernel.cu"),
     os.path.join(PATH, "xllm/csrc/ops/timestep_norm.cc"),
     os.path.join(PATH, "xllm/csrc/ops/timestep_norm_kernel.cu"),
-    os.path.join(PATH, "xllm/csrc/ops/timestep_decay_norm_kernel.cu"),
     os.path.join(PATH, "xllm/csrc/ops/timestep_decay_norm_cub.cc"),
     os.path.join(PATH, "xllm/csrc/ops/timestep_decay_norm_cub_kernel.cu"),
     os.path.join(PATH, "xllm/csrc/ops/timestep_decay_norm_lookback.cc"),

@@ -613,7 +613,7 @@ __device__ __forceinline__ void LocalGradients(float rstd, float ds, float db,
   *local_v = -0.5f * (rstd * rstd * rstd) * ds / correction2;
 }
 
-// Recover x - cummean from y; scale is clamped as in GroupTimestepDecayNormBwd.
+// Recover x - cummean from y, with |scale| clamped to at least eps.
 template <typename T_ACC>
 __device__ __forceinline__ T_ACC CenteredFromOutput(T_ACC y, T_ACC beta,
                                                     T_ACC scale, float eps) {

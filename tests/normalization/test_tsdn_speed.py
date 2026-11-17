@@ -6,8 +6,7 @@ import torch
 import xllm_extension.ops as xllm_ops
 
 
-def benchmark_timestep_decay_norm(
-    backend,
+def benchmark_timestep_decay_norm_lookback(
     memory_efficient,
     x,
     bos_mask,
@@ -27,10 +26,8 @@ def benchmark_timestep_decay_norm(
     warmup,
     epochs,
 ):
-    # The chunkwise and lookback ops take the same arguments.
-    prefix = "group_timestep_decay_norm_lookback" if backend == "lookback" else "group_timestep_decay_norm"
-    fwd_op = getattr(xllm_ops, f"{prefix}_fwd")
-    bwd_op = getattr(xllm_ops, f"{prefix}_bwd")
+    fwd_op = xllm_ops.group_timestep_decay_norm_lookback_fwd
+    bwd_op = xllm_ops.group_timestep_decay_norm_lookback_bwd
     with torch.no_grad():
         for _ in range(warmup):
             y, count, mean, var, cummean, cumrstd = fwd_op(
@@ -259,9 +256,7 @@ def test(
         f"warmup={warmup}, epochs={epochs}, bos_ratio={bos_ratio}, "
         f"padding_ratio={padding_ratio}:"
     )
-    baseline = benchmark_timestep_decay_norm(
-        "chunkwise",
-        False,
+    baseline = benchmark_timestep_decay_norm_cub(
         x,
         bos_mask,
         prev_count,
@@ -280,31 +275,9 @@ def test(
         warmup,
         epochs,
     )
-    candidate = benchmark_timestep_decay_norm_cub(
-        x,
-        bos_mask,
-        prev_count,
-        prev_mean,
-        prev_var,
-        weight,
-        bias,
-        y_grad,
-        mean_grad,
-        var_grad,
-        padding_mask,
-        num_groups,
-        0.999,
-        0.9999,
-        1e-5,
-        warmup,
-        epochs,
-    )
-    print_benchmark("timestep_decay_norm", baseline, epochs)
-    print_benchmark("timestep_decay_norm_cub", candidate, epochs)
-    print_speedup(baseline, candidate)
+    print_benchmark("timestep_decay_norm_cub", baseline, epochs)
     for memory_efficient in [False, True]:
-        candidate = benchmark_timestep_decay_norm(
-            "lookback",
+        candidate = benchmark_timestep_decay_norm_lookback(
             memory_efficient,
             x,
             bos_mask,

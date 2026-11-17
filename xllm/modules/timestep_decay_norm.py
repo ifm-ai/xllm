@@ -7,10 +7,8 @@ from torch.autograd.function import FunctionCtx
 from torch.nn.parameter import Parameter
 
 from xllm_extension.ops import (
-    group_timestep_decay_norm_fwd,
     group_timestep_decay_norm_cub_fwd,
     group_timestep_decay_norm_lookback_fwd,
-    group_timestep_decay_norm_bwd,
     group_timestep_decay_norm_cub_bwd,
     group_timestep_decay_norm_lookback_bwd,
 )
@@ -45,8 +43,7 @@ class TimestepDecayNormFunc(torch.autograd.Function):
             )
             ctx.save_for_backward(x, bos_mask, prev_count, cummean, cumrstd, gamma, beta, padding_mask)
         else:
-            fwd = group_timestep_decay_norm_lookback_fwd if backend == 'lookback' else group_timestep_decay_norm_fwd
-            y, count, mean, var, cummean, cumrstd = fwd(
+            y, count, mean, var, cummean, cumrstd = group_timestep_decay_norm_lookback_fwd(
                 x, bos_mask, prev_count, prev_mean, prev_var, gamma, beta, padding_mask, num_groups, beta1, beta2, eps,
             )
             ctx.save_for_backward(x if not memory_efficient else y, bos_mask, prev_count, cummean, cumrstd, gamma, beta, padding_mask)
@@ -80,8 +77,7 @@ class TimestepDecayNormFunc(torch.autograd.Function):
                 padding_mask, num_groups, beta1, beta2
             )
         else:
-            bwd = group_timestep_decay_norm_lookback_bwd if backend == 'lookback' else group_timestep_decay_norm_bwd
-            x_grad, prev_mean_grad, prev_var_grad, gamma_grad, beta_grad = bwd(
+            x_grad, prev_mean_grad, prev_var_grad, gamma_grad, beta_grad = group_timestep_decay_norm_lookback_bwd(
                 y_grad, mean_grad, var_grad, x_or_y, prev_count, bos_mask, cummean, cumrstd, gamma, beta,
                 padding_mask, num_groups, beta1, beta2, eps, memory_efficient
             )
@@ -110,6 +106,7 @@ class TimestepDecayNorm(nn.Module):
         self.num_groups = num_groups
 
         assert num_groups < num_features and num_features % num_groups == 0
+        assert backend in ['cub', 'lookback'], backend
         if backend == 'cub':
             assert not memory_efficient, 'timestep decay norm cub backend does not support memory efficient backward'
 
