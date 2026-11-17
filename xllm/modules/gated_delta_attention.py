@@ -499,7 +499,8 @@ class GatedDeltaAttention(nn.Module):
                 prev_sk, prev_aqk, prev_akk, prev_v, prev_ag, memory, log_norm_term
             )
             prev_tensor = send_to_next_context_parallel_region(prev_tensor)
-            attn = attn + prev_tensor.to(attn).mean() * 0
+            # keep the send in the graph; the state holds -inf (an empty log-norm term) when this rank has one chunk
+            attn = attn + prev_tensor.to(attn).nan_to_num(nan=0., posinf=0., neginf=0.).mean() * 0
 
         # B x L x D/TP
         h = self.wo(attn)
