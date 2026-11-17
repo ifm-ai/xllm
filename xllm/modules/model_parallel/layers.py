@@ -5,7 +5,6 @@
 
 
 from typing import Callable, Optional, List
-import math
 
 import torch
 import torch.nn.functional as F
@@ -131,7 +130,7 @@ class ParallelEmbedding(torch.nn.Module):
         padding_idx: Optional[int] = None,
         max_norm: Optional[float] = None,
         norm_type: float = 2.0,
-        scale_emb: bool = False,
+        embed_multiplier: float = 1.0,
         scale_grad_by_freq: bool = False,
         sparse: bool = False,
         gather_output: bool = True,
@@ -144,8 +143,7 @@ class ParallelEmbedding(torch.nn.Module):
         self.padding_idx = padding_idx
         self.max_norm = max_norm
         self.norm_type = norm_type
-        self.scale_emb = scale_emb
-        self.embedding_scale = math.sqrt(embedding_dim) if scale_emb else None
+        self.embed_multiplier = embed_multiplier
         self.scale_grad_by_freq = scale_grad_by_freq
         self.sparse = sparse
         self.gather_output = gather_output
@@ -179,8 +177,8 @@ class ParallelEmbedding(torch.nn.Module):
             self.scale_grad_by_freq,
             self.sparse,
         )
-        if self.scale_emb:
-            output_parallel = output_parallel * self.embedding_scale
+        if self.embed_multiplier != 1.0:
+            output_parallel = output_parallel * self.embed_multiplier
 
         if self.gather_output:
             output = gather_from_model_parallel_region(output_parallel)
@@ -196,7 +194,8 @@ class ParallelEmbedding(torch.nn.Module):
             s += ', max_norm={max_norm}'
         if self.norm_type != 2:
             s += ', norm_type={norm_type}'
-        s += ', scale_emb={scale_emb}'
+        if self.embed_multiplier != 1.0:
+            s += ', embed_multiplier={embed_multiplier}'
         if self.scale_grad_by_freq is not False:
             s += ', scale_grad_by_freq={scale_grad_by_freq}'
         if self.sparse is not False:

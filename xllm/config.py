@@ -174,7 +174,7 @@ class ModelConf(Config):
     attention_dropout: float = 0.0  # Dropout rate for attention weights after softmax.
 
     swiglu: bool = False  # Whether to use SwiGLU in dense FFN. Otherwise uses SiLU.
-    scale_emb: bool = False  # Whether to scale embedding output by sqrt(model_dim).
+    embed_multiplier: float = 1.0  # Multiplier on the embedding output (the former scale_emb: sqrt(model_dim)).
     layerwise_ckpt: bool = False  # Whether to enable activation checkpointing for each layer to save memory by recomputing forward during backprop.
 
     fused_block: bool = False  # Whether to use custom fused forward/backward implementations for training blocks; incompatible with layerwise_ckpt.
@@ -192,6 +192,8 @@ class ModelConf(Config):
     def __post_init__(self):
         assert self.arch in ['transformer', 'gekko']
         assert self.ddp_backend in ['fsdp1', 'fsdp2']
+        assert self.embed_multiplier > 0 and self.embed_multiplier != float('inf'), \
+            f'model.embed_multiplier must be finite and > 0, got {self.embed_multiplier}'
 
         assert self.causal_attn_backend in [None, "swift", "flash", 'xattn']
         assert self.sca_backend in ["swift", "flash", 'xattn']
