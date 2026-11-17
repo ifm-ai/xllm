@@ -1,5 +1,6 @@
 import os
 import json
+import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Tuple, Dict, Any
@@ -93,7 +94,10 @@ def reload_config_and_tokenizer(ckpt_dir: Path, tokenizer_path: Optional[str] = 
     tokenizer_cfg.path = new_tokenizer_path
 
     tokenizer = build_tokenizer(cfg=tokenizer_cfg)
-    model_cfg: ModelConf = ModelConf.from_dict(cfg["model"])
+    model_dict = dict(cfg["model"])
+    if model_dict.pop("scale_emb", False):  # older checkpoints: scale_emb multiplied the embedding by sqrt(model_dim)
+        model_dict["embed_multiplier"] = model_dict.get("embed_multiplier", 1.0) * math.sqrt(model_dict["model_dim"])
+    model_cfg: ModelConf = ModelConf.from_dict(model_dict)
     model_cfg.fused_block = False
     model_cfg.init_mode = 'none'
     # old ckpt don't have vocab_size set
