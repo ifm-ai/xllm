@@ -3,6 +3,7 @@ from logging import getLogger
 from typing import Optional
 from pathlib import Path
 from typing import List, Dict
+import copy
 import os
 import json
 import math
@@ -299,8 +300,10 @@ class MuPConf(Config):
     m_N = model_dim / base_model_dim, m_L = num_layers / base_num_layers, c = m_L^-alpha. Scale num_heads,
     num_kv_heads and ffn_hidden_dim with model_dim and keep head_dim fixed. Muon needs no width factor: its
     spectral_norm update scale already transfers across widths. The residual branches are scaled by c without a
-    multiplier in the forward: c is folded into residual_out, whose init std and lr are x c, weight decay x 1/c
-    (lr * weight_decay unchanged) and gradients x c in the clipping norm. Training then matches a residual
+    multiplier in the forward; depth_fold says where c goes instead.
+
+    depth_fold residual_out (default): c is folded into residual_out, whose init std and lr are x c, weight decay
+    x 1/c (lr * weight_decay unchanged) and gradients x c in the clipping norm. Training then matches a residual
     multiplier c exactly. Factors on the configured values, and init stds (sigma_h = base_init_hidden_std m_N^-1/2):
 
         role           lr               eps               weight_decay  init_std                     clip_scale
@@ -311,16 +314,37 @@ class MuPConf(Config):
         final_norm     1                1                 1             -                            1
         readout        m_N^-1           1                 m_N           base_init_unembed_std / m_N  1
 
+    depth_fold embed: the residual stream is scaled by 1/c instead, through the embedding. Every read of the stream
+    goes through a scale-invariant norm (the blocks' pre-norms, the final norm before the readout), so the branches
+    see the same inputs and the readout the same features, and training matches a residual multiplier c up to the
+    norms' eps. The embedding E' = E / c then needs init std and lr x 1/c, eps x c, weight decay x c (lr *
+    weight_decay unchanged) and gradients x 1/c in the clipping norm; residual_out steps as hidden_matrix:
+
+        embed          1/c              c m_N^-1          c             base_init_embed_std / c      1/c
+        residual_out   m_L^(alpha-1)    1                 1             sigma_h                      1
+
+    Muon never sees c (no per-matrix update scales), and the model is unchanged for serving. It needs every read of
+    the stream to be normalized: a skip that adds a stream state or the embedding to a later block's input (as
+    gains on x0 / U-Net skips would) would also need its gain's lr x c; none of the supported models has one.
+    With depth_fold embed, init_mode he is supported too: the hidden matrices keep He's 1/sqrt(fan_in) init, which
+    already scales as m_N^-1/2, and base_init_hidden_std must be left unset.
+
     Every parameter must have one of these roles: none may be left to `other`. A --roles value set explicitly
-    must equal the table's.
+    must equal the table's, unless compose_roles: then a role's lr, eps and weight_decay set with --roles multiply
+    the table's (a recipe tuned at the base size keeps its per-role factors on top of mup's, e.g. --roles.embed.lr 32
+    with the embed fold at c = 0.5 steps the embedding at lr x 64; weight_decay 0 stays 0). init_std and clip_scale
+    stay the table's. resolve() keeps the user's factors in user_roles, so a run's config.json resolves the same.
     """
     base_model_dim: int  # model_dim of the base model the hyperparameters were tuned on
     base_num_layers: int  # num_layers of the base model
-    base_init_hidden_std: float  # Init std of the hidden matrices at base width; x m_N^-1/2
-    base_init_embed_std: float  # Init std of the embedding, the same at every width
+    base_init_embed_std: float  # Init std of the embedding at every width (x 1/c with depth_fold embed)
     base_init_unembed_std: float  # Init std of the readout at base width; x m_N^-1
     base_head_dim: int  # head_dim of the base model; the transfer keeps it fixed, checked against the model's
+    base_init_hidden_std: Optional[float] = None  # Init std of the hidden matrices at base width; x m_N^-1/2. Required with init_mode gaussian, unset with he
     alpha: float = 1.0  # Depth exponent in [0.5, 1]: c = m_L^-alpha
+    depth_fold: str = "residual_out"  # Where c = m_L^-alpha goes: residual_out (wo / fc2) or embed
+    compose_roles: bool = False  # --roles lr / eps / weight_decay multiply the table's instead of having to equal it
+    user_roles: Optional[RolesConf] = NOCLI()  # with compose_roles: the --roles values as set, kept by resolve()
     width_multiplier: Optional[float] = NOCLI()  # m_N, set by resolve()
     depth_multiplier: Optional[float] = NOCLI()  # m_L, set by resolve()
     branch_scale: Optional[float] = NOCLI()  # c = m_L^-alpha, set by resolve()
@@ -329,11 +353,18 @@ class MuPConf(Config):
         """The table at the resolved multipliers."""
         m_n, m_l, c = self.width_multiplier, self.depth_multiplier, self.branch_scale
         depth_lr = m_l ** (self.alpha - 1)
-        hidden_std = self.base_init_hidden_std / math.sqrt(m_n)
+        # None (init_mode he, depth_fold embed only): the hidden matrices keep their module's init
+        hidden_std = None if self.base_init_hidden_std is None else self.base_init_hidden_std / math.sqrt(m_n)
+        if self.depth_fold == "embed":
+            embed = dict(lr=1 / c, eps=c / m_n, weight_decay=c, init_std=self.base_init_embed_std / c, clip_scale=1 / c)
+            residual_out = dict(lr=depth_lr, init_std=hidden_std)
+        else:
+            embed = dict(eps=1 / m_n, init_std=self.base_init_embed_std)
+            residual_out = dict(lr=depth_lr * c, weight_decay=1 / c, init_std=hidden_std * c, clip_scale=c)
         table = {
-            "embed": dict(eps=1 / m_n, init_std=self.base_init_embed_std),
+            "embed": embed,
             "hidden_matrix": dict(lr=depth_lr, init_std=hidden_std),
-            "residual_out": dict(lr=depth_lr * c, weight_decay=1 / c, init_std=hidden_std * c, clip_scale=c),
+            "residual_out": residual_out,
             "hidden_vector": dict(lr=depth_lr, eps=c / m_n),
             "final_norm": {},
             "readout": dict(lr=1 / m_n, weight_decay=m_n, init_std=self.base_init_unembed_std / m_n),
@@ -344,16 +375,27 @@ class MuPConf(Config):
 
     def resolve(self, model: ModelConf, optim: OptimConf, roles: RolesConf) -> None:
         """Check that the run supports mup; set the multipliers and the roles."""
+        if self.depth_fold not in ("residual_out", "embed"):
+            raise ValueError(f"mup.depth_fold must be residual_out or embed, got {self.depth_fold!r}")
+        embed_fold = self.depth_fold == "embed"
+        # he keeps the hidden matrices' own init; residual_out's fold needs their std (x c), so only the embed fold
+        he = embed_fold and model.init_mode == "he"
         for name in ("base_model_dim", "base_num_layers", "base_head_dim", "base_init_hidden_std",
                      "base_init_embed_std", "base_init_unembed_std"):
             value = getattr(self, name)
+            if name == "base_init_hidden_std" and he:
+                if value is not None:
+                    raise ValueError("mup.base_init_hidden_std must be unset with model.init_mode he: the hidden "
+                                     "matrices keep He's 1/sqrt(fan_in) init")
+                continue
             if value is None or not math.isfinite(value) or value <= 0:
                 raise ValueError(f"mup.{name} must be positive and finite, got {value}")
         if not 0.5 <= self.alpha <= 1.0:
             raise ValueError(f"mup.alpha must be in [0.5, 1], got {self.alpha}")
         for name, actual, supported in (
-            ("model.arch", model.arch, ["transformer"]),
-            ("model.init_mode", model.init_mode, ["gaussian"]),
+            # gekko: every read of the stream is normalized (GDA's timenorm, the FFN norm, the final norm)
+            ("model.arch", model.arch, ["transformer", "gekko"] if embed_fold else ["transformer"]),
+            ("model.init_mode", model.init_mode, ["gaussian", "he"] if embed_fold else ["gaussian"]),
             ("model.init_std", model.init_std, [None]),  # the roles' init_std replace these
             ("model.init_embed_std", model.init_embed_std, [None]),
             ("model.init_logits_std", model.init_logits_std, [None]),
@@ -373,10 +415,25 @@ class MuPConf(Config):
                              f"mup.base_head_dim {self.base_head_dim}")
 
         # already resolved (a run's config.json): the roles hold that preset, not values the user set
-        applied = self.preset() if self.width_multiplier is not None else {}
+        first = self.width_multiplier is None
+        applied = {} if first else self.preset()
         self.width_multiplier = model.model_dim / self.base_model_dim
         self.depth_multiplier = model.num_layers / self.base_num_layers
         self.branch_scale = self.depth_multiplier ** -self.alpha
+        if self.compose_roles:
+            if first or self.user_roles is None:
+                self.user_roles = copy.deepcopy(roles)
+            for role, values in self.preset().items():
+                user = getattr(self.user_roles, role)
+                for name in ("init_std", "clip_scale"):
+                    if getattr(user, name) is not None:
+                        raise ValueError(f"roles.{role}.{name}: with mup.compose_roles only lr, eps and weight_decay "
+                                         f"compose; mup sets {name}")
+                for name in ("lr", "eps", "weight_decay"):
+                    if getattr(user, name) is not None:
+                        setattr(values, name, getattr(values, name) * getattr(user, name))
+                setattr(roles, role, values)
+            return
         for role, values in self.preset().items():
             for f in fields(RoleConf):
                 current, value = getattr(getattr(roles, role), f.name), getattr(values, f.name)

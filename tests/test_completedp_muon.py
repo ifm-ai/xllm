@@ -445,3 +445,195 @@ def test_folded_training_matches_residual_multiplier(cpu_transport, monkeypatch,
     else:
         train(unscaled, build_muon_cpu(unscaled, cfg, unfolded(roles), cpu_transport), 8)
     assert fold_error(multiplier, unscaled, c) > 5 * max(tol, 1e-4)
+
+
+# ---- depth_fold embed: c in the embedding (the residual stream x 1/c) instead of in wo / fc2 ----
+
+def test_embed_fold_preset():
+    """m_N = 2, m_L = 4. alpha 0.5: c = 0.5; alpha 1: c = 0.25. embed: lr 1/c, eps c/m_N, weight decay c, init
+    base_init_embed_std / c (0.5 / c), clip 1/c; residual_out steps as hidden_matrix; the rest as the default fold."""
+    mup, roles = resolved(depth_fold="embed")
+    assert mup.branch_scale == 0.5
+    assert_roles(roles, {
+        "embed": (2.0, 0.25, 0.5, 1.0, 2.0),
+        "hidden_matrix": (0.5, 1.0, 1.0, 0.01414213562373095, 1.0),
+        "residual_out": (0.5, 1.0, 1.0, 0.01414213562373095, 1.0),
+        "hidden_vector": (0.5, 0.25, 1.0, None, 1.0),
+        "final_norm": (1.0, 1.0, 1.0, None, 1.0),
+        "readout": (0.5, 1.0, 2.0, 0.02, 1.0),
+        "other": (1.0, 1.0, 1.0, None, 1.0),
+    })
+    _, roles = resolved(depth_fold="embed", alpha=1.0)
+    assert_roles(roles, {"embed": (4.0, 0.125, 0.25, 2.0, 4.0),
+                         "residual_out": (1.0, 1.0, 1.0, 0.01414213562373095, 1.0)})
+
+
+@pytest.mark.parametrize("model_kw, mup_kw, match", [
+    ({}, {"depth_fold": "readout"}, "mup.depth_fold must be residual_out or embed, got 'readout'"),
+    ({"arch": "gekko"}, {}, "mup requires model.arch in ['transformer'], got 'gekko'"),  # the default fold
+    ({"init_mode": "he"}, {}, "mup requires model.init_mode in ['gaussian'], got 'he'"),
+    ({"init_mode": "he"}, {"depth_fold": "embed"}, "mup.base_init_hidden_std must be unset with model.init_mode he"),
+    ({}, {"depth_fold": "embed", "base_init_hidden_std": None}, "mup.base_init_hidden_std must be positive"),
+])
+def test_embed_fold_resolve_rejects(model_kw, mup_kw, match):
+    with pytest.raises(ValueError, match=re.escape(match)):
+        mup_conf(**mup_kw).resolve(model_conf(**model_kw), OptimConf(optimizer="muon"), RolesConf())
+
+
+def test_embed_fold_he_keeps_hidden_init():
+    """init_mode he: the hidden matrices keep He's init (no init_std); embed and readout still get theirs."""
+    for arch in ("transformer", "gekko"):
+        _, roles = resolved(model_conf(arch=arch, init_mode="he"), depth_fold="embed", base_init_hidden_std=None)
+        assert_roles(roles, {"embed": (2.0, 0.25, 0.5, 1.0, 2.0), "hidden_matrix": (0.5, 1.0, 1.0, None, 1.0),
+                             "residual_out": (0.5, 1.0, 1.0, None, 1.0), "readout": (0.5, 1.0, 2.0, 0.02, 1.0)})
+
+
+def test_embed_fold_on_gekko(cpu_transport):
+    """Gekko under mup with the embed fold: every parameter has a role, the embedding and readout start at their
+    stds, and the optimizer has the preset's groups."""
+    from tests.test_roles import gekko
+    cfg = dict(model_dim=64, num_layers=4, num_heads=4, ffn_hidden_dim=128, vocab_size=512)
+    mup, roles = resolved(model_conf(arch="gekko", init_mode="he", **cfg), base_model_dim=32, base_num_layers=1,
+                          base_head_dim=16, base_init_hidden_std=None, depth_fold="embed", alpha=1.0)
+    assert mup.branch_scale == 0.25
+    with roles_lib.init_roles(roles):
+        model = gekko(init_mode="he", **cfg)
+    roles_lib.require_roles(model)
+    assert abs(model.embed.weight.std().item() / (0.5 / 0.25) - 1) < 0.05  # base_init_embed_std / c
+    assert abs(model.output.output.weight.std().item() / (0.04 / 2) - 1) < 0.05  # base_init_unembed_std / m_N
+    opt = build_muon_cpu(model, CFG, roles, cpu_transport)
+    groups = groups_by_role(opt)
+    assert math.isclose(groups["embed"]["lr"], 4e-3) and math.isclose(groups["embed"]["eps"], 1.25e-9)
+    assert math.isclose(groups["embed"]["weight_decay"], 0.025)
+    assert set(zip(opt.lr_scales, opt.wd_scales)) == {(1.0, 1.0)}  # Muon: no per-matrix scales
+
+
+def embed_pair(c):
+    """multiplier: residual multiplier c, plain init. folded: no multiplier, embedding x 1/c."""
+    torch.manual_seed(0)
+    multiplier = Toy(multiplier=c)
+    folded = Toy()
+    folded.load_state_dict(multiplier.state_dict())
+    with torch.no_grad():
+        folded.embed.weight.div_(c)
+    return multiplier, folded
+
+
+def embed_fold_error(multiplier, folded, c):
+    """Max relative difference between the folded weights and the multiplier run's (embedding / c)."""
+    err = 0.0
+    for a, b in zip(multiplier.parameters(), folded.parameters()):
+        want = a / c if b is folded.embed.weight else a
+        err = max(err, ((b - want).abs().max() / want.abs().max()).item())
+    return err
+
+
+# (alpha, clipping, tolerance), as FOLD_CASES
+EMBED_FOLD_CASES = [
+    (0.5, False, 0.0),
+    (1.0, False, 0.0),
+    (0.5, True, 2e-3),
+    (1.0, True, 2e-3),
+]
+
+
+def negligible_norm_eps(monkeypatch):
+    """The fold is exact up to the norms' eps: rms(x / c) + eps is not rms(x) / c + eps. With an eps below float32's
+    resolution at these scales (the stream's mean square is ~1), c a power of two scales every value exactly and the
+    runs are bit-identical; with float32's eps (Norm's default) they differ by ~1e-7, which Muon's bf16 momentum
+    rounds into ~1e-3 differences in a few weights."""
+    monkeypatch.setattr(Norm, "forward", lambda self, x: F.rms_norm(x, (x.shape[-1],), eps=1e-30) * (1 + self.weight))
+
+
+@pytest.mark.parametrize("alpha, clipping, tol", EMBED_FOLD_CASES)
+def test_embed_folded_training_matches_residual_multiplier(cpu_transport, monkeypatch, alpha, clipping, tol):
+    """The residual stream x 1/c through the embedding trains as the multiplier c on the branches: the branches and
+    the readout read the stream through norms, so they see the same values."""
+    exact_orthogonalization(monkeypatch)
+    negligible_norm_eps(monkeypatch)
+    mup, roles = resolved(alpha=alpha, depth_fold="embed")
+    c = mup.branch_scale
+    reference_roles = unfolded(resolved(alpha=alpha)[1])  # c in the forward: embed and residual_out unscaled
+    multiplier, folded = embed_pair(c)
+    opt_multiplier = build_muon_cpu(multiplier, FOLD_CFG, reference_roles, cpu_transport)
+    opt_folded = build_muon_cpu(folded, FOLD_CFG, roles, cpu_transport)
+    assert set(zip(opt_folded.lr_scales, opt_folded.wd_scales)) == {(roles.hidden_matrix.lr, 1.0)}
+    norms = []
+    clips = [clipper(0.5, norms=norms), clipper(0.5, roles_lib.clip_grad_scales(folded, roles))] if clipping \
+        else [None] * 2
+    losses = [train(multiplier, opt_multiplier, 8, clips[0]), train(folded, opt_folded, 8, clips[1])]
+    assert max(abs(a - b) for a, b in zip(*losses)) <= tol * losses[0][0]
+    assert losses[0][-1] < losses[0][0] - 0.5  # it trains
+    assert not clipping or min(norms) > 0.5  # every step clips
+    assert embed_fold_error(multiplier, folded, c) <= tol
+
+    # negative control: the embedding x 1/c without its lr / eps / decay / clip factors drifts away
+    _, unscaled = embed_pair(c)
+    train(unscaled, build_muon_cpu(unscaled, FOLD_CFG, reference_roles, cpu_transport), 8,
+          clipper(0.5) if clipping else None)
+    assert embed_fold_error(multiplier, unscaled, c) > 5 * max(tol, 1e-4)
+
+
+# ---- compose_roles: --roles lr / eps / weight_decay multiply the preset's ----
+
+M6_RECIPE = dict(embed=RoleConf(lr=32.0, weight_decay=0.0), readout=RoleConf(lr=4.0, weight_decay=0.0),
+                 hidden_vector=RoleConf(lr=8.0, weight_decay=0.0))  # a recipe tuned at the base size
+
+
+def test_compose_roles_multiplies_the_preset():
+    """m_N = 2, m_L = 4, alpha 0.5, embed fold (c = 0.5). embed lr 32 x 1/c = 64, weight decay 0 x c = 0; readout
+    lr 4 x 1/m_N = 2, weight decay 0; hidden_vector lr 8 x m_L^(alpha-1) = 4, weight decay 0; the others the preset's."""
+    mup = mup_conf(depth_fold="embed", compose_roles=True)
+    roles = RolesConf(**M6_RECIPE)
+    mup.resolve(model_conf(), OptimConf(optimizer="muon"), roles)
+    assert_roles(roles, {
+        "embed": (64.0, 0.25, 0.0, 1.0, 2.0),
+        "hidden_matrix": (0.5, 1.0, 1.0, 0.01414213562373095, 1.0),
+        "residual_out": (0.5, 1.0, 1.0, 0.01414213562373095, 1.0),
+        "hidden_vector": (4.0, 0.25, 0.0, None, 1.0),
+        "final_norm": (1.0, 1.0, 1.0, None, 1.0),
+        "readout": (2.0, 1.0, 0.0, 0.02, 1.0),
+    })
+    assert mup.user_roles == RolesConf(**M6_RECIPE)  # kept as set
+    # default fold, eps composes too
+    roles = RolesConf(embed=RoleConf(lr=32.0, eps=4.0))
+    mup_conf(compose_roles=True).resolve(model_conf(), OptimConf(optimizer="muon"), roles)
+    assert_roles(roles, {"embed": (32.0, 2.0, 1.0, 0.5, 1.0), "residual_out": (0.25, 1.0, 2.0, 0.007071067811865475, 0.5)})
+
+
+def test_compose_roles_rejects_init_and_clip():
+    for name in ("init_std", "clip_scale"):
+        with pytest.raises(ValueError, match=f"roles.readout.{name}: with mup.compose_roles only lr, eps and weight_decay"):
+            mup_conf(compose_roles=True).resolve(model_conf(), OptimConf(optimizer="muon"),
+                                                 RolesConf(readout=RoleConf(**{name: 0.5})))
+
+
+def test_compose_roles_without_flag_still_conflicts():
+    """PR #30's behaviour without the flag: a --roles value must equal the preset's."""
+    with pytest.raises(ValueError, match=re.escape("roles.embed.lr=32.0 conflicts with mup, which sets it to 2.0")):
+        mup_conf(depth_fold="embed").resolve(model_conf(), OptimConf(optimizer="muon"), RolesConf(**M6_RECIPE))
+
+
+def test_compose_roles_config_json_round_trip():
+    """config.json holds the composed roles and the user's factors: reloading composes once, not twice, and a wider
+    run from it recomposes with its own preset."""
+    cfg = trainer_conf(mup=mup_conf(depth_fold="embed", compose_roles=True), roles=RolesConf(**M6_RECIPE))
+    assert cfg.roles.embed.lr == 64.0 and cfg.roles.readout.lr == 2.0
+    saved = json.loads(json.dumps(cfg.to_dict()))
+    reloaded = TrainerConf.from_dict(copy.deepcopy(saved))
+    assert reloaded.roles == cfg.roles and reloaded.mup == cfg.mup
+    saved["model"].update(model_dim=1024, num_heads=16)  # m_N = 4
+    wider = TrainerConf.from_dict(saved)
+    assert_roles(wider.roles, {"embed": (64.0, 0.125, 0.0, 1.0, 2.0), "readout": (1.0, 1.0, 0.0, 0.01, 1.0)})
+
+
+def test_composed_zero_decay_reaches_the_optimizer(cpu_transport):
+    """roles.embed / readout weight_decay 0 (this branch has no optim.disable_wd_emb / out): their AdamW groups decay
+    nothing, whatever the preset's factor."""
+    mup = mup_conf(depth_fold="embed", compose_roles=True)
+    roles = RolesConf(**M6_RECIPE)
+    mup.resolve(model_conf(), OptimConf(optimizer="muon"), roles)
+    groups = groups_by_role(build_muon_cpu(transformer(), CFG, roles, cpu_transport))
+    assert groups["embed"]["weight_decay"] == groups["readout"]["weight_decay"] == 0.0
+    assert groups["hidden_vector"]["weight_decay"] == 0.0 and groups["final_norm"]["weight_decay"] == 0.1
+    assert math.isclose(groups["embed"]["lr"], 64e-3) and math.isclose(groups["readout"]["lr"], 2e-3)
