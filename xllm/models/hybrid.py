@@ -157,7 +157,7 @@ class HybridGekko(XLLModel):
             else:
                 cache_layers, cache_output, cache_segment = None, None, None
 
-            start = 0 if cache_layers[0][0] is None else cache_layers[0][0][-1]
+            start = 0 if cache is None else cache_layers[0][0][-1]
             end = start + seq_len
             if seq_len >= self.chunk_size:
                 assert start % self.chunk_size == 0 and end % self.chunk_size == 0
