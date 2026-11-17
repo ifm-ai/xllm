@@ -145,6 +145,7 @@ class ModelConf(Config):
     causal_conv_width: int = 4  # Width of Q/K/V causal convolution kernel in Gekko. Currently supports 1-4 tokens
     causal_conv_backend: str = 'triton'  # triton or fla
     causal_conv_weight_normalization: bool = True  # Whether to apply softmax normalization for causal convolution weights
+    apply_conv_in_causal_attn: bool = False  # Whether to apply causal convs on qkv of MHA
     # Initialization
     init_mode: str = 'he'  # he, gaussian, xavier, or none (skipping init)
     init_std: Optional[float] = None  # Init std for gaussian; If None, deriving from input dimensions. he/xavier requires None
@@ -169,6 +170,7 @@ class ModelConf(Config):
     # Rope base
     rope_base: float = 100000  # RoPE frequency base
     rope_head_dim: Optional[int] = None  # RoPE dimensions per Q/K head. None means full head_dim, 0 disables RoPE.
+    apply_nope_in_causal_attn: bool = False  # Remove RoPE in causal attention if True.
     # Dropout rates
     dropout: float = 0.0  # Dropout rate for embeddings and for sublayer outputs before residual connections.
     hidden_dropout: float = 0.0  # Dropout rate for attention activations before output projection and for FFN intermediate activations.
@@ -239,6 +241,9 @@ class ModelConf(Config):
         assert 0 <= self.dropout < 1
         assert 0 <= self.attention_dropout < 1
         assert 0 <= self.hidden_dropout < 1
+
+        if self.apply_nope_in_causal_attn:
+            assert self.arch == 'hybrid', 'NoPE requires hybrid architecture'
 
         if self.arch == 'hybrid':
             assert self.full_attn_layer_list is not None

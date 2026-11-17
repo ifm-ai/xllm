@@ -205,10 +205,75 @@ class GekkoBlock(nn.Module):
         return out, None, cache
 
     def num_parameters(self):
-        pass
+        model_dim = self.gda.mdim
+        head_dim = self.gda.head_dim
+        v_head_dim = self.gda.v_head_dim
+        n_heads = self.gda.num_heads
+        n_kv_heads = self.gda.num_kv_heads
+        apply_bias_term = self.gda.apply_bias_term
+        conv_width = self.gda.q_conv.kernel_size
+        attn_act_func = self.gda.attn_act_func
+        ffn_hidden_dim = self.nffn.hidden_dim
+        swiglu = self.nffn.swiglu
+        # GDA
+        gda_params = model_dim * (n_heads + n_kv_heads) * (head_dim + v_head_dim)
+        # out proj
+        gda_params += model_dim * n_heads * v_head_dim
+        # bias term
+        gda_params += (n_kv_heads + n_heads) * v_head_dim if apply_bias_term else n_kv_heads * v_head_dim
+        # residual
+        gda_params += num_params_in_residual(self.residual_func, model_dim, self.residual_heads, n_heads * v_head_dim)
+        # conv params
+        conv_params = conv_width * (n_heads * head_dim + n_kv_heads * (head_dim + v_head_dim))
+        # norm params
+        norm_params = model_dim * (3 if self.apply_rmsnorm else 4) + head_dim * (n_heads + n_kv_heads)
+        if attn_act_func == 'softdelta':
+            gda_params += model_dim * (n_kv_heads * head_dim + n_heads)
+            conv_params += conv_width * n_kv_heads * head_dim
+            norm_params += n_kv_heads * head_dim
+        # FFN
+        ffn_params = model_dim * ffn_hidden_dim * (3 if swiglu else 2)
+        ffn_params += num_params_in_residual(self.residual_func, model_dim, self.residual_heads, ffn_hidden_dim)
+
+        activated_params = gda_params + conv_params + norm_params + ffn_params
+        total_params = activated_params
+        return total_params, activated_params
 
     def tflops_per_token(self, seq_len: int):
-        pass
+        chunk_size = self.gda.chunk_size
+        model_dim = self.gda.mdim
+        head_dim = self.gda.head_dim
+        v_head_dim = self.gda.v_head_dim
+        n_heads = self.gda.num_heads
+        n_kv_heads = self.gda.num_kv_heads
+        conv_width = self.gda.q_conv.kernel_size
+        attn_act_func = self.gda.attn_act_func
+
+        qdim = n_heads * head_dim
+        kdim = n_kv_heads * head_dim
+        vdim = n_kv_heads * v_head_dim
+        hdim = n_heads * v_head_dim
+        # TFLoPs
+        _, tflops_per_token = self.num_parameters()
+        # norm flops
+        norm_flops = model_dim * 8 + hdim * 2 + qdim + kdim
+        # conv flops
+        conv_flops = conv_width * (qdim + kdim + vdim) * 2
+        tflops_per_token += norm_flops + conv_flops
+        # SCA flops
+        if attn_act_func == 'softmax':
+            tflops_per_token += (qdim + hdim) * chunk_size
+        elif attn_act_func == 'softdelta':
+            tflops_per_token += (qdim + hdim + kdim) * chunk_size
+        else:
+            raise ValueError(f"Unknown attention activation function: {attn_act_func}")
+        # AWM flops
+        tflops_per_token += (kdim * 2 + qdim) * v_head_dim
+        # residual
+        # TODO
+        res_flops = 0.0
+
+        return tflops_per_token
 
 
 class GekkoOutputLayer(nn.Module):
@@ -496,79 +561,6 @@ class Gekko(XLLModel):
     def support_multi_segments_with_cache(self) -> bool:
         return True
 
-    def num_parameters(self):
-        embed_params = self.model_dim * self.vocab_size * 2
-        gda_params_per_block = self.model_dim * (self.num_heads + self.num_kv_heads) * (self.head_dim + self.v_head_dim)
-        # out proj
-        gda_params_per_block += self.model_dim * self.num_heads * self.v_head_dim
-        if self.apply_bias_term:
-            gda_params_per_block += (self.num_kv_heads + self.num_heads) * self.v_head_dim
-        else:
-            gda_params_per_block += self.num_kv_heads * self.v_head_dim
-        gda_params_per_block += num_params_in_residual(self.residual_func, self.model_dim, self.residual_heads, self.num_heads * self.v_head_dim)
-        # conv params
-        conv_params_per_block = self.causal_conv_width * (self.num_heads * self.head_dim + self.num_kv_heads * (self.head_dim + self.v_head_dim))
-        # norm params
-        norm_params_per_block = self.model_dim * (3 if self.apply_rmsnorm else 4) + self.head_dim * (self.num_heads + self.num_kv_heads)
-        if self.attn_act_func == 'softdelta':
-            gda_params_per_block += self.model_dim * (self.num_kv_heads * self.head_dim + self.num_heads)
-            conv_params_per_block += self.causal_conv_width * self.num_kv_heads * self.head_dim
-            norm_params_per_block += self.num_kv_heads * self.head_dim
-        # FFN
-        ffn_params_per_block = self.model_dim * self.ffn_hidden_dim * (3 if self.swiglu else 2)
-        ffn_params_per_block += num_params_in_residual(self.residual_func, self.model_dim, self.residual_heads, self.ffn_hidden_dim)
-
-        activated_params = (gda_params_per_block + conv_params_per_block + norm_params_per_block) * self.num_layers
-        activated_params += ffn_params_per_block * self.num_dense_layers + embed_params
-        total_params = activated_params
-        if self.num_experts > 0:
-            shared_expert_params = self.model_dim * self.expert_inter_dim * self.num_shared_experts * 3
-            routed_expert_params = self.model_dim * self.expert_inter_dim * self.num_experts * 3
-            activated_expert_params = self.model_dim * self.expert_inter_dim * self.num_activated_experts * 3
-            router_params = self.model_dim * self.num_experts
-            activated_params += (shared_expert_params + activated_expert_params + router_params) * (self.num_layers - self.num_dense_layers)
-            total_params += (shared_expert_params + routed_expert_params + router_params) * (self.num_layers - self.num_dense_layers)
-        # final norm
-        activated_params += self.model_dim * 2
-        total_params += self.model_dim * 2
-        return total_params, activated_params, embed_params
-
-    def tflops_per_token(self, seq_len: int):
-        expansion_factor = 6
-        q_dim = self.num_heads * self.head_dim
-        k_dim = self.num_kv_heads * self.head_dim
-        v_dim = self.num_kv_heads * self.v_head_dim
-        h_dim = self.num_heads * self.v_head_dim
-        embed_flops = self.model_dim + self.vocab_size
-        logits_flops = self.model_dim * self.vocab_size
-        # norm flops
-        norm_flops = self.model_dim * (2 if self.apply_rmsnorm else 4) + h_dim * 2
-        norm_flops += (q_dim + k_dim) * 2
-        timestep_norm_flops = self.model_dim * 8
-        # residual flops
-        # TODO
-        res_flops = 0.0
-        conv_flops = self.causal_conv_width * (q_dim + k_dim + v_dim) * 2
-        sca_flops = self.model_dim * (q_dim + k_dim + v_dim + h_dim)
-        sca_flops += (q_dim + h_dim) * self.chunk_size * 1.5
-        if self.attn_act_func == 'softdelta':
-            conv_flops += self.causal_conv_width * k_dim * 2
-            norm_flops += k_dim * 2
-            sca_flops += self.model_dim * (k_dim + self.num_heads)
-            sca_flops += k_dim * self.chunk_size * 1.5
-        awk_flops = (k_dim * 2 + q_dim) * self.v_head_dim
-        attn_flops = sca_flops + awk_flops + self.model_dim * h_dim
-        ffn_flops = self.model_dim * self.ffn_hidden_dim * (3 if self.swiglu else 2)
-        moe_flops = self.model_dim * self.expert_inter_dim * (self.num_activated_experts + self.num_shared_experts) * 3
-        moe_flops += self.model_dim * self.num_experts
-
-        total_tflops = embed_flops + logits_flops + timestep_norm_flops
-        total_tflops += self.num_layers * (norm_flops + timestep_norm_flops + conv_flops + attn_flops + res_flops)
-        total_tflops += self.num_dense_layers * ffn_flops
-        total_tflops += (self.num_layers - self.num_dense_layers) * moe_flops
-        total_tflops = total_tflops * expansion_factor / 10 ** 12
-        return total_tflops
-
 
 # register some models configurations
 # fmt: off
@@ -582,10 +574,5 @@ ConfStore["gekko-4B"] = ModelConf(arch='gekko', num_layers=36, model_dim=2560, n
                                   head_dim=128, v_head_dim=128, rope_head_dim=128, rope_base=500000, chunk_size=4096,
                                   causal_conv_width=4, causal_conv_weight_normalization=True, ffn_hidden_dim=9216, swiglu=True,
                                   layernorm_num_groups=2, timenorm_num_groups=40, timenorm_eps=1e-5, layernorm_eps=1e-5, rmsnorm_eps=1e-6)
-
-ConfStore["gekko-7B"] = ModelConf(arch='gekko', num_layers=38, model_dim=4096, num_heads=48, num_kv_heads=8,
-                                    head_dim=128, v_head_dim=128, rope_head_dim=128, rope_base=500000, chunk_size=4096,
-                                    causal_conv_width=4, causal_conv_weight_normalization=True, ffn_hidden_dim=8192, swiglu=True,
-                                    layernorm_num_groups=4, timenorm_num_groups=64, timenorm_eps=1e-5, layernorm_eps=1e-5, rmsnorm_eps=1e-6)
 
 # fmt: on

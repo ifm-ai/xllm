@@ -4,6 +4,7 @@ from torch import Tensor
 from torch import nn
 from torch.utils.checkpoint import checkpoint
 
+from xllm.configuration import ConfStore
 from xllm.data.dataset_streamer.tokenizer import Tokenizer
 from xllm.modules import (
     RotaryEmbedding,
@@ -242,3 +243,34 @@ class HybridGekko(XLLModel):
     def support_multi_segments_with_cache(self) -> bool:
         # TODO: causal attn w. xattn backend supports it.
         return False
+
+
+# register some models configurations
+# fmt: off
+
+ConfStore["hybrid-gekko-0.9B"] = ModelConf(
+    arch='hybrid', num_layers=28, full_attn_layer_list='7,17,27', chunk_size=4096, model_dim=1536,
+    num_heads=8, num_kv_heads=4, head_dim=256, v_head_dim=256, rope_head_dim=128, rope_base=500000,
+    qknorm=True, apply_attn_gate=True, attn_gate_func='softplus',
+    causal_conv_width=4, causal_conv_weight_normalization=True, ffn_hidden_dim=4096, swiglu=True,
+    layernorm_num_groups=2, timenorm_num_groups=24, apply_rmsnorm=True,
+    timenorm_eps=1e-5, layernorm_eps=1e-5, rmsnorm_eps=1e-6
+)
+
+ConfStore["hybrid-gekko-4B"] = ModelConf(
+    arch='hybrid', num_layers=36, full_attn_layer_list='8,17,26,35', chunk_size=4096, model_dim=2560,
+    num_heads=32, num_kv_heads=8, head_dim=128, v_head_dim=128, rope_head_dim=128, rope_base=500000,
+    qknorm=True, apply_attn_gate=True, attn_gate_func='softplus',
+    causal_conv_width=4, causal_conv_weight_normalization=True, ffn_hidden_dim=9216, swiglu=True,
+    layernorm_num_groups=2, timenorm_num_groups=40, apply_rmsnorm=True,
+    timenorm_eps=1e-5, layernorm_eps=1e-5, rmsnorm_eps=1e-6
+)
+
+ConfStore["hybrid-gekko-7B"] = ModelConf(
+    arch='hybrid', num_layers=46, chunk_size=4096, full_attn_layer_list='5,15,25,35,45', model_dim=3584,
+    num_heads=40, num_kv_heads=8, head_dim=128, v_head_dim=128, rope_head_dim=128, rope_base=500000,
+    qknorm=True, apply_attn_gate=True, attn_gate_func='softplus',
+    causal_conv_width=4, causal_conv_weight_normalization=True, ffn_hidden_dim=8192, swiglu=True,
+    layernorm_num_groups=4, timenorm_num_groups=48, apply_rmsnorm=True,
+    timenorm_eps=1e-5, layernorm_eps=1e-5, rmsnorm_eps=1e-6
+)

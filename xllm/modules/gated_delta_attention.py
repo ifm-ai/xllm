@@ -87,6 +87,7 @@ class GatedDeltaAttention(nn.Module):
         self.v_head_dim = self.head_dim if v_head_dim is None else v_head_dim
         self.rope_head_dim = self.head_dim if rope_head_dim is None else rope_head_dim
         self.attn_act_func = attn_act_func
+        self.apply_bias_term = apply_bias_term
 
         assert self.num_heads % self.num_kv_heads == 0
         assert 0 <= self.rope_head_dim <= self.head_dim

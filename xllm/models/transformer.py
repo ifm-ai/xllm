@@ -225,7 +225,7 @@ class TransformerBlock(nn.Module):
             tflops_per_token += model_dim * n_heads
             tflops_per_token += (n_heads + n_kv_heads) * head_dim * seq_len  # qkv - kkv
         else:
-            raise ValueError(f"Unknown attention activation function: {self.attn_act_func}")
+            raise ValueError(f"Unknown attention activation function: {attn_act_func}")
 
         # residual
         # TODO
@@ -448,7 +448,7 @@ class TransformerMoEBlock(nn.Module):
             tflops_per_token += model_dim * n_heads
             tflops_per_token += (n_heads + n_kv_heads) * head_dim * seq_len  # qkv - kkv
         else:
-            raise ValueError(f"Unknown attention activation function: {self.attn_act_func}")
+            raise ValueError(f"Unknown attention activation function: {attn_act_func}")
 
         # residual
         # TODO
@@ -701,7 +701,7 @@ class TransformerMoVABlock(nn.Module):
             tflops_per_token += model_dim * n_heads
             tflops_per_token += (n_heads + n_kv_heads) * head_dim * seq_len  # qkv - kkv
         else:
-            raise ValueError(f"Unknown attention activation function: {self.attn_act_func}")
+            raise ValueError(f"Unknown attention activation function: {attn_act_func}")
 
         # residual
         # TODO
