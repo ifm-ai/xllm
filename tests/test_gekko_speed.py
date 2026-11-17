@@ -36,8 +36,9 @@ def awk_fwd(
     xk = xk.transpose(1, 2)
     xv = xv.transpose(1, 2)
     return adaptive_working_memory_fwd(
-        xq, xk, xk, xv, chunk_size, memory, log_norm_term, prev_k, prev_k, prev_v,
-        segment_idx, prev_segment_count, ortho, 1e-6
+        xq, xk, xk, xv, None, chunk_size, memory, log_norm_term,
+        prev_k, prev_k, prev_v, None,
+        segment_idx, prev_segment_count, False, ortho, 1e-6
     )
 
 
@@ -62,8 +63,8 @@ def awk_bwd(
     xv = xv.transpose(1, 2)
     y_grad = y_grad.transpose(1, 2)
     memory_outs, lnt_outs, kv_outs, kk_outs, prev_outs = adaptive_working_memory_accum_fwd(
-        xq, xk, xk, xv, chunk_size, memory, log_norm_term, prev_k, prev_k, prev_v,
-        segment_idx, prev_segment_count, ortho, 1e-6, False
+        xq, xk, xk, xv, None, chunk_size, memory, log_norm_term, prev_k, prev_k, prev_v, None,
+        segment_idx, prev_segment_count, False, ortho, 1e-6, False
     )
     accum_memory, memory_residual, memory_mask = memory_outs
     log_norm_term, curr_log_norm_term, accum_log_norm_term, ratio = lnt_outs
@@ -72,12 +73,12 @@ def awk_bwd(
     prev_kkey, prev_k_fp32, prev_kk_fp32, prev_k_mask = prev_outs
     return adaptive_working_memory_bwd(
         y_grad, mem_grad, lnt_grad,
-        xq, xk, awk_kkey, xv, chunk_size,
+        xq, xk, awk_kkey, xv, None, chunk_size,
         awk_rvalue, awk_rvalue_rstd, awk_vvalue, awk_avalue,
         ak_fp32, akk_fp32, awk_key_mask,
         accum_memory, memory_residual, memory_mask,
         log_norm_term, curr_log_norm_term, accum_log_norm_term, ratio, awk_out_mask,
-        prev_k, prev_kkey, prev_v, prev_k_fp32, prev_kk_fp32, prev_k_mask, ortho
+        prev_k, prev_kkey, prev_v, None, prev_k_fp32, prev_kk_fp32, prev_k_mask, False, ortho
     )
 
 
@@ -220,11 +221,11 @@ def test_causal_conv1d(
             print(f'{backend} causal conv1d w. hx bwd: {delta:.2f}s')
 
 
-def test_flash_sliding_window_attention_speed(
-    query, key, value, out_grad, chunk_size, scale, epochs
+def test_flash_full_attention_speed(
+    query, key, value, out_grad, scale, epochs
 ):
     with torch.no_grad():
-        window_size = (chunk_size, 0)
+        window_size = (-1, -1)
         q_grad, k_grad, v_grad = torch.empty_like(query), torch.empty_like(key), torch.empty_like(value)
         # warm up
         for _ in range(100):
@@ -316,7 +317,7 @@ def test_adaptive_working_memory(
     with torch.no_grad():
         # warm up
         for _ in range(100):
-            out, _, mem, lnt = awk_fwd(
+            out, mem, lnt = awk_fwd(
                 query, key, value, None, None, None, None,
                 chunk_size, segment_idx, None, ortho
             )
@@ -328,7 +329,7 @@ def test_adaptive_working_memory(
 
         start = timer()
         for _ in range(epochs):
-            out, _, mem, lnt = awk_fwd(
+            out, mem, lnt = awk_fwd(
                 query, key, value, None, None, None, None,
                 chunk_size, segment_idx, None, ortho,
             )
@@ -427,7 +428,7 @@ def test(B: int, L: int, D: int, W: int, H: int, HKV: int, S: int, V: int, chunk
     if S <= 256 and V <= 256:
         test_sliding_chunk_attention(query, key, value, out_grad, chunk_size, bos_mask, segment_idx, 0, 'xattn', epochs)
         if S == V and dtype in ['bf16', 'fp16']:
-            test_flash_sliding_window_attention_speed(query, key, value, out_grad, chunk_size * 2, 1.0 / math.sqrt(D), epochs)
+            test_flash_full_attention_speed(query, key, value, out_grad, 1.0 / math.sqrt(D), epochs)
 
     test_adaptive_working_memory(query, key, value, out_grad, mem_grad, lnt_grad, chunk_size, segment_idx, False, epochs)
     # test_adaptive_working_memory(query, key, value, out_grad, mem_grad, lnt_grad, chunk_size, segment_idx, True, epochs)
