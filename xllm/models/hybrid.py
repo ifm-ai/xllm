@@ -164,7 +164,7 @@ class HybridGekko(XLLModel):
             elif seq_len > 1:
                 assert start % self.chunk_size == 0
 
-            if bos_mask is not None:
+            if cache is not None and bos_mask is not None:
                 prev_bos_mask, prev_segment_idx, prev_segment_count = cache_segment
                 if prev_bos_mask is not None:
                     bos_mask = torch.cat([prev_bos_mask, bos_mask], dim=1)
