@@ -152,7 +152,11 @@ class HybridGekko(XLLModel):
                 token_mask = token_mask[:, start:end] if token_mask is not None else None
         else:
             assert self.context_parallel_size == 1, "inference mode does not support context parallel."
-            cache_layers, cache_output, cache_segment = cache
+            if cache is not None:
+                cache_layers, cache_output, cache_segment = cache
+            else:
+                cache_layers, cache_output, cache_segment = None, None, None
+
             start = 0 if cache_layers[0][0] is None else cache_layers[0][0][-1]
             end = start + seq_len
             if seq_len >= self.chunk_size:
