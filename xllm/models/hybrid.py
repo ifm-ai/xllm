@@ -87,16 +87,16 @@ class HybridGekko(XLLModel):
         return block_cls
 
     def forward(
-            self,
-            tokens: Tensor,
-            multi_segments: bool,
-            targets: Optional[Tensor] = None,
-            token_mask: Optional[Tensor] = None,
-            moe_router_load_balancing_type: Optional[str] = None,
-            attn_stability_control: int = 0,
-            deterministic: bool = True,
-            cache: Optional[Tuple[List[Any], Tuple[Tensor, Tensor, Tensor],
-                                  Tuple[Tensor, Tensor, Tensor]]] = None,
+        self,
+        tokens: Tensor,
+        multi_segments: bool,
+        targets: Optional[Tensor] = None,
+        token_mask: Optional[Tensor] = None,
+        moe_router_load_balancing_type: Optional[str] = None,
+        attn_stability_control: int = 0,
+        deterministic: bool = True,
+        cache: Optional[Tuple[List[Any], Tuple[Tensor, Tensor, Tensor],
+                              Tuple[Tensor, Tensor, Tensor]]] = None,
     ):
         bsz, seq_len = tokens.shape
 
@@ -171,21 +171,6 @@ class HybridGekko(XLLModel):
         x = memory_efficient_dropout(emb, self.dropout, self.training)
         # rope frequencies
         freq_cis = None if self.rope is None else self.rope.get_freqs_cis(start, end, x.device)
-
-        for i, layer in enumerate(self.layers):
-            layer_cache = cache[i] if cache is not None else None
-            if self.layerwise_ckpt:
-                x, aux_loss, layer_cache = checkpoint(
-                    layer, x, freq_cis, bos_mask, segments, moe_router_load_balancing_type,
-                    attn_stability_control, deterministic, layer_cache,
-                    use_reentrant=False, preserve_rng_state=True
-                )
-            else:
-                x, aux_loss, layer_cache = layer(
-                    x, freq_cis, bos_mask, segments, moe_router_load_balancing_type,
-                    attn_stability_control, deterministic, layer_cache
-                )
-
 
         aux_loss_sum = None
         health_collector = get_active_health_collector()
