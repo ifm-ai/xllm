@@ -47,22 +47,23 @@ class SimpleJsonlTemplator(Templator):
             )
         return text
 
-IGNORE_INDEX = -100
 
+IGNORE_INDEX = -100
 
 SYSTEM = (
     "You are K2, a helpful assistant created by Mohamed bin Zayed University of Artificial Intelligence "
     "(MBZUAI) Institute of Foundation Models (IFM)."
 )
 
+TOOL_PRESENTATION_FORMATS = None
+TOOL_CALL_FORMATS = None
+
+
 def _require_env(name: str) -> str:
     value = os.getenv(name)
     if value is None:
         raise RuntimeError(f"Environment variable {name} is not set")
     return value
-
-TOOL_PRESENTATION_FORMATS = json.loads(_require_env("TOOL_PRESENTATION_FORMATS"))
-TOOL_CALL_FORMATS = json.loads(_require_env("TOOL_CALL_FORMATS"))
 
 
 def _field(obj: Any, name: str) -> Any:
@@ -160,6 +161,14 @@ def apply_chat_template_randomized(
 
     has_tools = bool(conversation[0].get("tools", False))
     if has_tools:
+        # load Tool format
+        global TOOL_PRESENTATION_FORMATS
+        global TOOL_CALL_FORMATS
+        if TOOL_PRESENTATION_FORMATS is None:
+            assert TOOL_CALL_FORMATS is None
+            TOOL_PRESENTATION_FORMATS = json.loads(_require_env("TOOL_PRESENTATION_FORMATS"))
+            TOOL_CALL_FORMATS = json.loads(_require_env("TOOL_CALL_FORMATS"))
+
         if rng.random() < 0.0001:
             for i, tool in enumerate(conversation[0]["tools"]):
                 if not ("type" in tool and tool["type"] == "function"):
