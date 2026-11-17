@@ -41,6 +41,7 @@ class MultiheadAttention(nn.Module):
         n_kv_heads: Optional[int],
         head_dim: Optional[int],
         rope_head_dim: Optional[int],
+        apply_nope: bool,
         attn_act_func: str,
         qknorm: bool,
         norm_num_groups: int,
@@ -68,6 +69,7 @@ class MultiheadAttention(nn.Module):
         self.n_kv_heads = n_heads if n_kv_heads is None else n_kv_heads
         self.head_dim = mdim // n_heads if head_dim is None else head_dim
         self.rope_head_dim = self.head_dim if rope_head_dim is None else rope_head_dim
+        self.nope = apply_nope
         self.qknorm = qknorm
         self.attn_act_func = attn_act_func
 
@@ -178,6 +180,7 @@ class MultiheadAttention(nn.Module):
             self.local_kv_heads,
             self.head_dim,
             self.rope_head_dim,
+            self.nope,
             None,
             self.attention_dropout,
             self.causal_attn_backend,
@@ -231,7 +234,8 @@ class MultiheadAttention(nn.Module):
 
         # B x L x (H*S)
         attn, new_cache = self.causal_attention(
-            xq, xk, xv, g, freqs_cis, bos_mask, segments, stability_control, deterministic, cache
+            xq, xk, xv, g, None if self.nope else freqs_cis,
+            bos_mask, segments, stability_control, deterministic, cache
         )
         if self.apply_attn_gate:
             if self.attn_gate_fn == "silu":
@@ -252,7 +256,7 @@ class MultiheadAttention(nn.Module):
 
     def extra_repr(self) -> str:
         return 'dim={}, heads={} ({}), head_dim={} ({}), act={}, backend={}, gate={}, init={} ({})'.format(
-            self.mdim, self.n_heads, self.n_kv_heads, self.head_dim, self.rope_head_dim,
+            self.mdim, self.n_heads, self.n_kv_heads, self.head_dim, 'nope' if self.nope else self.rope_head_dim,
             self.attn_act_func, self.causal_attn_backend,
             self.attn_gate_fn if self.apply_attn_gate else None,
             self.init_mode, self.init_std

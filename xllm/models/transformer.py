@@ -59,6 +59,7 @@ class TransformerBlock(nn.Module):
         self.recompute_fc1_out = cfg.recompute_fc1_out
         self.recompute_fc3_out = cfg.recompute_fc3_out
         self.dropout = cfg.dropout
+        self.apply_nope = cfg.apply_nope_in_causal_attn
         self.apply_rmsnorm = cfg.apply_rmsnorm
         self.layernorm_eps = cfg.layernorm_eps
         self.rmsnorm_eps = cfg.rmsnorm_eps
@@ -73,6 +74,7 @@ class TransformerBlock(nn.Module):
             n_kv_heads=cfg.num_kv_heads,
             head_dim=cfg.head_dim,
             rope_head_dim=cfg.rope_head_dim,
+            apply_nope=cfg.apply_nope_in_causal_attn,
             attn_act_func=cfg.attn_act_func,
             qknorm=cfg.qknorm,
             norm_num_groups=cfg.layernorm_num_groups,
@@ -128,7 +130,7 @@ class TransformerBlock(nn.Module):
             return fn.apply(
                 self.layer_id,
                 x,
-                freqs_cis,
+                None if self.apply_nope else freqs_cis,
                 bos_mask,
                 segments,
                 self.attention.norm.weight,
@@ -144,6 +146,7 @@ class TransformerBlock(nn.Module):
                 self.attention.local_kv_heads,
                 self.attention.head_dim,
                 self.attention.rope_head_dim,
+                self.apply_nope,
                 self.attention.attn_act_func,
                 self.attention.apply_attn_gate,
                 self.attention.attn_gate_fn,
@@ -249,6 +252,7 @@ class TransformerMoEBlock(nn.Module):
         self.recompute_fc3_out = cfg.recompute_fc3_out
         self.recompute_router = cfg.recompute_router
         self.dropout = cfg.dropout
+        self.apply_nope = cfg.apply_nope_in_causal_attn
         self.apply_rmsnorm = cfg.apply_rmsnorm
         self.layernorm_eps = cfg.layernorm_eps
         self.rmsnorm_eps = cfg.rmsnorm_eps
@@ -263,6 +267,7 @@ class TransformerMoEBlock(nn.Module):
             n_kv_heads=cfg.num_kv_heads,
             head_dim=cfg.head_dim,
             rope_head_dim=cfg.rope_head_dim,
+            apply_nope=cfg.apply_nope_in_causal_attn,
             attn_act_func=cfg.attn_act_func,
             qknorm=cfg.qknorm,
             norm_num_groups=cfg.layernorm_num_groups,
@@ -326,7 +331,7 @@ class TransformerMoEBlock(nn.Module):
             return fn.apply(
                 self.layer_id,
                 x,
-                freqs_cis,
+                None if self.apply_nope else freqs_cis,
                 bos_mask,
                 segments,
                 self.attention.norm.weight,
@@ -342,6 +347,7 @@ class TransformerMoEBlock(nn.Module):
                 self.attention.local_kv_heads,
                 self.attention.head_dim,
                 self.attention.rope_head_dim,
+                self.apply_nope,
                 self.attention.attn_act_func,
                 self.attention.apply_attn_gate,
                 self.attention.attn_gate_fn,
@@ -472,6 +478,7 @@ class TransformerMoVABlock(nn.Module):
         self.recompute_fc3_out = cfg.recompute_fc3_out
         self.recompute_router = cfg.recompute_router
         self.dropout = cfg.dropout
+        self.apply_nope = cfg.apply_nope_in_causal_attn
         self.apply_rmsnorm = cfg.apply_rmsnorm
         self.layernorm_eps = cfg.layernorm_eps
         self.rmsnorm_eps = cfg.rmsnorm_eps
@@ -486,6 +493,7 @@ class TransformerMoVABlock(nn.Module):
             n_kv_heads=cfg.num_kv_heads,
             head_dim=cfg.head_dim,
             rope_head_dim=cfg.rope_head_dim,
+            apply_nope=cfg.apply_nope_in_causal_attn,
             attn_act_func=cfg.attn_act_func,
             num_values=cfg.num_values,
             num_activated_values=cfg.num_activated_values,
@@ -557,7 +565,7 @@ class TransformerMoVABlock(nn.Module):
             return fn.apply(
                 self.layer_id,
                 x,
-                freqs_cis,
+                None if self.apply_nope else freqs_cis,
                 bos_mask,
                 segments,
                 self.mova.norm.weight,
@@ -573,6 +581,7 @@ class TransformerMoVABlock(nn.Module):
                 self.mova.local_kv_heads,
                 self.mova.head_dim,
                 self.mova.rope_head_dim,
+                self.nope,
                 self.mova.router.weight,
                 self.mova.n_values,
                 self.mova.topk,
