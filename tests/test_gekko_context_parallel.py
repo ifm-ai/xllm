@@ -75,9 +75,13 @@ def losses_and_grads(cfg, cp, chunks_per_rank, multi_segments=False):
 @pytest.mark.parametrize("fused", [False, True], ids=["unfused", "fused"])
 @pytest.mark.parametrize("chunks_per_rank", [1, 2])
 def test_context_parallel_matches_one_rank(world, chunks_per_rank, fused, awm_gate, multi_segments, request):
-    if awm_gate and not fused:  # on main too; the fused path with the gate is within ~1%
+    # The fused block does not apply the AWM gate (bitwise the model without it), so with fused=True the gate cases
+    # check only the other parameters. Unfused, the forget_gate grad is bf16 noise of 1.3-3.8% against fp32 across
+    # seeds even on one rank (others ~2%; fp32 matches within 0.1%), so two bf16 runs can differ by more than RTOL.
+    if awm_gate and not fused:
         request.applymarker(pytest.mark.xfail(
-            reason="unfused AWM gate under context parallel: forget_gate grad 1-2.6% off the one-rank one", strict=False))
+            reason="bf16 noise of the unfused forget_gate grad (1.3-3.8% off fp32 on one rank) can exceed RTOL",
+            strict=False))
     cfg = ModelConf(**(BASE | dict(fused_block=fused, apply_awm_gate=awm_gate)))
     ref_loss, ref = losses_and_grads(cfg, 1, chunks_per_rank, multi_segments)  # every rank: the whole sequence alone
     loss, grads = losses_and_grads(cfg, WORLD, chunks_per_rank, multi_segments)
