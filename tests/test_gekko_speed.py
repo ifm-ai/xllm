@@ -255,7 +255,7 @@ def test_flash_full_attention_speed(
         torch.cuda.synchronize()
 
         delta = timer() - start
-        print(f'flash3 SWA fwd: {delta:.2f}s')
+        print(f'flash3 fwd: {delta:.2f}s')
 
         start = timer()
         for _ in range(epochs):
@@ -267,7 +267,7 @@ def test_flash_full_attention_speed(
         torch.cuda.synchronize()
 
         delta = timer() - start
-        print(f'flash3 SWA bwd: {delta:.2f}s')
+        print(f'flash3 bwd: {delta:.2f}s')
 
 
 def test_sliding_chunk_attention(
