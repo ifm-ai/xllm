@@ -86,9 +86,11 @@ class BufferAssembler:
                               (encode_packed_seqs)
       - next_refill_state   : the streamer, packer, token-credit and RNG states the next
                               refill starts from, captured when it was started
-      A reload with both puts these back instead of re-reading and re-tokenizing the
-      active slot's data; it reaches the same state, so the batches that follow are the
-      same. A state without them (older checkpoints) is reloaded by the rebuild.
+      - fast_restore_key    : the sequence length, source budgets and packer they were packed with
+      A reload with these and the same key puts them back instead of re-reading and
+      re-tokenizing the active slot's data; it reaches the same state, so the batches that
+      follow are the same. A state without them (older checkpoints), or saved by a loader
+      configured differently (e.g. another seq_len or data mix), is reloaded by the rebuild.
     """
 
     def __init__(
@@ -394,11 +396,18 @@ class BufferAssembler:
                     "rng_state": self._next_rng_state,
                 })
                 state["active_seqs"] = encode_packed_seqs(self._buffers[self._active][state["popping_idx"]:])
+                state["fast_restore_key"] = self._fast_restore_key()
             return state
+
+    def _fast_restore_key(self) -> Dict[str, Any]:
+        # the saved sequences are valid only for the loader that packed them: sequence length, sources, their
+        # weights and buffer size (ds_budgets), and packer
+        return {"seq_len": self.seq_len, "ds_budgets": dict(self.ds_budgets), "packer": type(self.packer).__name__}
 
     def set_state(self, state: Dict[str, Any]) -> None:
         self._wait_prefetch()
-        if "active_seqs" in state and "next_refill_state" in state:
+        if "active_seqs" in state and "next_refill_state" in state \
+                and state.get("fast_restore_key") == self._fast_restore_key():
             self._set_state_fast(state)
             return
 

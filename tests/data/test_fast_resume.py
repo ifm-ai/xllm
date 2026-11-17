@@ -36,6 +36,7 @@ def _without_fast_restore(state):
     state = copy.deepcopy(state)
     state["assembler"].pop("active_seqs")
     state["assembler"].pop("next_refill_state")
+    state["assembler"].pop("fast_restore_key", None)
     return state
 
 
@@ -63,6 +64,42 @@ def test_fast_restore_matches_uninterrupted_run(tmp_path, n_before, packing_type
             # the state after the restore is again the uninterrupted run's
             again = restored.get_state()
             assert again["steps"] == reference.get_state()["steps"]
+    finally:
+        for loader in loaders:
+            loader.close()
+
+
+@pytest.mark.parametrize("change", ["seq_len", "data_mix"])
+def test_a_loader_configured_differently_restores_by_the_rebuild(tmp_path, change):
+    # the saved sequences were packed for the old seq_len / mix: the restore must re-pack them, as the rebuild does
+    for name in ("a", "b"):
+        os.makedirs(tmp_path / name)
+        _write_data(str(tmp_path / name))
+
+    def build(seq_len=4, mix="a:1.0"):
+        data_mix_str = ",".join(f"{tmp_path}/{part.split(':')[0]}:{part.split(':')[1]}:text:text" for part in mix.split(","))
+        loader = MultiSourceDataLoader(
+            tokenizer=_Tokenizer(), data_mix_str=data_mix_str, seq_len=seq_len, batch_size=1, num_buffered_seq=4,
+            world_rank=0, world_size=1, packing_type="bestfit", num_workers=1,
+        )
+        loader.assembler._sync_refill = True
+        loaders.append(loader)
+        return loader
+
+    loaders = []
+    try:
+        source = build()
+        for _ in range(3):
+            next(source)
+        state = copy.deepcopy(source.get_state())
+        new = dict(seq_len=8) if change == "seq_len" else dict(mix="a:0.5,b:0.5")
+        batches = []
+        for restore_state in (state, _without_fast_restore(state)):
+            restored = build(**new)
+            restored.set_state(copy.deepcopy(restore_state))
+            batches.append([next(restored) for _ in range(6)])
+        for fast, rebuilt in zip(*batches):
+            _assert_batch_equal(rebuilt, fast)
     finally:
         for loader in loaders:
             loader.close()
