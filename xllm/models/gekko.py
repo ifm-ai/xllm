@@ -204,6 +204,12 @@ class GekkoBlock(nn.Module):
         out = self.nffn(y)
         return out, None, cache
 
+    def num_parameters(self):
+        pass
+
+    def tflops_per_token(self, seq_len: int):
+        pass
+
 
 class GekkoOutputLayer(nn.Module):
     def __init__(self, cfg: ModelConf):
@@ -315,6 +321,21 @@ class GekkoOutputLayer(nn.Module):
             if mask is not None:
                 loss = loss * mask.to(loss)
             return loss, cache
+
+    def num_parameters(self):
+        embed_params = self.model_dim * self.output_size * 2
+        # final norm
+        norm_params = self.model_dim * 2
+
+        total_params = embed_params + norm_params
+        return total_params, embed_params
+
+    def tflops_per_token(self, seq_len: int):
+        embed_flops = self.model_dim + self.output_size
+        logits_flops = self.model_dim * self.output_size
+        norm_flops = self.model_dim * 8
+
+        return embed_flops + logits_flops + norm_flops
 
 
 class Gekko(XLLModel):

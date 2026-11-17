@@ -25,6 +25,9 @@ class XLLModel(nn.Module):
         super().__init__()
 
         self.arch = cfg.arch
+        self.layers = None
+        self.output = None
+
         self.num_layers = cfg.num_layers
         assert cfg.vocab_size > 0
         self.vocab_size = cfg.vocab_size
@@ -144,13 +147,21 @@ class XLLModel(nn.Module):
     def support_multi_segments_with_cache(self) -> bool:
         raise NotImplemented
 
-    @abc.abstractmethod
     def num_parameters(self):
-        raise NotImplemented
+        total_params, embed_params = self.output.num_parameters()
+        activated_params = total_params
+        for i, layer in enumerate(self.layers):
+            layer_params, layer_act_params = layer.num_parameters()
+            total_params += layer_params
+            activated_params += layer_act_params
+        return total_params, activated_params, embed_params
 
-    @abc.abstractmethod
     def tflops_per_token(self, seq_len: int):
-        raise NotImplemented
+        expansion_factor = 6
+        total_tflops = self.output.tflops_per_token(seq_len)
+        for i, layer in enumerate(self.layers):
+            total_tflops += layer.tflops_per_token(seq_len)
+        return total_tflops * expansion_factor / 10**12
 
     def extra_repr(self) -> str:
         repr = (

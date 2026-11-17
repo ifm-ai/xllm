@@ -181,6 +181,58 @@ class TransformerBlock(nn.Module):
 
         return out, None, cache
 
+    def num_parameters(self):
+        model_dim = self.attention.mdim
+        attn_act_func = self.attention.attn_act_func
+        nk = {"softmax": 1, "softdelta": 2}[attn_act_func]
+        head_dim = self.attention.head_dim
+        n_heads = self.attention.n_heads
+        n_kv_heads = self.attention.n_kv_heads
+        apply_attn_gate = self.attention.apply_attn_gate
+        qknorm = self.attention.qknorm
+        ffn_hidden_dim = self.nffn.hidden_dim
+        swiglu = self.nffn.swiglu
+
+        # MHA
+        attn_params = model_dim * (n_heads * 2 + n_kv_heads * (nk + 1)) * head_dim
+        if attn_act_func == 'softdelta':
+            attn_params += model_dim * n_heads
+        if apply_attn_gate:
+            attn_params += model_dim * n_heads * head_dim
+        attn_params += num_params_in_residual(self.residual_func, model_dim, self.residual_heads, n_heads * head_dim)
+        # Norm
+        norm_params = model_dim * (2 if self.apply_rmsnorm else 4)
+        if qknorm:
+            norm_params += (n_heads + n_kv_heads * nk) * head_dim
+        # FFN
+        ffn_params = model_dim * ffn_hidden_dim * (3 if swiglu else 2)
+        ffn_params += num_params_in_residual(self.residual_func, model_dim, self.residual_heads, ffn_hidden_dim)
+
+        activated_params = attn_params + norm_params + ffn_params
+        return activated_params, activated_params
+
+    def tflops_per_token(self, seq_len: int):
+        model_dim = self.attention.mdim
+        attn_act_func = self.attention.attn_act_func
+        head_dim = self.attention.head_dim
+        n_heads = self.attention.n_heads
+        n_kv_heads = self.attention.n_kv_heads
+
+        _, tflops_per_token = self.num_parameters()
+        if attn_act_func == 'softmax':
+            tflops_per_token += n_heads * head_dim * seq_len
+        elif attn_act_func == 'softdelta':
+            tflops_per_token += model_dim * n_heads
+            tflops_per_token += (n_heads + n_kv_heads) * head_dim * seq_len  # qkv - kkv
+        else:
+            raise ValueError(f"Unknown attention activation function: {self.attn_act_func}")
+
+        # residual
+        # TODO
+        res_flops = 0.0
+
+        return tflops_per_token
+
 
 class TransformerMoEBlock(nn.Module):
 
@@ -342,6 +394,67 @@ class TransformerMoEBlock(nn.Module):
         out, aux_loss = self.moe(y, moe_router_load_balancing_type)
 
         return out, aux_loss, cache
+
+    def num_parameters(self):
+        model_dim = self.attention.mdim
+        attn_act_func = self.attention.attn_act_func
+        nk = {"softmax": 1, "softdelta": 2}[attn_act_func]
+        head_dim = self.attention.head_dim
+        n_heads = self.attention.n_heads
+        n_kv_heads = self.attention.n_kv_heads
+        apply_attn_gate = self.attention.apply_attn_gate
+        qknorm = self.attention.qknorm
+        expert_inter_dim = self.moe.inter_dim
+        n_shared_experts = self.moe.n_shared_experts
+        n_experts = self.moe.n_experts
+        n_activated_experts = self.moe.topk
+
+        # MHA
+        attn_params = model_dim * (n_heads * 2 + n_kv_heads * (nk + 1)) * head_dim
+        if attn_act_func == 'softdelta':
+            attn_params += model_dim * n_heads
+        if apply_attn_gate:
+            attn_params += model_dim * n_heads * head_dim
+        attn_params += num_params_in_residual(self.residual_func, model_dim, self.residual_heads, n_heads * head_dim)
+        # Norm
+        norm_params = model_dim * (2 if self.apply_rmsnorm else 4)
+        if qknorm:
+            norm_params += (n_heads + n_kv_heads * nk) * head_dim
+
+        activated_params = attn_params + norm_params
+        total_params = activated_params
+        # MoE
+        shared_expert_params = model_dim * expert_inter_dim * n_shared_experts * 3
+        routed_expert_params = model_dim * expert_inter_dim * n_experts * 3
+        activated_expert_params = model_dim * expert_inter_dim * n_activated_experts * 3
+        router_params = model_dim * n_experts
+        residual_params = num_params_in_residual(self.residual_func, model_dim, self.residual_heads, model_dim)
+        activated_params += shared_expert_params + activated_expert_params + router_params + residual_params
+        total_params += shared_expert_params + routed_expert_params + router_params
+
+        return total_params, activated_params
+
+    def tflops_per_token(self, seq_len: int):
+        model_dim = self.attention.mdim
+        attn_act_func = self.attention.attn_act_func
+        head_dim = self.attention.head_dim
+        n_heads = self.attention.n_heads
+        n_kv_heads = self.attention.n_kv_heads
+
+        _, tflops_per_token = self.num_parameters()
+        if attn_act_func == 'softmax':
+            tflops_per_token += n_heads * head_dim * seq_len
+        elif attn_act_func == 'softdelta':
+            tflops_per_token += model_dim * n_heads
+            tflops_per_token += (n_heads + n_kv_heads) * head_dim * seq_len  # qkv - kkv
+        else:
+            raise ValueError(f"Unknown attention activation function: {self.attn_act_func}")
+
+        # residual
+        # TODO
+        res_flops = 0.0
+
+        return tflops_per_token
 
 
 class TransformerMoVABlock(nn.Module):
@@ -519,6 +632,83 @@ class TransformerMoVABlock(nn.Module):
 
         return out, aux_loss, cache
 
+    def num_parameters(self):
+        model_dim = self.attention.mdim
+        attn_act_func = self.attention.attn_act_func
+        nk = {"softmax": 1, "softdelta": 2}[attn_act_func]
+        head_dim = self.mova.head_dim
+        n_heads = self.mova.n_heads
+        n_kv_heads = self.mova.n_kv_heads
+        apply_attn_gate = self.mova.apply_attn_gate
+        qknorm = self.mova.qknorm
+        n_values = self.mova.n_values
+        n_activated_values = self.mova.topk
+        expert_inter_dim = self.moe.inter_dim
+        n_shared_experts = self.moe.n_shared_experts
+        n_experts = self.moe.n_experts
+        n_activated_experts = self.moe.topk
+
+        # MHA
+        attn_params = model_dim * (n_heads * 2 + n_kv_heads * (nk + 1)) * head_dim
+        if attn_act_func == 'softdelta':
+            attn_params += model_dim * n_heads
+        if apply_attn_gate:
+            attn_params += model_dim * n_heads * head_dim
+        attn_params += num_params_in_residual(self.residual_func, model_dim, self.residual_heads, n_heads * head_dim)
+        # Norm
+        norm_params = model_dim * (2 if self.apply_rmsnorm else 4)
+        if qknorm:
+            norm_params += (n_heads + n_kv_heads * nk) * head_dim
+
+        activated_params = norm_params
+        total_params = activated_params
+        # MoVA
+        mova_qko_params = model_dim * (n_heads * 2 + n_kv_heads * nk) * head_dim
+        if attn_act_func == 'softdelta':
+            mova_qko_params += model_dim * n_heads
+        if apply_attn_gate:
+            mova_qko_params += model_dim * n_heads * head_dim
+
+        mova_qko_params += num_params_in_residual(self.residual_func, model_dim, self.residual_heads, n_heads * head_dim)
+        # Value
+        routed_value_params = model_dim * n_kv_heads * head_dim * n_values
+        activated_value_params = model_dim * n_kv_heads * head_dim * n_activated_values
+        router_params = model_dim * n_values
+        activated_params += mova_qko_params + activated_value_params + router_params
+        total_params += mova_qko_params + routed_value_params + router_params
+        # MoE
+        shared_expert_params = model_dim * expert_inter_dim * n_shared_experts * 3
+        routed_expert_params = model_dim * expert_inter_dim * n_experts * 3
+        activated_expert_params = model_dim * expert_inter_dim * n_activated_experts * 3
+        router_params = model_dim * n_experts
+        residual_params = num_params_in_residual(self.residual_func, model_dim, self.residual_heads, model_dim)
+        activated_params += shared_expert_params + activated_expert_params + router_params + residual_params
+        total_params += shared_expert_params + routed_expert_params + router_params
+
+        return total_params, activated_params
+
+    def tflops_per_token(self, seq_len: int):
+        model_dim = self.mova.mdim
+        attn_act_func = self.mova.attn_act_func
+        head_dim = self.mova.head_dim
+        n_heads = self.mova.n_heads
+        n_kv_heads = self.mova.n_kv_heads
+
+        _, tflops_per_token = self.num_parameters()
+        if attn_act_func == 'softmax':
+            tflops_per_token += n_heads * head_dim * seq_len
+        elif attn_act_func == 'softdelta':
+            tflops_per_token += model_dim * n_heads
+            tflops_per_token += (n_heads + n_kv_heads) * head_dim * seq_len  # qkv - kkv
+        else:
+            raise ValueError(f"Unknown attention activation function: {self.attn_act_func}")
+
+        # residual
+        # TODO
+        res_flops = 0.0
+
+        return tflops_per_token
+
 
 class TransformerOutputLayer(nn.Module):
     def __init__(self, cfg: ModelConf):
@@ -607,6 +797,21 @@ class TransformerOutputLayer(nn.Module):
             if mask is not None:
                 loss = loss * mask.to(loss)
             return loss
+
+    def num_parameters(self):
+        embed_params = self.model_dim * self.output_size * 2
+        # final norm
+        norm_params = self.model_dim * (1 if self.apply_rmsnorm else 2)
+
+        total_params = embed_params + norm_params
+        return total_params, embed_params
+
+    def tflops_per_token(self, seq_len: int):
+        embed_flops = self.model_dim + self.output_size
+        logits_flops = self.model_dim * self.output_size
+        norm_flops = self.model_dim * (2 if self.apply_rmsnorm else 4)
+
+        return embed_flops + logits_flops + norm_flops
 
 
 class Transformer(XLLModel):
@@ -781,103 +986,6 @@ class Transformer(XLLModel):
             # B x L1 x L2
             seg_mask = torch.ne(q_segment_idx.unsqueeze(2), k_segment_idx.unsqueeze(1))
             return seg_mask
-
-    def num_parameters(self):
-        embed_params = self.model_dim * self.vocab_size * 2
-        nk = {"softmax": 1, "softdelta": 2}[self.attn_act_func]
-        attn_params_per_block = self.model_dim * (self.num_heads * 2 + self.num_kv_heads * (nk + 1)) * self.head_dim
-        if self.attn_act_func == 'softdelta':
-            attn_params_per_block += self.model_dim * self.num_heads
-        if self.apply_attn_gate:
-            attn_params_per_block += self.model_dim * self.num_heads * self.head_dim
-        attn_params_per_block += num_params_in_residual(self.residual_func, self.model_dim, self.residual_heads, self.num_heads * self.head_dim)
-        # Norm
-        norm_params_per_block = self.model_dim * (2 if self.apply_rmsnorm else 4)
-        if self.qknorm:
-            norm_params_per_block += (self.num_heads + self.num_kv_heads * nk) * self.head_dim
-        # FFN
-        ffn_params_per_block = self.model_dim * self.ffn_hidden_dim * (3 if self.swiglu else 2)
-        ffn_params_per_block += num_params_in_residual(self.residual_func, self.model_dim, self.residual_heads, self.ffn_hidden_dim)
-
-        activated_params = norm_params_per_block * self.num_layers
-        activated_params += (attn_params_per_block + ffn_params_per_block) * self.num_dense_layers + embed_params
-        total_params = activated_params
-        if self.num_values > 0:
-            mova_qko_params = self.model_dim * (self.num_heads * 2 + self.num_kv_heads * nk) * self.head_dim
-            if self.attn_act_func == 'softdelta':
-                mova_qko_params += self.model_dim * self.num_heads
-            if self.apply_attn_gate:
-                mova_qko_params += self.model_dim * self.num_heads * self.head_dim
-            mova_qko_params += num_params_in_residual(self.residual_func, self.model_dim, self.residual_heads, self.num_heads * self.head_dim)
-            # Value
-            routed_value_params = self.model_dim * self.num_kv_heads * self.head_dim * self.num_values
-            activated_value_params = self.model_dim * self.num_kv_heads * self.head_dim * self.num_activated_values
-            router_params = self.model_dim * self.num_values
-            activated_params += (mova_qko_params + activated_value_params + router_params) * (self.num_layers - self.num_dense_layers)
-            total_params += (mova_qko_params + routed_value_params + router_params) * (self.num_layers - self.num_dense_layers)
-        else:
-            activated_params += attn_params_per_block * (self.num_layers - self.num_dense_layers)
-            total_params += attn_params_per_block * (self.num_layers - self.num_dense_layers)
-        if self.num_experts > 0:
-            shared_expert_params = self.model_dim * self.expert_inter_dim * self.num_shared_experts * 3
-            routed_expert_params = self.model_dim * self.expert_inter_dim * self.num_experts * 3
-            activated_expert_params = self.model_dim * self.expert_inter_dim * self.num_activated_experts * 3
-            router_params = self.model_dim * self.num_experts
-            residual_params = num_params_in_residual(self.residual_func, self.model_dim, self.residual_heads, self.model_dim)
-            activated_params += (shared_expert_params + activated_expert_params + router_params + residual_params) * (self.num_layers - self.num_dense_layers)
-            total_params += (shared_expert_params + routed_expert_params + router_params) * (self.num_layers - self.num_dense_layers)
-        # final norm
-        activated_params += self.model_dim * (1 if self.apply_rmsnorm else 2)
-        total_params += self.model_dim * (1 if self.apply_rmsnorm else 2)
-        return total_params, activated_params, embed_params
-
-    def tflops_per_token(self, seq_len: int):
-        expansion_factor = 6
-        embed_flops = self.model_dim + self.vocab_size
-        logits_flops = self.model_dim * self.vocab_size
-        nk = {"softmax": 1, "softdelta": 2}[self.attn_act_func]
-        norm_flops = self.model_dim * (4 if self.apply_rmsnorm else 8)
-        if self.qknorm:
-            norm_flops += (self.num_heads + self.num_kv_heads * nk) * self.head_dim * 2
-        attn_flops = self.model_dim * (self.num_heads * 2 + self.num_kv_heads * (nk + 1)) * self.head_dim
-
-        # FFN
-        ffn_flops = self.model_dim * self.ffn_hidden_dim * (3 if self.swiglu else 2)
-
-        # residual
-        # TODO
-        res_flops = 0.0
-
-        # MoVA
-        mova_flops = self.model_dim * (self.num_heads * 2 + self.num_kv_heads * nk) * self.head_dim
-        mova_flops += self.model_dim * self.num_kv_heads * self.head_dim * self.num_activated_values
-        mova_flops += self.model_dim * self.num_values
-
-        if self.apply_attn_gate:
-            attn_flops += self.model_dim * self.num_heads * self.head_dim
-            mova_flops += self.model_dim * self.num_heads * self.head_dim
-
-        if self.attn_act_func == 'softmax':
-            attn_flops += self.num_heads * self.head_dim * seq_len
-            mova_flops += self.num_heads * self.head_dim * seq_len
-        elif self.attn_act_func == 'softdelta':
-            attn_flops += self.model_dim * self.num_heads
-            attn_flops += (self.num_heads + self.num_kv_heads) * self.head_dim * seq_len  # qkv - kkv
-            mova_flops += self.model_dim * self.num_heads
-            mova_flops += (self.num_heads + self.num_kv_heads) * self.head_dim * seq_len  # qkv - kkv
-        else:
-            raise ValueError(f"Unknown attention activation function: {self.attn_act_func}")
-
-        # MoE
-        moe_flops = self.model_dim * self.expert_inter_dim * (self.num_activated_experts + self.num_shared_experts) * 3
-        moe_flops += self.model_dim * self.num_experts
-
-        total_tflops = embed_flops + logits_flops + norm_flops
-        total_tflops += self.num_layers * (norm_flops + res_flops)
-        total_tflops += self.num_dense_layers * (attn_flops + ffn_flops)
-        total_tflops += (self.num_layers - self.num_dense_layers) * (moe_flops + (mova_flops if self.num_values > 0 else attn_flops))
-        total_tflops = total_tflops * expansion_factor / 10**12
-        return total_tflops
 
 
 # register some models configurations
