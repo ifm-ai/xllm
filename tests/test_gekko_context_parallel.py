@@ -2,7 +2,9 @@
 
 Each context-parallel rank trains on its slice of the sequence and passes its chunk state to the next rank; the
 per-rank losses and gradients summed over the ranks must equal the single-rank ones (within bf16 rounding). Covered:
-one chunk per rank (the first rank sends a state whose log-norm term is still all -inf) and two, fused and unfused.
+one chunk per rank (the first rank sends a state whose log-norm term is still all -inf) and two, fused and unfused, with
+and without the AWM gate, on one document or on packed documents (multi_segments) whose boundaries fall inside a chunk,
+on the last token of a rank's slice and just after it.
 
 Launch with context parallel = the number of GPUs (2 or more):
     torchrun --nproc_per_node 2 -m pytest -q tests/test_gekko_context_parallel.py
@@ -41,7 +43,7 @@ def world():
     dist.destroy_process_group()
 
 
-def losses_and_grads(cfg, cp, chunks_per_rank):
+def losses_and_grads(cfg, cp, chunks_per_rank, multi_segments=False):
     """(loss, {name: grad summed over the ranks}) with context parallel `cp`, chunks_per_rank chunks per rank of WORLD."""
     initialize_model_parallel(1, cp, timeout=600)
     try:
@@ -52,7 +54,11 @@ def losses_and_grads(cfg, cp, chunks_per_rank):
         g = torch.Generator().manual_seed(1)
         tokens = torch.randint(3, cfg.vocab_size, (1, seq), generator=g).cuda()
         targets = torch.randint(3, cfg.vocab_size, (1, seq), generator=g).cuda()
-        tok_loss, _, _ = model(tokens=tokens, targets=targets, multi_segments=False)
+        if multi_segments:  # documents end (eos) inside a chunk, on a rank's last token and just after it
+            per_rank = chunks_per_rank * CHUNK
+            for pos in (CHUNK // 2, per_rank - 1, per_rank + 5):
+                tokens[:, pos] = TOK.eos_id
+        tok_loss, _, _ = model(tokens=tokens, targets=targets, multi_segments=multi_segments)
         loss = tok_loss.float().sum() / targets.numel()  # the gathered loss: every token
         loss.backward()
         grads = {n: p.grad.float() for n, p in model.named_parameters() if p.grad is not None}
@@ -64,16 +70,17 @@ def losses_and_grads(cfg, cp, chunks_per_rank):
         destroy_model_parallel()
 
 
+@pytest.mark.parametrize("multi_segments", [False, True], ids=["", "segments"])
 @pytest.mark.parametrize("awm_gate", [False, True], ids=["", "awm_gate"])
 @pytest.mark.parametrize("fused", [False, True], ids=["unfused", "fused"])
 @pytest.mark.parametrize("chunks_per_rank", [1, 2])
-def test_context_parallel_matches_one_rank(world, chunks_per_rank, fused, awm_gate, request):
+def test_context_parallel_matches_one_rank(world, chunks_per_rank, fused, awm_gate, multi_segments, request):
     if awm_gate and not fused:  # on main too; the fused path with the gate is within ~1%
         request.applymarker(pytest.mark.xfail(
             reason="unfused AWM gate under context parallel: forget_gate grad 1-2.6% off the one-rank one", strict=False))
     cfg = ModelConf(**(BASE | dict(fused_block=fused, apply_awm_gate=awm_gate)))
-    ref_loss, ref = losses_and_grads(cfg, 1, chunks_per_rank)  # every rank computes the whole sequence alone
-    loss, grads = losses_and_grads(cfg, WORLD, chunks_per_rank)
+    ref_loss, ref = losses_and_grads(cfg, 1, chunks_per_rank, multi_segments)  # every rank: the whole sequence alone
+    loss, grads = losses_and_grads(cfg, WORLD, chunks_per_rank, multi_segments)
     assert loss == pytest.approx(ref_loss, rel=1e-3), (loss, ref_loss)
     assert set(grads) == set(ref)
     worst, name = max((((grads[n] - ref[n]).norm() / ref[n].norm()).item(), n) for n in ref if ref[n].norm() > 0)
