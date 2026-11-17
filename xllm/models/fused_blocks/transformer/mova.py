@@ -423,7 +423,9 @@ class TransformerMoVABlockFunction(torch.autograd.Function):
         # output dropout
         out_grad = memory_efficient_dropout_bwd(out_grad, dropout, out_rng_state)
         # Not in place: autograd hands the same aux-loss grad tensor to every layer whose aux losses were summed.
-        aux_loss_grad = aux_loss_grad * 0.5
+        # None without a load-balancing loss (the forward returns no aux loss).
+        if aux_loss_grad is not None:
+            aux_loss_grad = aux_loss_grad * 0.5
 
         if handle_x is not None:
             handle_x.wait()

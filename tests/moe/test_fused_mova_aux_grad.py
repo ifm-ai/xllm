@@ -88,3 +88,17 @@ def test_each_layer_gets_its_full_aux_loss_gradient(one_rank):
             unfused_ratio = ((unfused[i][j] * ref).sum() / (ref * ref).sum()).item()
             assert ratio == pytest.approx(1.0, abs=0.02), f"layer {i} {name}: fused summed/alone {ratio:.4f}"
             assert unfused_ratio == pytest.approx(1.0, abs=0.05), f"layer {i} {name}: unfused/alone {unfused_ratio:.4f}"
+
+
+def test_fused_blocks_train_without_a_load_balancing_loss(one_rank):
+    # moe_router_load_balancing_type None: the blocks return no aux loss, so the backward gets no aux-loss grad
+    blocks = mova_stack()
+    x0 = torch.randn(BSZ, SEQ, DIM, device='cuda', generator=torch.Generator('cuda').manual_seed(9)).bfloat16()
+    freqs = RotaryEmbedding(128, SEQ * 2, base=500000).get_freqs_cis(0, SEQ, 'cuda')
+    h = x0.clone().requires_grad_()
+    x = h
+    for b in blocks:
+        x, aux, _ = b(x, freqs, None, None, None, 0, False)
+    assert aux is None
+    x.float().sum().backward()
+    assert torch.isfinite(h.grad).all()
