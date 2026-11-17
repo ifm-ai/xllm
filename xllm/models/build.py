@@ -21,6 +21,7 @@ from xllm.data.dataset_streamer.tokenizer import Tokenizer
 from xllm.models.xllm import XLLModel
 from xllm.models.gekko import Gekko
 from xllm.models.transformer import Transformer
+from xllm.models.hybrid import HybridGekko
 
 logger = getLogger()
 
@@ -29,6 +30,7 @@ def get_model_cls(arch: str):
     return {
         "transformer": Transformer,
         "gekko": Gekko,
+        "hybrid": HybridGekko
     }[arch]
 
 
