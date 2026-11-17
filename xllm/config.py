@@ -363,6 +363,7 @@ class TrainerConf(Config):
     # Logging
     disable_workers_print: bool = False  # Whether to disable logging from non-main training processes (workers).
     disable_logging: bool = False  # Whether to disable metric logging via MetricLogger, including JSONL, TensorBoard, and W&B.
+    async_metric_writer: bool = False  # Whether rank 0 writes JSONL, TensorBoard and W&B from a separate process.
 
     # Training hyperparameters
     batch_size: Optional[int] = None  # Num of sequences per DP rank per step. Set either this or global_batch_size.
