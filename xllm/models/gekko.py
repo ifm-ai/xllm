@@ -219,7 +219,7 @@ class GekkoBlock(nn.Module):
         gda_params = model_dim * (n_heads + n_kv_heads) * (head_dim + v_head_dim)
         # AWM forget gate
         if self.gda.forget_gate:
-            gda_params += model_dim * n_kv_heads * head_dim
+            gda_params += (model_dim + 2) * n_kv_heads * head_dim
         # out proj
         gda_params += model_dim * n_heads * v_head_dim
         # bias term
