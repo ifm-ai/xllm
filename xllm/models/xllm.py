@@ -54,6 +54,8 @@ class XLLModel(nn.Module):
         self.num_activated_values = cfg.num_activated_values
         self.num_experts = cfg.num_experts
         self.num_activated_experts = cfg.num_activated_experts
+        self.effective_num_experts = cfg.effective_num_experts
+        self.effective_num_activated_experts = cfg.effective_num_activated_experts
         self.num_shared_experts = cfg.num_shared_experts
         if self.num_experts == 0:
             assert cfg.num_dense_layers is None
@@ -61,6 +63,8 @@ class XLLModel(nn.Module):
         else:
             self.num_dense_layers = 0 if cfg.num_dense_layers is None else cfg.num_dense_layers
         self.expert_inter_dim = cfg.expert_inter_dim
+        self.moe_latent_dim = cfg.moe_latent_dim
+        self.moe_latent_post_rmsnorm = cfg.moe_latent_post_rmsnorm
 
         self.apply_rmsnorm = cfg.apply_rmsnorm
 
