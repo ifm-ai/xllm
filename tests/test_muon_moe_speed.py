@@ -16,6 +16,7 @@ import torch
 import torch.distributed as dist
 from torch.optim.adamw import AdamW
 
+from tests.optim_conf import optim_conf
 from xllm.config import OptimConf
 from xllm.distributed import initialize_model_parallel
 from xllm.distributed.utils import get_device_mesh
@@ -28,7 +29,7 @@ TP = int(os.environ.get("TP", "1"))
 LAYERS = int(os.environ.get("LAYERS", "4"))
 EXPERTS, INTER, MODEL = 128, 768, 2560
 WARMUP, ITERS = 3, 10
-CFG = OptimConf(optimizer="muon", lr=1e-3, muon_lr=0.02, muon_momentum=0.95, weight_decay=0.01,
+CFG = optim_conf(optimizer="muon", lr=1e-3, muon_lr=0.02, muon_momentum=0.95, weight_decay=0.01,
                 beta1=0.9, beta2=0.95, epsilon=1e-8)
 
 
@@ -75,8 +76,8 @@ def main():
         model = build(mesh, whole=name == "muon whole")
         set_grads(model)
         if name == "adamw":
-            opt = AdamW(list(model.parameters()), lr=CFG.lr, betas=(CFG.beta1, CFG.beta2), eps=CFG.epsilon,
-                        weight_decay=CFG.weight_decay, foreach=True)
+            opt = AdamW(list(model.parameters()), lr=CFG.adamw.lr, betas=(CFG.adamw.beta1, CFG.adamw.beta2), eps=CFG.adamw.epsilon,
+                        weight_decay=CFG.adamw.weight_decay, foreach=True)
             blocks, remote = 0, 0
         else:
             opt = build_muon(model, CFG)

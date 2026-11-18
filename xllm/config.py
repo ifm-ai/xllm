@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from logging import getLogger
 from typing import Optional
 from pathlib import Path
@@ -80,37 +80,54 @@ class SlurmConf(Config):
 
 
 @dataclass
-class OptimConf(Config):
-    optimizer: str = "adamw"  # adamw, or muon (Muon for linear weights in the blocks, AdamW for the rest)
-    lr: float = 1e-3  # AdamW learning rate after warmup
-    muon_lr: float = 0.01  # Muon learning rate after warmup (optimizer=muon)
-    muon_momentum: float = 0.95
-    muon_nesterov: bool = True  # Nesterov momentum (Keller Jordan Muon, Moonlight)
-    muon_adjust_lr: Optional[str] = "spectral_norm"  # Muon update scaling: spectral_norm, rms_norm or None
-    muon_block_scale: str = "block"  # Update scale of a row block (from the layers' `muon` marks): block (its own shape) or matrix (its whole matrix's shape)
-    muon_weight_decay: Optional[float] = None  # Decoupled weight decay of the Muon matrices; None = weight_decay
-    warmup: int = 2000  # Num of steps for LR warmup. 0 means no warmup
-    weight_decay: float = 0.1  # Decoupled weight decay
-    epsilon: float = 1e-8
+class AdamWConf(Config):
+    # AdamW: every parameter with optimizer=adamw; with optimizer=muon, those Muon does not take (embedding, norms, head)
+    lr: float = 1e-3  # learning rate after warmup
     beta1: float = 0.9
     beta2: float = 0.98
+    epsilon: float = 1e-8
+    weight_decay: float = 0.1  # decoupled weight decay
+
+    def __post_init__(self):
+        assert self.lr >= 0 and self.weight_decay >= 0 and self.epsilon > 0
+
+
+@dataclass
+class MuonConf(Config):
+    # Muon: the linear weights in the blocks (optimizer=muon)
+    lr: float = 0.01  # learning rate after warmup
+    momentum: float = 0.95
+    nesterov: bool = True  # Nesterov momentum (Keller Jordan Muon, Moonlight)
+    adjust_lr: str = "spectral_norm"  # update scale: spectral_norm sqrt(fan_out / fan_in), rms_norm 0.2 sqrt(max(fan_out, fan_in)), or none (1)
+    block_scale: str = "block"  # fans of a row block (register_muon): block (its own shape) or matrix (its whole matrix's shape)
+    weight_decay: float = 0.1  # decoupled weight decay
+
+    def __post_init__(self):
+        assert self.adjust_lr in ["spectral_norm", "rms_norm", "none"]
+        assert self.block_scale in ["block", "matrix"]
+        assert self.lr >= 0 and self.weight_decay >= 0
+
+
+@dataclass
+class OptimConf(Config):
+    optimizer: str = "adamw"  # adamw, or muon (Muon for linear weights in the blocks, AdamW for the rest)
+    adamw: AdamWConf = field(default_factory=AdamWConf)
+    muon: MuonConf = field(default_factory=MuonConf)
+    warmup: int = 2000  # Num of steps for LR warmup. 0 means no warmup
     clip: float = 1.0  # Global gradient L2 norm clipping threshold, before applying loss scale.
     scheduler: str = "cosine"  # LR scheduler: linear, cosine, constant, or wsd (warmup-stable-decay)
     lr_init_ratio: float = 1e-4  # The initial LR = lr_init_ratio * lr
     lr_end_ratio: float = 0.01  # The ending LR = lr_end_ratio * lr. Also the end value if using a cosine scheduler
     cycles: float = 1.0  # Cycles of half period of cosine scheduler. 1 means decaying from peak to lr_end_ratio
-    wsd_decay_duration_steps: Optional[int] = None  # Number of steps in the WSD decay phase. Decay starts at total_steps - wsd_decay_duration_steps.
+    wsd_decay_duration_steps: int = 0  # Number of steps in the WSD decay phase (wsd only, > 0). Decay starts at total_steps - wsd_decay_duration_steps.
     wsd_decay_style: str = 'cosine'  # The curve type of decay phase in WSD scheduler: cosine or linear
 
     def __post_init__(self):
         assert self.optimizer in ['adamw', 'muon']
-        assert self.muon_adjust_lr in [None, "spectral_norm", "rms_norm"]
-        assert self.muon_block_scale in ['block', 'matrix']
-        assert self.muon_weight_decay is None or self.muon_weight_decay >= 0
         assert self.scheduler in ['linear', 'cosine', 'constant', 'wsd']
         assert self.warmup >= 0
         if self.scheduler == 'wsd':
-            assert self.wsd_decay_duration_steps is not None, 'decay duration steps is required for WSD.'
+            assert self.wsd_decay_duration_steps > 0, 'decay duration steps is required for WSD.'
 
 
 @dataclass

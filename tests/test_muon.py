@@ -23,6 +23,7 @@ from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import fully_shard
 from torch.distributed.tensor import Replicate, Shard, distribute_tensor
 
+from tests.optim_conf import optim_conf
 from xllm.config import OptimConf
 from xllm.distributed import initialize_model_parallel
 from xllm.distributed.wrap import enable_wrap, wrap
@@ -55,13 +56,13 @@ def row_boxes(shape, n):
 
 
 # no weight decay in the Muon checks: the comparison is on the orthogonalized update only
-CFG = OptimConf(optimizer="muon", lr=1e-3, muon_lr=0.02, muon_momentum=0.95, weight_decay=0.0,
+CFG = optim_conf(optimizer="muon", lr=1e-3, muon_lr=0.02, muon_momentum=0.95, weight_decay=0.0,
                 beta1=0.9, beta2=0.95, epsilon=1e-8)
-CFG_PLAIN_RMS = OptimConf(optimizer="muon", lr=1e-3, muon_lr=0.02, muon_momentum=0.95, weight_decay=0.0,
+CFG_PLAIN_RMS = optim_conf(optimizer="muon", lr=1e-3, muon_lr=0.02, muon_momentum=0.95, weight_decay=0.0,
                           beta1=0.9, beta2=0.95, epsilon=1e-8, muon_nesterov=False, muon_adjust_lr="rms_norm")
-CFG_MATRIX_SCALE = OptimConf(optimizer="muon", lr=1e-3, muon_lr=0.02, muon_momentum=0.95, weight_decay=0.0,
+CFG_MATRIX_SCALE = optim_conf(optimizer="muon", lr=1e-3, muon_lr=0.02, muon_momentum=0.95, weight_decay=0.0,
                              beta1=0.9, beta2=0.95, epsilon=1e-8, muon_block_scale="matrix")
-CFG_ADAMW = OptimConf(optimizer="muon", lr=1e-3, muon_lr=0.02, weight_decay=0.1, beta1=0.9, beta2=0.95,
+CFG_ADAMW = optim_conf(optimizer="muon", lr=1e-3, muon_lr=0.02, weight_decay=0.1, beta1=0.9, beta2=0.95,
                       epsilon=1e-8)
 STEPS = 3
 
@@ -81,16 +82,16 @@ def dense_muon(full, specs, grads, cfg):
     mom = [torch.zeros_like(x) for x in full]
     for step_grads in grads:
         for x, m, g, spec in zip(full, mom, step_grads, specs):
-            m.mul_(cfg.muon_momentum).add_(g)
-            u = (g + cfg.muon_momentum * m if cfg.muon_nesterov else m).to(torch.bfloat16)
+            m.mul_(cfg.muon.momentum).add_(g)
+            u = (g + cfg.muon.momentum * m if cfg.muon.nesterov else m).to(torch.bfloat16)
             out = torch.empty_like(u)
             for b in spec.blocks(tuple(x.shape)):
                 blk = u[b.r0:b.r1, b.c0:b.c1]
-                o = newton_schulz((blk if blk.shape[0] <= blk.shape[1] else blk.mT)[None], cfg.epsilon)[0]
+                o = newton_schulz((blk if blk.shape[0] <= blk.shape[1] else blk.mT)[None], cfg.adamw.epsilon)[0]
                 out[b.r0:b.r1, b.c0:b.c1] = o if blk.shape[0] <= blk.shape[1] else o.mT
-            fan_out, fan_in = spec.fans(tuple(x.shape), per_block=cfg.muon_block_scale == "block")
-            scale = 0.2 * math.sqrt(max(fan_out, fan_in)) if cfg.muon_adjust_lr == "rms_norm" else math.sqrt(fan_out / fan_in)
-            x.mul_(1 - cfg.muon_lr * cfg.weight_decay).add_(out.float(), alpha=-cfg.muon_lr * scale)
+            fan_out, fan_in = spec.fans(tuple(x.shape), per_block=cfg.muon.block_scale == "block")
+            scale = 0.2 * math.sqrt(max(fan_out, fan_in)) if cfg.muon.adjust_lr == "rms_norm" else math.sqrt(fan_out / fan_in)
+            x.mul_(1 - cfg.muon.lr * cfg.muon.weight_decay).add_(out.float(), alpha=-cfg.muon.lr * scale)
     return full
 
 
@@ -198,7 +199,7 @@ def check_resume_config_wins(mesh):
         old.step()
     saved = copy.deepcopy(old.state_dict())
     assert [g["weight_decay"] for g in saved["param_groups"]] == [0.1, 0.1]
-    cfg = OptimConf(optimizer="muon", lr=1e-3, muon_lr=0.02, weight_decay=0.05, muon_weight_decay=0.2,
+    cfg = optim_conf(optimizer="muon", lr=1e-3, muon_lr=0.02, weight_decay=0.05, muon_weight_decay=0.2,
                     beta1=0.9, beta2=0.95, epsilon=1e-6)
     new = Muon(params[:n], [WHOLE] * n, params[n:], mesh, cfg)
     new.load_state_dict(saved)
@@ -236,7 +237,7 @@ class ResumeNet(nn.Module):
 def check_resume_checkpoint(mesh, dcp):
     """Save and reload as train.py does (dcp_for_optimizer true: DCP; false: torch.save of each rank's state), into a
     model and optimizer built from another seed: the next steps must equal an uninterrupted run bit for bit."""
-    cfg = OptimConf(optimizer="muon", lr=1e-3, muon_lr=0.02, weight_decay=0.1, beta1=0.9, beta2=0.95, epsilon=1e-8)
+    cfg = optim_conf(optimizer="muon", lr=1e-3, muon_lr=0.02, weight_decay=0.1, beta1=0.9, beta2=0.95, epsilon=1e-8)
     rank = dist.get_rank()
 
     def build(seed):
@@ -367,7 +368,7 @@ def check_tensor_parallel(rep=1, tp=2):
             dist.all_gather(parts, p.full_tensor().contiguous(), group=tp_group)
             got.append(torch.cat(parts, dim=d))
         want = dense_muon([x.clone() for x in full], global_specs, grads, cfg)
-        check(f"muon TP={tp} replicas={rep} dp={dp} scale={cfg.muon_block_scale} "
+        check(f"muon TP={tp} replicas={rep} dp={dp} scale={cfg.muon.block_scale} "
               f"vs dense reference", got, want, full, 3e-2)
         if cfg is CFG and tp > 1:  # negative control: orthogonalizing each rank's half on its own is a different update
             cut = [2, 3, 4, 5]  # the weights whose matrix TP cuts
@@ -397,8 +398,8 @@ def main():
         got = run_sharded(Muon, mesh, params[:n], [g[:n] for g in grads], muon_params=params[:n],
                           specs=specs, adamw_params=[], mesh=mesh, cfg=cfg)
         want = dense_muon([x.clone() for x in full], specs, [g[:n] for g in grads], cfg)
-        check(f"muon heads={heads} scale={cfg.muon_block_scale} nesterov={cfg.muon_nesterov} "
-              f"adjust={cfg.muon_adjust_lr} vs dense reference", got, want, full, 3e-2)
+        check(f"muon heads={heads} scale={cfg.muon.block_scale} nesterov={cfg.muon.nesterov} "
+              f"adjust={cfg.muon.adjust_lr} vs dense reference", got, want, full, 3e-2)
         if heads and cfg is CFG:
             # negative controls: per-head vs whole-matrix, and block vs matrix scale, must differ far beyond the tolerance
             whole_ref = dense_muon([x.clone() for x in full], [WHOLE] * n, [g[:n] for g in grads], cfg)
@@ -419,8 +420,8 @@ def main():
     got = run_sharded(Muon, mesh, params, grads, muon_params=params[:n], specs=[WHOLE] * n,
                       adamw_params=params[n:], mesh=mesh, cfg=CFG_ADAMW)
     ref = [nn.Parameter(v.clone()) for v in vecs]
-    adamw = torch.optim.AdamW(ref, lr=CFG_ADAMW.lr, betas=(CFG_ADAMW.beta1, CFG_ADAMW.beta2),
-                              eps=CFG_ADAMW.epsilon, weight_decay=CFG_ADAMW.weight_decay)
+    adamw = torch.optim.AdamW(ref, lr=CFG_ADAMW.adamw.lr, betas=(CFG_ADAMW.adamw.beta1, CFG_ADAMW.adamw.beta2),
+                              eps=CFG_ADAMW.adamw.epsilon, weight_decay=CFG_ADAMW.adamw.weight_decay)
     for step_grads in grads:
         for p, g in zip(ref, step_grads[n:]):
             p.grad = g
@@ -441,9 +442,9 @@ def main():
         _, _, _, dparams = make(mesh, seed=1)
         want = run_sharded(
             lambda **kw: DionMuon(**kw), mesh, dparams[:k], [g[:k] for g in grads],
-            params=[{"params": dparams[:k], "algorithm": "muon", "lr": CFG.muon_lr}],
-            distributed_mesh=mesh, mu=CFG.muon_momentum, nesterov=CFG.muon_nesterov, weight_decay=CFG.weight_decay,
-            epsilon=CFG.epsilon, adjust_lr="spectral_norm", use_polar_express=False,
+            params=[{"params": dparams[:k], "algorithm": "muon", "lr": CFG.muon.lr}],
+            distributed_mesh=mesh, mu=CFG.muon.momentum, nesterov=CFG.muon.nesterov, weight_decay=CFG.muon.weight_decay,
+            epsilon=CFG.adamw.epsilon, adjust_lr="spectral_norm", use_polar_express=False,
         )
         check("muon whole-matrix vs dion.Muon", got, want, full[:k], 3e-2)
 

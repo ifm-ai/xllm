@@ -20,6 +20,7 @@ import torch
 import torch.distributed as dist
 from torch.distributed.tensor import Shard, distribute_tensor
 
+from tests.optim_conf import optim_conf
 from xllm.config import OptimConf
 from xllm.distributed import get_model_parallel_group, get_model_parallel_rank, initialize_model_parallel
 from xllm.distributed.utils import get_device_mesh
@@ -30,7 +31,7 @@ from xllm.optim.muon import build_muon, newton_schulz
 TP = int(os.environ.get("TP", "1"))
 STEPS = 3
 TOL = 3e-2
-CFG = OptimConf(optimizer="muon", lr=1e-3, muon_lr=0.02, muon_momentum=0.95, weight_decay=0.0,
+CFG = optim_conf(optimizer="muon", lr=1e-3, muon_lr=0.02, muon_momentum=0.95, weight_decay=0.0,
                 beta1=0.9, beta2=0.95, epsilon=1e-8)
 # (experts, inter dim, model dim): inter != model, so every expert is a non-square matrix
 SHAPES = [(8, 96, 160), (16, 96, 160), (6, 64, 96), (2, 64, 96)]
@@ -65,14 +66,14 @@ def per_expert_muon(w, grads, n, cfg):
     w = w.clone()
     mom = torch.zeros_like(w)
     for g in grads:
-        mom.mul_(cfg.muon_momentum).add_(g)
-        u = (g + cfg.muon_momentum * mom).to(torch.bfloat16)  # nesterov
+        mom.mul_(cfg.muon.momentum).add_(g)
+        u = (g + cfg.muon.momentum * mom).to(torch.bfloat16)  # nesterov
         for e in range(n):
             x = u[e * rows:(e + 1) * rows]
             wide = x.shape[0] <= x.shape[1]
-            o = newton_schulz((x if wide else x.mT)[None], cfg.epsilon)[0]
+            o = newton_schulz((x if wide else x.mT)[None], cfg.adamw.epsilon)[0]
             o = (o if wide else o.mT).float()
-            w[e * rows:(e + 1) * rows] += -cfg.muon_lr * math.sqrt(x.shape[0] / x.shape[1]) * o
+            w[e * rows:(e + 1) * rows] += -cfg.muon.lr * math.sqrt(x.shape[0] / x.shape[1]) * o
     return w
 
 

@@ -202,26 +202,27 @@ TRAINING_CFGS=(
 )
 
 OPTIM_CFGS=(
-  --optim.lr ${LR}
+  --optim.adamw.lr ${LR}
   --optim.scheduler ${SCHEDULER}
   --optim.lr_init_ratio 1e-4
   --optim.lr_end_ratio 0.1
-  --optim.beta1 0.9
-  --optim.beta2 0.95
+  --optim.adamw.beta1 0.9
+  --optim.adamw.beta2 0.95
   --optim.clip 1.0
   --optim.warmup ${WARMUP}
-  --optim.weight_decay ${WD}
+  --optim.adamw.weight_decay ${WD}
 )
 if [ "${SCHEDULER}" = "wsd" ]; then
   OPTIM_CFGS+=(--optim.wsd_decay_duration_steps ${WSD_DECAY_STEPS} --optim.wsd_decay_style "linear")
 fi
 if [ "${OPTIM}" = "muon" ]; then
-  # Muon: weights of the layers marked `muon` (attention, FFN); AdamW (--optim.lr) for the rest.
+  # Muon: weights of the layers marked `muon` (attention, FFN); AdamW (--optim.adamw.lr) for the rest.
   OPTIM_CFGS+=(
     --optim.optimizer "muon"
-    --optim.muon_lr ${MUON_LR}
-    --optim.muon_momentum 0.95
-    --optim.muon_block_scale ${MUON_BLOCK_SCALE}
+    --optim.muon.lr ${MUON_LR}
+    --optim.muon.momentum 0.95
+    --optim.muon.block_scale ${MUON_BLOCK_SCALE}
+    --optim.muon.weight_decay ${WD}  # same decay as the AdamW group (the old muon_weight_decay=None fallback)
     --dcp_for_optimizer "true"
   )
 fi

@@ -133,15 +133,15 @@ srun --cpu-bind=none -u --label python -u train.py \
   --nccl_timeout 18000 \
   --cluster_check_level -1 \
   --sync_check_freq 1000000 \
-  --optim.lr 8e-4 \
+  --optim.adamw.lr 8e-4 \
   --optim.scheduler cosine \
   --optim.lr_init_ratio 1e-4 \
   --optim.lr_end_ratio 0.1 \
-  --optim.beta1 0.9 \
-  --optim.beta2 0.95 \
+  --optim.adamw.beta1 0.9 \
+  --optim.adamw.beta2 0.95 \
   --optim.clip 1.0 \
   --optim.warmup 3000 \
-  --optim.weight_decay 0.1 \
+  --optim.adamw.weight_decay 0.1 \
   --valid.ppl_files_str "${VALID_DATA}" \
   --valid.tasks_root_dir "${TASK_ROOT}" \
   --valid.tasks_str copa \
