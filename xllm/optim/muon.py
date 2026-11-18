@@ -95,10 +95,11 @@ def newton_schulz(X: Tensor, eps: float) -> Tensor:
 def group_hparams(cfg: OptimConf, algorithm: str) -> dict:
     """Param-group hyperparameters that OptimConf sets for "muon" or "adamw" (single source of truth)."""
     if algorithm == "muon":
-        wd = cfg.weight_decay if cfg.muon_weight_decay is None else cfg.muon_weight_decay
-        return {"momentum": cfg.muon_momentum, "nesterov": cfg.muon_nesterov, "adjust_lr": cfg.muon_adjust_lr,
-                "block_scale": cfg.muon_block_scale, "weight_decay": wd}
-    return {"betas": (cfg.beta1, cfg.beta2), "weight_decay": cfg.weight_decay}
+        m = cfg.muon
+        return {"lr": m.lr, "momentum": m.momentum, "nesterov": m.nesterov, "adjust_lr": m.adjust_lr,
+                "block_scale": m.block_scale, "weight_decay": m.weight_decay}
+    a = cfg.adamw
+    return {"lr": a.lr, "betas": (a.beta1, a.beta2), "weight_decay": a.weight_decay}
 
 
 class Muon(Optimizer):
@@ -110,9 +111,9 @@ class Muon(Optimizer):
     def __init__(self, muon_params: list[nn.Parameter], specs: list[MuonSpec], adamw_params: list[nn.Parameter],
                  mesh: DeviceMesh, cfg: OptimConf, tp_group: dist.ProcessGroup | None = None):
         """specs[i]: muon_params[i]'s Blocks (register_muon); tp_group: the TP group, if any (params are then TP-local)."""
-        groups = [dict(params=muon_params, lr=cfg.muon_lr, algorithm="muon", **group_hparams(cfg, "muon")),
-                  dict(params=adamw_params, lr=cfg.lr, algorithm="adamw", **group_hparams(cfg, "adamw"))]
-        super().__init__(groups, {"eps": cfg.epsilon})
+        groups = [dict(params=muon_params, algorithm="muon", **group_hparams(cfg, "muon")),
+                  dict(params=adamw_params, algorithm="adamw", **group_hparams(cfg, "adamw"))]
+        super().__init__(groups, {"eps": cfg.adamw.epsilon})
         self._ranks(mesh, tp_group)
         self.w = [_local(p) for p in muon_params]  # shards: weights, momenta (state, from the first gradient), directions
         self.m: list[Tensor | None] = [None] * len(muon_params)
@@ -259,7 +260,7 @@ class Muon(Optimizer):
               maximize=False)
 
 
-def _scale(fan_out: int, fan_in: int, adjust_lr: str | None) -> float:
+def _scale(fan_out: int, fan_in: int, adjust_lr: str) -> float:
     """sqrt(fan_out / fan_in) for adjust_lr spectral_norm, 0.2 sqrt(max(fan_out, fan_in)) for rms_norm, else 1."""
     if adjust_lr == "spectral_norm":
         return math.sqrt(fan_out / fan_in)

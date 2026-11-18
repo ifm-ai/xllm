@@ -29,10 +29,10 @@ def build_optimizer(model: nn.Module, cfg: OptimConf, total_steps: int, param_dt
     else:
         optimizer = AdamW(
             model.parameters(),
-            lr=cfg.lr,
-            betas=(cfg.beta1, cfg.beta2),
-            weight_decay=cfg.weight_decay,
-            eps=cfg.epsilon,
+            lr=cfg.adamw.lr,
+            betas=(cfg.adamw.beta1, cfg.adamw.beta2),
+            weight_decay=cfg.adamw.weight_decay,
+            eps=cfg.adamw.epsilon,
         )
 
     # scheduler
@@ -53,8 +53,8 @@ def restore_optimizer_config(optimizer, cfg: OptimConf):
         return
     from .muon import group_hparams
     for group in optimizer.param_groups:
-        lr = cfg.muon_lr if group["algorithm"] == "muon" else cfg.lr
-        values = dict(group_hparams(cfg, group["algorithm"]), eps=cfg.epsilon, initial_lr=lr)
+        values = group_hparams(cfg, group["algorithm"])
+        values.update(eps=cfg.adamw.epsilon, initial_lr=values.pop("lr"))  # the scheduler sets the current lr
         changed = {key: (group.get(key), value) for key, value in values.items() if group.get(key) != value}
         if changed:
             logger.info(f"Resume {group['algorithm']}: configured values replace checkpoint values (old, new): {changed}")

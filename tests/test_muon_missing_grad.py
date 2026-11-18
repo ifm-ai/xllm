@@ -10,6 +10,7 @@ import pytest
 import torch
 from torch import nn
 
+from tests.optim_conf import optim_conf
 from xllm.config import OptimConf
 import xllm.optim.muon as muon
 from xllm.optim.muon_spec import muon_spec
@@ -47,7 +48,7 @@ def cpu_transport(monkeypatch):
 def test_missing_grad_skips_state_and_weight_update(cpu_transport, nesterov, initialized):
     skipped = nn.Parameter(torch.ones(2, 3), requires_grad=initialized)
     active = nn.Parameter(torch.ones(2, 3))
-    cfg = OptimConf(optimizer="muon", muon_lr=0.1, weight_decay=0.2, muon_nesterov=nesterov)
+    cfg = optim_conf(optimizer="muon", muon_lr=0.1, weight_decay=0.2, muon_nesterov=nesterov)
     opt = muon.Muon([skipped, active], [muon_spec()] * 2, [], LocalMesh(), cfg)
     cpu_transport(opt)
 
@@ -69,14 +70,14 @@ def test_missing_grad_skips_state_and_weight_update(cpu_transport, nesterov, ini
         # A real zero gradient still decays momentum and updates the parameter.
         skipped.grad = torch.zeros_like(skipped)
         opt.step()
-        torch.testing.assert_close(opt.state[skipped]["momentum"], old_momentum * cfg.muon_momentum)
+        torch.testing.assert_close(opt.state[skipped]["momentum"], old_momentum * cfg.muon.momentum)
         assert not torch.equal(skipped, before)
     else:
         assert skipped not in opt.state
 
 
 def test_state_roundtrip_restores_algorithm_and_next_update(cpu_transport):
-    cfg = OptimConf(optimizer="muon", muon_lr=0.02, muon_momentum=0.8,
+    cfg = optim_conf(optimizer="muon", muon_lr=0.02, muon_momentum=0.8,
                     muon_nesterov=False, muon_adjust_lr="rms_norm", beta1=0.7, beta2=0.9)
     p, a = nn.Parameter(torch.ones(4, 3)), nn.Parameter(torch.ones(3))
     spec = muon_spec("(h d) m", fan_out="d", fan_in="m", d=2)
@@ -86,7 +87,7 @@ def test_state_roundtrip_restores_algorithm_and_next_update(cpu_transport):
     old.step()
     saved = copy.deepcopy(old.state_dict())
     q, b = nn.Parameter(p.detach().clone()), nn.Parameter(a.detach().clone())
-    new = muon.Muon([q], [spec], [b], LocalMesh(), OptimConf(optimizer="muon", muon_block_scale="matrix"))
+    new = muon.Muon([q], [spec], [b], LocalMesh(), optim_conf(optimizer="muon", muon_block_scale="matrix"))
     cpu_transport(new)
     new.load_state_dict(saved)
     for loaded, expected in zip(new.param_groups, saved["param_groups"]):
@@ -100,7 +101,7 @@ def test_state_roundtrip_restores_algorithm_and_next_update(cpu_transport):
 
     momentum = new.state[q]["momentum"].clone()
     moments = new.state[b]["exp_avg"].clone()
-    cfg = OptimConf(optimizer="muon", muon_momentum=0.6, muon_nesterov=True,
+    cfg = optim_conf(optimizer="muon", muon_momentum=0.6, muon_nesterov=True,
                     muon_block_scale="matrix", muon_adjust_lr="spectral_norm",
                     beta1=0.5, beta2=0.8, muon_weight_decay=0.2, weight_decay=0.03, epsilon=1e-6)
     restore_optimizer_config(new, cfg)
@@ -117,7 +118,7 @@ def test_state_roundtrip_restores_algorithm_and_next_update(cpu_transport):
 
 def test_closure_computes_gradients_and_returns_loss(cpu_transport):
     p = nn.Parameter(torch.ones(2, 3))
-    opt = muon.Muon([p], [muon_spec()], [], LocalMesh(), OptimConf(optimizer="muon"))
+    opt = muon.Muon([p], [muon_spec()], [], LocalMesh(), optim_conf(optimizer="muon"))
     cpu_transport(opt)
     calls = []
 
@@ -135,7 +136,7 @@ def test_closure_computes_gradients_and_returns_loss(cpu_transport):
 
 def test_muon_factory_requires_fsdp2_model():
     with pytest.raises(ValueError, match="wrapped with FSDP2"):
-        build_optimizer(nn.Linear(3, 2), OptimConf(optimizer="muon"), 10, "bf16")
+        build_optimizer(nn.Linear(3, 2), optim_conf(optimizer="muon"), 10, "bf16")
 
 
 def test_registration_does_not_import_optimizer_runtime():
@@ -154,15 +155,15 @@ def test_first_resumed_lr_uses_new_base_at_restored_position():
                      OptimConf=OptimConf, logger=logging.getLogger(__name__))
     exec(compile(ast.Module(body=[fn], type_ignores=[]), str(path), "exec"), namespace)
     p = nn.Parameter(torch.ones(1))
-    cfg = OptimConf(lr=0.1, scheduler="constant", warmup=10)
-    old_opt = torch.optim.AdamW([p], lr=cfg.lr)
+    cfg = optim_conf(lr=0.1, scheduler="constant", warmup=10)
+    old_opt = torch.optim.AdamW([p], lr=cfg.adamw.lr)
     old_sched = build_lr_scheduler(old_opt, cfg, 100)
     for _ in range(3):
         old_opt.step()
         old_sched.step()
     saved_sched = copy.deepcopy(old_sched.state_dict())
-    cfg.lr = 0.2
-    new_opt = torch.optim.AdamW([p], lr=cfg.lr)
+    cfg.adamw.lr = 0.2
+    new_opt = torch.optim.AdamW([p], lr=cfg.adamw.lr)
     new_sched = build_lr_scheduler(new_opt, cfg, 100)
     new_opt.load_state_dict(old_opt.state_dict())
     saved = dict(scheduler=saved_sched, step=3, scale=1, scale_updates=0, clip_cumulative=0, data_state={})
@@ -177,7 +178,7 @@ def test_dcp_checkpoint_roundtrip(cpu_transport, tmp_path):
     import torch.distributed.checkpoint as dcp
     from torch.distributed.checkpoint.state_dict import get_optimizer_state_dict, set_optimizer_state_dict
 
-    cfg = OptimConf(optimizer="muon", muon_momentum=0.8, weight_decay=0.2)
+    cfg = optim_conf(optimizer="muon", muon_momentum=0.8, weight_decay=0.2)
     model = nn.Linear(3, 2)
     opt = muon.Muon([model.weight], [muon_spec()], [model.bias], LocalMesh(), cfg)
     cpu_transport(opt)
@@ -188,7 +189,7 @@ def test_dcp_checkpoint_roundtrip(cpu_transport, tmp_path):
     saved = get_optimizer_state_dict(model, opt)
     dcp.save(saved, checkpoint_id=tmp_path / "optimizer")
     new = muon.Muon([model.weight], [muon_spec()], [model.bias], LocalMesh(),
-                    OptimConf(optimizer="muon", muon_momentum=0.6, weight_decay=0.01))
+                    optim_conf(optimizer="muon", muon_momentum=0.6, weight_decay=0.01))
     cpu_transport(new)
     template = get_optimizer_state_dict(model, new)
     dcp.load(template, checkpoint_id=tmp_path / "optimizer")
