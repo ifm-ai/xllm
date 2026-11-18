@@ -22,12 +22,8 @@
 #
 # Variables (default):
 #   SAVE            dump dir (required)
-#   OPTIM           adamw | muon (adamw); for muon: MUON_LR (0.01),
-#                   MUON_SCALE_SHAPE (block): scale of a q/k/v/r head block from its own shape (block)
-#                   or the whole weight's shape (whole); wo is one block either way
-#   LR              AdamW LR, also for the non-matrix params under muon (2e-3)
-#   SCHEDULER       constant | cosine | wsd (constant); WARMUP steps (3000);
-#                   WSD_DECAY_STEPS (20% of the run) for wsd
+#   OPTIM           adamw | muon (adamw). Optimizer settings are the config defaults (Muon 1e-3 / wd 0.1 rms_norm,
+#                   AdamW 2e-3 / 0.02, constant, warmup 3000); override with extra flags (e.g. --optim.muon.lr 2e-3)
 #   TPP             run length in tokens per non-embedding parameter (200)
 #   EVAL_TPP        eval interval in TPP; every eval checkpoint is kept (20)
 #   CKPTS_PER_EVAL  rolling checkpoints per eval interval, bounds work lost to preemption (3)
@@ -38,11 +34,6 @@
 : "${SAVE:?set SAVE}"
 PYTHON=${PYTHON:-.venv/bin/python}
 OPTIM=${OPTIM:-adamw}
-MUON_SCALE_SHAPE=${MUON_SCALE_SHAPE:-block}
-MUON_LR=${MUON_LR:-0.01}
-LR=${LR:-2e-3}
-SCHEDULER=${SCHEDULER:-constant}
-WARMUP=${WARMUP:-3000}
 TPP=${TPP:-200}
 EVAL_TPP=${EVAL_TPP:-20}
 CKPTS_PER_EVAL=${CKPTS_PER_EVAL:-3}
@@ -72,7 +63,6 @@ export UCX_NET_DEVICES=mlx5_ib0:1
 #export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
 
 BSZ=32
-WD=0.02
 SEQ_LEN=8192
 ROPE_DIM=64
 ROPE_BASE=500000
@@ -85,8 +75,7 @@ UNIT=$(( LOG_FREQ * CKPTS_PER_EVAL ))  # eval interval is a multiple of this, so
 EVAL_FREQ=$(( (EVAL_TPP * NON_EMBED_PARAMS / TOKENS_PER_STEP + UNIT / 2) / UNIT * UNIT ))
 STEPS=$(( EVAL_FREQ * TPP / EVAL_TPP ))
 DUMP_FREQ=$(( EVAL_FREQ / CKPTS_PER_EVAL ))
-WSD_DECAY_STEPS=${WSD_DECAY_STEPS:-$(( STEPS / 5 ))}
-echo "k2-horizon-0.9B: ${OPTIM} ${SCHEDULER}, ${STEPS} steps x ${TOKENS_PER_STEP} tokens" \
+echo "k2-horizon-0.9B: ${OPTIM} (config defaults), ${STEPS} steps x ${TOKENS_PER_STEP} tokens" \
      "(${TPP} TPP), eval+kept ckpt every ${EVAL_FREQ}, rolling ckpt every ${DUMP_FREQ}"
 
 mkdir -p "${SAVE}/restarts"
@@ -201,30 +190,10 @@ TRAINING_CFGS=(
   --cluster_check_level 1
 )
 
-OPTIM_CFGS=(
-  --optim.adamw.lr ${LR}
-  --optim.scheduler ${SCHEDULER}
-  --optim.lr_init_ratio 1e-4
-  --optim.lr_end_ratio 0.1
-  --optim.adamw.beta1 0.9
-  --optim.adamw.beta2 0.95
-  --optim.clip 1.0
-  --optim.warmup ${WARMUP}
-  --optim.adamw.weight_decay ${WD}
-)
-if [ "${SCHEDULER}" = "wsd" ]; then
-  OPTIM_CFGS+=(--optim.wsd_decay_duration_steps ${WSD_DECAY_STEPS} --optim.wsd_decay_style "linear")
-fi
+OPTIM_CFGS=()  # optimizer settings: the config defaults (xllm/config.py AdamWConf / MuonConf / OptimConf)
 if [ "${OPTIM}" = "muon" ]; then
-  # Muon: weights of the layers marked `muon` (attention, FFN); AdamW (--optim.adamw.lr) for the rest.
-  OPTIM_CFGS+=(
-    --optim.optimizer "muon"
-    --optim.muon.lr ${MUON_LR}
-    --optim.muon.momentum 0.95
-    --optim.muon.scale_shape ${MUON_SCALE_SHAPE}
-    --optim.muon.weight_decay ${WD}  # same decay as the AdamW group (the old muon_weight_decay=None fallback)
-    --dcp_for_optimizer "true"
-  )
+  # Muon: weights of the layers registered with register_muon (attention, FFN); AdamW for the rest.
+  OPTIM_CFGS+=(--optim.optimizer "muon" --dcp_for_optimizer "true")
 fi
 
 VALID_CFGS=(
