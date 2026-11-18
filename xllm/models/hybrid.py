@@ -104,31 +104,18 @@ class HybridGekko(XLLModel):
             assert token_mask is None
 
         if multi_segments:
-            full_bos_mask = get_bos_mask(tokens, self.eos_id, use_eos=True)
+            assert cache is None or self.support_multi_segments_with_cache()
+            bos_mask = get_bos_mask(tokens, self.eos_id, use_eos=True)
             segments = Transformer.get_segment_arg(
-                full_bos_mask, self.causal_attn_backend, self.context_parallel_rank, self.context_parallel_size
+                bos_mask, self.causal_attn_backend, self.context_parallel_rank, self.context_parallel_size
             )
-            bos_mask = full_bos_mask
             segment_idx = get_segment_idx_from_bos_mask(bos_mask)
             prev_segment_count = None
         else:
-            full_bos_mask = None
             segments = None
             bos_mask = None
             segment_idx = None
             prev_segment_count = None
-
-        if self.training:
-            start = self.context_parallel_rank * seq_len
-            end = (self.context_parallel_rank + 1) * seq_len
-            tokens = tokens[:, start:end]
-            if full_bos_mask is not None:
-                full_bos_mask = full_bos_mask[:, :end]
-            if targets is not None:
-                targets = targets[:, start:end]
-                token_mask = token_mask[:, start:end] if token_mask is not None else None
-        else:
-            assert self.context_parallel_size == 1, "inference mode does not support context parallel."
 
         if self.training:
             assert cache is None, "training model does not support kv cache."
@@ -141,12 +128,11 @@ class HybridGekko(XLLModel):
             prev = max(0, start - self.chunk_size)
             end = (self.context_parallel_rank + 1) * seq_len
             tokens = tokens[:, start:end]
-            if full_bos_mask is not None:
-                full_bos_mask = full_bos_mask[:, :end]
+            if bos_mask is not None:
                 if self.context_parallel_rank > 0:
                     prev_segment_count = segment_idx[:, max(prev - 1, 0)]
-                segment_idx = segment_idx[:, prev:end]
-                bos_mask = bos_mask[:, prev:end]
+                segment_idx = segment_idx[:, :end]
+                bos_mask = bos_mask[:, :end]
             if targets is not None:
                 targets = targets[:, start:end]
                 token_mask = token_mask[:, start:end] if token_mask is not None else None
@@ -221,8 +207,6 @@ class HybridGekko(XLLModel):
                 if end % self.chunk_size == 0:
                     length = prev_segment_idx.shape[1]
                     prev_segment_count = prev_segment_idx[:, max(length - self.chunk_size - 1, 0)]
-                    prev_segment_idx = prev_segment_idx[:, length - self.chunk_size:]
-                    prev_bos_mask = prev_bos_mask[:, length - self.chunk_size:]
 
                 cache_segment = (prev_bos_mask, prev_segment_idx, prev_segment_count)
             cache = (cache_layers, cache_output, cache_segment)
@@ -230,8 +214,7 @@ class HybridGekko(XLLModel):
         return logits_or_loss, aux_loss_sum, cache
 
     def support_multi_segments_with_cache(self) -> bool:
-        # TODO: causal attn w. xattn backend supports it.
-        return False
+        return self.causal_attn_backend == 'xattn'
 
 
 # register some models configurations
