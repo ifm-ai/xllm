@@ -29,6 +29,7 @@ from xllm.models.blocks import (
     TransformerOutputLayer
 )
 from xllm.utils import get_init_fn
+from xllm.optim.roles import register_role
 
 
 class Transformer(XLLModel):
@@ -45,9 +46,11 @@ class Transformer(XLLModel):
             from xllm.distributed.wrap import wrap
 
         init_fn = get_init_fn('gaussian', dim=self.model_dim, std=cfg.init_embed_std)
-        self.embed = wrap(ParallelEmbedding(
+        embed = ParallelEmbedding(
             self.vocab_size, self.model_dim, embed_multiplier=cfg.embed_multiplier, gather_output=False, init_method=init_fn
-        ))
+        )
+        register_role(embed, "weight", "embed")  # xllm/optim/roles.py
+        self.embed = wrap(embed)
 
         assert self.v_head_dim == self.head_dim
         if self.rope_head_dim > 0:

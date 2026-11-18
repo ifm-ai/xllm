@@ -27,6 +27,7 @@ from xllm.models.fused_blocks import (
     GekkoOutputLayerFunction
 )
 from xllm.utils import get_init_fn
+from xllm.optim.roles import register_role
 
 
 class TransformerOutputLayer(nn.Module):
@@ -60,6 +61,10 @@ class TransformerOutputLayer(nn.Module):
             gather_output=False,
             init_method=init_fn
         )
+        # roles (xllm/optim/roles.py)
+        register_role(self.final_norm, "weight", "final_norm")
+        register_role(self.final_norm, "bias", "final_norm")
+        register_role(self.output, "weight", "readout")
 
     def forward(
         self,
@@ -150,6 +155,10 @@ class GekkoOutputLayer(nn.Module):
         init_fn = get_init_fn('gaussian', dim=self.model_dim, std=cfg.init_logits_std)
         self.output = ColumnParallelLinear(self.model_dim, self.output_size, bias=False,
                                            input_is_parallel=True, gather_output=False, init_method=init_fn)
+        # roles (xllm/optim/roles.py)
+        register_role(self.final_norm, "weight", "final_norm")
+        register_role(self.final_norm, "bias", "final_norm")
+        register_role(self.output, "weight", "readout")
 
         self.context_parallel_rank = get_context_parallel_rank()
 
