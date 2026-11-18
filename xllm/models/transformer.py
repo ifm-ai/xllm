@@ -1,4 +1,4 @@
-from typing import Optional, Tuple, List, Any
+from typing import Optional, Tuple, List, Any, Callable
 import torch
 from torch import Tensor
 from torch import nn
@@ -43,6 +43,7 @@ from xllm.models.fused_blocks import (
     TransformerOutputLayerFunction,
 )
 from xllm.utils import get_init_fn
+from xllm.modules.mtp import MultiTokenPrediction
 
 
 class TransformerBlock(nn.Module):
@@ -551,30 +552,54 @@ class TransformerOutputLayer(nn.Module):
             gather_output=False,
             init_method=init_fn
         )
+        # multi-token prediction (xllm/modules/mtp.py): a final norm per module, next to the shared output weight so
+        # that they are gathered with this layer; empty without it
+        self.mtp_norms = nn.ModuleList(
+            norm_cls(
+                cfg.model_dim,
+                num_groups=cfg.layernorm_num_groups,
+                elementwise_affine=cfg.norm_affine,
+                eps=norm_eps,
+                memory_efficient=cfg.memory_efficient_norm
+            ) for _ in range(cfg.mtp_depth)
+        )
+
+    def _loss(self, norm: nn.Module, x: Tensor, y: Tensor, mask: Optional[Tensor]) -> Tensor:
+        return TransformerOutputLayerFunction.apply(
+            x,
+            y,
+            mask,
+            norm.weight,
+            norm.bias,
+            norm.groups_per_partition,
+            self.output.weight,
+            self.layernorm_eps,
+            self.rmsnorm_eps,
+            self.apply_rmsnorm,
+            norm.gather_input,
+            self.recompute_logits,
+        )
+
+    def mtp_loss(self, k: int, x: Tensor, y: Tensor, mask: Tensor) -> Tensor:
+        """The token losses of multi-token prediction module k, with its final norm: one more call of the fused
+        loss, so that each loss gets its own (uniform) gradient scale in backward."""
+        return self._loss(self.mtp_norms[k - 1], x, y, mask)
 
     def forward(
         self,
         x: Tensor,
         y: Optional[Tensor],
         mask: Optional[Tensor] = None,
+        mtp: Optional[Callable[[nn.Module], List[Tensor]]] = None,
     ):
+        """mtp: in training only, runs the multi-token prediction modules inside this forward, where the norms are
+        gathered, and returns their token losses; then the token losses are returned as (main, mtp(self))."""
         if self.training:
             assert y is not None
-            fn = TransformerOutputLayerFunction
-            return fn.apply(
-                x,
-                y,
-                mask,
-                self.final_norm.weight,
-                self.final_norm.bias,
-                self.final_norm.groups_per_partition,
-                self.output.weight,
-                self.layernorm_eps,
-                self.rmsnorm_eps,
-                self.apply_rmsnorm,
-                self.final_norm.gather_input,
-                self.recompute_logits,
-            )
+            loss = self._loss(self.final_norm, x, y, mask)
+            if mtp is None:
+                return loss
+            return loss, mtp(self)
 
         x = self.final_norm(x)
         if not self.final_norm.gather_input:
@@ -643,6 +668,10 @@ class Transformer(XLLModel):
             self.layers.append(wrap(layer))
 
         self.output = wrap(TransformerOutputLayer(cfg))
+
+        # multi-token prediction (xllm/modules/mtp.py): a block of the last layer's kind per module, training only.
+        # Built last, so that the main model's weights are initialized as without it.
+        self.mtp = MultiTokenPrediction(cfg, block_cls, wrap) if cfg.mtp_depth > 0 else None
 
     def forward(
         self,
@@ -717,7 +746,14 @@ class Transformer(XLLModel):
             if cache is not None:
                 cache[i] = layer_cache
 
-        logits_or_loss = self.output(x, targets, token_mask)
+        if self.mtp is not None and self.training and targets is not None:
+            # multi-token prediction: its losses are kept for self.mtp.take_outputs()
+            block_args = (freq_cis, bos_mask, segments, moe_router_load_balancing_type, attn_stability_control,
+                          deterministic)
+            logits_or_loss = self.mtp(self.output, x, emb, targets, token_mask, self.eos_id, block_args,
+                                      self.layerwise_ckpt)
+        else:
+            logits_or_loss = self.output(x, targets, token_mask)
         if targets is not None and self.context_parallel_size > 1:
             logits_or_loss = gather_from_context_parallel_region(logits_or_loss)
 
@@ -780,6 +816,9 @@ class Transformer(XLLModel):
             return seg_mask
 
     def num_parameters(self):
+        return self._num_parameters() if self.mtp is None else self.mtp.num_parameters(self)
+
+    def _num_parameters(self):
         embed_params = self.model_dim * self.vocab_size * 2
         nk = {"softmax": 1, "softdelta": 2}[self.attn_act_func]
         attn_params_per_block = self.model_dim * (self.num_heads * 2 + self.num_kv_heads * (nk + 1)) * self.head_dim
@@ -829,6 +868,9 @@ class Transformer(XLLModel):
         return total_params, activated_params, embed_params
 
     def tflops_per_token(self, seq_len: int):
+        return self._tflops_per_token(seq_len) if self.mtp is None else self.mtp.tflops_per_token(self, seq_len)
+
+    def _tflops_per_token(self, seq_len: int):
         expansion_factor = 6
         embed_flops = self.model_dim + self.vocab_size
         logits_flops = self.model_dim * self.vocab_size
