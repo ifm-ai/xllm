@@ -81,12 +81,13 @@ class SlurmConf(Config):
 
 @dataclass
 class AdamWConf(Config):
-    # AdamW: every parameter with optimizer=adamw; with optimizer=muon, those Muon does not take (embedding, norms, head)
-    lr: float = 1e-3  # learning rate after warmup
+    # AdamW: every parameter with optimizer=adamw; with optimizer=muon, those Muon does not take (embedding, norms, head).
+    # Defaults = the gekko4-0.9B / k2-horizon-0.9B recipe.
+    lr: float = 2e-3  # learning rate after warmup
     beta1: float = 0.9
-    beta2: float = 0.98
+    beta2: float = 0.95
     epsilon: float = 1e-8
-    weight_decay: float = 0.1  # decoupled weight decay
+    weight_decay: float = 0.02  # decoupled weight decay
 
     def __post_init__(self):
         assert self.lr >= 0 and self.weight_decay >= 0 and self.epsilon > 0
@@ -94,11 +95,12 @@ class AdamWConf(Config):
 
 @dataclass
 class MuonConf(Config):
-    # Muon: the linear weights in the blocks (optimizer=muon)
-    lr: float = 0.01  # learning rate after warmup
+    # Muon: the linear weights in the blocks (optimizer=muon). Defaults = the gekko4-0.9B recipe (lr 1e-3, wd 0.1,
+    # Kimi rms_norm scale, no Nesterov): best of the 16.8M-token-batch lr x wd sweeps.
+    lr: float = 1e-3  # learning rate after warmup
     momentum: float = 0.95
-    nesterov: bool = True  # Nesterov momentum (Keller Jordan Muon, Moonlight)
-    adjust_lr: str = "spectral_norm"  # update scale: spectral_norm sqrt(fan_out / fan_in), rms_norm 0.2 sqrt(max(fan_out, fan_in)), or none (1)
+    nesterov: bool = False  # Nesterov momentum (Keller Jordan Muon, Moonlight)
+    adjust_lr: str = "rms_norm"  # update scale: spectral_norm sqrt(fan_out / fan_in), rms_norm 0.2 sqrt(max(fan_out, fan_in)), or none (1)
     scale_shape: str = "block"  # shape whose fans give adjust_lr's scale: block (each Newton-Schulz block, e.g. one head) or whole (the whole weight)
     weight_decay: float = 0.1  # decoupled weight decay
 
@@ -113,11 +115,11 @@ class OptimConf(Config):
     optimizer: str = "adamw"  # adamw, or muon (Muon for linear weights in the blocks, AdamW for the rest)
     adamw: AdamWConf = field(default_factory=AdamWConf)
     muon: MuonConf = field(default_factory=MuonConf)
-    warmup: int = 2000  # Num of steps for LR warmup. 0 means no warmup
+    warmup: int = 3000  # Num of steps for LR warmup. 0 means no warmup
     clip: float = 1.0  # Global gradient L2 norm clipping threshold, before applying loss scale.
-    scheduler: str = "cosine"  # LR scheduler: linear, cosine, constant, or wsd (warmup-stable-decay)
+    scheduler: str = "constant"  # LR scheduler: linear, cosine, constant, or wsd (warmup-stable-decay)
     lr_init_ratio: float = 1e-4  # The initial LR = lr_init_ratio * lr
-    lr_end_ratio: float = 0.01  # The ending LR = lr_end_ratio * lr. Also the end value if using a cosine scheduler
+    lr_end_ratio: float = 0.1  # The ending LR = lr_end_ratio * lr. Also the end value if using a cosine scheduler
     cycles: float = 1.0  # Cycles of half period of cosine scheduler. 1 means decaying from peak to lr_end_ratio
     wsd_decay_duration_steps: int = 0  # Number of steps in the WSD decay phase (wsd only, > 0). Decay starts at total_steps - wsd_decay_duration_steps.
     wsd_decay_style: str = 'cosine'  # The curve type of decay phase in WSD scheduler: cosine or linear
