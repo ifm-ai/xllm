@@ -12,6 +12,8 @@ from xllm.data.build import build_data_loader
 from xllm.data.buffer_assembler.packer.packer import (
     BestFitHybridPacker,
     BestFitPacker,
+    BestFitRoundRobinHybridPacker,
+    BestFitRoundRobinPacker,
     BestFitTransversalPacker,
     SimpleConcatPacker,
 )
@@ -54,6 +56,8 @@ def _build_loader(data_dir, packing_type="bestfit"):
     ("bestfit", BestFitPacker),
     ("bestfit-transversal", BestFitTransversalPacker),
     ("bestfit-hybrid", BestFitHybridPacker),
+    ("bestfit-round-robin", BestFitRoundRobinPacker),
+    ("bestfit-round-robin-hybrid", BestFitRoundRobinHybridPacker),
 ])
 def test_build_data_loader_selects_packing_type(tmp_path, packing_type, packer_class):
     (tmp_path / "data.chunk0.jsonl").write_text(

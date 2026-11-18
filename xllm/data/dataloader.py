@@ -20,7 +20,14 @@ from xllm.data.dataset_streamer.feature_builder.feature_builder import (
 )
 from xllm.data.dataset_streamer.templator.templator import SimpleJsonlTemplator
 from xllm.data.buffer_assembler.buffer_assembler import BufferAssembler
-from xllm.data.buffer_assembler.packer.packer import SimpleConcatPacker, BestFitHybridPacker, BestFitPacker, BestFitTransversalPacker
+from xllm.data.buffer_assembler.packer.packer import (
+    SimpleConcatPacker,
+    BestFitHybridPacker,
+    BestFitPacker,
+    BestFitRoundRobinHybridPacker,
+    BestFitRoundRobinPacker,
+    BestFitTransversalPacker,
+)
 from xllm.data.data_types import PackedSeq, Batch
 from xllm.data.dataset_streamer.tokenizer import Tokenizer
 
@@ -47,8 +54,10 @@ class MultiSourceDataLoader:
     - world_rank: Rank of current GPU process.
     - world_size: Total number of ranks.
     - packing_type: "simple" concatenation, "bestfit" bin packing, or
-      "bestfit-transversal" (bestfit placing each chunk in the emptiest bin), or
-      "bestfit-hybrid" (emptiest bin, but best-fit into nearly-full bins).
+      "bestfit-transversal" (bestfit placing each chunk in the emptiest bin),
+      "bestfit-hybrid" (emptiest bin, but best-fit into nearly-full bins),
+      "bestfit-round-robin" (next bin in turn that fits), or
+      "bestfit-round-robin-hybrid" (round-robin, but best-fit into nearly-full bins).
     - num_workers: Number of tokenizer worker threads used during buffer refill.
     - max_consecutive_skips: Fail a source after this many consecutive records
       fail to produce tokenized features.
@@ -102,6 +111,8 @@ class MultiSourceDataLoader:
             "bestfit": BestFitPacker,
             "bestfit-transversal": BestFitTransversalPacker,
             "bestfit-hybrid": BestFitHybridPacker,
+            "bestfit-round-robin": BestFitRoundRobinPacker,
+            "bestfit-round-robin-hybrid": BestFitRoundRobinHybridPacker,
         }
         if _packing_type in bestfit_packers:
             packer_cls = bestfit_packers[_packing_type]
@@ -115,7 +126,8 @@ class MultiSourceDataLoader:
         elif _packing_type == "simple":
             self.packer = SimpleConcatPacker(seq_len=seq_len, pad_id=self.pad_id)
         else:
-            raise ValueError(f"Unknown packing_type: {packing_type!r}. Supported: 'simple', 'bestfit', 'bestfit-transversal', 'bestfit-hybrid'")
+            raise ValueError(f"Unknown packing_type: {packing_type!r}. Supported: 'simple', "
+                             "'bestfit', 'bestfit-transversal', 'bestfit-hybrid', 'bestfit-round-robin', 'bestfit-round-robin-hybrid'")
 
         # build streamers
         self.streamers: Dict[str, DatasetStreamer] = {}  # keyed by dataset_dir

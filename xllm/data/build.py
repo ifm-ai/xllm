@@ -16,6 +16,7 @@ def build_data_loader(tokenizer: Tokenizer, cfg: TrainerConf) -> MultiSourceData
     cfg.data_parallel_size  : total number of data-parallel ranks
     cfg.dataloader.buffer_size   : refill token-budget multiplier; target tokens ~= buffer_size * seq_len
     cfg.dataloader.packing_type  : "simple" | "bestfit" | "bestfit-transversal" | "bestfit-hybrid"
+                                   | "bestfit-round-robin" | "bestfit-round-robin-hybrid"
     cfg.dataloader.num_workers   : source reader/tokenizer worker threads
     cfg.dataloader.max_consecutive_skips : invalid records allowed before a source fails
     cfg.dataloader.skip_long_docs : skip overlong non-text records with bestfit

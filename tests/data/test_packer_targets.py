@@ -3,6 +3,8 @@ import numpy as np
 from xllm.data.buffer_assembler.packer.packer import (
     BestFitHybridPacker,
     BestFitPacker,
+    BestFitRoundRobinHybridPacker,
+    BestFitRoundRobinPacker,
     BestFitTransversalPacker,
     IGNORE_INDEX,
     SimpleConcatPacker,
@@ -218,3 +220,34 @@ def test_best_fit_hybrid_carries_chunks_that_fit_nowhere():
     packer, bins = _pack_lengths(BestFitHybridPacker, 4, [5, 4, 4], finish_threshold=2)
     assert bins == [(1,), (2,)]
     assert [len(c[0]) for c in packer.pending_chunks] == [4]
+
+
+def test_best_fit_round_robin_cycles_and_skips_bins_that_are_too_full():
+    # Capacity 10, 20 tokens -> two bins. 5 -> A, 4 -> B, 4 -> A, 3 -> B;
+    # 2: A (1 left) is skipped -> B; last 2 fits nowhere and stays pending.
+    packer, bins = _pack_lengths(BestFitRoundRobinPacker, 9, [5, 4, 4, 3, 2, 2])
+    assert bins == [(1, 3), (2, 4, 5)]
+    assert [len(c[0]) for c in packer.pending_chunks] == [2]
+
+
+def test_best_fit_round_robin_caps_bins_at_max_active_bins():
+    packer, bins = _pack_lengths(BestFitRoundRobinPacker, 9, [5, 5, 5, 5], max_active_bins=1)
+    assert bins == [(1, 2)]
+    assert len(packer.pending_chunks) == 2
+
+
+def test_best_fit_round_robin_hybrid_uses_hybrid_finish_threshold():
+    assert BestFitRoundRobinHybridPacker(seq_len=4096).finish_threshold == 2000
+    assert BestFitRoundRobinHybridPacker(seq_len=131072).finish_threshold == 6553
+
+
+def test_best_fit_round_robin_hybrid_finishes_best_fit_without_moving_cursor():
+    # Capacity 10, 40 tokens -> four bins; bins with < 4 tokens left are finished best-fit.
+    # 9 -> A, 7 -> B (3 left), 4 -> C; cursor at D.
+    # 3 -> B (finishing, best-fit); the cursor stays at D, so the next 3 -> D.
+    # 3 -> C (A, B full; C 3 left), 3 -> C (finishing), 3 -> D, 3 -> D; the 2 fits nowhere.
+    packer, bins = _pack_lengths(
+        BestFitRoundRobinHybridPacker, 9, [9, 7, 4, 3, 3, 3, 3, 3, 3, 2], finish_threshold=4
+    )
+    assert bins == [(1,), (2, 4), (3, 6, 7), (5, 8, 9)]
+    assert [len(c[0]) for c in packer.pending_chunks] == [2]

@@ -456,3 +456,113 @@ class BestFitHybridPacker(BestFitPacker):
             else:
                 heapq.heappush(open_heap, (-space, bin_id))
         return unpacked
+
+
+class _MaxSegmentTree:
+    """Max segment tree over bin spaces, for 'first bin at or after i that fits n'."""
+
+    def __init__(self, values: List[int]):
+        size = 1
+        while size < len(values):
+            size *= 2
+        self.size = size
+        self.tree: List[int] = [0] * (2 * size)
+        self.tree[size:size + len(values)] = values
+        for i in range(size - 1, 0, -1):
+            self.tree[i] = max(self.tree[2 * i], self.tree[2 * i + 1])
+
+    def get(self, i: int) -> int:
+        return self.tree[self.size + i]
+
+    def set(self, i: int, value: int) -> None:
+        i += self.size
+        self.tree[i] = value
+        i //= 2
+        while i > 0:
+            self.tree[i] = max(self.tree[2 * i], self.tree[2 * i + 1])
+            i //= 2
+
+    def first_at_least(self, start: int, n: int) -> Optional[int]:
+        """Lowest index >= start whose value is >= n, or None."""
+        return self._descend(1, 0, self.size, start, n)
+
+    def _descend(self, node: int, lo: int, hi: int, start: int, n: int) -> Optional[int]:
+        if hi <= start or self.tree[node] < n:
+            return None
+        if hi - lo == 1:
+            return lo
+        mid = (lo + hi) // 2
+        found = self._descend(2 * node, lo, mid, start, n)
+        if found is None:
+            found = self._descend(2 * node + 1, mid, hi, start, n)
+        return found
+
+
+class BestFitRoundRobinPacker(BestFitPacker):
+    """Round-robin placement of length-sorted chunks over pre-opened bins.
+
+    Bins are opened up front as in BestFitTransversalPacker. A cursor walks the
+    bins in order: each chunk (in decreasing length order) goes into the first
+    bin at or after the cursor that can hold it, wrapping around, and the
+    cursor then moves to the bin after it. Bins too full for the chunk are
+    skipped. Chunks that fit nowhere stay pending for the next refill.
+
+    Subclasses with a positive ``finish_threshold`` first place a chunk, when
+    possible, into the bin with the least space among those with less than
+    ``finish_threshold`` tokens left that can hold it (best-fit); such
+    placements leave the cursor where it was.
+    """
+
+    finish_threshold = 0
+
+    def _assign_pending_to_bins(self) -> List[_Chunk]:
+        total_tokens = sum(len(c[0]) for c in self.pending_chunks)
+        num_bins = min(self.max_active_bins, max(1, total_tokens // self.bin_capacity))
+        self.next_bin_id = num_bins
+        spaces = _MaxSegmentTree([self.bin_capacity] * num_bins)
+        cursor = 0
+        # Bins being finished: sorted by (remaining space, arrival order) for best-fit lookup.
+        finishing: List[Tuple[int, int, int]] = []
+        arrival = 0
+
+        unpacked: List[_Chunk] = []
+        for tokens, mask, info in self.pending_chunks:
+            n = len(tokens)
+            i = bisect.bisect_left(finishing, (n, -1, -1))
+            if i < len(finishing):
+                space, _, bin_id = finishing.pop(i)
+            else:
+                bin_id = spaces.first_at_least(cursor, n)
+                if bin_id is None:
+                    bin_id = spaces.first_at_least(0, n)
+                if bin_id is None:
+                    unpacked.append((tokens, mask, info))
+                    continue
+                space = spaces.get(bin_id)
+                cursor = (bin_id + 1) % num_bins
+            self.bins[bin_id].append((tokens, mask, info))
+            self.bin_lengths[bin_id] += n
+            space -= n
+            spaces.set(bin_id, space)
+            if 0 < space < self.finish_threshold:
+                bisect.insort(finishing, (space, arrival, bin_id))
+                arrival += 1
+        return unpacked
+
+
+class BestFitRoundRobinHybridPacker(BestFitRoundRobinPacker):
+    """Round-robin placement that switches to best-fit to finish nearly-full bins.
+
+    For each length-sorted chunk: if some bin has less than
+    ``finish_threshold`` tokens left and can hold the chunk, it goes into the
+    one of those bins with the least space left (best-fit), without moving the
+    round-robin cursor; otherwise it goes round-robin as in
+    BestFitRoundRobinPacker. ``finish_threshold`` is max(2000, 5% of seq_len),
+    as in BestFitHybridPacker.
+    """
+
+    def __init__(self, seq_len: int, *args: Any, **kwargs: Any):
+        super().__init__(seq_len, *args, **kwargs)
+        self.finish_threshold = max(
+            BestFitHybridPacker.MIN_FINISH_TOKENS, int(BestFitHybridPacker.FINISH_FRACTION * seq_len)
+        )
