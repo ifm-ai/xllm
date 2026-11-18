@@ -29,7 +29,6 @@ class TransformerBlock(nn.Module):
         self.apply_nope = cfg.apply_nope_in_causal_attn
         self.apply_causal_conv = cfg.apply_conv_in_causal_attn
         self.apply_rmsnorm = cfg.apply_rmsnorm
-        self.layernorm_eps = cfg.layernorm_eps
         self.rmsnorm_eps = cfg.rmsnorm_eps
 
         if self.fused_block:
@@ -65,6 +64,7 @@ class TransformerBlock(nn.Module):
             residual_heads=cfg.residual_heads,
             init_mode=cfg.init_mode,
             init_std=cfg.init_std,
+            stream_norm_eps=cfg.stream_norm_eps,
         )
 
         self.nffn = NormalizedFeedForwardNetwork(
@@ -84,6 +84,7 @@ class TransformerBlock(nn.Module):
             residual_heads=cfg.residual_heads,
             init_mode=cfg.init_mode,
             init_std=cfg.init_std,
+            stream_norm_eps=cfg.stream_norm_eps,
         )
 
     def forward(
@@ -134,7 +135,7 @@ class TransformerBlock(nn.Module):
                 self.attention.attention_dropout,
                 self.attention.hidden_dropout,
                 self.nffn.swiglu,
-                self.layernorm_eps,
+                self.nffn.norm_eps,  # both pre-norms' eps
                 self.rmsnorm_eps,
                 self.apply_rmsnorm,
                 self.attention.norm.gather_input,

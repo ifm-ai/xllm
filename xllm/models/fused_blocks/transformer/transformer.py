@@ -69,7 +69,7 @@ class TransformerBlockFunction(torch.autograd.Function):
         attention_dropout: float,
         hidden_dropout: float,
         swiglu: bool,
-        layernorm_eps: float,
+        stream_norm_eps: float,  # the eps of the norms that read the residual stream
         rmsnorm_eps: float,
         apply_rmsnorm: bool,
         gather_before_norm: bool,
@@ -101,7 +101,7 @@ class TransformerBlockFunction(torch.autograd.Function):
             if ffn_norm_b is not None:
                 ffn_norm_b, handle_ffn_norm_b = all_gather(ffn_norm_b, parallel_region='model', async_op=True)
 
-        mx, _, _ = layer_or_rmsnorm_fwd(x_, attn_norm_w, attn_norm_b, norm_local_groups, layernorm_eps, rmsnorm_eps, apply_rmsnorm)
+        mx, _, _ = layer_or_rmsnorm_fwd(x_, attn_norm_w, attn_norm_b, norm_local_groups, stream_norm_eps, stream_norm_eps, apply_rmsnorm)
         if not gather_before_norm:
             mx, _ = all_gather(mx, parallel_region='model', async_op=False)
 
@@ -143,7 +143,7 @@ class TransformerBlockFunction(torch.autograd.Function):
                 handle_ffn_norm_b.wait()
                 ffn_norm_b = reshape_gathered_tensor_along_specific_dim(ffn_norm_b, gather_dim=0)
 
-        xf, _, _ = layer_or_rmsnorm_fwd(xo_, ffn_norm_w, ffn_norm_b, norm_local_groups, layernorm_eps, rmsnorm_eps, apply_rmsnorm)
+        xf, _, _ = layer_or_rmsnorm_fwd(xo_, ffn_norm_w, ffn_norm_b, norm_local_groups, stream_norm_eps, stream_norm_eps, apply_rmsnorm)
         if not gather_before_norm:
             xf, _ = all_gather(xf, parallel_region='model', async_op=False)
 
@@ -193,7 +193,7 @@ class TransformerBlockFunction(torch.autograd.Function):
         ctx.rope_head_dim = rope_head_dim
         ctx.apply_nope = apply_nope
         ctx.norm_local_groups = norm_local_groups
-        ctx.layernorm_eps = layernorm_eps
+        ctx.stream_norm_eps = stream_norm_eps
         ctx.rmsnorm_eps = rmsnorm_eps
         ctx.attn_act_func = attn_act_func
         ctx.apply_attn_gate = apply_attn_gate
@@ -264,7 +264,7 @@ class TransformerBlockFunction(torch.autograd.Function):
         rope_head_dim = ctx.rope_head_dim
         apply_nope = ctx.apply_nope
         norm_local_groups = ctx.norm_local_groups
-        layernorm_eps = ctx.layernorm_eps
+        stream_norm_eps = ctx.stream_norm_eps
         rmsnorm_eps = ctx.rmsnorm_eps
         dropout = ctx.dropout
         attention_dropout = ctx.attention_dropout
@@ -302,7 +302,7 @@ class TransformerBlockFunction(torch.autograd.Function):
             out_grad, handle_out = all_gather(out_grad, parallel_region='model', async_op=True)
             # recompute xf
             xf, xo_mean, xo_invvar = layer_or_rmsnorm_fwd(
-                xo_, ffn_norm_w, ffn_norm_b, norm_local_groups, layernorm_eps, rmsnorm_eps, apply_rmsnorm
+                xo_, ffn_norm_w, ffn_norm_b, norm_local_groups, stream_norm_eps, stream_norm_eps, apply_rmsnorm
             )
             handle_xf = None
         else:
@@ -311,7 +311,7 @@ class TransformerBlockFunction(torch.autograd.Function):
             handle_x = None
             # recompute xf
             xf, xo_mean, xo_invvar = layer_or_rmsnorm_fwd(
-                xo_, ffn_norm_w, ffn_norm_b, norm_local_groups, layernorm_eps, rmsnorm_eps, apply_rmsnorm
+                xo_, ffn_norm_w, ffn_norm_b, norm_local_groups, stream_norm_eps, stream_norm_eps, apply_rmsnorm
             )
             xf, handle_xf = all_gather(xf, parallel_region='model', async_op=True)
 
@@ -324,7 +324,7 @@ class TransformerBlockFunction(torch.autograd.Function):
 
         # recompute mx
         mx, x_mean, x_invvar = layer_or_rmsnorm_fwd(
-            x_, attn_norm_w, attn_norm_b, norm_local_groups, layernorm_eps, rmsnorm_eps, apply_rmsnorm
+            x_, attn_norm_w, attn_norm_b, norm_local_groups, stream_norm_eps, stream_norm_eps, apply_rmsnorm
         )
 
         if handle_xf is not None:
@@ -462,7 +462,7 @@ class TransformerBlockFunction(torch.autograd.Function):
             None,  # attention_dropout
             None,  # hidden_dropout
             None,  # swiglu
-            None,  # layernorm_eps
+            None,  # stream_norm_eps
             None,  # rmsnorm_eps
             None,  # apply_rmsnorm
             None,  # gather_before_norm
@@ -493,7 +493,7 @@ class TransformerOutputLayerFunction(torch.autograd.Function):
         final_norm_b: torch.Tensor,  # (d/MP)
         norm_local_groups: int,
         wo: torch.Tensor,  # (voc/MP, d)
-        layernorm_eps: float,
+        stream_norm_eps: float,  # the eps of the norms that read the residual stream
         rmsnorm_eps: float,
         apply_rmsnorm: bool,
         gather_before_norm: bool,
@@ -508,7 +508,7 @@ class TransformerOutputLayerFunction(torch.autograd.Function):
             if final_norm_b is not None:
                 final_norm_b, _ = all_gather(final_norm_b, parallel_region='model', async_op=False)
 
-        mx, _, _ = layer_or_rmsnorm_fwd(x, final_norm_w, final_norm_b, norm_local_groups, layernorm_eps, rmsnorm_eps, apply_rmsnorm)
+        mx, _, _ = layer_or_rmsnorm_fwd(x, final_norm_w, final_norm_b, norm_local_groups, stream_norm_eps, stream_norm_eps, apply_rmsnorm)
         collector = get_active_health_collector()
         output = fused_linear_cross_entropy_fwd(
             mx, wo, y, mask, compute_grad=(not recompute_logits),
@@ -539,7 +539,7 @@ class TransformerOutputLayerFunction(torch.autograd.Function):
         )
 
         ctx.norm_local_groups = norm_local_groups
-        ctx.layernorm_eps = layernorm_eps
+        ctx.stream_norm_eps = stream_norm_eps
         ctx.rmsnorm_eps = rmsnorm_eps
         ctx.apply_rmsnorm = apply_rmsnorm
         ctx.gather_before_norm = gather_before_norm
@@ -560,14 +560,14 @@ class TransformerOutputLayerFunction(torch.autograd.Function):
         ) = ctx.saved_tensors
 
         norm_local_groups = ctx.norm_local_groups
-        layernorm_eps = ctx.layernorm_eps
+        stream_norm_eps = ctx.stream_norm_eps
         rmsnorm_eps = ctx.rmsnorm_eps
         apply_rmsnorm = ctx.apply_rmsnorm
         gather_before_norm = ctx.gather_before_norm
 
         # recompute mx
         mx, x_mean, x_invvar = layer_or_rmsnorm_fwd(
-            x, final_norm_w, final_norm_b, norm_local_groups, layernorm_eps, rmsnorm_eps, apply_rmsnorm
+            x, final_norm_w, final_norm_b, norm_local_groups, stream_norm_eps, stream_norm_eps, apply_rmsnorm
         )
 
         mx_grad, wo_grad = fused_linear_cross_entropy_bwd(
@@ -593,7 +593,7 @@ class TransformerOutputLayerFunction(torch.autograd.Function):
             final_norm_b_grad,
             None,  # norm_local_groups
             wo_grad,
-            None,  # layernorm_eps
+            None,  # stream_norm_eps
             None,  # rmsnorm_eps
             None,  # apply rmsnorm
             None,  # gather before norm
