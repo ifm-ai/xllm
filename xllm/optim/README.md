@@ -8,10 +8,10 @@
 `--dcp_for_optimizer true` (the optimizer state is sharded like the parameters).
 
 - **Parameters.** A module registers the weights Muon updates in its `__init__` with
-  `register_muon`; they use `--optim.muon_lr`. Everything else (embedding, output layer,
-  norms, biases, convolutions, the MoE router) uses AdamW with `--optim.lr`. Both groups
-  follow the same LR schedule. AdamW uses `--optim.weight_decay`; the Muon matrices use
-  `--optim.muon_weight_decay` (default: the same value). Attention, the FFN, MoE experts and
+  `register_muon`; they use `--optim.muon.lr`. Everything else (embedding, output layer,
+  norms, biases, convolutions, the MoE router) uses AdamW with `--optim.adamw.lr`. Both groups
+  follow the same LR schedule. AdamW uses `--optim.adamw.weight_decay`; the Muon matrices use
+  `--optim.muon.weight_decay` (default 0.1). Attention, the FFN, MoE experts and
   shared experts register their projections; linear layers in the blocks that are not
   registered are listed in a warning when the optimizer is built.
 - **Registration API.** Import `register_muon` from `xllm.optim.muon_spec`; model construction does not import the optimizer runtime. Expert layouts and arbitrary block grids describe internal geometry; this release supports dense training with any TP and CP.
@@ -50,15 +50,15 @@
 - **Mesh.** The optimizer takes the mesh from the FSDP2 parameters themselves
   (`param.device_mesh`) and works over its shard dimension.
 - **Step.**
-  1. Each rank updates the momentum of its own shard (`m = mu * m + g`; Nesterov by default, `--optim.muon_nesterov`)
+  1. Each rank updates the momentum of its own shard (`m = mu * m + g`; Nesterov by default, `--optim.muon.nesterov`)
      and casts the update direction to bf16.
   2. A fixed plan assigns every block to one rank (the one storing most of it, then the least loaded). One
      all-to-all sends each block's pieces to its owner; meanwhile the blocks that lie whole in their owner's
      shard (heads, experts) are orthogonalized without communication, one buffer per block shape at a time.
   3. The owner stacks its blocks by shape and runs one batched
      Newton-Schulz per shape (Polar Express coefficients), then scales each block by its own shape
-     (`--optim.muon_block_scale block`, default) or its whole matrix's shape (`matrix`):
-     `sqrt(rows / cols)` for `--optim.muon_adjust_lr spectral_norm` (default),
+     (`--optim.muon.scale_shape block`, default) or the whole weight's shape (`whole`):
+     `sqrt(rows / cols)` for `--optim.muon.adjust_lr spectral_norm` (default),
      `0.2 * sqrt(max(rows, cols))` for `rms_norm`.
   4. A second all-to-all returns the pieces; each rank applies
      `p = p - lr * (wd * p + update)` to its shard.
@@ -74,6 +74,6 @@
   an actual zero gradient still updates state. The fixed collective sequence is preserved.
 
 ```bash
---optim.optimizer muon --optim.muon_lr 0.01 --optim.lr 2e-3 \
+--optim.optimizer muon --optim.muon.lr 0.01 --optim.adamw.lr 2e-3 \
 --dcp_for_optimizer true
 ```

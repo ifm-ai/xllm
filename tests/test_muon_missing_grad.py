@@ -87,7 +87,7 @@ def test_state_roundtrip_restores_algorithm_and_next_update(cpu_transport):
     old.step()
     saved = copy.deepcopy(old.state_dict())
     q, b = nn.Parameter(p.detach().clone()), nn.Parameter(a.detach().clone())
-    new = muon.Muon([q], [spec], [b], LocalMesh(), optim_conf(optimizer="muon", muon_block_scale="matrix"))
+    new = muon.Muon([q], [spec], [b], LocalMesh(), optim_conf(optimizer="muon", muon_scale_shape="whole"))
     cpu_transport(new)
     new.load_state_dict(saved)
     for loaded, expected in zip(new.param_groups, saved["param_groups"]):
@@ -102,11 +102,11 @@ def test_state_roundtrip_restores_algorithm_and_next_update(cpu_transport):
     momentum = new.state[q]["momentum"].clone()
     moments = new.state[b]["exp_avg"].clone()
     cfg = optim_conf(optimizer="muon", muon_momentum=0.6, muon_nesterov=True,
-                    muon_block_scale="matrix", muon_adjust_lr="spectral_norm",
+                    muon_scale_shape="whole", muon_adjust_lr="spectral_norm",
                     beta1=0.5, beta2=0.8, muon_weight_decay=0.2, weight_decay=0.03, epsilon=1e-6)
     restore_optimizer_config(new, cfg)
     group, adam = new.param_groups
-    assert (group["momentum"], group["nesterov"], group["block_scale"], group["adjust_lr"]) == (0.6, True, "matrix", "spectral_norm")
+    assert (group["momentum"], group["nesterov"], group["scale_shape"], group["adjust_lr"]) == (0.6, True, "whole", "spectral_norm")
     assert (group["weight_decay"], adam["weight_decay"], adam["betas"], group["eps"]) == (0.2, 0.03, (0.5, 0.8), 1e-6)
     torch.testing.assert_close(new.state[q]["momentum"], momentum, rtol=0, atol=0)
     torch.testing.assert_close(new.state[b]["exp_avg"], moments, rtol=0, atol=0)

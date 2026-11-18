@@ -97,7 +97,7 @@ def group_hparams(cfg: OptimConf, algorithm: str) -> dict:
     if algorithm == "muon":
         m = cfg.muon
         return {"lr": m.lr, "momentum": m.momentum, "nesterov": m.nesterov, "adjust_lr": m.adjust_lr,
-                "block_scale": m.block_scale, "weight_decay": m.weight_decay}
+                "scale_shape": m.scale_shape, "weight_decay": m.weight_decay}
     a = cfg.adamw
     return {"lr": a.lr, "betas": (a.beta1, a.beta2), "weight_decay": a.weight_decay}
 
@@ -159,7 +159,7 @@ class Muon(Optimizer):
         mine_buf for the all-to-all; theirs, the ranks' slices of the blocks I own, unpacked from theirs_buf the
         same way."""
         self.fans = {"block": [spec.fans(shape, per_block=True) for spec, shape in zip(specs, shapes)],
-                     "matrix": [spec.fans(shape, per_block=False) for spec, shape in zip(specs, shapes)]}
+                     "whole": [spec.fans(shape, per_block=False) for spec, shape in zip(specs, shapes)]}
         self.blocks: list[Block] = [b for i, (spec, shape) in enumerate(zip(specs, shapes)) for b in spec.blocks(shape, i)]
         regions = [spec.regions(shape, self.coords, self.dp, self.tp) for spec, shape in zip(specs, shapes)]
         slices = [[(r, box) for r, region in enumerate(regions[b.param]) if (box := b.overlap(region))]
@@ -241,8 +241,8 @@ class Muon(Optimizer):
 
     def _update(self, group: dict, live: list[int]):
         """W <- W - lr (wd W + scale u) for the params with a gradient, in fp32. The scale multiplies the update, not
-        the decay: from the fans of the block, or of the whole weight (block_scale)."""
-        fans = self.fans[group["block_scale"]]
+        the decay: from the fans of the block, or of the whole weight (scale_shape)."""
+        fans = self.fans[group["scale_shape"]]
         xllm_ops.muon_update_([self.w[i] for i in live], [self.u[i] for i in live],
                               [_scale(*fans[i], group["adjust_lr"]) for i in live], group["lr"], group["weight_decay"])
 
