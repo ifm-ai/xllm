@@ -144,8 +144,8 @@ def check_registration(mesh):
 
 def check_model_blocks():
     """register_muon in the real blocks gives the Blocks of the marks it replaced: wq / wr one row
-    block per head, wk / wv one per KV head, wo / wg / FFN whole; experts one per expert, shared
-    experts whole."""
+    block per head, wk / wv one per KV head (softdelta: each of a KV head's two keys its own block),
+    wo / FFN whole; experts one per expert, shared experts whole."""
     import dataclasses
     from xllm.configuration import ConfStore
     from xllm.models.gekko import GekkoBlock
@@ -155,14 +155,17 @@ def check_model_blocks():
         heads = getattr(parent, "n_heads", None) or getattr(parent, "num_heads", None)
         kv_heads = getattr(parent, "n_kv_heads", None) or getattr(parent, "num_kv_heads", None)
         n = {"wq": heads, "wr": heads, "wk": kv_heads, "wv": kv_heads}.get(attr, 1)
+        if attr == "wk" and getattr(parent, "attn_act_func", "softmax") == "softdelta":
+            n *= 2
         if type(parent).__name__ == "Expert":
             n = parent.n_experts
         return row_boxes(shape, n)
 
     # (config, block, overrides, registered weights: the marked ones, plus experts and shared experts)
+    # softdelta (ifm #58): no wg; the transformer gets a wr (the per-head forget logits)
     cases = [("k2-horizon-0.9B", TransformerBlock, {}, 7), ("k2-horizon-0.9B", TransformerBlock, {"attn_act_func": "softdelta"}, 8),
-             ("gekko-0.9B", GekkoBlock, {}, 8), ("gekko-0.9B", GekkoBlock, {"attn_act_func": "softdelta"}, 9),
-             ("gekko-7.1B", GekkoBlock, {}, 8), ("k2-horizon-moe-36B-a4B", TransformerMoEBlock, {}, 11)]
+             ("gekko-0.9B", GekkoBlock, {}, 8), ("gekko-0.9B", GekkoBlock, {"attn_act_func": "softdelta"}, 8),
+             ("gekko-7B", GekkoBlock, {}, 8), ("k2-horizon-moe-36B-a4B", TransformerMoEBlock, {}, 11)]
     for name, cls, overrides, n_registered in cases:
         block = cls(dataclasses.replace(ConfStore[name], **overrides), layer_id=0)
         checked = []

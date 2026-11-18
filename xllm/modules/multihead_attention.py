@@ -198,15 +198,13 @@ class MultiheadAttention(nn.Module):
             num_features=self.n_heads * self.head_dim, eps=rmsnorm_eps, init_std=init_std
         )
 
-        # Muon (xllm/optim/muon.py): one Newton-Schulz block per head (a q head holds both softdelta
-        # queries); wo and wg are whole matrices
-        register_muon(self.wq, layout="(h k d) m", fan_out="k d", fan_in="m", k=nq, d=self.head_dim, tp_dim=0)
-        for w in (self.wk, self.wv, self.wr):
-            if w is not None:
-                register_muon(w, layout="(h d) m", fan_out="d", fan_in="m", d=self.head_dim, tp_dim=0)
+        # Muon (xllm/optim/muon.py): one Newton-Schulz block per head (each of a kv head's two softdelta
+        # keys is its own block; wr holds a head's gate rows and, for softdelta, its forget logit); wo is whole
+        for w in (self.wq, self.wk, self.wv):
+            register_muon(w, layout="(h d) m", fan_out="d", fan_in="m", d=self.head_dim, tp_dim=0)
+        if self.wr is not None:
+            register_muon(self.wr, layout="(h d) m", fan_out="d", fan_in="m", d=rdim // self.n_heads, tp_dim=0)
         register_muon(self.wo, tp_dim=1)
-        if self.wg is not None:
-            register_muon(self.wg, tp_dim=1)
 
     def forward(
         self,
