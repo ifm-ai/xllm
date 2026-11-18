@@ -23,8 +23,8 @@
 # Variables (default):
 #   SAVE            dump dir (required)
 #   OPTIM           adamw | muon (adamw); for muon: MUON_LR (0.01),
-#                   MUON_BLOCK_SCALE (block): scale of a q/k/v/r head block from its own shape (block)
-#                   or its whole matrix's shape (matrix); wo stays whole
+#                   MUON_SCALE_SHAPE (block): scale of a q/k/v/r head block from its own shape (block)
+#                   or the whole weight's shape (whole); wo is one block either way
 #   LR              AdamW LR, also for the non-matrix params under muon (2e-3)
 #   SCHEDULER       constant | cosine | wsd (constant); WARMUP steps (3000);
 #                   WSD_DECAY_STEPS (20% of the run) for wsd
@@ -38,7 +38,7 @@
 : "${SAVE:?set SAVE}"
 PYTHON=${PYTHON:-.venv/bin/python}
 OPTIM=${OPTIM:-adamw}
-MUON_BLOCK_SCALE=${MUON_BLOCK_SCALE:-block}
+MUON_SCALE_SHAPE=${MUON_SCALE_SHAPE:-block}
 MUON_LR=${MUON_LR:-0.01}
 LR=${LR:-2e-3}
 SCHEDULER=${SCHEDULER:-constant}
@@ -221,7 +221,7 @@ if [ "${OPTIM}" = "muon" ]; then
     --optim.optimizer "muon"
     --optim.muon.lr ${MUON_LR}
     --optim.muon.momentum 0.95
-    --optim.muon.block_scale ${MUON_BLOCK_SCALE}
+    --optim.muon.scale_shape ${MUON_SCALE_SHAPE}
     --optim.muon.weight_decay ${WD}  # same decay as the AdamW group (the old muon_weight_decay=None fallback)
     --dcp_for_optimizer "true"
   )

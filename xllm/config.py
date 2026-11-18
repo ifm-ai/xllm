@@ -99,12 +99,12 @@ class MuonConf(Config):
     momentum: float = 0.95
     nesterov: bool = True  # Nesterov momentum (Keller Jordan Muon, Moonlight)
     adjust_lr: str = "spectral_norm"  # update scale: spectral_norm sqrt(fan_out / fan_in), rms_norm 0.2 sqrt(max(fan_out, fan_in)), or none (1)
-    block_scale: str = "block"  # fans of a row block (register_muon): block (its own shape) or matrix (its whole matrix's shape)
+    scale_shape: str = "block"  # shape whose fans give adjust_lr's scale: block (each Newton-Schulz block, e.g. one head) or whole (the whole weight)
     weight_decay: float = 0.1  # decoupled weight decay
 
     def __post_init__(self):
         assert self.adjust_lr in ["spectral_norm", "rms_norm", "none"]
-        assert self.block_scale in ["block", "matrix"]
+        assert self.scale_shape in ["block", "whole"]
         assert self.lr >= 0 and self.weight_decay >= 0
 
 

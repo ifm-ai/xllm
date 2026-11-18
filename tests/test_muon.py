@@ -61,7 +61,7 @@ CFG = optim_conf(optimizer="muon", lr=1e-3, muon_lr=0.02, muon_momentum=0.95, we
 CFG_PLAIN_RMS = optim_conf(optimizer="muon", lr=1e-3, muon_lr=0.02, muon_momentum=0.95, weight_decay=0.0,
                           beta1=0.9, beta2=0.95, epsilon=1e-8, muon_nesterov=False, muon_adjust_lr="rms_norm")
 CFG_MATRIX_SCALE = optim_conf(optimizer="muon", lr=1e-3, muon_lr=0.02, muon_momentum=0.95, weight_decay=0.0,
-                             beta1=0.9, beta2=0.95, epsilon=1e-8, muon_block_scale="matrix")
+                             beta1=0.9, beta2=0.95, epsilon=1e-8, muon_scale_shape="whole")
 CFG_ADAMW = optim_conf(optimizer="muon", lr=1e-3, muon_lr=0.02, weight_decay=0.1, beta1=0.9, beta2=0.95,
                       epsilon=1e-8)
 STEPS = 3
@@ -78,7 +78,7 @@ def make(mesh, seed):
 
 def dense_muon(full, specs, grads, cfg):
     """Reference: every block orthogonalized on its own, on full matrices; the update is scaled in
-    fp32 by a block's fans (muon_block_scale=block) or by the whole weight's (matrix)."""
+    fp32 by a block's fans (muon.scale_shape=block) or by the whole weight's (whole)."""
     mom = [torch.zeros_like(x) for x in full]
     for step_grads in grads:
         for x, m, g, spec in zip(full, mom, step_grads, specs):
@@ -89,7 +89,7 @@ def dense_muon(full, specs, grads, cfg):
                 blk = u[b.r0:b.r1, b.c0:b.c1]
                 o = newton_schulz((blk if blk.shape[0] <= blk.shape[1] else blk.mT)[None], cfg.adamw.epsilon)[0]
                 out[b.r0:b.r1, b.c0:b.c1] = o if blk.shape[0] <= blk.shape[1] else o.mT
-            fan_out, fan_in = spec.fans(tuple(x.shape), per_block=cfg.muon.block_scale == "block")
+            fan_out, fan_in = spec.fans(tuple(x.shape), per_block=cfg.muon.scale_shape == "block")
             scale = 0.2 * math.sqrt(max(fan_out, fan_in)) if cfg.muon.adjust_lr == "rms_norm" else math.sqrt(fan_out / fan_in)
             x.mul_(1 - cfg.muon.lr * cfg.muon.weight_decay).add_(out.float(), alpha=-cfg.muon.lr * scale)
     return full
@@ -368,7 +368,7 @@ def check_tensor_parallel(rep=1, tp=2):
             dist.all_gather(parts, p.full_tensor().contiguous(), group=tp_group)
             got.append(torch.cat(parts, dim=d))
         want = dense_muon([x.clone() for x in full], global_specs, grads, cfg)
-        check(f"muon TP={tp} replicas={rep} dp={dp} scale={cfg.muon.block_scale} "
+        check(f"muon TP={tp} replicas={rep} dp={dp} scale={cfg.muon.scale_shape} "
               f"vs dense reference", got, want, full, 3e-2)
         if cfg is CFG and tp > 1:  # negative control: orthogonalizing each rank's half on its own is a different update
             cut = [2, 3, 4, 5]  # the weights whose matrix TP cuts
@@ -398,7 +398,7 @@ def main():
         got = run_sharded(Muon, mesh, params[:n], [g[:n] for g in grads], muon_params=params[:n],
                           specs=specs, adamw_params=[], mesh=mesh, cfg=cfg)
         want = dense_muon([x.clone() for x in full], specs, [g[:n] for g in grads], cfg)
-        check(f"muon heads={heads} scale={cfg.muon.block_scale} nesterov={cfg.muon.nesterov} "
+        check(f"muon heads={heads} scale={cfg.muon.scale_shape} nesterov={cfg.muon.nesterov} "
               f"adjust={cfg.muon.adjust_lr} vs dense reference", got, want, full, 3e-2)
         if heads and cfg is CFG:
             # negative controls: per-head vs whole-matrix, and block vs matrix scale, must differ far beyond the tolerance
