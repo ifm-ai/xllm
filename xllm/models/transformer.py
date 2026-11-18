@@ -257,6 +257,9 @@ class TransformerMoEBlock(nn.Module):
             init_mode=cfg.init_mode,
             init_std=cfg.init_std
         )
+        # TransformerMoEBlockFunction normalises the MoE input on slices exactly when the attention norm gathers
+        # an RMSNorm, so that choice must match the MoE norm's
+        assert getattr(self.moe.norm, 'partitioned_output', False) == (self.attention.norm.gather_input and self.apply_rmsnorm)
 
     def forward(
         self,

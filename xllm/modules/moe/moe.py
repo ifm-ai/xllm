@@ -77,13 +77,17 @@ class NormalizedMoE(nn.Module):
 
         norm_cls = GroupRMSNorm if apply_rmsnorm else GroupLayerNorm
         norm_eps = rmsnorm_eps if apply_rmsnorm else layernorm_eps
+        # the MoE layer works on D/TP slices, so the RMSNorm keeps its input's partition instead of gathering;
+        # the fused block (TransformerMoEBlockFunction) does the same whenever it would gather an RMSNorm
+        norm_kwargs = {'partitioned_output': True} if apply_rmsnorm else {}
         self.norm = norm_cls(
             model_dim,
             num_groups=norm_num_groups,
             elementwise_affine=norm_affine,
             eps=norm_eps,
             memory_efficient=memory_efficient_norm,
-            disable_input_reduce=True
+            disable_input_reduce=True,
+            **norm_kwargs
         )
         init_fn = get_init_fn(init_mode, dim=model_dim, std=init_std)
         # router
