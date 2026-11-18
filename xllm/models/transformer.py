@@ -60,7 +60,6 @@ class TransformerBlock(nn.Module):
         self.recompute_fc3_out = cfg.recompute_fc3_out
         self.dropout = cfg.dropout
         self.apply_rmsnorm = cfg.apply_rmsnorm
-        self.layernorm_eps = cfg.layernorm_eps
         self.rmsnorm_eps = cfg.rmsnorm_eps
 
         if self.fused_block:
@@ -91,6 +90,7 @@ class TransformerBlock(nn.Module):
             residual_heads=cfg.residual_heads,
             init_mode=cfg.init_mode,
             init_std=cfg.init_std,
+            stream_norm_eps=cfg.stream_norm_eps,
         )
 
         self.nffn = NormalizedFeedForwardNetwork(
@@ -110,6 +110,7 @@ class TransformerBlock(nn.Module):
             residual_heads=cfg.residual_heads,
             init_mode=cfg.init_mode,
             init_std=cfg.init_std,
+            stream_norm_eps=cfg.stream_norm_eps,
         )
 
     def forward(
@@ -158,7 +159,7 @@ class TransformerBlock(nn.Module):
                 self.attention.attention_dropout,
                 self.attention.hidden_dropout,
                 self.nffn.swiglu,
-                self.layernorm_eps,
+                self.nffn.norm_eps,  # both pre-norms' eps
                 self.rmsnorm_eps,
                 self.apply_rmsnorm,
                 self.attention.norm.gather_input,
@@ -527,17 +528,18 @@ class TransformerOutputLayer(nn.Module):
         self.model_dim = cfg.model_dim
         self.output_size = cfg.vocab_size
         self.apply_rmsnorm = cfg.apply_rmsnorm
-        self.layernorm_eps = cfg.layernorm_eps
         self.rmsnorm_eps = cfg.rmsnorm_eps
         self.recompute_logits = cfg.recompute_logits
 
         norm_cls = GroupRMSNorm if cfg.apply_rmsnorm else GroupLayerNorm
-        norm_eps = cfg.rmsnorm_eps if self.apply_rmsnorm else cfg.layernorm_eps
+        self.norm_eps = cfg.stream_norm_eps
+        if self.norm_eps is None:
+            self.norm_eps = cfg.rmsnorm_eps if self.apply_rmsnorm else cfg.layernorm_eps
         self.final_norm = norm_cls(
             cfg.model_dim,
             num_groups=cfg.layernorm_num_groups,
             elementwise_affine=cfg.norm_affine,
-            eps=norm_eps,
+            eps=self.norm_eps,
             memory_efficient=cfg.memory_efficient_norm
         )
 
@@ -569,7 +571,7 @@ class TransformerOutputLayer(nn.Module):
                 self.final_norm.bias,
                 self.final_norm.groups_per_partition,
                 self.output.weight,
-                self.layernorm_eps,
+                self.norm_eps,
                 self.rmsnorm_eps,
                 self.apply_rmsnorm,
                 self.final_norm.gather_input,
