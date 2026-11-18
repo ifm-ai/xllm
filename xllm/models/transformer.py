@@ -42,6 +42,7 @@ from xllm.models.fused_blocks import (
     TransformerMoVABlockFunction,
     TransformerOutputLayerFunction,
 )
+from xllm.optim.roles import register_role
 from xllm.utils import get_init_fn
 
 
@@ -553,6 +554,10 @@ class TransformerOutputLayer(nn.Module):
             gather_output=False,
             init_method=init_fn
         )
+        # roles (xllm/optim/roles.py)
+        register_role(self.final_norm, "weight", "final_norm")
+        register_role(self.final_norm, "bias", "final_norm")
+        register_role(self.output, "weight", "readout")
 
     def forward(
         self,
@@ -625,9 +630,11 @@ class Transformer(XLLModel):
             from xllm.distributed.wrap import wrap
 
         init_fn = get_init_fn('gaussian', dim=self.model_dim, std=cfg.init_embed_std)
-        self.embed = wrap(ParallelEmbedding(
+        embed = ParallelEmbedding(
             self.vocab_size, self.model_dim, embed_multiplier=cfg.embed_multiplier, gather_output=False, init_method=init_fn
-        ))
+        )
+        register_role(embed, "weight", "embed")  # xllm/optim/roles.py
+        self.embed = wrap(embed)
 
         assert self.v_head_dim == self.head_dim
         if self.rope_head_dim > 0:
