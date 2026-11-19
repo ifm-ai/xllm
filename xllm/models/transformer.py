@@ -123,7 +123,8 @@ class TransformerBlock(nn.Module):
         moe_router_load_balancing_type: Optional[str] = None,
         attn_stability_control: int = 0,
         deterministic: bool = True,
-        cache: Optional[Tuple[Tensor, Tensor, int]] = None,
+        cache: Optional[Tuple[Tuple[Tensor, Tensor, int],
+                              Tuple[Tensor, Tensor, Tensor]]] = None,
     ) -> Tuple[Tensor, Optional[Tensor], Optional[Any]]:
         if self.fused_block and self.training:
             fn = TransformerBlockFunction
@@ -324,7 +325,8 @@ class TransformerMoEBlock(nn.Module):
         moe_router_load_balancing_type: Optional[str] = None,
         attn_stability_control: int = 0,
         deterministic: bool = True,
-        cache: Optional[Tuple[Tensor, Tensor, int]] = None,
+        cache: Optional[Tuple[Tuple[Tensor, Tensor, int],
+                              Tuple[Tensor, Tensor, Tensor]]] = None,
     ) -> Tuple[Tensor, Optional[Tensor], Optional[Any]]:
         if self.fused_block and self.training:
             fn = TransformerMoEBlockFunction
@@ -558,7 +560,8 @@ class TransformerMoVABlock(nn.Module):
         moe_router_load_balancing_type: Optional[str] = None,
         attn_stability_control: int = 0,
         deterministic: bool = True,
-        cache: Optional[Tuple[Tensor, Tensor, int]] = None,
+        cache: Optional[Tuple[Tuple[Tensor, Tensor, int],
+                              Tuple[Tensor, Tensor, Tensor]]] = None,
     ) -> Tuple[Tensor, Optional[Tensor], Optional[Any]]:
         if self.fused_block and self.training:
             fn = TransformerMoVABlockFunction
@@ -867,7 +870,8 @@ class Transformer(XLLModel):
         moe_router_load_balancing_type: Optional[str] = None,
         attn_stability_control: int = 0,
         deterministic: bool = True,
-        cache: Optional[List[Tuple[Tensor, Tensor, int]]] = None,
+        cache: Optional[List[Tuple[Tuple[Tensor, Tensor, int],
+                                   Tuple[Tensor, Tensor, Tensor]]]] = None,
     ):
         bsz, seq_len = tokens.shape
 
@@ -900,7 +904,7 @@ class Transformer(XLLModel):
                 token_mask = token_mask[:, start:end] if token_mask is not None else None
         else:
             assert self.context_parallel_size == 1, "inference mode does not support context parallel."
-            cache_len = 0 if cache is None else cache[0][-1]
+            cache_len = 0 if cache is None else cache[0][0][-1]
 
         # embeddings
         emb = self.embed(tokens)

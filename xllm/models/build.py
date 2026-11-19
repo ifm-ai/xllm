@@ -166,7 +166,7 @@ def init_cache(model: nn.Module):
 
 
 def init_transformer_cache(model):
-    cache = [(None, None, 0) for _ in range(model.num_layers)]
+    cache = [((None, None, 0), (None, None, None)) for _ in range(model.num_layers)]
     return cache
 
 

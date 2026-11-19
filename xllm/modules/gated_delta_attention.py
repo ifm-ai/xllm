@@ -393,10 +393,15 @@ class GatedDeltaAttention(nn.Module):
             prev_aqk, prev_akk, prev_ag, memory, log_norm_term = None, None, None, None, None
             cache_sca, cache_awk, cache_norm, cache_conv = None, None, None, None
 
-        if prev_v is not None and bos_mask is not None:
-            bos_mask_curr = bos_mask[:, self.chunk_size:]
+        if bos_mask is not None:
+            full_length = bos_mask.shape[1]
+            curr = full_length - seq_len
+            prev = curr if prev_v is None else curr - self.chunk_size
+            bos_mask_curr = bos_mask[:, curr:]
+            bos_mask = bos_mask[:, prev:]
+            segment_idx = segment_idx[:, prev:]
         else:
-            bos_mask_curr = bos_mask
+            bos_mask_curr = None
 
         # B x L x D/TP
         x, prev_count, prev_mean, prev_var = self.timenorm(x, bos_mask_curr, prev_count, prev_mean, prev_var)

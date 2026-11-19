@@ -208,9 +208,15 @@ class MultiheadAttention(nn.Module):
         segments: Optional[Any] = None,
         stability_control: int = 0,
         deterministic: bool = True,
-        cache: Optional[Tuple[Tensor, Tensor]] = None,
+        cache: Optional[Tuple[Tuple[Tensor, Tensor, int],
+                              Tuple[Tensor, Tensor, Tensor]]] = None,
     ) -> Tuple[Tensor, Optional[Any]]:
         residual = x
+        if cache is not None:
+            cache_attn, cache_conv = cache
+        else:
+            cache_attn, cache_conv = None, None
+
         x = self.norm(x)
         if not self.norm.gather_input:
             x = gather_copy_model_parallel_region(x)
@@ -233,9 +239,9 @@ class MultiheadAttention(nn.Module):
             r = g = None
 
         # B x L x (H*S)
-        attn, new_cache = self.causal_attention(
+        attn, cache_attn = self.causal_attention(
             xq, xk, xv, g, None if self.nope else freqs_cis,
-            bos_mask, segments, stability_control, deterministic, cache
+            bos_mask, segments, stability_control, deterministic, cache_attn
         )
         if self.apply_attn_gate:
             if self.attn_gate_fn == "silu":
@@ -252,7 +258,10 @@ class MultiheadAttention(nn.Module):
         # residual
         out = self.residual(h, residual, c=attn)
 
-        return out, new_cache
+        if cache is not None:
+            cache = (cache_attn, cache_conv)
+
+        return out, cache
 
     def extra_repr(self) -> str:
         return 'dim={}, heads={} ({}), head_dim={} ({}), act={}, backend={}, gate={}, init={} ({})'.format(
