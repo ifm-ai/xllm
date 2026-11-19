@@ -149,7 +149,7 @@ class MultiheadAttention(nn.Module):
 
         # qkv shortconvs
         self.q_conv = CausalConv1d(
-            self.num_heads * self.head_dim,
+            self.n_heads * self.head_dim,
             causal_conv_width,
             bias=False,
             apply_weight_normalization=causal_conv_weight_normalization,
@@ -249,11 +249,17 @@ class MultiheadAttention(nn.Module):
         cache: Optional[Tuple[Tuple[Tensor, Tensor, int],
                               Tuple[Tensor, Tensor, Tensor]]] = None,
     ) -> Tuple[Tensor, Optional[Any]]:
+        bsz, seq_len, _ = x.size()
         residual = x
+
         if cache is not None:
             cache_attn, cache_conv = cache
+            conv_state_q, conv_state_k, conv_state_v = cache_conv
+        elif should_recv_from_prev():
+            pass
         else:
             cache_attn, cache_conv = None, None
+            conv_state_q, conv_state_k, conv_state_v = None, None, None
 
         x = self.norm(x)
         if not self.norm.gather_input:
@@ -263,6 +269,27 @@ class MultiheadAttention(nn.Module):
         xq = self.wq(x)
         xk = self.wk(x)
         xv = self.wv(x)
+        if self.causal_conv:
+            if bos_mask is not None:
+                curr = bos_mask.shape[1] - seq_len
+                bos_mask_curr = bos_mask[:, curr:]
+            else:
+                bos_mask_curr = None
+
+            output_final_state = cache_conv is not None or should_send_to_next()
+            # B x L x Q/TP
+            xq, conv_state_q = self.q_conv(
+                xq, conv_state_q, bos_mask_curr, output_final_state, deterministic
+            )
+            # B x L x K/TP
+            xk, conv_state_k = self.k_conv(
+                xk, conv_state_k, bos_mask_curr, output_final_state, deterministic
+            )
+            # B x L x V/TP
+            xv, conv_state_v = self.v_conv(
+                xv, conv_state_v, bos_mask_curr, output_final_state, deterministic
+            )
+
         if self.qknorm:
             xq = self.query_norm(xq)
             xk = self.key_norm(xk)
