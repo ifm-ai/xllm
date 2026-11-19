@@ -6,7 +6,7 @@ from torch.nn import functional as F
 from einops import rearrange
 
 from xllm.distributed.utils import reshape_gathered_tensor_along_specific_dim
-from xllm.health_metrics import get_active_health_collector
+from xllm.metrics import health
 from xllm.modules.context_parallel import (
     should_send_to_next,
     should_recv_from_prev,
@@ -242,7 +242,7 @@ class GekkoBlockFunction(torch.autograd.Function):
 
         sk, _ = rmsnorm_fwd(xk_, knorm_w, local_kv_heads, rmsnorm_eps)
         sk = rearrange(sk, 'b l (k s) -> b l k s', k=local_kv_heads)
-        health_collector = get_active_health_collector()
+        health_collector = health.active_collector()
         # Partial RoPE mutates sk; reduce its pre-RoPE vectors before that update.
         health_sca_key_l2 = None
         if health_collector is not None and health_collector.enable_gekko_stats:
@@ -1123,21 +1123,12 @@ class GekkoOutputLayerFunction(torch.autograd.Function):
             handle1 = None
             handle2 = None
 
-        collector = get_active_health_collector()
         output = fused_linear_cross_entropy_fwd(
             out_tsn, wo, y, mask, compute_grad=(not recompute_logits),
-            collect_logits_stats=(
-                collector is not None and collector.enable_logits_stats
-            ),
+            collect_logits_stats=health.logits_stats_enabled(),
         )
         if output.logits_stats is not None:
-            assert collector is not None
-            collector.record_logits_stats(
-                output.logits_stats.sum,
-                output.logits_stats.count,
-                output.logits_stats.minimum,
-                output.logits_stats.maximum,
-            )
+            health.record_logits_stats(*output.logits_stats)
         loss, grad_tsn, grad_wo = output.loss, output.grad_input, output.grad_weight
 
         if send_to_next:

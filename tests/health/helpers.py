@@ -21,7 +21,7 @@ for name in (
 
 from xllm.config import ModelConf  # noqa: E402
 from xllm.distributed import FullyShardedDataParallel  # noqa: E402
-from xllm.health_metrics import HealthMetricCollector  # noqa: E402
+from xllm.metrics.health import HealthMetricCollector  # noqa: E402
 from xllm.models.transformer import Transformer  # noqa: E402
 
 TOKENS = torch.tensor([[3, 7, 5, 9], [4, 4, 8, 6]])

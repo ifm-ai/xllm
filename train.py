@@ -19,6 +19,7 @@ from xllm.config import (
     TrainerConf,
     ValidConf,
     DataLoaderConfig,
+    HealthConf,
 )
 from xllm.checkpointing import (
     get_latest_checkpoint_paths_for_sharded_states,
@@ -58,9 +59,9 @@ from xllm.utils import (
 )
 from xllm.models import build_model
 from xllm.optim import build_optimizer, rescale_grads
-from xllm.monitor import GPUMonitor, Timings
-from xllm.metrics import MetricLogger, build_mlogger
-from xllm.health_metrics import HealthMetricCollector
+from xllm.metrics.monitor import GPUMonitor, Timings
+from xllm.metrics.metric_logger import MetricLogger, build_mlogger
+from xllm.metrics.health import HealthMetricCollector
 from xllm.modules.moe.moe import moe_layer_ids
 from xllm.modules.moe.mova import mova_layer_ids
 from xllm.configuration import cfg_from_cli
@@ -268,7 +269,7 @@ def main(cfg: TrainerConf):
     # setup loggers
     enable_loggers = cfg.slurm.is_master and not cfg.disable_logging
     enable_wandb = cfg.slurm.is_master and cfg.log_wandb and has_wandb
-    enable_health = cfg.health_metrics and not cfg.disable_logging
+    enable_health = cfg.health.enabled and not cfg.disable_logging
     to_log = ["train", "optim", "timings", "cluster_checks"]
     if cfg.async_eval_ngpus < 1:
         to_log.append("eval")
@@ -281,19 +282,19 @@ def main(cfg: TrainerConf):
         ) for k in to_log
     }
     router_stats_layers = {}
-    if cfg.health_moe_stats:
+    if cfg.health.moe_stats:
         router_stats_layers["moe"] = moe_layer_ids(model)
-    if cfg.health_mova_stats:
+    if cfg.health.mova_stats:
         router_stats_layers["mova"] = mova_layer_ids(model)
     health_collector = HealthMetricCollector(
         enabled=enable_health,
-        freq=cfg.health_log_freq,
+        freq=cfg.health.log_freq,
         num_layers=cfg.model.num_layers,
-        enable_query_key_stats=cfg.health_query_key_stats,
-        enable_weight_norms=cfg.health_weight_norms,
-        enable_gradient_norms=cfg.health_gradient_norms,
-        enable_logits_stats=cfg.health_logits_stats,
-        enable_gekko_stats=cfg.health_gekko_stats,
+        enable_query_key_stats=cfg.health.query_key_stats,
+        enable_weight_norms=cfg.health.weight_norms,
+        enable_gradient_norms=cfg.health.gradient_norms,
+        enable_logits_stats=cfg.health.logits_stats,
+        enable_gekko_stats=cfg.health.gekko_stats,
         router_stats_layers=router_stats_layers,
     )
 
@@ -710,6 +711,7 @@ if __name__ == "__main__":
         optim=OptimConf(),
         valid=ValidConf(),
         dataloader=DataLoaderConfig(),
+        health=HealthConf(),
     )
     cfg = cfg_from_cli(cfg)
     main(cfg)

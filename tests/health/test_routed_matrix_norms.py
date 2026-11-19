@@ -14,8 +14,8 @@ import torch.distributed as dist
 import tests.health.helpers  # noqa: F401  (installs the CPU stubs before any xllm import)
 import xllm.distributed.initialize as parallel_state
 from tests.health.helpers import TOKENS, logged_metrics, shard, tiny_transformer
-from xllm.health_metrics import _MATRIX_PARAMETER_PATHS, HealthMetricCollector, _matrix_metric_path
-from xllm.matrix_norms import MatrixSlice, flat_slice_squared_l2, matrix_slices, partitioned_squared_l2
+from xllm.metrics.health import _MATRIX_PARAMETER_PATHS, HealthMetricCollector, _matrix_metric_path
+from xllm.metrics.matrix_norms import MatrixSlice, flat_slice_squared_l2, matrix_slices, partitioned_squared_l2
 
 
 # --------------------------------------------------------------------------------------------------

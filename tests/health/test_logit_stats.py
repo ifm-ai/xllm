@@ -11,7 +11,7 @@ import xllm.models.fused_blocks.transformer.transformer as transformer_fused
 from tests.health.helpers import (
     MASK, TARGETS, TOKENS, logged_metrics, make_layers_identity, set_embeddings, stats, tiny_transformer,
 )
-from xllm.health_metrics import HealthMetricCollector
+from xllm.metrics.health import HealthMetricCollector
 
 
 def _logits_stats(metrics):
