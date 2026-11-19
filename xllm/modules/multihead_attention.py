@@ -9,18 +9,25 @@ from xllm.distributed import (
     get_model_parallel_world_size,
 )
 from xllm.distributed.utils import divide_and_check_no_remainder
-from xllm.modules.layer_norm import GroupLayerNorm
-from xllm.modules.rms_norm import GroupRMSNorm
-from xllm.modules.causal_attention import (
-    CausalSoftmaxAttention,
-    CausalSoftdeltaAttention
-)
-from xllm.modules.residual import build_residual
 from xllm.modules.model_parallel import (
     ColumnParallelLinear,
     RowParallelLinear,
     gather_copy_model_parallel_region,
 )
+from xllm.modules.context_parallel import (
+    should_send_to_next,
+    should_recv_from_prev,
+    send_to_next_context_parallel_region,
+    recv_from_prev_context_parallel_region,
+)
+from xllm.modules.layer_norm import GroupLayerNorm
+from xllm.modules.rms_norm import GroupRMSNorm
+from xllm.modules.causal_conv import CausalConv1d
+from xllm.modules.causal_attention import (
+    CausalSoftmaxAttention,
+    CausalSoftdeltaAttention
+)
+from xllm.modules.residual import build_residual
 from xllm.modules.fused_ops import (
     memory_efficient_dropout,
 )
@@ -44,6 +51,10 @@ class MultiheadAttention(nn.Module):
         apply_nope: bool,
         attn_act_func: str,
         qknorm: bool,
+        apply_causal_conv: bool,
+        causal_conv_width: int,
+        causal_conv_backend: str,
+        causal_conv_weight_normalization,
         norm_num_groups: int,
         norm_affine: bool,
         layernorm_eps: float,
@@ -72,6 +83,7 @@ class MultiheadAttention(nn.Module):
         self.nope = apply_nope
         self.qknorm = qknorm
         self.attn_act_func = attn_act_func
+        self.causal_conv = apply_causal_conv
 
         assert self.n_heads % self.n_kv_heads == 0
         assert 0 <= self.rope_head_dim <= self.head_dim
@@ -135,19 +147,31 @@ class MultiheadAttention(nn.Module):
             init_method=init_fn
         )
 
-        # attention gate projection
-        rdim ={"softmax": 0, "softdelta": self.n_heads}[attn_act_func]
-        if self.apply_attn_gate:
-            rdim += self.n_heads * self.head_dim
-        self.wr = ColumnParallelLinear(
-            mdim,
-            rdim,
+        # qkv shortconvs
+        self.q_conv = CausalConv1d(
+            self.num_heads * self.head_dim,
+            causal_conv_width,
             bias=False,
-            input_is_parallel=False,
-            disable_input_reduce=True,
-            gather_output=False,
-            init_method=init_fn
-        ) if rdim > 0 else None
+            apply_weight_normalization=causal_conv_weight_normalization,
+            activation=None,
+            backend=causal_conv_backend,
+        ) if apply_causal_conv else None
+        self.k_conv = CausalConv1d(
+            self.n_kv_heads * self.head_dim * nk,
+            causal_conv_width,
+            bias=False,
+            apply_weight_normalization=causal_conv_weight_normalization,
+            activation=None,
+            backend=causal_conv_backend,
+        ) if apply_causal_conv else None
+        self.v_conv = CausalConv1d(
+            self.n_kv_heads * self.head_dim,
+            causal_conv_width,
+            bias=False,
+            apply_weight_normalization=causal_conv_weight_normalization,
+            activation='silu',
+            backend=causal_conv_backend,
+        ) if apply_causal_conv else None
 
         # qk-norm
         self.query_norm = GroupRMSNorm(
@@ -165,6 +189,20 @@ class MultiheadAttention(nn.Module):
             eps=rmsnorm_eps,
             memory_efficient=False,
         ) if self.qknorm else None
+
+        # attention gate projection
+        rdim = {"softmax": 0, "softdelta": self.n_heads}[attn_act_func]
+        if self.apply_attn_gate:
+            rdim += self.n_heads * self.head_dim
+        self.wr = ColumnParallelLinear(
+            mdim,
+            rdim,
+            bias=False,
+            input_is_parallel=False,
+            disable_input_reduce=True,
+            gather_output=False,
+            init_method=init_fn
+        ) if rdim > 0 else None
 
         if self.attn_act_func == "softmax":
             causal_attention_cls = CausalSoftmaxAttention

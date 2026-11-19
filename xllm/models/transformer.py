@@ -60,6 +60,7 @@ class TransformerBlock(nn.Module):
         self.recompute_fc3_out = cfg.recompute_fc3_out
         self.dropout = cfg.dropout
         self.apply_nope = cfg.apply_nope_in_causal_attn
+        self.apply_causal_conv = cfg.apply_nope_in_causal_attn
         self.apply_rmsnorm = cfg.apply_rmsnorm
         self.layernorm_eps = cfg.layernorm_eps
         self.rmsnorm_eps = cfg.rmsnorm_eps
@@ -77,6 +78,10 @@ class TransformerBlock(nn.Module):
             apply_nope=cfg.apply_nope_in_causal_attn,
             attn_act_func=cfg.attn_act_func,
             qknorm=cfg.qknorm,
+            apply_causal_conv=cfg.apply_conv_in_causal_attn,
+            causal_conv_width=cfg.causal_conv_width,
+            causal_conv_backend=cfg.causal_conv_backend,
+            causal_conv_weight_normalization=cfg.causal_conv_weight_normalization,
             norm_num_groups=cfg.layernorm_num_groups,
             norm_affine=cfg.norm_affine,
             layernorm_eps=cfg.layernorm_eps,
@@ -194,6 +199,7 @@ class TransformerBlock(nn.Module):
         n_kv_heads = self.attention.n_kv_heads
         apply_attn_gate = self.attention.apply_attn_gate
         qknorm = self.attention.qknorm
+        conv_width = self.attention.q_conv.kernel_size if self.apply_causal_conv else 0
         ffn_hidden_dim = self.nffn.hidden_dim
         swiglu = self.nffn.swiglu
 
@@ -208,11 +214,13 @@ class TransformerBlock(nn.Module):
         norm_params = model_dim * (2 if self.apply_rmsnorm else 4)
         if qknorm:
             norm_params += (n_heads + n_kv_heads * nk) * head_dim
+        # conv params
+        conv_params = conv_width * (n_heads * head_dim + 2 * n_kv_heads * head_dim)
         # FFN
         ffn_params = model_dim * ffn_hidden_dim * (3 if swiglu else 2)
         ffn_params += num_params_in_residual(self.residual_func, model_dim, self.residual_heads, ffn_hidden_dim)
 
-        activated_params = attn_params + norm_params + ffn_params
+        activated_params = attn_params + norm_params + conv_params + ffn_params
         return activated_params, activated_params
 
     def tflops_per_token(self, seq_len: int):
@@ -221,6 +229,11 @@ class TransformerBlock(nn.Module):
         head_dim = self.attention.head_dim
         n_heads = self.attention.n_heads
         n_kv_heads = self.attention.n_kv_heads
+        qknorm = self.attention.qknorm
+        conv_width = self.attention.q_conv.kernel_size if self.apply_causal_conv else 0
+
+        qdim = n_heads * head_dim
+        kdim = vdim = n_kv_heads * head_dim
 
         _, tflops_per_token = self.num_parameters()
         if attn_act_func == 'softmax':
@@ -231,6 +244,11 @@ class TransformerBlock(nn.Module):
         else:
             raise ValueError(f"Unknown attention activation function: {attn_act_func}")
 
+        # norm flops
+        norm_flops = model_dim * 2 + ((qdim + kdim) if qknorm else 0)
+        # conv flops
+        conv_flops = conv_width * (qdim + kdim + vdim) * 2
+        tflops_per_token += norm_flops + conv_flops
         # residual
         # TODO
         res_flops = 0.0
@@ -254,6 +272,7 @@ class TransformerMoEBlock(nn.Module):
         self.recompute_router = cfg.recompute_router
         self.dropout = cfg.dropout
         self.apply_nope = cfg.apply_nope_in_causal_attn
+        self.apply_causal_conv = cfg.apply_nope_in_causal_attn
         self.apply_rmsnorm = cfg.apply_rmsnorm
         self.layernorm_eps = cfg.layernorm_eps
         self.rmsnorm_eps = cfg.rmsnorm_eps
@@ -271,6 +290,10 @@ class TransformerMoEBlock(nn.Module):
             apply_nope=cfg.apply_nope_in_causal_attn,
             attn_act_func=cfg.attn_act_func,
             qknorm=cfg.qknorm,
+            apply_causal_conv=cfg.apply_conv_in_causal_attn,
+            causal_conv_width=cfg.causal_conv_width,
+            causal_conv_backend=cfg.causal_conv_backend,
+            causal_conv_weight_normalization=cfg.causal_conv_weight_normalization,
             norm_num_groups=cfg.layernorm_num_groups,
             norm_affine=cfg.norm_affine,
             layernorm_eps=cfg.layernorm_eps,
@@ -412,6 +435,7 @@ class TransformerMoEBlock(nn.Module):
         n_kv_heads = self.attention.n_kv_heads
         apply_attn_gate = self.attention.apply_attn_gate
         qknorm = self.attention.qknorm
+        conv_width = self.attention.q_conv.kernel_size if self.apply_causal_conv else 0
         expert_inter_dim = self.moe.inter_dim
         n_shared_experts = self.moe.n_shared_experts
         n_experts = self.moe.n_experts
@@ -428,8 +452,10 @@ class TransformerMoEBlock(nn.Module):
         norm_params = model_dim * (2 if self.apply_rmsnorm else 4)
         if qknorm:
             norm_params += (n_heads + n_kv_heads * nk) * head_dim
+        # conv params
+        conv_params = conv_width * (n_heads * head_dim + 2 * n_kv_heads * head_dim)
 
-        activated_params = attn_params + norm_params
+        activated_params = attn_params + norm_params + conv_params
         total_params = activated_params
         # MoE
         shared_expert_params = model_dim * expert_inter_dim * n_shared_experts * 3
@@ -448,6 +474,11 @@ class TransformerMoEBlock(nn.Module):
         head_dim = self.attention.head_dim
         n_heads = self.attention.n_heads
         n_kv_heads = self.attention.n_kv_heads
+        qknorm = self.attention.qknorm
+        conv_width = self.attention.q_conv.kernel_size if self.apply_causal_conv else 0
+
+        qdim = n_heads * head_dim
+        kdim = vdim = n_kv_heads * head_dim
 
         _, tflops_per_token = self.num_parameters()
         if attn_act_func == 'softmax':
@@ -458,6 +489,11 @@ class TransformerMoEBlock(nn.Module):
         else:
             raise ValueError(f"Unknown attention activation function: {attn_act_func}")
 
+        # norm flops
+        norm_flops = model_dim * 2 + ((qdim + kdim) if qknorm else 0)
+        # conv flops
+        conv_flops = conv_width * (qdim + kdim + vdim) * 2
+        tflops_per_token += norm_flops + conv_flops
         # residual
         # TODO
         res_flops = 0.0
@@ -481,6 +517,7 @@ class TransformerMoVABlock(nn.Module):
         self.recompute_router = cfg.recompute_router
         self.dropout = cfg.dropout
         self.apply_nope = cfg.apply_nope_in_causal_attn
+        self.apply_causal_conv = cfg.apply_nope_in_causal_attn
         self.apply_rmsnorm = cfg.apply_rmsnorm
         self.layernorm_eps = cfg.layernorm_eps
         self.rmsnorm_eps = cfg.rmsnorm_eps
@@ -500,6 +537,10 @@ class TransformerMoVABlock(nn.Module):
             num_values=cfg.num_values,
             num_activated_values=cfg.num_activated_values,
             qknorm=cfg.qknorm,
+            apply_causal_conv=cfg.apply_conv_in_causal_attn,
+            causal_conv_width=cfg.causal_conv_width,
+            causal_conv_backend=cfg.causal_conv_backend,
+            causal_conv_weight_normalization=cfg.causal_conv_weight_normalization,
             norm_num_groups=cfg.layernorm_num_groups,
             norm_affine=cfg.norm_affine,
             layernorm_eps=cfg.layernorm_eps,
@@ -584,7 +625,7 @@ class TransformerMoVABlock(nn.Module):
                 self.mova.local_kv_heads,
                 self.mova.head_dim,
                 self.mova.rope_head_dim,
-                self.nope,
+                self.apply_nope,
                 self.mova.router.weight,
                 self.mova.n_values,
                 self.mova.topk,
@@ -653,6 +694,7 @@ class TransformerMoVABlock(nn.Module):
         n_kv_heads = self.mova.n_kv_heads
         apply_attn_gate = self.mova.apply_attn_gate
         qknorm = self.mova.qknorm
+        conv_width = self.attention.q_conv.kernel_size if self.apply_causal_conv else 0
         n_values = self.mova.n_values
         n_activated_values = self.mova.topk
         expert_inter_dim = self.moe.inter_dim
@@ -660,19 +702,14 @@ class TransformerMoVABlock(nn.Module):
         n_experts = self.moe.n_experts
         n_activated_experts = self.moe.topk
 
-        # MHA
-        attn_params = model_dim * (n_heads * 2 + n_kv_heads * (nk + 1)) * head_dim
-        if attn_act_func == 'softdelta':
-            attn_params += model_dim * n_heads
-        if apply_attn_gate:
-            attn_params += model_dim * n_heads * head_dim
-        attn_params += num_params_in_residual(self.residual_func, model_dim, self.residual_heads, n_heads * head_dim)
         # Norm
         norm_params = model_dim * (2 if self.apply_rmsnorm else 4)
         if qknorm:
             norm_params += (n_heads + n_kv_heads * nk) * head_dim
 
-        activated_params = norm_params
+        # conv params
+        conv_params = conv_width * (n_heads * head_dim + 2 * n_kv_heads * head_dim)
+        activated_params = norm_params + conv_params
         total_params = activated_params
         # MoVA
         mova_qko_params = model_dim * (n_heads * 2 + n_kv_heads * nk) * head_dim
@@ -705,6 +742,11 @@ class TransformerMoVABlock(nn.Module):
         head_dim = self.mova.head_dim
         n_heads = self.mova.n_heads
         n_kv_heads = self.mova.n_kv_heads
+        qknorm = self.attention.qknorm
+        conv_width = self.attention.q_conv.kernel_size if self.apply_causal_conv else 0
+
+        qdim = n_heads * head_dim
+        kdim = vdim = n_kv_heads * head_dim
 
         _, tflops_per_token = self.num_parameters()
         if attn_act_func == 'softmax':
@@ -715,6 +757,11 @@ class TransformerMoVABlock(nn.Module):
         else:
             raise ValueError(f"Unknown attention activation function: {attn_act_func}")
 
+        # norm flops
+        norm_flops = model_dim * 2 + ((qdim + kdim) if qknorm else 0)
+        # conv flops
+        conv_flops = conv_width * (qdim + kdim + vdim) * 2
+        tflops_per_token += norm_flops + conv_flops
         # residual
         # TODO
         res_flops = 0.0

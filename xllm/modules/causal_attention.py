@@ -147,12 +147,8 @@ class CausalSoftmaxAttention(nn.Module):
             else:
                 q_segment_idx, k_segment_idx = None, None
 
-            if slen == 1 and cache is not None:
-                use_causal_mask = False
-            else:
-                use_causal_mask = True
             output = swift_efficient_attention(
-                xq, xk, xv, q_segment_idx, k_segment_idx, self.scale, self.dropout, use_causal_mask, self.training
+                xq, xk, xv, q_segment_idx, k_segment_idx, self.scale, self.dropout, True, self.training
             )
         elif self.backend == 'xattn':
             if segments is not None:
