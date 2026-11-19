@@ -108,7 +108,7 @@ class HybridGekko(XLLModel):
             bos_mask = get_bos_mask(tokens, self.eos_id, use_eos=True)
             segments = Transformer.get_segment_arg(
                 bos_mask, self.causal_attn_backend, self.context_parallel_rank, self.context_parallel_size
-            )
+            ) if self.causal_attn_backend == 'flash' else None  # flash attention
             segment_idx = get_segment_idx_from_bos_mask(bos_mask)
             prev_segment_count = None
         else:
@@ -155,6 +155,9 @@ class HybridGekko(XLLModel):
                 if prev_bos_mask is not None:
                     bos_mask = torch.cat([prev_bos_mask, bos_mask], dim=1)
                     segment_idx = torch.cat([prev_segment_idx, segment_idx + prev_segment_idx[:, -1:]], dim=1)
+
+        if segment_idx is not None and segments is None:
+            segments = self.get_segment_arg(segment_idx, seq_len, self.causal_attn_backend)
 
         # embeddings
         emb = self.embed(tokens)
@@ -215,6 +218,30 @@ class HybridGekko(XLLModel):
 
     def support_multi_segments_with_cache(self) -> bool:
         return self.causal_attn_backend == 'xattn'
+
+    @staticmethod
+    def get_segment_arg(segment_idx, query_length, causal_attn_backend):
+        bsz, seq_len = segment_idx.shape
+        qstart = seq_len - query_length
+
+        if causal_attn_backend == 'swift':
+            q_segment_idx = segment_idx[:, qstart:]
+            k_segment_idx = segment_idx
+            return q_segment_idx, k_segment_idx
+        elif causal_attn_backend == 'xattn':
+            # B x 1
+            last_qidx = segment_idx[:, qstart:(qstart + 1)]
+            total_seqlen_k = torch.sum(segment_idx >= last_qidx, dim=1).max().item()
+            return segment_idx, total_seqlen_k
+        else:
+            assert causal_attn_backend is None
+            # B x L1
+            q_segment_idx = segment_idx[:, qstart:]
+            # B x L2
+            k_segment_idx = segment_idx
+            # B x L1 x L2
+            seg_mask = torch.ne(q_segment_idx.unsqueeze(2), k_segment_idx.unsqueeze(1))
+            return seg_mask
 
 
 # register some models configurations
