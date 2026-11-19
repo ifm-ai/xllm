@@ -102,7 +102,6 @@ class CausalSoftmaxAttention(nn.Module):
         _record_query_key_stats(self.layer_id, xq, xk)
 
         if cache is not None:
-            assert segments is None
             cache_k, cache_v, cache_len = cache
             xk = torch.cat([cache_k, xk], dim=1) if cache_k is not None else xk
             xv = torch.cat([cache_v, xv], dim=1) if cache_v is not None else xv
