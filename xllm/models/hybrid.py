@@ -217,7 +217,7 @@ class HybridGekko(XLLModel):
         return logits_or_loss, aux_loss_sum, cache
 
     def support_multi_segments_with_cache(self) -> bool:
-        return self.causal_attn_backend == 'xattn'
+        return self.causal_attn_backend != 'flash'
 
     @staticmethod
     def get_segment_arg(segment_idx, query_length, causal_attn_backend):
