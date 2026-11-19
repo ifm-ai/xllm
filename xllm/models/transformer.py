@@ -60,7 +60,7 @@ class TransformerBlock(nn.Module):
         self.recompute_fc3_out = cfg.recompute_fc3_out
         self.dropout = cfg.dropout
         self.apply_nope = cfg.apply_nope_in_causal_attn
-        self.apply_causal_conv = cfg.apply_nope_in_causal_attn
+        self.apply_causal_conv = cfg.apply_conv_in_causal_attn
         self.apply_rmsnorm = cfg.apply_rmsnorm
         self.layernorm_eps = cfg.layernorm_eps
         self.rmsnorm_eps = cfg.rmsnorm_eps
@@ -272,7 +272,7 @@ class TransformerMoEBlock(nn.Module):
         self.recompute_router = cfg.recompute_router
         self.dropout = cfg.dropout
         self.apply_nope = cfg.apply_nope_in_causal_attn
-        self.apply_causal_conv = cfg.apply_nope_in_causal_attn
+        self.apply_causal_conv = cfg.apply_conv_in_causal_attn
         self.apply_rmsnorm = cfg.apply_rmsnorm
         self.layernorm_eps = cfg.layernorm_eps
         self.rmsnorm_eps = cfg.rmsnorm_eps
@@ -517,7 +517,7 @@ class TransformerMoVABlock(nn.Module):
         self.recompute_router = cfg.recompute_router
         self.dropout = cfg.dropout
         self.apply_nope = cfg.apply_nope_in_causal_attn
-        self.apply_causal_conv = cfg.apply_nope_in_causal_attn
+        self.apply_causal_conv = cfg.apply_conv_in_causal_attn
         self.apply_rmsnorm = cfg.apply_rmsnorm
         self.layernorm_eps = cfg.layernorm_eps
         self.rmsnorm_eps = cfg.rmsnorm_eps
