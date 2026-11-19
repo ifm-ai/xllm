@@ -175,7 +175,7 @@ def mova_fwd(
     health_collector = get_active_health_collector()
     if health_collector is not None and layer_id is not None:
         # Local post-qk-norm, post-RoPE heads, before K is gathered across context ranks.
-        health_collector.record_query_key_stats(layer_id, xq_, local_xk)
+        health_collector.record_query_key_stats(layer_id, xq_, local_xk, gate=g)
 
     if handle_xk is not None:
         handle_xk.wait()

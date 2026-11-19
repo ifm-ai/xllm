@@ -1,4 +1,5 @@
 import pytest
+import torch
 import torch.nn.functional as F
 
 import xllm.models.fused_blocks.mha as mha
@@ -67,3 +68,21 @@ def test_fused_dense_block_logs_what_the_unfused_block_logs(fused_attention_call
 
     assert len(fused_attention_calls) == num_layers  # every layer went through the fused attention
     assert metrics == pytest.approx(expected, rel=1e-4, abs=1e-5)
+
+
+def test_fused_softdelta_block_logs_the_unfused_query_key_and_gate(fused_attention_calls, monkeypatch):
+    # The Q/K and gate hooks run before attention, so a zero attention output is enough for one layer.
+    calls = []
+    monkeypatch.setattr(mha, "softdelta_attn_fwd", lambda xq, *args, **kwargs: (
+        calls.append(xq.shape), torch.zeros_like(xq), None, None, None, None)[1:])
+    unfused = tiny_transformer(1, attn_act_func="softdelta")
+    fused = tiny_transformer(1, attn_act_func="softdelta", fused_block=True, causal_attn_backend="flash")
+    fused.load_state_dict(unfused.state_dict())
+    expected = logged_metrics(unfused, TOKENS, TARGETS, MASK, **FLAGS)
+
+    metrics = logged_metrics(fused, TOKENS, TARGETS, MASK, train=True, **FLAGS)
+
+    assert len(calls) == 1  # the layer went through the fused softdelta attention
+    for family in ("q_stats/", "k_stats/", "softdelta_gate_stats/"):
+        logged = {name: value for name, value in metrics.items() if name.startswith(family)}
+        assert logged and logged == pytest.approx({name: expected[name] for name in expected if name.startswith(family)}, rel=1e-4)

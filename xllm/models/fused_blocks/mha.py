@@ -71,10 +71,6 @@ def multihead_attention_fwd(
     xq_ = rmsnorm_fwd(xq, q_norm_w, local_heads, eps)[0] if q_norm_w is not None else xq
     xq_ = rearrange(xq_, 'b l (h s) -> b l h s', h=local_heads)
     xq_ = apply_rope(xq_, freqs_cis, head_dim, rope_head_dim, False)
-    health_collector = get_active_health_collector()
-    if health_collector is not None and layer_id is not None:
-        # Local post-qk-norm, post-RoPE heads, before K is gathered across context ranks.
-        health_collector.record_query_key_stats(layer_id, xq_, local_xk)
 
     if wr is not None:
         rg = rearrange(F.linear(mx, wr, None), 'b l (h s) -> b l h s', h=local_heads)
@@ -88,6 +84,11 @@ def multihead_attention_fwd(
         g = rg[:, :, :, -1] if attn_act_func == 'softdelta' else None
     else:
         r = g = None
+
+    health_collector = get_active_health_collector()
+    if health_collector is not None and layer_id is not None:
+        # Local post-qk-norm, post-RoPE heads, before K is gathered across context ranks.
+        health_collector.record_query_key_stats(layer_id, xq_, local_xk, gate=g)
 
     if handle_xv is not None:
         handle_xv.wait()
