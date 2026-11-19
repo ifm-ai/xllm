@@ -15,9 +15,33 @@ from xllm.data.dataset_streamer.tokenizer import Tokenizer
 from xllm.distributed import (
     get_context_parallel_world_size,
     get_data_parallel_world_size,
+    get_expert_outer_group,
+    get_expert_outer_world_size,
     get_model_parallel_group,
     get_model_parallel_world_size,
 )
+from xllm.modules.moe.expert import routed_expert_parameters
+
+
+def _grads_norm(grads: List[torch.Tensor], norm_type: float) -> torch.Tensor:
+    """Norm of gradients on one FSDP mesh, over the GPUs of its shard groups (each replica counted once)."""
+    if len(grads) == 0:
+        return torch.zeros((), device=torch.cuda.current_device())
+    total_norm = get_total_norm(grads, norm_type, False, None)
+    if isinstance(total_norm, DTensor):
+        total_norm = total_norm.full_tensor()
+    return total_norm
+
+
+def _all_reduce_norm(total_norm: torch.Tensor, norm_type: float, group: dist.ProcessGroup) -> torch.Tensor:
+    """Norm of the gradients of all GPUs of a group, from the norm of each GPU's."""
+    if norm_type == math.inf:
+        dist.all_reduce(total_norm, op=dist.ReduceOp.MAX, group=group)
+    else:
+        total_norm = total_norm ** norm_type
+        dist.all_reduce(total_norm, group=group)
+        total_norm = total_norm ** (1.0 / norm_type)
+    return total_norm
 
 
 class XLLModel(nn.Module):
@@ -119,22 +143,31 @@ class XLLModel(nn.Module):
         if len(grads) == 0:
             return 0.
 
-        total_norm = get_total_norm(grads, norm_type, False, None)
-        if isinstance(total_norm, DTensor):
-            total_norm = total_norm.full_tensor()
+        if get_expert_outer_world_size() == 1:
+            # the routed experts are on the model's mesh, split over TP as the rest of the model
+            total_norm = _grads_norm(grads, norm_type)
+            parameter_groups = [parameters]
+        else:
+            # The routed experts are on their own mesh, and DTensor ops do not mix meshes. The experts at a TP
+            # rank are split over the E_out replicas of an expert group: add these up, then the rest of the
+            # model's, then add both up over TP below.
+            expert_ids = {id(p) for p in routed_expert_parameters(self)}
+            parameter_groups = [
+                [p for p in parameters if id(p) not in expert_ids],
+                [p for p in parameters if id(p) in expert_ids],
+            ]
+            dense_norm, expert_norm = (
+                _grads_norm([p.grad for p in group if p.grad is not None], norm_type) for group in parameter_groups
+            )
+            expert_norm = _all_reduce_norm(expert_norm, norm_type, get_expert_outer_group())
+            total_norm = torch.linalg.vector_norm(torch.stack([dense_norm, expert_norm]), norm_type)
 
-        model_parallel_world_size = get_model_parallel_world_size()
         # Reconstruct the total gradient norm depending on the norm type
-        if model_parallel_world_size > 1:
-            model_parallel_process_group = get_model_parallel_group()
-            if norm_type == math.inf:
-                dist.all_reduce(total_norm, op=dist.ReduceOp.MAX, group=model_parallel_process_group)
-            else:
-                total_norm = total_norm ** norm_type
-                dist.all_reduce(total_norm, group=model_parallel_process_group)
-                total_norm = total_norm ** (1.0 / norm_type)
+        if get_model_parallel_world_size() > 1:
+            total_norm = _all_reduce_norm(total_norm, norm_type, get_model_parallel_group())
 
-        clip_grads_with_norm_(parameters, max_norm, total_norm, None)
+        for group in parameter_groups:
+            clip_grads_with_norm_(group, max_norm, total_norm, None)
         total_norm_cpu = total_norm.item()
         return total_norm_cpu
 

@@ -4,7 +4,7 @@ import logging
 import datetime
 import torch
 
-from .utils import ensure_divisibility
+from .utils import ensure_divisibility, divide_and_check_no_remainder
 
 logger = logging.getLogger()
 
@@ -26,6 +26,10 @@ _PREV_CHUNK_RANK: Optional[int] = None
 # HSDP group for checkpoint saving and loading.
 _HYBRID_SHARD_DATA_PARALLEL_WORLD_SIZE: Optional[int] = None
 _HYBRID_SHARD_DATA_PARALLEL_GROUP: Optional[torch.distributed.ProcessGroup] = None
+# Expert outer group (the GPUs at the same TP rank in one expert group) that the current rank belongs to.
+_EXPERT_OUTER_GROUP: Optional[torch.distributed.ProcessGroup] = None
+_EXPERT_OUTER_RANK: Optional[int] = None
+_EXPERT_OUTER_WORLD_SIZE: Optional[int] = None
 
 
 def initialize_model_parallel(
@@ -34,7 +38,8 @@ def initialize_model_parallel(
     timeout: int,
     model_parallel_backend: Optional[str] = None,
     context_parallel_backend: Optional[str] = None,
-    ddp_backend: Optional[str] = None
+    ddp_backend: Optional[str] = None,
+    expert_parallel_size: Optional[int] = None
 ) -> None:
     """
     Initialize GPU parallel groups.
@@ -46,6 +51,8 @@ def initialize_model_parallel(
         model_parallel_backend: model parallel backend,
         context_parallel_backend: context parallel backend,
         ddp_backend: data parallel backend
+        expert_parallel_size: number of GPUs used to split the routed experts,
+            a multiple of model_parallel_size (None: same as model_parallel_size).
 
     """
     # Get world size and rank. Ensure some consistencies.
@@ -56,6 +63,11 @@ def initialize_model_parallel(
     rank = torch.distributed.get_rank()
 
     data_parallel_size = int(world_size / (model_parallel_size * context_parallel_size))
+    if expert_parallel_size is None:
+        expert_parallel_size = model_parallel_size
+    # EP = TP x E_out: E_out consecutive data parallel replicas form an expert group
+    expert_outer_size = divide_and_check_no_remainder(expert_parallel_size, model_parallel_size)
+    ensure_divisibility(data_parallel_size, expert_outer_size)
     device = torch.device(torch.cuda.current_device())
     timeout = datetime.timedelta(seconds=timeout)
 
@@ -63,6 +75,7 @@ def initialize_model_parallel(
         logger.info("> initializing data    parallel with size {}".format(data_parallel_size))
         logger.info("> initializing context parallel with size {}".format(context_parallel_size))
         logger.info("> initializing model   parallel with size {}".format(model_parallel_size))
+        logger.info("> initializing expert  parallel with size {}".format(expert_parallel_size))
 
     groups = torch.LongTensor(range(world_size)).reshape(data_parallel_size, context_parallel_size, model_parallel_size)
 
@@ -119,6 +132,33 @@ def initialize_model_parallel(
         group = torch.distributed.new_group(ranks, timeout=timeout, backend=ddp_backend, device_id=device)
         if k == found[2]:
             _HYBRID_SHARD_DATA_PARALLEL_GROUP = group
+
+    # Build the expert groups. The GPU at TP rank k in replica o of its expert group owns the experts
+    # [k * N / TP + o * N / EP, k * N / TP + (o + 1) * N / EP). With CP, each CP rank has its own expert groups.
+    # The TP x E_out GPUs of an expert group need no group of their own: the dispatch goes over the outer
+    # group, then the model parallel group. Neither do the GPUs owning the same experts: their FSDP mesh
+    # (get_expert_device_mesh) has its own shard and replicate groups.
+    global _EXPERT_OUTER_GROUP
+    if expert_outer_size == 1:
+        # Every replica is an expert group: the experts are split as the model is.
+        _EXPERT_OUTER_GROUP = None
+    else:
+        # expert group x replica in expert group x CP x TP
+        groups = torch.LongTensor(range(world_size)).reshape(
+            -1, expert_outer_size, context_parallel_size, model_parallel_size
+        )
+        found = torch.where(groups == rank)
+        assert all(len(x) == 1 for x in found)
+        found = [x.item() for x in found]
+        for g in range(groups.size(0)):
+            for j in range(context_parallel_size):
+                for k in range(model_parallel_size):
+                    ranks = groups[g, :, j, k].tolist()
+                    group = torch.distributed.new_group(
+                        ranks, timeout=timeout, backend=model_parallel_backend, device_id=device
+                    )
+                    if g == found[0] and j == found[2] and k == found[3]:
+                        _EXPERT_OUTER_GROUP = group
 
 
 def model_parallel_is_initialized() -> bool:
@@ -220,6 +260,29 @@ def get_hybrid_shard_data_parallel_world_size() -> int:
     return _HYBRID_SHARD_DATA_PARALLEL_WORLD_SIZE
 
 
+def get_expert_outer_group() -> torch.distributed.ProcessGroup:
+    """Get the expert outer group the caller rank belongs to."""
+    return _EXPERT_OUTER_GROUP
+
+
+def get_expert_outer_world_size() -> int:
+    """Return world size for the expert outer group (E_out = EP / TP)."""
+    global _EXPERT_OUTER_WORLD_SIZE
+    if _EXPERT_OUTER_WORLD_SIZE is None:
+        group = get_expert_outer_group()
+        _EXPERT_OUTER_WORLD_SIZE = 1 if group is None else torch.distributed.get_world_size(group=group)
+    return _EXPERT_OUTER_WORLD_SIZE
+
+
+def get_expert_outer_rank() -> int:
+    """Return my rank for the expert outer group (the position of my replica in its expert group)."""
+    global _EXPERT_OUTER_RANK
+    if _EXPERT_OUTER_RANK is None:
+        group = get_expert_outer_group()
+        _EXPERT_OUTER_RANK = 0 if group is None else torch.distributed.get_rank(group=group)
+    return _EXPERT_OUTER_RANK
+
+
 def get_parallel_region(parallel_region: str) -> Tuple[int, int, torch.distributed.ProcessGroup]:
     if parallel_region == 'data':
         rank = get_data_parallel_rank()
@@ -272,3 +335,10 @@ def destroy_model_parallel() -> None:
 
     global _HYBRID_SHARD_DATA_PARALLEL_GROUP
     _HYBRID_SHARD_DATA_PARALLEL_GROUP = None
+
+    global _EXPERT_OUTER_GROUP
+    _EXPERT_OUTER_GROUP = None
+    global _EXPERT_OUTER_WORLD_SIZE
+    _EXPERT_OUTER_WORLD_SIZE = None
+    global _EXPERT_OUTER_RANK
+    _EXPERT_OUTER_RANK = None

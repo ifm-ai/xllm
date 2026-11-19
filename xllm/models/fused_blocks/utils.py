@@ -24,7 +24,8 @@ from xllm.modules.fused_ops import (
     sliding_chunk_softmax_attention_fwd as sca_fwd,
     sliding_chunk_softmax_attention_bwd as sca_bwd,
     multi_group_matmul_fwd,
-    multi_group_matmul_bwd,
+    multi_group_matmul_dgrad,
+    multi_group_matmul_wgrad,
 )
 from xllm.modules.moe.permute import (
     fused_y_perm_fwd,
@@ -913,8 +914,10 @@ def grouped_experts_fwd(
     backend: str,
     memory_efficient: bool,
     dropout: float,
-    hidden_rng_state: Optional[Tensor] = None
-) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Optional[Tensor]]:
+    hidden_rng_state: Optional[Tensor] = None,
+    with_output: bool = True,
+) -> Tuple[Optional[Tensor], Tensor, Tensor, Tensor, Tensor, Optional[Tensor]]:
+    # with_output=False stops before the last matmul, for a backward recompute that needs only the activations
     h1 = multi_group_matmul_fwd(x, w1, group_sizes, True, backend)
     h3 = multi_group_matmul_fwd(x, w3, group_sizes, True, backend)
     h1s = F.silu(h1)
@@ -924,8 +927,38 @@ def grouped_experts_fwd(
     else:
         hidden = h1s * h3
     hidden, hidden_rng_state_or_noise = memory_efficient_dropout_fwd(hidden, dropout, True, hidden_rng_state)
-    out = multi_group_matmul_fwd(hidden, w2, group_sizes, True, backend)
+    out = multi_group_matmul_fwd(hidden, w2, group_sizes, True, backend) if with_output else None
     return out, h1, h1s, h3, hidden, hidden_rng_state_or_noise
+
+
+def row_dots(a: Tensor, b: Tensor, chunk_rows: int = 16384) -> Tensor:
+    # fp32 row sums of a * b, in row chunks so the fp32 temporaries stay small
+    out = torch.empty(a.shape[0], dtype=torch.float32, device=a.device)
+    for start in range(0, a.shape[0], chunk_rows):
+        end = start + chunk_rows
+        out[start:end] = (a[start:end].float() * b[start:end].float()).sum(dim=-1)
+    return out
+
+
+class DeferredExpertWgrad:
+    """
+    The expert weight gradients of grouped_experts_bwd(..., defer_wgrad=True): calling it once returns
+    (w1_grad, w2_grad, w3_grad), equal to those of defer_wgrad=False. It keeps the matmul inputs
+    (y_grad, x, hidden and two gradient buffers), which must not be changed before the call; it drops
+    them after it.
+    """
+
+    def __init__(self, y_grad, x, hidden, h1_grad, h3_grad, w1, w2, w3, group_sizes: List[int], backend: str):
+        self._inputs = (y_grad, x, hidden, h1_grad, h3_grad, w1, w2, w3, group_sizes, backend)
+
+    def __call__(self) -> Tuple[Tensor, Tensor, Tensor]:
+        assert self._inputs is not None, "the expert weight gradients were already computed"
+        y_grad, x, hidden, h1_grad, h3_grad, w1, w2, w3, group_sizes, backend = self._inputs
+        self._inputs = None
+        w2_grad = multi_group_matmul_wgrad(y_grad, w2, hidden, group_sizes, True, backend)
+        w1_grad = multi_group_matmul_wgrad(h1_grad, w1, x, group_sizes, True, backend)
+        w3_grad = multi_group_matmul_wgrad(h3_grad, w3, x, group_sizes, True, backend)
+        return w1_grad, w2_grad, w3_grad
 
 
 def grouped_experts_bwd(
@@ -943,19 +976,33 @@ def grouped_experts_bwd(
     memory_efficient: bool,
     dropout: float,
     hidden_rng_state: Optional[Tensor],
-    hidden_noise: Optional[Tensor]
-) -> Tuple[Tensor, Tensor, Tensor, Optional[Tensor]]:
-    h_grad, w2_grad = multi_group_matmul_bwd(y_grad, w2, hidden, group_sizes, True, backend)
+    hidden_noise: Optional[Tensor],
+    with_output_dots: bool = False,
+    defer_wgrad: bool = False,
+) -> Tuple[Any, ...]:
+    # defer_wgrad=True returns (x_grad, DeferredExpertWgrad[, output_dots]) instead of
+    # (x_grad, w1_grad, w2_grad, w3_grad[, output_dots]): the weight gradients are computed when it is called
+    h_grad = multi_group_matmul_dgrad(y_grad, w2, group_sizes, True, backend)
+    w2_grad = None if defer_wgrad else multi_group_matmul_wgrad(y_grad, w2, hidden, group_sizes, True, backend)
+    # per row, <y_grad, out> = <y_grad @ w2, hidden> = <h_grad, hidden>; taken before h_grad is reused in place
+    output_dots = row_dots(h_grad, hidden) if with_output_dots else None
     h_grad = memory_efficient_dropout_bwd(h_grad, dropout, hidden_rng_state, hidden_noise)
     # x_grad from h1
     h1s_grad = torch.mul(h_grad, h3, out=h3) if memory_efficient else h_grad * h3
     h1_grad = torch.ops.aten.silu_backward(h1s_grad, h1)
-    x_grad, w1_grad = multi_group_matmul_bwd(h1_grad, w1, x, group_sizes, True, backend)
+    x_grad = multi_group_matmul_dgrad(h1_grad, w1, group_sizes, True, backend)
+    w1_grad = None if defer_wgrad else multi_group_matmul_wgrad(h1_grad, w1, x, group_sizes, True, backend)
     # x_grad from h3
     h3_grad = torch.mul(h_grad, h1s, out=h_grad)
-    x_grad_h3, w3_grad = multi_group_matmul_bwd(h3_grad, w3, x, group_sizes, True, backend)
+    x_grad_h3 = multi_group_matmul_dgrad(h3_grad, w3, group_sizes, True, backend)
+    w3_grad = None if defer_wgrad else multi_group_matmul_wgrad(h3_grad, w3, x, group_sizes, True, backend)
 
     x_grad = torch.add(x_grad, x_grad_h3, out=x_grad)
+    if defer_wgrad:
+        wgrad = DeferredExpertWgrad(y_grad, x, hidden, h1_grad, h3_grad, w1, w2, w3, group_sizes, backend)
+        return (x_grad, wgrad, output_dots) if with_output_dots else (x_grad, wgrad)
+    if with_output_dots:
+        return x_grad, w1_grad, w2_grad, w3_grad, output_dots
     return x_grad, w1_grad, w2_grad, w3_grad
 
 

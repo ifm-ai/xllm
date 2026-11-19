@@ -9,7 +9,6 @@ def _sequential_multi_group_matmul(inp1, inp2, inp3, group_sizes: List[int], tra
     assert len(group_sizes) == n_bsz
 
     out = torch.empty(bsz, d_out, dtype=inp1.dtype, device=inp1.device)
-    out2 = None if inp3 is None else torch.zeros_like(inp2)
     start = 0
     for i in range(n_bsz):
         if group_sizes[i] == 0:
@@ -19,9 +18,27 @@ def _sequential_multi_group_matmul(inp1, inp2, inp3, group_sizes: List[int], tra
         mat1 = inp1[start:end]
         mat2 = inp2[i].t() if transpose else inp2[i]
         torch.mm(mat1, mat2, out=out[start:end])
-        if out2 is not None:
-            mat3 = inp3[start:end]
-            torch.mm(mat3.t(), mat1, out=out2[i]) if transpose else torch.mm(mat1.t(), mat3, out=out2[i])
         start = end
 
+    out2 = None if inp3 is None else _sequential_multi_group_matmul_wgrad(inp1, inp2, inp3, group_sizes, transpose)
     return out, out2
+
+
+def _sequential_multi_group_matmul_wgrad(inp1, inp2, inp3, group_sizes: List[int], transpose: bool):
+    # the second output of _sequential_multi_group_matmul (inp3 given), one matmul per non-empty group
+    n_bsz = inp2.shape[0]
+    assert len(group_sizes) == n_bsz
+
+    out2 = torch.zeros_like(inp2)
+    start = 0
+    for i in range(n_bsz):
+        if group_sizes[i] == 0:
+            continue
+
+        end = start + group_sizes[i]
+        mat1 = inp1[start:end]
+        mat3 = inp3[start:end]
+        torch.mm(mat3.t(), mat1, out=out2[i]) if transpose else torch.mm(mat1.t(), mat3, out=out2[i])
+        start = end
+
+    return out2

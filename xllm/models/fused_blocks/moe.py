@@ -1,4 +1,5 @@
 from functools import partial
+from typing import Optional
 import torch
 from torch.nn import functional as F
 from einops import rearrange
@@ -13,36 +14,80 @@ from xllm.modules.fused_ops import (
     memory_efficient_dropout_bwd,
 )
 from xllm.modules.moe.router import calc_probs
+from xllm.modules.moe.dedup import masked_gather_sum
+from xllm.modules.moe.dispatch import moe_overlap, NodeDispatcher
 from .utils import (
-    fused_permute_y_fwd,
-    fused_permute_y_bwd_y_grad,
-    fused_permute_y_bwd_scores_grad,
     grouped_experts_fwd,
     grouped_experts_bwd,
 )
 from .distributed import (
     all_gather,
     all_reduce,
-    all_to_all,
 )
+
+
+class PrefetchSlot:
+    """A fused MoE layer's part in the backward prefetch of the dispatch (moe_prefetch_dispatch, EP > TP).
+
+    The backward of a MoE layer sends the layer input to the expert group's replicas again. That first hop needs
+    only the input and the routing, known since forward: the backward of the MoE layer after it, which runs just
+    before, starts it once its own MoE part is done, so the hop runs under that layer's attention backward instead
+    of at the start of this one. The layer's forward fills its slot (fill: the input rows, kept until then, and
+    the routing), the next layer's backward starts the hop (start_previous) and this layer's backward takes it
+    (take). The slots link the layers of one forward pass (DispatchPrefetch); the autograd nodes hold them, so
+    nothing outlives the graph. Every rank runs the layers in the same order and fills the same slots, so the
+    ranks of the expert outer group start the same hops in the same order.
+    """
+
+    def __init__(self, previous: Optional['PrefetchSlot']):
+        # the slot of the MoE layer before this one in forward: its backward comes right after this one's
+        self.previous = previous
+        self._inputs = None
+        self._started = None
+
+    def fill(self, dispatcher, routing_indices, state, x):
+        self._inputs = (dispatcher, routing_indices, state, x)
+
+    def start_previous(self):
+        """Start the first hop of the previous layer's backward dispatch, if it has one."""
+        previous, self.previous = self.previous, None
+        if previous is not None and previous._inputs is not None:
+            dispatcher, routing_indices, state, x = previous._inputs
+            previous._inputs = None
+            outer = dispatcher.replan_outer(routing_indices, state)
+            previous._started = (outer, dispatcher.start_dispatch(x, outer))
+
+    def take(self):
+        """(plan.outer, the started first hop) for moe_bwd, or None if it was not started."""
+        started, self._started, self._inputs = self._started, None, None
+        return started
+
+
+class DispatchPrefetch:
+    """The PrefetchSlots of one forward pass, one per fused MoE layer, in order."""
+
+    def __init__(self):
+        self._last = None
+
+    def slot(self) -> PrefetchSlot:
+        self._last = PrefetchSlot(self._last)
+        return self._last
 
 
 def moe_fwd(
     xf, router_w, router_bias, routing_score_func, routing_scaling_factor, router_load_balancing_type,
-    fc1_w, fc2_w, fc3_w, n_experts, n_local_experts, expert_start_idx, expert_end_idx, topk,
+    fc1_w, fc2_w, fc3_w, n_experts, dispatcher, topk,
     expert_w1, expert_w2, expert_w3, expert_backend, moe_permutation_backend,
-    hidden_dropout, recompute_fc1_out, recompute_fc3_out,
+    hidden_dropout, recompute_fc1_out, recompute_fc3_out, keep_dispatched=False, prefetch=None,
 ):
+    """keep_dispatched: also return the dispatched input (n x D, this rank's tokens) for moe_bwd, which then does
+    not send it again; otherwise None. prefetch: this layer's PrefetchSlot, filled at EP > TP unless
+    keep_dispatched."""
     bsz, seq_len, _ = xf.size()
     # Router logits
     # B x L x N
     routing_logits = F.linear(xf, router_w).to(torch.float32)
     routing_logits, handle_router = all_reduce(routing_logits, parallel_region='model', async_op=True)
-
-    if fc1_w is not None:
-        h1, handle_h1 = all_reduce(F.linear(xf, fc1_w), parallel_region='model', async_op=True)
-    else:
-        h1, handle_h1 = None, None
 
     # Router indices
     if routing_score_func == 'softmax':
@@ -68,8 +113,6 @@ def moe_fwd(
     routing_indices_flat = routing_indices.flatten()
     # N
     tokens_per_expert = torch.bincount(routing_indices_flat, minlength=n_experts)
-    sorted_indices = torch.argsort(routing_indices_flat, stable=True)
-    permute_indices = sorted_indices // topk
 
     if router_load_balancing_type is None:
         aux_loss = None
@@ -87,19 +130,52 @@ def moe_fwd(
 
     rank = get_model_parallel_rank()
     world_size = get_model_parallel_world_size()
-    group_sizes = tokens_per_expert[expert_start_idx:expert_end_idx].tolist()
-    input_splits = tokens_per_expert.view(-1, n_local_experts).sum(dim=1).tolist()
-    curr_bsz = input_splits[rank]
-    output_splits = [curr_bsz for _ in range(world_size)]
+    n_local_experts = dispatcher.n_local
+    plan = dispatcher.plan(routing_indices_flat, tokens_per_expert, topk_scores)
+    group_sizes = plan.group_sizes
 
-    # B*L*K x D/TP
-    permuted_x = torch.index_select(xf.view(bsz * seq_len, -1), 0, permute_indices)
-    xp, handle_xp = all_to_all(permuted_x, input_splits, output_splits, parallel_region='model', async_op=True)
+    # each token's slice goes once to every rank holding one of its experts
+    overlap = moe_overlap()
+    xu = dispatcher.dispatch(xf.view(bsz * seq_len, -1), plan, overlap)
+
+    # the shared expert's input GEMMs run under the dispatch
+    if fc1_w is not None:
+        h1, handle_h1 = all_reduce(F.linear(xf, fc1_w), parallel_region='model', async_op=True)
+    else:
+        h1, handle_h1 = None, None
 
     if fc3_w is not None:
         h3, handle_h3 = all_reduce(F.linear(xf, fc3_w), parallel_region='model', async_op=True)
     else:
         h3, handle_h3 = None, None
+
+    # B' x D: local tokens, rebuilt
+    xu = xu.wait()
+    dispatched = xu if keep_dispatched else None
+    if prefetch is not None and not keep_dispatched and isinstance(dispatcher, NodeDispatcher):
+        # T x D/TP: kept until the backward of the next MoE layer starts this one's first hop
+        prefetch.fill(dispatcher, routing_indices_flat, plan.state, xf.view(bsz * seq_len, -1))
+    # the routing scores of the tokens this TP group computes
+    scores = dispatcher.local_scores(topk_scores, plan)
+    if plan.n_pairs > 0:
+        ew1 = rearrange(expert_w1, '(n s) d -> n s d', n=n_local_experts)
+        ew2 = rearrange(expert_w2, '(n s) d -> n s d', n=n_local_experts)
+        ew3 = rearrange(expert_w3, '(n s) d -> n s d', n=n_local_experts)
+        # P x D: one row per local (token, expert) pair, in expert order
+        xp = torch.index_select(xu, 0, plan.tp.pair_rows)
+        del xu
+        y2, _, _, _, _, expert_hidden_rng_state = grouped_experts_fwd(
+            xp, ew1, ew2, ew3, group_sizes, expert_backend,
+            memory_efficient=True, dropout=hidden_dropout,
+        )
+        # B' x D: experts' outputs scaled by their routing scores and summed per token
+        pair_scores = scores.reshape(-1)[plan.tp.pair_slots]
+        y2 = masked_gather_sum(y2, plan.tp.pair_table, pair_scores, moe_permutation_backend)
+    else:
+        y2 = xu
+        expert_hidden_rng_state = None
+
+    y2 = dispatcher.combine(y2, plan, overlap)
 
     if h1 is not None:
         if handle_h1 is not None:
@@ -107,26 +183,6 @@ def moe_fwd(
         h1s = F.silu(h1)
     else:
         h1s = None
-
-    if handle_xp is not None:
-        handle_xp.wait()
-
-    # B' x D
-    if curr_bsz > 0:
-        ew1 = rearrange(expert_w1, '(n s) d -> n s d', n=n_local_experts)
-        ew2 = rearrange(expert_w2, '(n s) d -> n s d', n=n_local_experts)
-        ew3 = rearrange(expert_w3, '(n s) d -> n s d', n=n_local_experts)
-        xp = rearrange(xp, '(w b) d -> b (w d)', w=world_size)
-        y2, _, _, _, _, expert_hidden_rng_state = grouped_experts_fwd(
-            xp, ew1, ew2, ew3, group_sizes, expert_backend,
-            memory_efficient=True, dropout=hidden_dropout,
-        )
-        y2 = rearrange(y2, 'b (w d) -> (w b) d', w=world_size)
-    else:
-        y2 = xp
-        expert_hidden_rng_state = None
-
-    y2, handle_y2 = all_to_all(y2, output_splits, input_splits, parallel_region='model', async_op=True)
 
     if h3 is not None:
         assert h1s is not None
@@ -142,30 +198,46 @@ def moe_fwd(
         assert h1 is None
         y1, shared_hidden_rng_state = None, None
 
-    if handle_y2 is not None:
-        handle_y2.wait()
-
-    # permute y2
-    y2, _ = fused_permute_y_fwd(sorted_indices, y2, topk_scores, bsz, seq_len, topk, moe_permutation_backend)
+    # B x L x D/TP: add up the parts returned by each rank
+    y2 = y2.wait().view(bsz, seq_len, -1)
 
     # combine shared expert
     out = torch.add(y1, y2, out=y2) if y1 is not None else y2
 
     return (
         out, aux_loss, (original_scores, routing_indices, org_topk_scores, tokens_per_expert), (h1, h3),
-        (group_sizes, input_splits, output_splits, curr_bsz), (expert_hidden_rng_state, shared_hidden_rng_state)
+        plan.state,
+        (expert_hidden_rng_state, shared_hidden_rng_state),
+        dispatched,
     )
 
 
 def moe_bwd(
     out_grad, aux_loss_grad, xf, xf_flat, original_scores, routing_indices, org_topk_scores, tokens_per_expert,
     router_w, router_bias, router_bias_update_rate, routing_score_func, routing_scaling_factor, router_load_balancing_type,
-    h1, h3, fc1_w, fc2_w, fc3_w, n_experts, n_local_experts, topk, expert_w1, expert_w2, expert_w3,
-    expert_backend, moe_permutation_backend, hidden_dropout, group_sizes, input_splits, output_splits, curr_bsz,
-    expert_hidden_rng_state, shared_hidden_rng_state, gather_before_norm,
+    h1, h3, fc1_w, fc2_w, fc3_w, n_experts, dispatcher, topk, expert_w1, expert_w2, expert_w3,
+    expert_backend, moe_permutation_backend, hidden_dropout, dispatch_state,
+    expert_hidden_rng_state, shared_hidden_rng_state, gather_before_norm, dispatched=None, prefetched=None,
 ):
+    """dispatched: the dispatched input that moe_fwd kept (keep_dispatched), or None to send it again.
+    prefetched: PrefetchSlot.take(), the first hop of the input's dispatch if the next layer's backward started it."""
     bsz, seq_len, _ = xf.size()
-    world_size = len(output_splits)
+    n_local_experts = dispatcher.n_local
+    # B*L*K
+    routing_indices_flat = routing_indices.flatten()
+    x_rows = xf.view(bsz * seq_len, -1)
+    grad_rows = out_grad.reshape(bsz * seq_len, -1)
+    # the layer input (unless forward kept it) and the output gradient go to the experts again. At EP > TP their
+    # first hop, to the expert group's replicas, needs only its own part of the plan: it starts first, and runs
+    # under the recompute below
+    if prefetched is not None:
+        assert dispatched is None
+        outer, xu = prefetched
+    else:
+        outer = dispatcher.replan_outer(routing_indices_flat, dispatch_state)
+        xu = dispatcher.start_dispatch(x_rows, outer) if dispatched is None else None
+    yu_grad = dispatcher.start_dispatch(grad_rows, outer)
+
     # recompute router
     if original_scores is None:
         routing_logits = F.linear(xf, router_w).to(torch.float32)
@@ -199,20 +271,17 @@ def moe_bwd(
         topk_scores = org_topk_scores
     scaled_topk_scores = (topk_scores * routing_scaling_factor if routing_scaling_factor else topk_scores).to(xf)
 
-    # B*L*K
-    sorted_indices = torch.argsort(routing_indices.flatten(), stable=True)
+    # rebuilt from the routing rather than kept from forward: cheap, and less state to save
+    plan = dispatcher.replan(routing_indices_flat, dispatch_state, outer)
+    group_sizes = plan.group_sizes
 
-    # recompute xp
-    # B*L*K x D/TP
-    permute_indices = sorted_indices // topk
-    permuted_x = torch.index_select(xf.view(bsz * seq_len, -1), 0, permute_indices)
-    xp, handle_xp = all_to_all(permuted_x, input_splits, output_splits, parallel_region='model', async_op=True)
+    # recompute xp: each token's slice goes once to every rank holding one of its experts
+    overlap = moe_overlap()
+    if dispatched is None:
+        xu = dispatcher.dispatch(x_rows, plan, overlap, started=xu)
 
-    # B*L*K x D/TP
-    y2_grad, inverse_indices = fused_permute_y_bwd_y_grad(
-        out_grad, sorted_indices, scaled_topk_scores, bsz, seq_len, topk, moe_permutation_backend
-    )
-    y2_grad, handle_y2_grad = all_to_all(y2_grad, input_splits, output_splits, parallel_region='model', async_op=True)
+    # the output gradient goes the same way, unscaled; the owner applies the routing scores
+    yu_grad = dispatcher.dispatch(grad_rows, plan, overlap, started=yu_grad)
 
     if original_scores is None:
         # Router indices
@@ -252,49 +321,76 @@ def moe_bwd(
         h_grad, fc2_w_grad, h1s = None, None, None
         handle_h, h_noise = None, None
 
-    if handle_xp is not None:
-        handle_xp.wait()
-
-    # B' x D
-    if curr_bsz > 0:
+    # B' x D: local tokens, rebuilt (or kept by forward)
+    xu = xu.wait() if dispatched is None else dispatched
+    del dispatched
+    # the routing scores of the tokens this TP group computes; EP > TP: those received in forward, kept in
+    # the plan state, which equal the recomputed ones bitwise
+    scores = dispatcher.local_scores(scaled_topk_scores, plan)
+    if plan.n_pairs > 0:
         ew1 = rearrange(expert_w1, '(n s) d -> n s d', n=n_local_experts)
         ew2 = rearrange(expert_w2, '(n s) d -> n s d', n=n_local_experts)
         ew3 = rearrange(expert_w3, '(n s) d -> n s d', n=n_local_experts)
-        xp = rearrange(xp, '(w b) d -> b (w d)', w=world_size)
-        y2, eh1, eh1s, eh3, eh, expert_hidden_noise = grouped_experts_fwd(
-            xp, ew1, ew2, ew3, group_sizes, expert_backend, False, hidden_dropout, expert_hidden_rng_state
+        # P x D: one row per local (token, expert) pair, in expert order
+        xp = torch.index_select(xu, 0, plan.tp.pair_rows)
+        del xu
+        # the expert outputs are not needed: their routing scores' gradient comes from the backward below
+        _, eh1, eh1s, eh3, eh, expert_hidden_noise = grouped_experts_fwd(
+            xp, ew1, ew2, ew3, group_sizes, expert_backend, False, hidden_dropout, expert_hidden_rng_state,
+            with_output=False,
         )
-        y2 = rearrange(y2, 'b (w d) -> (w b) d', w=world_size)
     else:
-        y2 = xp
+        xp = xu
         eh1, eh1s, eh3, eh = None, None, None, None
         ew1, ew2, ew3 = None, None, None
         expert_hidden_noise = None
 
-    y2, handle_y2 = all_to_all(y2, output_splits, input_splits, parallel_region='model', async_op=True)
-
-    if handle_y2_grad is not None:
-        handle_y2_grad.wait()
-
-    # B*L*K x D/TP
-    if curr_bsz > 0:
-        y2_grad = rearrange(y2_grad, '(w b) d -> b (w d)', w=world_size)
-        xp_grad, ew1_grad, ew2_grad, ew3_grad = grouped_experts_bwd(
+    # B' x D: output gradient of the local tokens, rebuilt
+    yu_grad = yu_grad.wait()
+    if plan.n_pairs > 0:
+        # P x D: scaled by each pair's routing score
+        pair_scores = scores.reshape(-1)[plan.tp.pairs]
+        y2_grad = torch.index_select(yu_grad, 0, plan.tp.pair_rows).mul_(pair_scores.unsqueeze(1))
+        del yu_grad
+        # the expert weight gradients are deferred: they run under the combine below
+        xp_grad, expert_wgrad, output_dots = grouped_experts_bwd(
             y2_grad, xp, ew1, ew2, ew3, eh1, eh1s, eh3, eh, group_sizes, expert_backend,
-            True, hidden_dropout, expert_hidden_rng_state, expert_hidden_noise
+            True, hidden_dropout, expert_hidden_rng_state, expert_hidden_noise, with_output_dots=True,
+            defer_wgrad=True,
         )
-        xp_grad = rearrange(xp_grad, 'b (w d) -> (w b) d', w=world_size)
+        # routing scores' gradient, <out_grad, expert output>, for the local pairs; other ranks add theirs
+        # through the logits-gradient all-reduce below. A score that underflowed to 0 would give 0 / 0; its
+        # gradient is later multiplied by that score's probability, which is 0, so the clamp only avoids NaN.
+        topk_scores_grad = torch.zeros(plan.n_tokens * topk, device=xf.device, dtype=torch.float32)
+        topk_scores_grad[plan.tp.pairs] = output_dots / pair_scores.float().clamp_min(torch.finfo(torch.float32).tiny)
+        # B' x D: summed per local token
+        xu_grad = masked_gather_sum(xp_grad, plan.tp.pair_table, None, moe_permutation_backend)
+        del xp_grad
+    else:
+        xu_grad = yu_grad
+        topk_scores_grad = torch.zeros(plan.n_tokens * topk, device=xf.device, dtype=torch.float32)
+        expert_wgrad = None
+
+    # the routing scores' gradient, back to the tokens' replica, ahead of the combine on the expert outer
+    # group; waited for where it is used
+    topk_scores_grad = dispatcher.scores_grad(topk_scores_grad.view(plan.n_tokens, topk), plan)
+    # the input gradient from the experts, back to the tokens; the expert weight gradients and the shared
+    # expert's backward run under it
+    xf_grad = dispatcher.combine(xu_grad, plan, overlap)
+    del xu_grad
+
+    if expert_wgrad is not None:
+        ew1_grad, ew2_grad, ew3_grad = expert_wgrad()
+        # the expert recompute is no longer needed
+        del expert_wgrad, y2_grad, xp, eh1, eh1s, eh3, eh, expert_hidden_noise
         ew1_grad = rearrange(ew1_grad, 'n s d -> (n s) d')
         ew2_grad = rearrange(ew2_grad, 'n s d -> (n s) d')
         ew3_grad = rearrange(ew3_grad, 'n s d -> (n s) d')
     else:
-        xp_grad = y2_grad
         # FSDP must reduce the same parameters even when this rank has no expert tokens.
         ew1_grad = torch.zeros_like(expert_w1)
         ew2_grad = torch.zeros_like(expert_w2)
         ew3_grad = torch.zeros_like(expert_w3)
-
-    xp_grad, handle_xp_grad = all_to_all(xp_grad, output_splits, input_splits, parallel_region='model', async_op=True)
 
     if fc1_w is not None:
         if handle_h is not None:
@@ -311,14 +407,7 @@ def moe_bwd(
         xf_grad_shared = None
         fc1_w_grad, fc3_w_grad = None, None
 
-    if handle_y2 is not None:
-        handle_y2.wait()
-
     # router grad
-    topk_scores_grad = fused_permute_y_bwd_scores_grad(
-        out_grad, inverse_indices, y2, bsz, seq_len, topk, moe_permutation_backend
-    )
-
     if router_load_balancing_type is None:
         assert aux_loss_grad is None
         original_scores_grad_aux = None
@@ -349,7 +438,8 @@ def moe_bwd(
     else:
         handle_bias = None
 
-    topk_scores_grad = topk_scores_grad.float()
+    # B x L x K
+    topk_scores_grad = topk_scores_grad.wait().view(bsz, seq_len, topk).float()
     if routing_scaling_factor is not None:
         topk_scores_grad = topk_scores_grad * routing_scaling_factor
 
@@ -372,12 +462,8 @@ def moe_bwd(
     routing_logits_grad, handle_logits = all_reduce(routing_logits_grad, parallel_region='model', async_op=True)
 
     # xf grad from expert
-    if handle_xp_grad is not None:
-        handle_xp_grad.wait()
-    # re-order
-    xp_grad = torch.index_select(xp_grad, 0, inverse_indices)
-    # B x L x K x D/TP -> B x L x D/TP
-    xf_grad = xp_grad.view(bsz, seq_len, topk, -1).sum(dim=2)
+    # B x L x D/TP: add up the parts returned by each rank
+    xf_grad = xf_grad.wait().view(bsz, seq_len, -1)
 
     if xf_grad_shared is not None:
         xf_grad = torch.add(xf_grad, xf_grad_shared, out=xf_grad)

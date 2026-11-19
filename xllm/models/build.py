@@ -11,8 +11,9 @@ from xllm.distributed import (
     get_data_parallel_world_size,
     get_model_parallel_group,
     get_model_parallel_world_size,
+    get_expert_outer_world_size,
 )
-from xllm.distributed.utils import get_device_mesh
+from xllm.distributed.utils import get_device_mesh, get_expert_device_mesh
 from xllm.utils import (
     get_torch_dtype,
     create_on_gpu,
@@ -129,6 +130,14 @@ def build_model_fsdp2(
     replicated_size = data_parallel_size // fully_sharded_size * context_parallel_size
 
     device_mesh = get_device_mesh(fully_sharded_size, replicated_size, get_model_parallel_world_size())
+    expert_outer_size = get_expert_outer_world_size()
+    if expert_outer_size == 1:
+        # the experts are split as the rest of the model: shard them on the same mesh
+        expert_mesh = device_mesh
+    else:
+        expert_mesh = get_expert_device_mesh(
+            fully_sharded_size, context_parallel_size, get_model_parallel_world_size(), expert_outer_size
+        )
     compute_dtype = get_torch_dtype(dtype)
     assert compute_dtype is not None, f"Unknown dtype: {dtype}"
     mixed_precision = MixedPrecisionPolicy(
@@ -141,7 +150,7 @@ def build_model_fsdp2(
     }
     model_cls = get_model_cls(model_cfg.arch)
     with create_on_gpu():
-        with enable_wrap(**fsdp_cfg):
+        with enable_wrap(expert_mesh=expert_mesh, **fsdp_cfg):
             model = model_cls(model_cfg, tokenizer)
             model = wrap(model.cuda())
             model.train()

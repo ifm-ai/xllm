@@ -147,3 +147,66 @@ def get_device_mesh(
             )["cp", "dp"]
 
     return device_mesh
+
+
+def get_expert_shard_size(fully_sharded_size: int, n_expert_groups: int) -> int:
+    """FSDP shard group size of the routed experts: the most expert groups, up to fully_sharded_size, that split
+    them evenly. Each expert group holds every expert once; the shard group splits those weights across expert
+    groups, and its blocks of consecutive expert groups hold the same shards."""
+    return max(d for d in range(1, min(fully_sharded_size, n_expert_groups) + 1) if n_expert_groups % d == 0)
+
+
+def _new_groups(ranks: List[List[int]]) -> dist.ProcessGroup:
+    """Create the groups of the lists of ranks, on every rank, as DeviceMesh does; returns this rank's group."""
+    if dist.distributed_c10d._get_default_group().bound_device_id is not None:
+        # the default group's communicator is initialized: one split for all the groups
+        return dist.split_group(split_ranks=ranks)
+    mine = None
+    for group_ranks in ranks:
+        group = dist.new_group(group_ranks)
+        if dist.get_rank() in group_ranks:
+            mine = group
+    return mine
+
+
+def get_expert_device_mesh(
+    fully_sharded_size: int,
+    context_parallel_size: int,
+    model_parallel_size: int,
+    expert_outer_size: int,
+) -> DeviceMesh:
+    """
+    FSDP mesh of the routed experts: the expert data parallel GPUs (same TP rank and same replica in
+    their expert group, one per expert group and CP rank), as (replicate, shard) like get_device_mesh.
+
+    Arguments:
+        fully_sharded_size: FSDP shard group size of the rest of the model.
+        context_parallel_size: number of CP ranks.
+        model_parallel_size: number of TP ranks.
+        expert_outer_size: E_out = EP / TP, the number of replicas in an expert group.
+
+    The experts are sharded over get_expert_shard_size(fully_sharded_size, DP / E_out) expert groups
+    (min(fully_sharded_size, DP / E_out) when it divides DP / E_out), which keeps the shard groups of
+    get_device_mesh when E_out divides DP / fully_sharded_size, and replicated over the others and the CP
+    ranks. With E_out = 1 the ranks are those of get_device_mesh.
+
+    Only the shard and the replicate groups are created, not the groups of a mesh spanning every expert
+    parallel rank: those would be the expert parallel groups, never used.
+    """
+    world_size = dist.get_world_size()
+    data_parallel_size = divide_and_check_no_remainder(world_size, context_parallel_size * model_parallel_size)
+    n_expert_groups = divide_and_check_no_remainder(data_parallel_size, expert_outer_size)
+    sharded_size = get_expert_shard_size(fully_sharded_size, n_expert_groups)
+    # ranks in order: expert group x replica in expert group x CP x TP
+    mesh = torch.arange(world_size).view(n_expert_groups, expert_outer_size, context_parallel_size, model_parallel_size)
+    # expert parallel rank (replica, TP) x replicate (expert groups in a shard block, CP) x shard
+    mesh = mesh.permute(1, 3, 0, 2).reshape(expert_outer_size * model_parallel_size, sharded_size, -1)
+    mesh = mesh.transpose(1, 2).contiguous()
+    rank = dist.get_rank()
+    shard_group = _new_groups(mesh.reshape(-1, mesh.size(2)).tolist())
+    replicate_group = _new_groups(mesh.transpose(1, 2).reshape(-1, mesh.size(1)).tolist()) if mesh.size(1) > 1 else None
+    # this GPU's (replicate, shard) mesh; the ranks of each group are ascending, as their group ranks
+    mesh = mesh[(mesh == rank).nonzero()[0, 0]].contiguous()
+    if replicate_group is None:
+        return DeviceMesh.from_group(shard_group, "cuda", mesh=mesh[0], mesh_dim_names=("dp",))
+    return DeviceMesh.from_group([replicate_group, shard_group], "cuda", mesh=mesh, mesh_dim_names=("cp", "dp"))

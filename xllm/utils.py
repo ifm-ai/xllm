@@ -33,6 +33,7 @@ from xllm.distributed import (
     get_data_parallel_world_size,
     get_model_parallel_world_size,
     get_context_parallel_world_size,
+    get_expert_outer_world_size,
 )
 from xllm.distributed.utils import (
     reduce_scalar,
@@ -72,6 +73,14 @@ def get_master_rank_in_replicated_group(
     fully_sharded_size = data_parallel_size if fully_sharded_size is None else fully_sharded_size
     assert data_parallel_size % fully_sharded_size == 0
     replicated_size = data_parallel_size // fully_sharded_size * context_parallel_size
+
+    expert_outer_size = get_expert_outer_world_size()
+    if expert_outer_size > 1:
+        from xllm.modules.moe.checkpoint import master_rank_with_expert_replicas
+        return master_rank_with_expert_replicas(
+            global_rank, data_parallel_size, context_parallel_size, model_parallel_size, fully_sharded_size,
+            expert_outer_size,
+        )
 
     data_rank, _, model_rank = get_parallel_ranks(global_rank, model_parallel_size, replicated_size)
     return data_rank * replicated_size * model_parallel_size + model_rank
@@ -181,7 +190,14 @@ def create_on_gpu():
 
 
 def num_parameters(model: nn.Module, cfg):
-    nparams: int = sum(params.nelement() for params in model.parameters())
+    from xllm.modules.moe.expert import routed_expert_parameters
+    # each GPU counts its (FSDP-unsharded) parameters. With EP > TP, the routed experts are on a mesh E_out times
+    # smaller than the model's, so each expert is counted by E_out times fewer GPUs than the rest of the model
+    expert_ids = {id(p) for p in routed_expert_parameters(model)}
+    expert_outer_size = get_expert_outer_world_size()
+    nparams: int = sum(
+        params.nelement() * (expert_outer_size if id(params) in expert_ids else 1) for params in model.parameters()
+    )
     nparams = int(reduce_scalar(nparams, op="sum"))
     replicated_size = cfg.context_parallel_size * cfg.data_parallel_size
     if cfg.model.ddp_backend == 'fsdp1':
@@ -345,38 +361,50 @@ def clip_grad_norm_(
 
 
 def get_model_state(model, full_state: bool = False, cpu_offload: bool = True) -> Dict[str, Any]:
+    from xllm.modules.moe.checkpoint import experts_to_checkpoint
+    if full_state and get_expert_outer_world_size() > 1:
+        raise NotImplementedError("full model state dicts with EP > TP: the routed experts would not be gathered")
     state_dict_options = StateDictOptions(
         full_state_dict=full_state,
         cpu_offload=cpu_offload,
     )
-    return get_model_state_dict(model, options=state_dict_options)
+    # with EP > TP, the routed experts are saved and loaded at their rows of the TP rank's experts
+    return experts_to_checkpoint(model, get_model_state_dict(model, options=state_dict_options))
 
 
 def set_model_state(model, model_state_dict, full_state: bool = False, cpu_offload: bool = True):
+    from xllm.modules.moe.checkpoint import experts_from_checkpoint
+    if full_state and get_expert_outer_world_size() > 1:
+        raise NotImplementedError("full model state dicts with EP > TP: the routed experts would not be gathered")
     state_dict_options = StateDictOptions(
         full_state_dict=full_state,
         cpu_offload=cpu_offload,
     )
-    set_model_state_dict(model, model_state_dict, options=state_dict_options)
+    set_model_state_dict(model, experts_from_checkpoint(model, model_state_dict), options=state_dict_options)
 
 
 def get_sharded_optimizer_state(model, optimizer, dcp: bool) -> Dict[str, Any]:
     if dcp:
+        from xllm.modules.moe.checkpoint import expert_states_to_checkpoint
         state_dict_options = StateDictOptions(
             full_state_dict=False,
             cpu_offload=True,
         )
-        return get_optimizer_state_dict(model, optimizer, options=state_dict_options)
+        # with EP > TP, the routed experts' states are saved and loaded at their rows of the TP rank's experts
+        optimizer_state_dict = get_optimizer_state_dict(model, optimizer, options=state_dict_options)
+        return expert_states_to_checkpoint(model, optimizer_state_dict)
     else:
         return optimizer.state_dict()
 
 
 def set_sharded_optimizer_state(model, optimizer, optimizer_state_dict, dcp: bool):
     if dcp:
+        from xllm.modules.moe.checkpoint import expert_states_from_checkpoint
         state_dict_options = StateDictOptions(
             full_state_dict=False,
             cpu_offload=True,
         )
+        optimizer_state_dict = expert_states_from_checkpoint(model, optimizer_state_dict)
         set_optimizer_state_dict(model, optimizer, optimizer_state_dict, options=state_dict_options)
     else:
         optimizer.load_state_dict(optimizer_state_dict)

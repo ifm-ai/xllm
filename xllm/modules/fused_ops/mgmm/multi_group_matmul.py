@@ -4,10 +4,10 @@ import torch
 from torch import Tensor
 from torch.autograd.function import FunctionCtx
 
-from .sequential_mgmm import _sequential_multi_group_matmul
-from .nested_mgmm import _nested_multi_group_matmul
-from .torch_mgmm import _torch_multi_group_matmul
-from .te_mgmm import _te_multi_group_matmul
+from .sequential_mgmm import _sequential_multi_group_matmul, _sequential_multi_group_matmul_wgrad
+from .nested_mgmm import _nested_multi_group_matmul, _nested_multi_group_matmul_wgrad
+from .torch_mgmm import _torch_multi_group_matmul, _torch_multi_group_matmul_wgrad
+from .te_mgmm import _te_multi_group_matmul, _te_multi_group_matmul_wgrad
 
 
 class MultiGroupMatMulFunc(torch.autograd.Function):
@@ -83,6 +83,23 @@ def _multi_group_matmul(inp1, inp2, inp3, group_sizes: List[int], transpose: boo
         raise ValueError(f"Unknown backend: {backend}.")
 
 
+def _multi_group_matmul_wgrad(inp1, inp2, inp3, group_sizes: List[int], transpose: bool, backend: str):
+    """
+    The second output of _multi_group_matmul alone (inp3 is required): each backend's _multi_group_matmul
+    computes it with this function.
+    """
+    if backend == 'sequential':
+        return _sequential_multi_group_matmul_wgrad(inp1, inp2, inp3, group_sizes, transpose)
+    elif backend == 'nested':
+        return _nested_multi_group_matmul_wgrad(inp1, inp2, inp3, group_sizes, transpose)
+    elif backend == 'torch':
+        return _torch_multi_group_matmul_wgrad(inp1, inp2, inp3, group_sizes, transpose)
+    elif backend == 'te':
+        return _te_multi_group_matmul_wgrad(inp1, inp2, inp3, group_sizes, transpose)
+    else:
+        raise ValueError(f"Unknown backend: {backend}.")
+
+
 mgmm = MultiGroupMatMulFunc.apply
 
 
@@ -142,3 +159,26 @@ def multi_group_matmul_bwd(
     """
 
     return _multi_group_matmul(out_grad, inp2, inp1, group_sizes, not transpose, backend)
+
+
+def multi_group_matmul_dgrad(
+    out_grad, inp2, group_sizes: List[int], transpose: bool, backend: str
+) -> Tensor:
+    """
+    The first output of multi_group_matmul_bwd alone: grad_inp1, shape [bsz, d].
+    Arguments as in multi_group_matmul_bwd; inp1 is not needed.
+    """
+    out, _ = _multi_group_matmul(out_grad, inp2, None, group_sizes, not transpose, backend)
+    return out
+
+
+def multi_group_matmul_wgrad(
+    out_grad, inp2, inp1, group_sizes: List[int], transpose: bool, backend: str
+) -> Tensor:
+    """
+    The second output of multi_group_matmul_bwd alone: grad_inp2, same shape as inp2.
+    Arguments as in multi_group_matmul_bwd; inp2 only gives the output shape and dtype.
+    multi_group_matmul_bwd is multi_group_matmul_dgrad and this, so the two parts may run in either order, or
+    with other work between them, as long as their inputs are unchanged.
+    """
+    return _multi_group_matmul_wgrad(out_grad, inp2, inp1, group_sizes, not transpose, backend)

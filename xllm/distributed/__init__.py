@@ -15,6 +15,9 @@ from .initialize import (
     get_model_parallel_world_size,
     get_hybrid_shard_data_parallel_group,
     get_hybrid_shard_data_parallel_world_size,
+    get_expert_outer_group,
+    get_expert_outer_rank,
+    get_expert_outer_world_size,
     model_parallel_is_initialized,
 )
 
