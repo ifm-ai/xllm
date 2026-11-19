@@ -49,7 +49,7 @@ def initialize_logger() -> logging.Logger:
 
    # silence per-request HTTP debug logs from third-party libs (e.g. periodic otel metric exports)
     for name in ("urllib3", "requests", "opentelemetry"):
-        logging.getLogger(name).setLevel(logging.WARNING)
+        logging.getLogger(name).setLevel(logging.INFO)
 
     return logger
 
