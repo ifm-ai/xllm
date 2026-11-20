@@ -198,15 +198,15 @@ class TransformerMoVABlock(nn.Module):
         return out, aux_loss, cache
 
     def num_parameters(self):
-        model_dim = self.attention.mdim
-        attn_act_func = self.attention.attn_act_func
+        model_dim = self.mova.mdim
+        attn_act_func = self.mova.attn_act_func
         nk = {"softmax": 1, "softdelta": 2}[attn_act_func]
         head_dim = self.mova.head_dim
         n_heads = self.mova.n_heads
         n_kv_heads = self.mova.n_kv_heads
         apply_attn_gate = self.mova.apply_attn_gate
         qknorm = self.mova.qknorm
-        conv_width = self.attention.q_conv.kernel_size if self.apply_causal_conv else 0
+        conv_width = self.mova.q_conv.kernel_size if self.apply_causal_conv else 0
         n_values = self.mova.n_values
         n_activated_values = self.mova.topk
         expert_inter_dim = self.moe.inter_dim
@@ -254,8 +254,8 @@ class TransformerMoVABlock(nn.Module):
         head_dim = self.mova.head_dim
         n_heads = self.mova.n_heads
         n_kv_heads = self.mova.n_kv_heads
-        qknorm = self.attention.qknorm
-        conv_width = self.attention.q_conv.kernel_size if self.apply_causal_conv else 0
+        qknorm = self.mova.qknorm
+        conv_width = self.mova.q_conv.kernel_size if self.apply_causal_conv else 0
 
         qdim = n_heads * head_dim
         kdim = vdim = n_kv_heads * head_dim
