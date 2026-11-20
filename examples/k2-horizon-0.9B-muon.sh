@@ -1,8 +1,5 @@
 #! /bin/bash
 
-#SBATCH --account=llm360
-#SBATCH --qos=normal
-#SBATCH --partition=main
 #SBATCH --cpus-per-task=12
 #SBATCH --gpus-per-node=8
 #SBATCH --job-name=k2-horizon-0.9B
@@ -22,6 +19,11 @@
 #
 # Variables (default):
 #   SAVE            dump dir (required)
+#   DATA_ROOT       directory holding the data-mix datasets below (required)
+#   TOKENIZER       tokenizer path (required; the mix uses jais64k_enx10_codex6.5_arax5_3digits)
+#   VALID_ROOT      validation root with SlimPajama-627B/, AraV6/ and paloma/ (required)
+#   TASK_ROOT       eval task root (required)
+#   WANDB_TEAM      W&B entity (required)
 #   OPTIM           adamw | muon (adamw). Optimizer settings are the config defaults (Muon 1e-3 / wd 0.1 rms_norm,
 #                   AdamW 2e-3 / 0.02, constant, warmup 3000); override with extra flags (e.g. --optim.muon.lr 2e-3)
 #   TPP             run length in tokens per non-embedding parameter (200)
@@ -31,7 +33,8 @@
 #   CAUSAL_ATTN_BACKEND  global causal attention backend (xattn; flash = FA2)
 #   PYTHON          interpreter (.venv/bin/python)
 
-: "${SAVE:?set SAVE}"
+: "${SAVE:?set SAVE}" "${DATA_ROOT:?set DATA_ROOT}" "${TOKENIZER:?set TOKENIZER}" "${VALID_ROOT:?set VALID_ROOT}"
+: "${TASK_ROOT:?set TASK_ROOT}" "${WANDB_TEAM:?set WANDB_TEAM}"
 PYTHON=${PYTHON:-.venv/bin/python}
 OPTIM=${OPTIM:-adamw}
 TPP=${TPP:-200}
@@ -81,7 +84,7 @@ echo "k2-horizon-0.9B: ${OPTIM} (config defaults), ${STEPS} steps x ${TOKENS_PER
 mkdir -p "${SAVE}/restarts"
 cp "$0" "${SAVE}/run.sh"
 
-D=/lustrefs/shared/initial-dataset/stripped/xllm_merged
+D=${DATA_ROOT}
 DATA_MIX=(
   shaurya_nltk-web-QS-shuffled-High-randomized-questions_merged:0.04
   nemotron3_Nemotron-CC-v2_High-Quality:0.03
@@ -128,18 +131,14 @@ DATA_MIX=(
 )
 DATA=$(printf "${D}/%s:text:text," "${DATA_MIX[@]}")
 DATA=${DATA%,}
-TOKENIZER=/lustrefs/users/xuezhe.ma/projects/data/tokenizers/jais64k_enx10_codex6.5_arax5_3digits
 
-V=/lustrefs/shared/initial-dataset/pretrain_xllm
+V=${VALID_ROOT}
 PALOMA=(4chan_meta_sep c4_100_domains c4_en dolma-v1_5 dolma_100_programing_languages dolma_100_subreddits
   falcon-refinedweb gab m2d2_s2orc_unsplit m2d2_wikipedia_unsplit manosphere_meta_sep mc4 redpajama
   twitterAAE_HELM_fixed wikitext_103)
 VALID_DATA="${V}/SlimPajama-627B/validation/Slimpajama.jsonl,${V}/AraV6/valid/AraV6.valid.jsonl"
 VALID_DATA+=$(printf ",${V}/paloma/validation/val_%s.chunk0.jsonl" "${PALOMA[@]}")
-TASK_ROOT=/lustrefs/users/xuezhe.ma/projects/data/eval
 TASKS="boolq,hellaswag,nq,piqa,siqa,winogrande_1.1,obqa,arc_easy,arc_challenge,race_middle,race_high,copa,mmlu,arabic_mmlu,tqa,gsm8k,bbh,drop,mbpp,human_eval"
-
-WANDB_TEAM=mbzuai-llm
 
 DISTRIBUTED_CFGS=(
   --context_parallel_size 1
