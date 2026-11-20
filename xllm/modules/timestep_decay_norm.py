@@ -143,9 +143,9 @@ class TimestepDecayNorm(nn.Module):
             prev_count = self.prior_count.expand(batch_size).contiguous()
         # Initialize the running mean/variance in fp32.
         if prev_mean is None:
-            prev_mean = self.prior_mean.float().expand(batch_size, -1).contiguous()
+            prev_mean = self.prior_mean.expand(batch_size, -1).float().contiguous()
         if prev_var is None:
-            prev_var = self.prior_var.float().expand(batch_size, -1).contiguous()
+            prev_var = self.prior_var.expand(batch_size, -1).float().contiguous()
 
         output = timestep_decay_norm(
             x, bos_mask, prev_count, prev_mean, prev_var, self.weight + 1.0, self.bias,

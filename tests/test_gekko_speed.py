@@ -405,15 +405,15 @@ def test(B: int, L: int, D: int, W: int, H: int, HKV: int, S: int, V: int, chunk
 
     epochs = 1000
     print(f"B={B}, L={L}, D={D}, W={W}, H={H} ({HKV}), S={S}, V={V}, chunk={chunk_size}, AvgL={avg_len}, dtype={dtype}:")
-    # test_decay_timestep_norm(
-    #     x, bos_mask, prev_count, prev_mean, prev_var, norm_w, norm_b,
-    #     y_grad, mean_grad, var_grad, num_groups, 0.999, 0.9999,
-    #     1e-5, epochs, 'lookback'
-    # )
     test_decay_timestep_norm(
         x, bos_mask, prev_count, prev_mean, prev_var, norm_w, norm_b,
         y_grad, mean_grad, var_grad, num_groups, 0.999, 0.9999,
         1e-5, epochs, 'cub'
+    )
+    test_decay_timestep_norm(
+        x, bos_mask, prev_count, prev_mean, prev_var, norm_w, norm_b,
+        y_grad, mean_grad, var_grad, num_groups, 0.999, 0.9999,
+        1e-5, epochs, 'lookback'
     )
     ##################################################
     # test_scan_cema(x.transpose(1, 2), hx, p, q, gamma, y_grad.transpose(1, 2), h_grad, bos_mask, epochs, 'cub')

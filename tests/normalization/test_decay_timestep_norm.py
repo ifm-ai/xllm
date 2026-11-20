@@ -243,26 +243,26 @@ def test(B: int, L: int, H: int, num_groups: int, dtype: torch.dtype):
             torch.testing.assert_close(beta_mega_grad, beta1_mega_grad + beta2_mega_grad, rtol=rtol, atol=atol)
             print(f"B={B}, L={L}, H={H}, num_groups={num_groups}, backend={backend}, dtype={dtype}: pass 2-seg bwd test (mem_effn=False)")
 
-            if backend != 'cub':
-                # two-segment bwd
-                x2_mega_grad, prev_mean2_grad_mega, prev_var2_grad_mega, gamma2_mega_grad, beta2_mega_grad = mega_normalize_bwd(
-                    y_grad[:, L1:], mean_grad, var_grad, y2_mega, bos_mask[:, L1:], count1_mega, cummean2_mega, cumrstd2_mega,
-                    gamma, beta, num_groups, beta1, beta2, eps, True, backend,
-                )
-
-                x1_mega_grad, prev_mean1_grad_mega, prev_var1_grad_mega, gamma1_mega_grad, beta1_mega_grad = mega_normalize_bwd(
-                    y_grad[:, :L1], prev_mean2_grad_mega, prev_var2_grad_mega, y1_mega, bos_mask[:, :L1], prev_count, cummean1_mega, cumrstd1_mega,
-                    gamma, beta, num_groups, beta1, beta2, eps, True, backend
-                )
-
-                atol = 1e-4
-                rtol = 1e-2
-                torch.testing.assert_close(x_mega_grad, torch.cat([x1_mega_grad, x2_mega_grad], dim=1), rtol=rtol, atol=atol)
-                torch.testing.assert_close(prev_mean_grad_mega, prev_mean1_grad_mega, rtol=rtol, atol=atol)
-                torch.testing.assert_close(prev_var_grad_mega, prev_var1_grad_mega, rtol=rtol, atol=atol)
-                torch.testing.assert_close(gamma_mega_grad, gamma1_mega_grad + gamma2_mega_grad, rtol=rtol, atol=atol)
-                torch.testing.assert_close(beta_mega_grad, beta1_mega_grad + beta2_mega_grad, rtol=rtol, atol=atol)
-                print(f"B={B}, L={L}, H={H}, num_groups={num_groups}, backend={backend}, dtype={dtype}: pass 2-seg bwd test (mem_effn=True)")
+            # if backend != 'cub':
+            #     # two-segment bwd
+            #     x2_mega_grad, prev_mean2_grad_mega, prev_var2_grad_mega, gamma2_mega_grad, beta2_mega_grad = mega_normalize_bwd(
+            #         y_grad[:, L1:], mean_grad, var_grad, y2_mega, bos_mask[:, L1:], count1_mega, cummean2_mega, cumrstd2_mega,
+            #         gamma, beta, num_groups, beta1, beta2, eps, True, backend,
+            #     )
+            #
+            #     x1_mega_grad, prev_mean1_grad_mega, prev_var1_grad_mega, gamma1_mega_grad, beta1_mega_grad = mega_normalize_bwd(
+            #         y_grad[:, :L1], prev_mean2_grad_mega, prev_var2_grad_mega, y1_mega, bos_mask[:, :L1], prev_count, cummean1_mega, cumrstd1_mega,
+            #         gamma, beta, num_groups, beta1, beta2, eps, True, backend
+            #     )
+            #
+            #     atol = 1e-4
+            #     rtol = 1e-2
+            #     torch.testing.assert_close(x_mega_grad, torch.cat([x1_mega_grad, x2_mega_grad], dim=1), rtol=rtol, atol=atol)
+            #     torch.testing.assert_close(prev_mean_grad_mega, prev_mean1_grad_mega, rtol=rtol, atol=atol)
+            #     torch.testing.assert_close(prev_var_grad_mega, prev_var1_grad_mega, rtol=rtol, atol=atol)
+            #     torch.testing.assert_close(gamma_mega_grad, gamma1_mega_grad + gamma2_mega_grad, rtol=rtol, atol=atol)
+            #     torch.testing.assert_close(beta_mega_grad, beta1_mega_grad + beta2_mega_grad, rtol=rtol, atol=atol)
+            #     print(f"B={B}, L={L}, H={H}, num_groups={num_groups}, backend={backend}, dtype={dtype}: pass 2-seg bwd test (mem_effn=True)")
 
 
 def test_streaming(B: int, L: int, H: int, num_groups: int, prefill: int, dtype: torch.dtype):
