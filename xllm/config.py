@@ -404,6 +404,7 @@ class RolesConf(Config):
     hidden_vector: RoleConf = field(default_factory=RoleConf)  # norm gains, biases, gekko's conv kernels in the blocks
     final_norm: RoleConf = field(default_factory=RoleConf)
     readout: RoleConf = field(default_factory=RoleConf)
+    router: RoleConf = field(default_factory=RoleConf)  # the MoE / MoVA router weights (fan-out: the experts or values)
     other: RoleConf = field(default_factory=RoleConf)  # parameters no module tags (MoE)
 
     def __post_init__(self):

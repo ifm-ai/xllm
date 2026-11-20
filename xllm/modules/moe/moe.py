@@ -23,6 +23,7 @@ from xllm.modules.residual import build_residual
 from xllm.health_metrics import get_active_health_collector
 from xllm.utils import get_init_fn
 from xllm.optim.muon_spec import register_muon
+from xllm.optim.roles import register_role
 from .router import TopKRouter
 from .expert import Expert
 from .permute import fused_permute_y
@@ -144,6 +145,13 @@ class NormalizedMoE(nn.Module):
         for fc, tp_dim in ((self.fc1, 1), (self.fc2, 0), (self.fc3, 1)):  # row, column, row parallel
             if fc is not None:
                 register_muon(fc, tp_dim=tp_dim)  # Muon, shared experts as whole matrices (xllm/optim/muon.py)
+        # roles (xllm/optim/roles.py)
+        for fc in (self.fc1, self.fc2, self.fc3):
+            if fc is not None:
+                register_role(fc, "weight", "hidden_matrix")
+        register_role(self.norm, "weight", "hidden_vector")
+        register_role(self.norm, "bias", "hidden_vector")
+        register_role(self.router, "weight", "router")
         self.residual = build_residual(
             residual_func, 2 * layer_id + 2, model_dim, num_heads=residual_heads,
             num_features=model_dim, eps=rmsnorm_eps, init_std=init_std

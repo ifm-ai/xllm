@@ -7,6 +7,7 @@ from einops import rearrange
 
 from xllm.health_metrics import get_active_health_collector
 from xllm.utils import get_init_fn
+from xllm.optim.roles import register_role
 from xllm.distributed.utils import divide_and_check_no_remainder
 from xllm.distributed import (
     get_model_parallel_world_size,
@@ -276,6 +277,20 @@ class MOVAttention(nn.Module):
         if self.wr is not None:
             register_muon(self.wr, layout="(h d) m", fan_out="d", fan_in="m", d=rdim // self.n_heads, tp_dim=0)
         register_muon(self.wo, tp_dim=1)
+
+
+        # roles (xllm/optim/roles.py)
+        for w in (self.wq, self.wk, self.wv, self.wr, self.wo):
+            if w is not None:
+                register_role(w, "weight", "hidden_matrix")
+        for conv in (self.q_conv, self.k_conv, self.v_conv):  # depthwise kernels, as Gekko's
+            if conv is not None:
+                register_role(conv, "weight", "hidden_vector")
+        for norm in (self.norm, self.query_norm, self.key_norm):
+            if norm is not None:
+                register_role(norm, "weight", "hidden_vector")
+                register_role(norm, "bias", "hidden_vector")
+        register_role(self.router, "weight", "router")
 
     def _receive_prev_tensors(self, x):
         bsz, seq_len, _ = x.size()

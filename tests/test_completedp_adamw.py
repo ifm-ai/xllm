@@ -3,10 +3,11 @@ factor on the embedding (model.embed_multiplier with model.stream_norm_eps) in p
 
 1. The roles split a dense Transformer's parameters as Table 1 does: the input embedding, the matrices in the blocks,
    the vectors in the blocks (norm gains, biases), the final norm and the readout. CPU.
-2. The depth factor c on the branches (each block's wo and fc2 outputs × c) and the same model with
+2. The depth factor c on the branches (each block's wo and fc2 outputs × c, and the routed experts' outputs) and the
+   same model with
    embed_multiplier 1/c and the stream norms' eps × 1/c² get the same gradients (tests/test_stream_norm_eps.py), so
    AdamW with per-role values takes the same steps: with c a power of 2 the parameters after 3 steps match bit for
-   bit, unfused (a forward hook on wo / fc2 is the branch factor). GPU.
+   bit, dense, MoE and MoVA, unfused (a forward hook on wo / fc2 / the experts is the branch factor). GPU.
 
     PYTHONPATH=. pytest -q tests/test_completedp_adamw.py
 """
@@ -34,7 +35,11 @@ GEKKO = ModelConf(
     apply_rmsnorm=True, layernorm_num_groups=2, timenorm_num_groups=16, timenorm_beta1=0.999, timenorm_beta2=0.9999,
     init_mode="he", vocab_size=1024, chunk_size=1024,
 )
-BRANCH_OUT = ("gda.wo", "attention.wo", "nffn.fc2")
+MOE = replace(TRANSFORMER, num_experts=4, num_activated_experts=2, num_shared_experts=1, expert_inter_dim=256,
+              num_dense_layers=1)
+MOVA = replace(MOE, num_values=4, num_activated_values=2)
+# the branch outputs: attention / MoVA output projections, the FFN's and shared experts' fc2, the routed experts
+BRANCH_OUT = ("gda.wo", "attention.wo", "nffn.fc2", "mova.wo", "moe.fc2", "moe.experts")
 ADAMW = OptimConf(optimizer="adamw", adamw=AdamWConf(lr=1e-3, epsilon=1e-8, weight_decay=0.1))
 # Table 1's AdamW values at m_N = 2, m_L = 4, alpha = 1 (c = m_L^-alpha = 1/4) from the base lr 1e-3, eps 1e-8, wd 0.1
 ROLES = RolesConf(
@@ -42,6 +47,7 @@ ROLES = RolesConf(
     hidden_matrix=RoleConf(lr=1e-3 / 2, eps=1e-8 / 4 / 2, weight_decay=0.1 * 2),
     hidden_vector=RoleConf(eps=1e-8 / 4 / 2),
     readout=RoleConf(lr=1e-3 / 2, weight_decay=0.1 * 2),
+    router=RoleConf(lr=1e-3 / 2, eps=1e-8 / 4, weight_decay=0.1 * 2),  # lr m_L^(alpha-1)/m_N, eps m_L^-alpha, wd m_N
 )
 gpu = pytest.mark.skipif(not torch.cuda.is_available(), reason="the kernels need a GPU")
 
@@ -54,7 +60,7 @@ def build(cfg, branch_scale=None):
     if branch_scale is not None:
         hooked = [m.register_forward_hook(lambda m, i, out: out * branch_scale)
                   for n, m in model.named_modules() if n.endswith(BRANCH_OUT)]
-        assert len(hooked) == 2 * cfg.num_layers, hooked
+        assert len(hooked) >= 2 * cfg.num_layers, hooked
     return model
 
 
@@ -100,7 +106,7 @@ def train(cfg, branch_scale=None):
 
 
 @gpu
-@pytest.mark.parametrize("base", [TRANSFORMER, GEKKO], ids=["transformer", "gekko"])
+@pytest.mark.parametrize("base", [TRANSFORMER, GEKKO, MOE, MOVA], ids=["transformer", "gekko", "moe", "mova"])
 def test_adamw_steps_match_branch_scale(base):
     want_losses, want = train(base, branch_scale=C)
     got_losses, got = train(exact(base))

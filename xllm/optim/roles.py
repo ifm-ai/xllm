@@ -53,6 +53,11 @@ def param_groups(model: nn.Module, cfg: OptimConf, roles: RolesConf, muon_params
         raise ValueError("roles.other: untagged Muon weights (MoE) step in the Muon group, at hidden_matrix's values")
     if roles.hidden_matrix.eps is not None:
         raise ValueError("roles.hidden_matrix.eps: Muon has no eps to set")
+    muon_ids = {id(p) for p in muon_params}
+    adamw_matrices = [n for n, p in model.named_parameters() if role_of[id(p)] == "hidden_matrix" and id(p) not in muon_ids]
+    if adamw_matrices:  # roles.hidden_matrix's lr is Muon's
+        raise ValueError(f"roles: hidden_matrix weights not registered for Muon would step with AdamW at Muon's lr: "
+                         f"{adamw_matrices[:5]} ...")
 
     matrix = roles.hidden_matrix
     groups = [muon_group(cfg, muon_params, lr=matrix.lr, weight_decay=matrix.weight_decay)]

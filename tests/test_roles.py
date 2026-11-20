@@ -35,9 +35,15 @@ WANT = {  # group: (lr, eps, weight_decay)
 }
 
 
+MOE = dict(num_experts=4, num_activated_experts=2, num_shared_experts=1, expert_inter_dim=32, num_dense_layers=1)
+
+
 def build(arch):
     torch.manual_seed(0)
-    if arch == "gekko":
+    if arch in ("moe", "mova"):
+        from xllm.models.transformer import Transformer as cls
+        cfg = ModelConf(**(MODEL | MOE | (dict(num_values=4, num_activated_values=2) if arch == "mova" else {})))
+    elif arch == "gekko":
         from xllm.models.gekko import Gekko as cls
         cfg = ModelConf(**(MODEL | dict(arch="gekko", init_mode="he")))
     else:
@@ -71,7 +77,7 @@ def assert_values(opt, lr_key="lr"):
         assert g[name]["weight_decay"] == wd, (name, g[name]["weight_decay"])
 
 
-@pytest.mark.parametrize("arch", ["transformer", "gekko"])
+@pytest.mark.parametrize("arch", ["transformer", "gekko", "moe", "mova"])
 def test_every_parameter_has_a_role(arch):
     model = build(arch)
     tags = roles_lib.param_roles(model)
@@ -177,3 +183,27 @@ def test_adamw_without_roles_is_unchanged():
 def test_trainer_accepts_adamw_roles():
     TrainerConf(slurm=SlurmConf(), model=ModelConf(**MODEL), optim=ADAMW, valid=ValidConf(), tokenizer=TokenizerConf(),
                 dataloader=DataLoaderConfig(), roles=ADAMW_ROLES)
+
+
+@pytest.mark.parametrize("arch", ["moe", "mova"])
+def test_adamw_router_group(arch):
+    """MoE / MoVA: the experts, shared experts and MoVA projections are hidden matrices, the pre-norms hidden vectors,
+    and the routers their own group."""
+    from xllm.optim import build_optimizer
+    model = build(arch)
+    roles = RolesConf(hidden_matrix=RoleConf(lr=5e-4), router=RoleConf(lr=2.5e-4, eps=2e-9, weight_decay=0.3))
+    opt, _ = build_optimizer(model, ADAMW, 10, "fp32", roles)
+    g = {group["role"]: group for group in opt.param_groups}
+    want = {n for n, _ in model.named_parameters() if n.endswith("router.weight")}
+    assert {n for n, p in model.named_parameters() if any(p is q for q in g["router"]["params"])} == want
+    assert (g["router"]["initial_lr"], g["router"]["eps"], g["router"]["weight_decay"]) == (2.5e-4, 2e-9, 0.3)
+    matrices = {n for n, p in model.named_parameters() if any(p is q for q in g["hidden_matrix"]["params"])}
+    assert {n for n in matrices if ".moe." in n or ".mova." in n} >= {
+        n for n, _ in model.named_parameters() if n.endswith(("experts.weight1", "experts.weight2", "experts.weight3",
+                                                               "moe.fc1.weight", "moe.fc2.weight", "mova.wo.weight"))}
+
+
+def test_muon_rejects_adamw_matrices(cpu_transport):
+    """MoVA's projections are not registered for Muon: with roles they would step with AdamW at Muon's lr."""
+    with pytest.raises(ValueError, match="not registered for Muon"):
+        muon.build_muon(sharded("mova"), CFG, ROLES)
