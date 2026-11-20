@@ -634,28 +634,6 @@ GroupTimestepNormFwd(
   }
 }
 
-std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
-GroupTimestepDecayNormFwd(
-    const torch::Tensor& X,
-    const c10::optional<torch::Tensor>& bos_mask,
-    const torch::Tensor& prev_count,
-    const torch::Tensor& prev_mean,
-    const torch::Tensor& prev_var,
-    const torch::Tensor& gamma,
-    const torch::Tensor& beta,
-    const c10::optional<torch::Tensor>& padding_mask,
-    int64_t num_groups,
-    double beta1,
-    double beta2,
-    double eps
-) {
-  if (X.device().type() == torch::kCUDA) {
-    return GroupTimestepDecayNormCUDAFwd(X, bos_mask, prev_count, prev_mean, prev_var, gamma, beta, padding_mask, num_groups, beta1, beta2, eps);
-  } else {
-    throw;
-  }
-}
-
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
 GroupTimestepNormCPUBwd(
     const torch::Tensor& Y_grad,
@@ -714,46 +692,13 @@ GroupTimestepNormBwd(
   }
 }
 
-std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
-GroupTimestepDecayNormBwd(
-    const torch::Tensor& Y_grad,
-    const torch::Tensor& mean_grad,
-    const torch::Tensor& var_grad,
-    const torch::Tensor& X_or_Y,
-    const torch::Tensor& prev_count,
-    const c10::optional<torch::Tensor>& bos_mask,
-    const torch::Tensor& cummean,
-    const torch::Tensor& cumrstd,
-    const torch::Tensor& gamma,
-    const torch::Tensor& beta,
-    const c10::optional<torch::Tensor>& padding_mask,
-    int64_t num_groups,
-    double beta1,
-    double beta2,
-    double eps,
-    bool memory_efficient
-) {
-  if (X_or_Y.device().type() == torch::kCUDA) {
-    return GroupTimestepDecayNormCUDABwd(Y_grad, mean_grad, var_grad, X_or_Y,
-                                         prev_count, bos_mask, cummean, cumrstd, gamma, beta,
-                                         padding_mask, num_groups, beta1, beta2, eps,
-                                         memory_efficient);
-  } else {
-    throw;
-  }
-}
-
 void DefineTimestepNormOp(py::module& m) {
   m.def("timestep_norm_fwd", &TimestepNormFwd, "TimestepNorm forward")
       .def("timestep_norm_bwd", &TimestepNormBwd, "TimestepNorm backward")
       .def("group_timestep_norm_fwd", &GroupTimestepNormFwd,
            "GroupTimestepNorm forward")
       .def("group_timestep_norm_bwd", &GroupTimestepNormBwd,
-           "GroupTimestepNorm backward")
-      .def("group_timestep_decay_norm_fwd", &GroupTimestepDecayNormFwd,
-           "GroupTimestepDecayNorm forward")
-      .def("group_timestep_decay_norm_bwd", &GroupTimestepDecayNormBwd,
-           "GroupTimestepDecayNorm backward");
+           "GroupTimestepNorm backward");
 }
 
 }  // namespace ops

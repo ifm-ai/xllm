@@ -86,7 +86,7 @@ def test_decay_timestep_norm(
     x, bos_mask, prev_count, prev_mean, prev_var, weight, bias,
     y_grad, mean_grad, var_grad, num_groups, beta1, beta2, eps, epochs, backend,
 ):
-    tsdn_fwd = xllm_ops.group_timestep_decay_norm_fwd if backend == 'chunkwise' else xllm_ops.group_timestep_decay_norm_cub_fwd
+    tsdn_fwd = xllm_ops.group_timestep_decay_norm_lookback_fwd if backend == 'lookback' else xllm_ops.group_timestep_decay_norm_cub_fwd
     with torch.no_grad():
         # warm up
         for _ in range(100):
@@ -94,8 +94,8 @@ def test_decay_timestep_norm(
                 x, bos_mask, prev_count, prev_mean, prev_var, weight, bias,
                 None, num_groups, beta1, beta2, eps,
             )
-            if backend == 'chunkwise':
-                xllm_ops.group_timestep_decay_norm_bwd(
+            if backend == 'lookback':
+                xllm_ops.group_timestep_decay_norm_lookback_bwd(
                     y_grad, mean_grad, var_grad, x, prev_count, bos_mask, cummean, cumrstd,
                     weight, bias, None, num_groups, beta1, beta2, eps, False
                 )
@@ -121,8 +121,8 @@ def test_decay_timestep_norm(
 
         start = timer()
         for _ in range(epochs):
-            if backend == 'chunkwise':
-                xllm_ops.group_timestep_decay_norm_bwd(
+            if backend == 'lookback':
+                xllm_ops.group_timestep_decay_norm_lookback_bwd(
                     y_grad, mean_grad, var_grad, x, prev_count, bos_mask, cummean, cumrstd,
                     weight, bias, None, num_groups, beta1, beta2, eps, False
                 )
@@ -408,7 +408,7 @@ def test(B: int, L: int, D: int, W: int, H: int, HKV: int, S: int, V: int, chunk
     # test_decay_timestep_norm(
     #     x, bos_mask, prev_count, prev_mean, prev_var, norm_w, norm_b,
     #     y_grad, mean_grad, var_grad, num_groups, 0.999, 0.9999,
-    #     1e-5, epochs, 'chunkwise'
+    #     1e-5, epochs, 'lookback'
     # )
     test_decay_timestep_norm(
         x, bos_mask, prev_count, prev_mean, prev_var, norm_w, norm_b,
