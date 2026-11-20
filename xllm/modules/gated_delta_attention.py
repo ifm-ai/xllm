@@ -87,6 +87,7 @@ class GatedDeltaAttention(nn.Module):
         self.v_head_dim = self.head_dim if v_head_dim is None else v_head_dim
         self.rope_head_dim = self.head_dim if rope_head_dim is None else rope_head_dim
         self.attn_act_func = attn_act_func
+        self.apply_bias_term = apply_bias_term
 
         assert self.num_heads % self.num_kv_heads == 0
         assert 0 <= self.rope_head_dim <= self.head_dim
@@ -339,8 +340,6 @@ class GatedDeltaAttention(nn.Module):
             [n_groups, n_groups, conv_q_size, conv_k_size, conv_v_size, ksize, ksize, ksize, vsize, agsize, msize, lntsize],
             dim=-1
         )
-        prev_mean = prev_mean.to(x)
-        prev_var = prev_var.to(x)
         conv_q = conv_q.view(bsz, width, n_heads * kdim).to(x)
         conv_k = conv_k.view(bsz, width, n_kv_heads * kdim * nk).to(x)
         conv_v = conv_v.view(bsz, width, n_kv_heads * vdim).to(x)
@@ -392,10 +391,15 @@ class GatedDeltaAttention(nn.Module):
             prev_aqk, prev_akk, prev_ag, memory, log_norm_term = None, None, None, None, None
             cache_sca, cache_awk, cache_norm, cache_conv = None, None, None, None
 
-        if prev_v is not None and bos_mask is not None:
-            bos_mask_curr = bos_mask[:, self.chunk_size:]
+        if bos_mask is not None:
+            full_length = bos_mask.shape[1]
+            curr = full_length - seq_len
+            prev = curr if prev_v is None else curr - self.chunk_size
+            bos_mask_curr = bos_mask[:, curr:]
+            bos_mask = bos_mask[:, prev:]
+            segment_idx = segment_idx[:, prev:]
         else:
-            bos_mask_curr = bos_mask
+            bos_mask_curr = None
 
         # B x L x D/TP
         x, prev_count, prev_mean, prev_var = self.timenorm(x, bos_mask_curr, prev_count, prev_mean, prev_var)

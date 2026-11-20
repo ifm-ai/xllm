@@ -49,6 +49,7 @@ class CausalSoftmaxAttention(nn.Module):
         n_kv_heads: int,
         head_dim: int,
         rope_head_dim: int,
+        apply_nope: bool,
         scale: Optional[float],
         dropout: float,
         backend: Optional[str],
@@ -59,6 +60,7 @@ class CausalSoftmaxAttention(nn.Module):
         self.n_kv_heads = n_kv_heads
         self.head_dim = head_dim
         self.rope_head_dim = rope_head_dim
+        self.nope = apply_nope
         self.dropout = dropout
         self.backend = backend
         self.scale = 1.0 / math.sqrt(self.head_dim) if scale is None else scale
@@ -85,7 +87,9 @@ class CausalSoftmaxAttention(nn.Module):
         xk = rearrange(xk, 'b l (k d) -> b l k d', k=self.n_kv_heads)
         xv = rearrange(xv, 'b l (k d) -> b l k d', k=self.n_kv_heads)
 
-        if self.rope_head_dim == self.head_dim:
+        if self.nope:
+            assert freqs_cis is None
+        elif self.rope_head_dim == self.head_dim:
             xq, xk = apply_rotary_embeddings(xq, xk, freqs_cis=freqs_cis, backward=False)
         elif self.rope_head_dim > 0:
             xq_rope, xq_nope = torch.split(xq, [self.rope_head_dim, self.head_dim - self.rope_head_dim], dim=-1)
@@ -98,7 +102,6 @@ class CausalSoftmaxAttention(nn.Module):
         _record_query_key_stats(self.layer_id, xq, xk)
 
         if cache is not None:
-            assert segments is None
             cache_k, cache_v, cache_len = cache
             xk = torch.cat([cache_k, xk], dim=1) if cache_k is not None else xk
             xv = torch.cat([cache_v, xv], dim=1) if cache_v is not None else xv
@@ -143,12 +146,8 @@ class CausalSoftmaxAttention(nn.Module):
             else:
                 q_segment_idx, k_segment_idx = None, None
 
-            if slen == 1 and cache is not None:
-                use_causal_mask = False
-            else:
-                use_causal_mask = True
             output = swift_efficient_attention(
-                xq, xk, xv, q_segment_idx, k_segment_idx, self.scale, self.dropout, use_causal_mask, self.training
+                xq, xk, xv, q_segment_idx, k_segment_idx, self.scale, self.dropout, True, self.training
             )
         elif self.backend == 'xattn':
             if segments is not None:
@@ -183,7 +182,7 @@ class CausalSoftmaxAttention(nn.Module):
 
     def extra_repr(self) -> str:
         return 'heads={}, kv_heads={}, head_dim={}, rope_head_dim={}, backend={}'.format(
-            self.n_heads, self.n_kv_heads, self.head_dim, self.rope_head_dim, self.backend
+            self.n_heads, self.n_kv_heads, self.head_dim, 'nope' if self.nope else self.rope_head_dim, self.backend
         )
 
 
@@ -199,6 +198,7 @@ class CausalSoftdeltaAttention(nn.Module):
         n_kv_heads: int,
         head_dim: int,
         rope_head_dim: int,
+        apply_nope: bool,
         scale: Optional[float],
         dropout: float,
         backend: Optional[str],
@@ -209,6 +209,7 @@ class CausalSoftdeltaAttention(nn.Module):
         self.n_kv_heads = n_kv_heads
         self.head_dim = head_dim
         self.rope_head_dim = rope_head_dim
+        self.nope = apply_nope
         self.dropout = dropout
         self.backend = backend
         self.scale = 1.0 / math.sqrt(self.head_dim)  if scale is None else scale
@@ -233,7 +234,9 @@ class CausalSoftdeltaAttention(nn.Module):
         xk = xk[:, :, :, self.head_dim:]
         xv = rearrange(xv, 'b l (k s) -> b l k s', k=self.n_kv_heads)
 
-        if self.rope_head_dim == self.head_dim:
+        if self.nope:
+            assert freqs_cis is None
+        elif self.rope_head_dim == self.head_dim:
             xq = apply_rotary_embedding(xq, freqs_cis=freqs_cis, backward=False)
             kq, xk = apply_rotary_embeddings(kq, xk, freqs_cis=freqs_cis, backward=False)
         elif self.rope_head_dim > 0:
@@ -321,5 +324,5 @@ class CausalSoftdeltaAttention(nn.Module):
 
     def extra_repr(self) -> str:
         return 'heads={}, kv_heads={}, head_dim={}, rope_head_dim={}, backend={}'.format(
-            self.n_heads, self.n_kv_heads, self.head_dim, self.rope_head_dim, self.backend
+            self.n_heads, self.n_kv_heads, self.head_dim, 'nope' if self.nope else self.rope_head_dim, self.backend
         )

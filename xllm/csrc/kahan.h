@@ -107,8 +107,7 @@ class KahanWrapper<WelfordDecayData<T>> {
       if (x.count == 1) {
         thrust::tie(value_.mean, c1_) =
             KahanAdd((1 - x.beta1_pow) * (x.mean - value_.mean), value_.mean, c1_);
-        thrust::tie(value_.var, c1_) =
-            KahanAdd((1 - x.beta2_pow) * (x.var - value_.var), value_.var, c2_);
+        value_.var += (1 - x.beta2_pow) * (x.var - value_.var);
       } else {
         thrust::tie(value_.mean, c1_) =
             KahanAdd(x.mean - (1 - x.beta1_pow) * value_.mean, value_.mean, c1_);

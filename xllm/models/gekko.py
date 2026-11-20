@@ -1,4 +1,4 @@
-from typing import Optional, Tuple, List, Any
+from typing import Optional, Tuple, List
 import torch
 from torch import Tensor
 from torch import nn
@@ -6,315 +6,26 @@ from torch.utils.checkpoint import checkpoint
 
 from xllm.configuration import ConfStore
 from xllm.data.dataset_streamer.tokenizer import Tokenizer
-from xllm.modules import (
-    GatedDeltaAttention,
-    NormalizedFeedForwardNetwork,
-    RotaryEmbedding,
-    TimestepDecayNorm,
-)
-from xllm.modules.residual import num_params_in_residual
 from xllm.modules.fused_ops import memory_efficient_dropout
-from xllm.modules.model_parallel import (
-    ParallelEmbedding,
-    ColumnParallelLinear,
-    vocab_parallel_cross_entropy,
-)
+from xllm.modules.rotary_positional_embedding import RotaryEmbedding
+from xllm.modules.model_parallel import ParallelEmbedding
+from xllm.modules.context_parallel import gather_from_context_parallel_region
 from xllm.config import ModelConf
 from xllm.health_metrics import get_active_health_collector
 from xllm.distributed import (
     get_context_parallel_world_size,
     get_context_parallel_rank,
 )
-from xllm.modules.context_parallel import (
-    should_send_to_next,
-    should_recv_from_prev,
-    send_to_next_context_parallel_region,
-    recv_from_prev_context_parallel_region,
-    gather_from_context_parallel_region,
-)
 from xllm.modules.utils import (
     get_bos_mask,
     get_segment_idx_from_bos_mask
 )
 from xllm.models.xllm import XLLModel
-from xllm.models.fused_blocks import (
-    GekkoBlockFunction,
-    GekkoOutputLayerFunction
+from xllm.models.blocks import (
+    GekkoBlock,
+    GekkoOutputLayer,
 )
 from xllm.utils import get_init_fn
-
-
-class GekkoBlock(nn.Module):
-    def __init__(self, cfg: ModelConf, layer_id: int):
-        super().__init__()
-        self.layer_id = layer_id
-        self.residual_func = cfg.residual_func
-        self.residual_heads = cfg.residual_heads
-        self.fused_block = cfg.fused_block
-        self.recompute_q = cfg.recompute_q
-        self.recompute_kv = cfg.recompute_v
-        self.recompute_sca = cfg.recompute_attention
-        self.recompute_awk = cfg.recompute_awk
-        self.recompute_fc1_out = cfg.recompute_fc1_out
-        self.recompute_fc3_out = cfg.recompute_fc3_out
-        self.apply_rmsnorm = cfg.apply_rmsnorm
-        self.timenorm_eps = cfg.timenorm_eps
-        self.layernorm_eps = cfg.layernorm_eps
-        self.rmsnorm_eps = cfg.rmsnorm_eps
-
-        self.gda = GatedDeltaAttention(
-            layer_id=layer_id,
-            mdim=cfg.model_dim,
-            n_heads=cfg.num_heads,
-            n_kv_heads=cfg.num_kv_heads,
-            head_dim=cfg.head_dim,
-            v_head_dim=cfg.v_head_dim,
-            rope_head_dim=cfg.rope_head_dim,
-            chunk_size=cfg.chunk_size,
-            attn_act_func=cfg.attn_act_func,
-            attn_gate_func=cfg.attn_gate_func,
-            awm_forget_gate=cfg.apply_awm_gate,
-            awm_orthogonal_update=cfg.awm_orthogonal_update,
-            causal_conv_width=cfg.causal_conv_width,
-            causal_conv_backend=cfg.causal_conv_backend,
-            causal_conv_weight_normalization=cfg.causal_conv_weight_normalization,
-            sca_backend=cfg.sca_backend,
-            dropout=cfg.dropout,
-            attention_dropout=cfg.attention_dropout,
-            hidden_dropout=cfg.hidden_dropout,
-            timenorm_num_groups=cfg.timenorm_num_groups,
-            timenorm_beta1=cfg.timenorm_beta1,
-            timenorm_beta2=cfg.timenorm_beta2,
-            timenorm_backend=cfg.timenorm_backend,
-            timenorm_eps=cfg.timenorm_eps,
-            rmsnorm_eps=cfg.rmsnorm_eps,
-            apply_bias_term=cfg.apply_bias_term,
-            memory_efficient_norm=cfg.memory_efficient_norm,
-            residual_func=cfg.residual_func,
-            residual_heads=cfg.residual_heads,
-            init_mode=cfg.init_mode,
-            init_std=cfg.init_std,
-        )
-
-        self.nffn = NormalizedFeedForwardNetwork(
-            layer_id=layer_id,
-            model_dim=cfg.model_dim,
-            ffn_hidden_dim=cfg.ffn_hidden_dim,
-            swiglu=cfg.swiglu,
-            dropout=cfg.dropout,
-            hidden_dropout=cfg.hidden_dropout,
-            norm_num_groups=cfg.layernorm_num_groups,
-            norm_affine=cfg.norm_affine,
-            layernorm_eps=cfg.layernorm_eps,
-            rmsnorm_eps=cfg.rmsnorm_eps,
-            apply_rmsnorm=cfg.apply_rmsnorm,
-            memory_efficient_norm=cfg.memory_efficient_norm,
-            residual_func=cfg.residual_func,
-            residual_heads=cfg.residual_heads,
-            init_mode=cfg.init_mode,
-            init_std=cfg.init_std,
-        )
-
-    def forward(
-        self,
-        x: Tensor,
-        freqs_cis: Optional[Tensor],
-        bos_mask: Optional[Tensor] = None,
-        segment_idx: Optional[Tensor] = None,
-        prev_segment_count: Optional[Tensor] = None,
-        moe_router_load_balancing_type: Optional[str] = None,
-        attn_stability_control: int = 0,
-        deterministic: bool = True,
-        cache: Optional[Tuple[Tuple[Tensor, Tensor, int],
-                              Tuple[Tensor, Tensor, Tensor, Tensor, Tensor],
-                              Tuple[Tensor, Tensor, Tensor],
-                              Tensor]] = None,
-    ) -> Tuple[Tensor, Optional[Tensor], Optional[Any]]:
-        if self.fused_block and self.training:
-            fn = GekkoBlockFunction
-            return fn.apply(
-                self.layer_id,
-                x,
-                freqs_cis,
-                bos_mask,
-                segment_idx,
-                prev_segment_count,
-                self.gda.timenorm.weight,
-                self.gda.timenorm.bias,
-                self.gda.timenorm.prior_count,
-                self.gda.timenorm.prior_mean,
-                self.gda.timenorm.prior_var,
-                self.gda.timenorm.groups_per_partition,
-                self.gda.timenorm.beta1,
-                self.gda.timenorm.beta2,
-                self.gda.timenorm_backend,
-                self.gda.wq.weight,
-                self.gda.wk.weight,
-                self.gda.wv.weight,
-                self.gda.wv.bias,
-                self.gda.wr.weight,
-                self.gda.wr.bias,
-                self.gda.wo.weight,
-                self.gda.q_conv.weight,
-                self.gda.k_conv.weight,
-                self.gda.v_conv.weight,
-                self.gda.causal_conv_backend,
-                self.gda.q_conv.normalize_weight,
-                self.gda.query_norm.weight,
-                self.gda.key_norm.weight,
-                self.gda.local_heads,
-                self.gda.local_kv_heads,
-                self.gda.chunk_size,
-                self.gda.head_dim,
-                self.gda.v_head_dim,
-                self.gda.rope_head_dim,
-                self.gda.attn_act_func,
-                self.gda.attn_gate_fn,
-                self.gda.sca_backend,
-                self.gda.awm_orthogonal_update,
-                self.nffn.norm.weight,
-                self.nffn.norm.bias,
-                self.nffn.norm.groups_per_partition,
-                self.nffn.fc1.weight,
-                self.nffn.fc2.weight,
-                self.nffn.fc3.weight if self.nffn.swiglu else None,
-                self.gda.dropout,
-                self.gda.attention_dropout,
-                self.gda.hidden_dropout,
-                self.nffn.swiglu,
-                self.timenorm_eps,
-                self.layernorm_eps,
-                self.rmsnorm_eps,
-                self.apply_rmsnorm,
-                self.residual_func,
-                self.residual_heads,
-                attn_stability_control,
-                deterministic,
-                self.recompute_q,
-                self.recompute_kv,
-                self.recompute_sca,
-                self.recompute_awk,
-                self.recompute_fc1_out,
-                self.recompute_fc3_out,
-            )
-
-        y, cache = self.gda(
-            x, freqs_cis, bos_mask, segment_idx, prev_segment_count, attn_stability_control, deterministic, cache
-        )
-        out = self.nffn(y)
-        return out, None, cache
-
-
-class GekkoOutputLayer(nn.Module):
-    def __init__(self, cfg: ModelConf):
-        super().__init__()
-
-        self.model_dim = cfg.model_dim
-        self.output_size = cfg.vocab_size
-        self.recompute_logits = cfg.recompute_logits
-
-        self.final_norm = TimestepDecayNorm(
-            self.model_dim, cfg.timenorm_num_groups, cfg.timenorm_beta1, cfg.timenorm_beta2,
-            eps=cfg.timenorm_eps, backend=cfg.timenorm_backend,
-            memory_efficient=cfg.memory_efficient_norm
-        )
-
-        init_fn = get_init_fn('gaussian', dim=self.model_dim, std=cfg.init_logits_std)
-        self.output = ColumnParallelLinear(self.model_dim, self.output_size, bias=False,
-                                           input_is_parallel=True, gather_output=False, init_method=init_fn)
-
-        self.context_parallel_rank = get_context_parallel_rank()
-
-    def _receive_prev_count(self, x, bos_mask):
-        bsz, seq_len, _ = x.size()
-        if bos_mask is None:
-            prev_count = torch.full((bsz,), seq_len * self.context_parallel_rank, dtype=torch.int64, device=x.device)
-        else:
-            prev_count = torch.empty(bsz, dtype=torch.int64, device=x.device)
-            prev_count = recv_from_prev_context_parallel_region(prev_count)
-        return prev_count
-
-    def _receive_prev_tensors(self, x):
-        bsz, seq_len, _ = x.size()
-        n_groups = self.final_norm.groups_per_partition
-        prev_tensor = torch.empty((bsz, n_groups * 2), dtype=x.dtype, device=x.device, requires_grad=self.training)
-        prev_tensor = recv_from_prev_context_parallel_region(prev_tensor)
-        return prev_tensor
-
-    def _pack_prev_tensors(self, prev_mean, prev_var):
-        # B x (G*2)
-        prev_tensor = torch.cat([prev_mean, prev_var], dim=-1)
-        return prev_tensor
-
-    def _unpack_prev_tensors(self, x, prev_tensor):
-        n_groups = self.final_norm.groups_per_partition
-        prev_mean, prev_var = torch.split(prev_tensor, [n_groups, n_groups], dim=-1)
-        prev_mean = prev_mean
-        prev_var = prev_var
-        return prev_mean, prev_var
-
-    def forward(
-        self,
-        x: Tensor,
-        y: Optional[Tensor],
-        mask: Optional[Tensor] = None,
-        bos_mask: Optional[Tensor] = None,
-        cache: Optional[Tuple[Tensor, Tensor, Tensor]] = None,
-    ):
-        bsz, seq_len, _ = x.size()
-        if bos_mask is not None:
-            bos_mask = bos_mask[:, -seq_len:]
-
-        if self.training:
-            assert y is not None
-            fn = GekkoOutputLayerFunction
-            return fn.apply(
-                x,
-                y,
-                mask,
-                bos_mask,
-                self.final_norm.weight,
-                self.final_norm.bias,
-                self.final_norm.prior_count,
-                self.final_norm.prior_mean,
-                self.final_norm.prior_var,
-                self.final_norm.groups_per_partition,
-                self.final_norm.beta1,
-                self.final_norm.beta2,
-                self.final_norm.backend,
-                self.output.weight,
-                self.final_norm.eps,
-                self.recompute_logits,
-            )
-
-        if cache is not None:
-            prev_count, prev_mean, prev_var = cache
-        elif should_recv_from_prev():
-            prev_count = self._receive_prev_count(x, bos_mask)
-            prev_tensor = self._receive_prev_tensors(x)
-            prev_mean, prev_var = self._unpack_prev_tensors(x, prev_tensor)
-        else:
-            prev_count, prev_mean, prev_var = None, None, None
-
-        x, prev_count, prev_mean, prev_var = self.final_norm(x, bos_mask, prev_count, prev_mean, prev_var)
-
-        if cache is not None:
-            cache = (prev_count.detach(), prev_mean.detach(), prev_var.detach())
-        elif should_send_to_next():
-            if bos_mask is not None:
-                send_to_next_context_parallel_region(prev_count)
-            prev_tensor = self._pack_prev_tensors(prev_mean, prev_var)
-            prev_tensor = send_to_next_context_parallel_region(prev_tensor)
-            x = x + prev_tensor.to(x).mean() * 0
-
-        logits = self.output(x).float()
-        if y is None:
-            return logits, cache
-        else:
-            loss = vocab_parallel_cross_entropy(logits, y)
-            if mask is not None:
-                loss = loss * mask.to(loss)
-            return loss, cache
 
 
 class Gekko(XLLModel):
@@ -475,79 +186,6 @@ class Gekko(XLLModel):
     def support_multi_segments_with_cache(self) -> bool:
         return True
 
-    def num_parameters(self):
-        embed_params = self.model_dim * self.vocab_size * 2
-        gda_params_per_block = self.model_dim * (self.num_heads + self.num_kv_heads) * (self.head_dim + self.v_head_dim)
-        # out proj
-        gda_params_per_block += self.model_dim * self.num_heads * self.v_head_dim
-        if self.apply_bias_term:
-            gda_params_per_block += (self.num_kv_heads + self.num_heads) * self.v_head_dim
-        else:
-            gda_params_per_block += self.num_kv_heads * self.v_head_dim
-        gda_params_per_block += num_params_in_residual(self.residual_func, self.model_dim, self.residual_heads, self.num_heads * self.v_head_dim)
-        # conv params
-        conv_params_per_block = self.causal_conv_width * (self.num_heads * self.head_dim + self.num_kv_heads * (self.head_dim + self.v_head_dim))
-        # norm params
-        norm_params_per_block = self.model_dim * (3 if self.apply_rmsnorm else 4) + self.head_dim * (self.num_heads + self.num_kv_heads)
-        if self.attn_act_func == 'softdelta':
-            gda_params_per_block += self.model_dim * (self.num_kv_heads * self.head_dim + self.num_heads)
-            conv_params_per_block += self.causal_conv_width * self.num_kv_heads * self.head_dim
-            norm_params_per_block += self.num_kv_heads * self.head_dim
-        # FFN
-        ffn_params_per_block = self.model_dim * self.ffn_hidden_dim * (3 if self.swiglu else 2)
-        ffn_params_per_block += num_params_in_residual(self.residual_func, self.model_dim, self.residual_heads, self.ffn_hidden_dim)
-
-        activated_params = (gda_params_per_block + conv_params_per_block + norm_params_per_block) * self.num_layers
-        activated_params += ffn_params_per_block * self.num_dense_layers + embed_params
-        total_params = activated_params
-        if self.num_experts > 0:
-            shared_expert_params = self.model_dim * self.expert_inter_dim * self.num_shared_experts * 3
-            routed_expert_params = self.model_dim * self.expert_inter_dim * self.num_experts * 3
-            activated_expert_params = self.model_dim * self.expert_inter_dim * self.num_activated_experts * 3
-            router_params = self.model_dim * self.num_experts
-            activated_params += (shared_expert_params + activated_expert_params + router_params) * (self.num_layers - self.num_dense_layers)
-            total_params += (shared_expert_params + routed_expert_params + router_params) * (self.num_layers - self.num_dense_layers)
-        # final norm
-        activated_params += self.model_dim * 2
-        total_params += self.model_dim * 2
-        return total_params, activated_params, embed_params
-
-    def tflops_per_token(self, seq_len: int):
-        expansion_factor = 6
-        q_dim = self.num_heads * self.head_dim
-        k_dim = self.num_kv_heads * self.head_dim
-        v_dim = self.num_kv_heads * self.v_head_dim
-        h_dim = self.num_heads * self.v_head_dim
-        embed_flops = self.model_dim + self.vocab_size
-        logits_flops = self.model_dim * self.vocab_size
-        # norm flops
-        norm_flops = self.model_dim * (2 if self.apply_rmsnorm else 4) + h_dim * 2
-        norm_flops += (q_dim + k_dim) * 2
-        timestep_norm_flops = self.model_dim * 8
-        # residual flops
-        # TODO
-        res_flops = 0.0
-        conv_flops = self.causal_conv_width * (q_dim + k_dim + v_dim) * 2
-        sca_flops = self.model_dim * (q_dim + k_dim + v_dim + h_dim)
-        sca_flops += (q_dim + h_dim) * self.chunk_size * 1.5
-        if self.attn_act_func == 'softdelta':
-            conv_flops += self.causal_conv_width * k_dim * 2
-            norm_flops += k_dim * 2
-            sca_flops += self.model_dim * (k_dim + self.num_heads)
-            sca_flops += k_dim * self.chunk_size * 1.5
-        awk_flops = (k_dim * 2 + q_dim) * self.v_head_dim
-        attn_flops = sca_flops + awk_flops + self.model_dim * h_dim
-        ffn_flops = self.model_dim * self.ffn_hidden_dim * (3 if self.swiglu else 2)
-        moe_flops = self.model_dim * self.expert_inter_dim * (self.num_activated_experts + self.num_shared_experts) * 3
-        moe_flops += self.model_dim * self.num_experts
-
-        total_tflops = embed_flops + logits_flops + timestep_norm_flops
-        total_tflops += self.num_layers * (norm_flops + timestep_norm_flops + conv_flops + attn_flops + res_flops)
-        total_tflops += self.num_dense_layers * ffn_flops
-        total_tflops += (self.num_layers - self.num_dense_layers) * moe_flops
-        total_tflops = total_tflops * expansion_factor / 10 ** 12
-        return total_tflops
-
 
 # register some models configurations
 # fmt: off
@@ -561,10 +199,5 @@ ConfStore["gekko-4B"] = ModelConf(arch='gekko', num_layers=36, model_dim=2560, n
                                   head_dim=128, v_head_dim=128, rope_head_dim=128, rope_base=500000, chunk_size=4096,
                                   causal_conv_width=4, causal_conv_weight_normalization=True, ffn_hidden_dim=9216, swiglu=True,
                                   layernorm_num_groups=2, timenorm_num_groups=40, timenorm_eps=1e-5, layernorm_eps=1e-5, rmsnorm_eps=1e-6)
-
-ConfStore["gekko-7B"] = ModelConf(arch='gekko', num_layers=38, model_dim=4096, num_heads=48, num_kv_heads=8,
-                                    head_dim=128, v_head_dim=128, rope_head_dim=128, rope_base=500000, chunk_size=4096,
-                                    causal_conv_width=4, causal_conv_weight_normalization=True, ffn_hidden_dim=8192, swiglu=True,
-                                    layernorm_num_groups=4, timenorm_num_groups=64, timenorm_eps=1e-5, layernorm_eps=1e-5, rmsnorm_eps=1e-6)
 
 # fmt: on

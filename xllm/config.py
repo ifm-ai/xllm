@@ -108,6 +108,7 @@ class ModelConf(Config):
     ddp_backend: str = 'fsdp2'  # Distributed parameter sharding implementation: fsdp1 or fsdp2
     num_layers: int = 8
     model_dim: int = 1024  # Dimensions of token hidden state and residual stream
+    full_attn_layer_list: Optional[str] = None  # Comma separated list of full attention layer indices
     # Attention
     chunk_size: int = 2048  # Used for local attention, memory update in Gekko and prefilling.
     num_heads: int = 1  # Number of Query attention heads
@@ -128,7 +129,7 @@ class ModelConf(Config):
     # MoE & MoVA
     num_values: int = 0  # Num of value projections available for routing to in MoVA. 0 means MoVA off. Requires using MoE as well when using MoVA.
     num_activated_values: int = 0  # Num of activated value projections per token (top-k) in MoVA
-    mova_backend: str = 'sequential'  # sequential, nested, torch, or te
+    mova_backend: str = 'torch'  # sequential, nested, torch, or te
     num_experts: int = 0  # Num of experts to be routed in each MoE layer (not counting shared experts). 0 means using dense FFN
     num_activated_experts: int = 0  # Num of activated experts per token (top-k)
     num_shared_experts: int = 0  # Num of shared experts for each token, in addition to routed experts
@@ -138,12 +139,13 @@ class ModelConf(Config):
     moe_router_bias: bool = False  # Whether to include the router bias, only affects top-k selection.
     moe_router_bias_update_rate: Optional[float] = None  # Update rate for the router bias during backprop
     moe_router_scaling_factor: Optional[float] = None  # The scaling factor for outputs from selected experts. None means no scaling
-    moe_expert_backend: str = 'sequential'  # sequential, nested, torch, or te
-    moe_permutation_backend: str = 'torch'  # Token permutation and unpermutation backend: torch or triton
+    moe_expert_backend: str = 'torch'  # sequential, nested, torch, or te
+    moe_permutation_backend: str = 'triton'  # Token permutation and unpermutation backend: torch or triton
     # Causal conv1d
     causal_conv_width: int = 4  # Width of Q/K/V causal convolution kernel in Gekko. Currently supports 1-4 tokens
     causal_conv_backend: str = 'triton'  # triton or fla
     causal_conv_weight_normalization: bool = True  # Whether to apply softmax normalization for causal convolution weights
+    apply_conv_in_causal_attn: bool = False  # Whether to apply causal convs on qkv of MHA
     # Initialization
     init_mode: str = 'he'  # he, gaussian, xavier, or none (skipping init)
     init_std: Optional[float] = None  # Init std for gaussian; If None, deriving from input dimensions. he/xavier requires None
@@ -155,7 +157,7 @@ class ModelConf(Config):
     timenorm_num_groups: int = 32  # Num of groups of features used in timestep decay normalization in Gekko.
     timenorm_beta1: float = 0.999  # Used in timestep decay normalization.
     timenorm_beta2: float = 0.9999  # Used in timestep decay normalization.
-    timenorm_backend: str = 'cub'  # cub or chunkwise
+    timenorm_backend: str = 'lookback'  # cub or lookback
     layernorm_num_groups: int = 1  # Num of groups of features in LayerNorm/RMSNorm.
     memory_efficient_norm: bool = False  # Whether to use norm output for backward to save activation memory. Unsupported by 'cub' timestep norm backend.
     norm_affine: bool = True  # Enable learnable scaling in attention/FFN input norms (plus bias for LayerNorm).
@@ -168,6 +170,7 @@ class ModelConf(Config):
     # Rope base
     rope_base: float = 100000  # RoPE frequency base
     rope_head_dim: Optional[int] = None  # RoPE dimensions per Q/K head. None means full head_dim, 0 disables RoPE.
+    apply_nope_in_causal_attn: bool = False  # Remove RoPE in causal attention if True.
     # Dropout rates
     dropout: float = 0.0  # Dropout rate for embeddings and for sublayer outputs before residual connections.
     hidden_dropout: float = 0.0  # Dropout rate for attention activations before output projection and for FFN intermediate activations.
@@ -189,8 +192,16 @@ class ModelConf(Config):
 
     recompute_logits: bool = False  # Whether to recompute logits in output layer. Independent of fused_block. True = recompute logits and compute grad_X/grad_W during backward, False = precompute grad_X/grad_W during forward.
 
+    @property
+    def full_attention_layers(self) -> Optional[List[int]]:
+        if self.full_attn_layer_list is None:
+            return None
+
+        layers = [int(layer_id) for layer_id in self.full_attn_layer_list.split(',')]
+        return layers
+
     def __post_init__(self):
-        assert self.arch in ['transformer', 'gekko']
+        assert self.arch in ['transformer', 'gekko', 'hybrid']
         assert self.ddp_backend in ['fsdp1', 'fsdp2']
         assert self.embed_multiplier > 0 and self.embed_multiplier != float('inf'), \
             f'model.embed_multiplier must be finite and > 0, got {self.embed_multiplier}'
@@ -200,7 +211,7 @@ class ModelConf(Config):
         assert self.mova_backend in ['sequential', 'nested', 'torch', 'te']
         assert self.moe_expert_backend in ['sequential', 'nested', 'torch', 'te']
         assert self.moe_permutation_backend in ['torch', 'triton']
-        assert self.timenorm_backend in ['cub', 'chunkwise']
+        assert self.timenorm_backend in ['cub', 'lookback']
         assert self.causal_conv_backend in ['fla', 'triton']
 
         if self.fused_block:
@@ -233,7 +244,13 @@ class ModelConf(Config):
         assert 0 <= self.attention_dropout < 1
         assert 0 <= self.hidden_dropout < 1
 
-        if self.arch == 'transformer':
+        if self.apply_nope_in_causal_attn:
+            assert self.arch == 'hybrid', 'NoPE requires hybrid architecture'
+
+        if self.arch == 'hybrid':
+            assert self.full_attn_layer_list is not None
+
+        if self.arch in ['transformer', 'hybrid']:
             if self.fused_block:
                 assert self.causal_attn_backend is not None, 'requiring efficient attention when using fused block'
 
@@ -478,6 +495,6 @@ class TrainerConf(Config):
         if self.model.arch == 'transformer':
             assert self.model.layernorm_num_groups == 1 or self.model.layernorm_num_groups % self.model_parallel_size == 0, \
                 f"{self.model.layernorm_num_groups}/{self.model_parallel_size}"
-        elif self.model.arch in ['gekko']:
+        elif self.model.arch in ['gekko', 'hybrid']:
             assert self.model.layernorm_num_groups % self.model_parallel_size == 0, \
                 f"{self.model.layernorm_num_groups}/{self.model_parallel_size}"

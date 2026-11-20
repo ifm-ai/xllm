@@ -100,7 +100,7 @@ class SlidingChunkSoftmaxAttention(nn.Module):
                 q_segment_idx = segment_idx if segment_idx is None or prev_k is None else segment_idx[:,self.chunk_size:]
                 output = swift_efficient_attention(
                     xq, xk_, xv_, q_segment_idx, segment_idx,
-                    self.scale, self.dropout, slen > 1, self.training
+                    self.scale, self.dropout, True, self.training
                 )
 
             prev_k = xk

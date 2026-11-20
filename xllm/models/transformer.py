@@ -7,23 +7,9 @@ from torch.utils.checkpoint import checkpoint
 
 from xllm.configuration import ConfStore
 from xllm.data.dataset_streamer.tokenizer import Tokenizer
-from xllm.modules import (
-    MultiheadAttention,
-    NormalizedFeedForwardNetwork,
-    MOVAttention,
-    NormalizedMoE,
-    RotaryEmbedding,
-    GroupLayerNorm,
-    GroupRMSNorm,
-)
-from xllm.modules.residual import num_params_in_residual
 from xllm.modules.fused_ops import memory_efficient_dropout
-from xllm.modules.model_parallel import (
-    ParallelEmbedding,
-    ColumnParallelLinear,
-    vocab_parallel_cross_entropy,
-    gather_copy_model_parallel_region,
-)
+from xllm.modules.rotary_positional_embedding import RotaryEmbedding
+from xllm.modules.model_parallel import ParallelEmbedding
 from xllm.modules.context_parallel import gather_from_context_parallel_region
 from xllm.modules.utils import (
     get_bos_mask,
@@ -31,582 +17,18 @@ from xllm.modules.utils import (
 )
 from xllm.config import ModelConf
 from xllm.health_metrics import get_active_health_collector
-from xllm.models.xllm import XLLModel
 from xllm.distributed import (
     get_context_parallel_world_size,
     get_context_parallel_rank,
 )
-from xllm.models.fused_blocks import (
-    TransformerBlockFunction,
-    TransformerMoEBlockFunction,
-    TransformerMoVABlockFunction,
-    TransformerOutputLayerFunction,
+from xllm.models.xllm import XLLModel
+from xllm.models.blocks import (
+    TransformerBlock,
+    TransformerMoEBlock,
+    TransformerMoVABlock,
+    TransformerOutputLayer
 )
 from xllm.utils import get_init_fn
-
-
-class TransformerBlock(nn.Module):
-
-    def __init__(self, cfg: ModelConf, layer_id: int):
-        super().__init__()
-        self.layer_id = layer_id
-        self.residual_func = cfg.residual_func
-        self.residual_heads = cfg.residual_heads
-        self.fused_block = cfg.fused_block
-        self.recompute_q = cfg.recompute_q
-        self.recompute_kv = cfg.recompute_v
-        self.recompute_attention = cfg.recompute_attention
-        self.recompute_fc1_out = cfg.recompute_fc1_out
-        self.recompute_fc3_out = cfg.recompute_fc3_out
-        self.dropout = cfg.dropout
-        self.apply_rmsnorm = cfg.apply_rmsnorm
-        self.layernorm_eps = cfg.layernorm_eps
-        self.rmsnorm_eps = cfg.rmsnorm_eps
-
-        if self.fused_block:
-            assert cfg.causal_attn_backend in ['flash', 'xattn'], f"flash or xattn attention backend is required for fused block."
-
-        self.attention = MultiheadAttention(
-            layer_id=layer_id,
-            mdim=cfg.model_dim,
-            n_heads=cfg.num_heads,
-            n_kv_heads=cfg.num_kv_heads,
-            head_dim=cfg.head_dim,
-            rope_head_dim=cfg.rope_head_dim,
-            attn_act_func=cfg.attn_act_func,
-            qknorm=cfg.qknorm,
-            norm_num_groups=cfg.layernorm_num_groups,
-            norm_affine=cfg.norm_affine,
-            layernorm_eps=cfg.layernorm_eps,
-            rmsnorm_eps=cfg.rmsnorm_eps,
-            memory_efficient_norm=cfg.memory_efficient_norm,
-            apply_rmsnorm=cfg.apply_rmsnorm,
-            apply_attn_gate=cfg.apply_attn_gate,
-            attn_gate_func=cfg.attn_gate_func,
-            causal_attn_backend=cfg.causal_attn_backend,
-            dropout=cfg.dropout,
-            attention_dropout=cfg.attention_dropout,
-            hidden_dropout=cfg.hidden_dropout,
-            residual_func=cfg.residual_func,
-            residual_heads=cfg.residual_heads,
-            init_mode=cfg.init_mode,
-            init_std=cfg.init_std,
-        )
-
-        self.nffn = NormalizedFeedForwardNetwork(
-            layer_id=layer_id,
-            model_dim=cfg.model_dim,
-            ffn_hidden_dim=cfg.ffn_hidden_dim,
-            swiglu=cfg.swiglu,
-            dropout=cfg.dropout,
-            hidden_dropout=cfg.hidden_dropout,
-            norm_num_groups=cfg.layernorm_num_groups,
-            norm_affine=cfg.norm_affine,
-            layernorm_eps=cfg.layernorm_eps,
-            rmsnorm_eps=cfg.rmsnorm_eps,
-            memory_efficient_norm=cfg.memory_efficient_norm,
-            apply_rmsnorm=cfg.apply_rmsnorm,
-            residual_func=cfg.residual_func,
-            residual_heads=cfg.residual_heads,
-            init_mode=cfg.init_mode,
-            init_std=cfg.init_std,
-        )
-
-    def forward(
-        self,
-        x: Tensor,
-        freqs_cis: Optional[Tensor],
-        bos_mask: Optional[Tensor] = None,
-        segments: Optional[Any] = None,
-        moe_router_load_balancing_type: Optional[str] = None,
-        attn_stability_control: int = 0,
-        deterministic: bool = True,
-        cache: Optional[Tuple[Tensor, Tensor, int]] = None,
-    ) -> Tuple[Tensor, Optional[Tensor], Optional[Any]]:
-        if self.fused_block and self.training:
-            fn = TransformerBlockFunction
-            return fn.apply(
-                self.layer_id,
-                x,
-                freqs_cis,
-                bos_mask,
-                segments,
-                self.attention.norm.weight,
-                self.attention.norm.bias,
-                self.attention.wq.weight,
-                self.attention.wk.weight,
-                self.attention.wv.weight,
-                self.attention.wr.weight if self.attention.wr is not None else None,
-                self.attention.wo.weight,
-                self.attention.query_norm.weight if self.attention.qknorm else None,
-                self.attention.key_norm.weight if self.attention.qknorm else None,
-                self.attention.local_heads,
-                self.attention.local_kv_heads,
-                self.attention.head_dim,
-                self.attention.rope_head_dim,
-                self.attention.attn_act_func,
-                self.attention.apply_attn_gate,
-                self.attention.attn_gate_fn,
-                self.attention.causal_attn_backend,
-                self.nffn.norm.weight,
-                self.nffn.norm.bias,
-                self.nffn.norm.groups_per_partition,
-                self.nffn.fc1.weight,
-                self.nffn.fc2.weight,
-                self.nffn.fc3.weight if self.nffn.swiglu else None,
-                self.dropout,
-                self.attention.attention_dropout,
-                self.attention.hidden_dropout,
-                self.nffn.swiglu,
-                self.layernorm_eps,
-                self.rmsnorm_eps,
-                self.apply_rmsnorm,
-                self.attention.norm.gather_input,
-                self.residual_func,
-                self.residual_heads,
-                attn_stability_control,
-                deterministic,
-                self.recompute_q,
-                self.recompute_kv,
-                self.recompute_attention,
-                self.recompute_fc1_out,
-                self.recompute_fc3_out,
-            )
-
-        y, cache = self.attention(
-            x, freqs_cis, bos_mask, segments, attn_stability_control, deterministic, cache
-        )
-        # FFN
-        out = self.nffn(y)
-
-        return out, None, cache
-
-
-class TransformerMoEBlock(nn.Module):
-
-    def __init__(self, cfg: ModelConf, layer_id: int):
-        super().__init__()
-        self.layer_id = layer_id
-        self.residual_func = cfg.residual_func
-        self.residual_heads = cfg.residual_heads
-        self.fused_block = cfg.fused_block
-        self.recompute_q = cfg.recompute_q
-        self.recompute_kv = cfg.recompute_v
-        self.recompute_attention = cfg.recompute_attention
-        self.recompute_fc1_out = cfg.recompute_fc1_out
-        self.recompute_fc3_out = cfg.recompute_fc3_out
-        self.recompute_router = cfg.recompute_router
-        self.dropout = cfg.dropout
-        self.apply_rmsnorm = cfg.apply_rmsnorm
-        self.layernorm_eps = cfg.layernorm_eps
-        self.rmsnorm_eps = cfg.rmsnorm_eps
-
-        if self.fused_block:
-            assert cfg.causal_attn_backend in ['flash', 'xattn'], f"flash or xattn attention backend is required for fused block."
-
-        self.attention = MultiheadAttention(
-            layer_id=layer_id,
-            mdim=cfg.model_dim,
-            n_heads=cfg.num_heads,
-            n_kv_heads=cfg.num_kv_heads,
-            head_dim=cfg.head_dim,
-            rope_head_dim=cfg.rope_head_dim,
-            attn_act_func=cfg.attn_act_func,
-            qknorm=cfg.qknorm,
-            norm_num_groups=cfg.layernorm_num_groups,
-            norm_affine=cfg.norm_affine,
-            layernorm_eps=cfg.layernorm_eps,
-            rmsnorm_eps=cfg.rmsnorm_eps,
-            memory_efficient_norm=cfg.memory_efficient_norm,
-            apply_rmsnorm=cfg.apply_rmsnorm,
-            apply_attn_gate=cfg.apply_attn_gate,
-            attn_gate_func=cfg.attn_gate_func,
-            causal_attn_backend=cfg.causal_attn_backend,
-            dropout=cfg.dropout,
-            attention_dropout=cfg.attention_dropout,
-            hidden_dropout=cfg.hidden_dropout,
-            residual_func=cfg.residual_func,
-            residual_heads=cfg.residual_heads,
-            init_mode=cfg.init_mode,
-            init_std=cfg.init_std,
-        )
-
-        self.moe = NormalizedMoE(
-            layer_id=layer_id,
-            model_dim=cfg.model_dim,
-            expert_inter_dim=cfg.expert_inter_dim,
-            num_experts=cfg.num_experts,
-            num_activated_experts=cfg.num_activated_experts,
-            num_shared_experts=cfg.num_shared_experts,
-            expert_backend=cfg.moe_expert_backend,
-            permutation_backend=cfg.moe_permutation_backend,
-            router_score_func=cfg.moe_router_score_func,
-            router_bias=cfg.moe_router_bias,
-            router_bias_update_rate=cfg.moe_router_bias_update_rate,
-            router_scaling_factor=cfg.moe_router_scaling_factor,
-            dropout=cfg.dropout,
-            hidden_dropout=cfg.hidden_dropout,
-            norm_num_groups=cfg.layernorm_num_groups,
-            norm_affine=cfg.norm_affine,
-            layernorm_eps=cfg.layernorm_eps,
-            rmsnorm_eps=cfg.rmsnorm_eps,
-            memory_efficient_norm=cfg.memory_efficient_norm,
-            apply_rmsnorm=cfg.apply_rmsnorm,
-            residual_func=cfg.residual_func,
-            residual_heads=cfg.residual_heads,
-            init_mode=cfg.init_mode,
-            init_std=cfg.init_std
-        )
-
-    def forward(
-        self,
-        x: Tensor,
-        freqs_cis: Optional[Tensor],
-        bos_mask: Optional[Tensor] = None,
-        segments: Optional[Any] = None,
-        moe_router_load_balancing_type: Optional[str] = None,
-        attn_stability_control: int = 0,
-        deterministic: bool = True,
-        cache: Optional[Tuple[Tensor, Tensor, int]] = None,
-    ) -> Tuple[Tensor, Optional[Tensor], Optional[Any]]:
-        if self.fused_block and self.training:
-            fn = TransformerMoEBlockFunction
-            return fn.apply(
-                self.layer_id,
-                x,
-                freqs_cis,
-                bos_mask,
-                segments,
-                self.attention.norm.weight,
-                self.attention.norm.bias,
-                self.attention.wq.weight,
-                self.attention.wk.weight,
-                self.attention.wv.weight,
-                self.attention.wr.weight if self.attention.wr is not None else None,
-                self.attention.wo.weight,
-                self.attention.query_norm.weight if self.attention.qknorm else None,
-                self.attention.key_norm.weight if self.attention.qknorm else None,
-                self.attention.local_heads,
-                self.attention.local_kv_heads,
-                self.attention.head_dim,
-                self.attention.rope_head_dim,
-                self.attention.attn_act_func,
-                self.attention.apply_attn_gate,
-                self.attention.attn_gate_fn,
-                self.attention.causal_attn_backend,
-                self.moe.norm.weight,
-                self.moe.norm.bias,
-                self.moe.norm.groups_per_partition,
-                self.moe.fc1.weight if self.moe.fc1 is not None else None,
-                self.moe.fc2.weight if self.moe.fc2 is not None else None,
-                self.moe.fc3.weight if self.moe.fc3 is not None else None,
-                self.moe.router.weight,
-                self.moe.n_experts,
-                self.moe.n_local_experts,
-                self.moe.expert_start_idx,
-                self.moe.expert_end_idx,
-                self.moe.topk,
-                self.moe.permutation_backend,
-                self.moe.router.score_func,
-                self.moe.router.bias,
-                self.moe.router.bias_update_rate,
-                self.moe.router.scaling_factor,
-                moe_router_load_balancing_type,
-                self.moe.experts.weight1,
-                self.moe.experts.weight2,
-                self.moe.experts.weight3,
-                self.moe.experts.backend,
-                self.dropout,
-                self.attention.attention_dropout,
-                self.attention.hidden_dropout,
-                self.layernorm_eps,
-                self.rmsnorm_eps,
-                self.apply_rmsnorm,
-                self.attention.norm.gather_input,
-                self.residual_func,
-                self.residual_heads,
-                attn_stability_control,
-                deterministic,
-                self.recompute_q,
-                self.recompute_kv,
-                self.recompute_attention,
-                self.recompute_fc1_out,
-                self.recompute_fc3_out,
-                self.recompute_router,
-            )
-
-        y, cache = self.attention(
-            x, freqs_cis, bos_mask, segments, attn_stability_control, deterministic, cache
-        )
-        # MoE
-        out, aux_loss = self.moe(y, moe_router_load_balancing_type)
-
-        return out, aux_loss, cache
-
-
-class TransformerMoVABlock(nn.Module):
-
-    def __init__(self, cfg: ModelConf, layer_id: int):
-        super().__init__()
-        self.layer_id = layer_id
-        self.residual_func = cfg.residual_func
-        self.residual_heads = cfg.residual_heads
-        self.fused_block = cfg.fused_block
-        self.recompute_q = cfg.recompute_q
-        self.recompute_kv = cfg.recompute_v
-        self.recompute_attention = cfg.recompute_attention
-        self.recompute_fc1_out = cfg.recompute_fc1_out
-        self.recompute_fc3_out = cfg.recompute_fc3_out
-        self.recompute_router = cfg.recompute_router
-        self.dropout = cfg.dropout
-        self.apply_rmsnorm = cfg.apply_rmsnorm
-        self.layernorm_eps = cfg.layernorm_eps
-        self.rmsnorm_eps = cfg.rmsnorm_eps
-
-        if self.fused_block:
-            assert cfg.causal_attn_backend in ['flash', 'xattn'], f"flash or xattn attention backend is required for fused block."
-
-        self.mova = MOVAttention(
-            layer_id=layer_id,
-            mdim=cfg.model_dim,
-            n_heads=cfg.num_heads,
-            n_kv_heads=cfg.num_kv_heads,
-            head_dim=cfg.head_dim,
-            rope_head_dim=cfg.rope_head_dim,
-            attn_act_func=cfg.attn_act_func,
-            num_values=cfg.num_values,
-            num_activated_values=cfg.num_activated_values,
-            qknorm=cfg.qknorm,
-            norm_num_groups=cfg.layernorm_num_groups,
-            norm_affine=cfg.norm_affine,
-            layernorm_eps=cfg.layernorm_eps,
-            rmsnorm_eps=cfg.rmsnorm_eps,
-            memory_efficient_norm=cfg.memory_efficient_norm,
-            apply_rmsnorm=cfg.apply_rmsnorm,
-            apply_attn_gate=cfg.apply_attn_gate,
-            attn_gate_func=cfg.attn_gate_func,
-            causal_attn_backend=cfg.causal_attn_backend,
-            value_backend=cfg.mova_backend,
-            permutation_backend=cfg.moe_permutation_backend,
-            dropout=cfg.dropout,
-            attention_dropout=cfg.attention_dropout,
-            hidden_dropout=cfg.hidden_dropout,
-            router_score_func=cfg.moe_router_score_func,
-            router_bias=cfg.moe_router_bias,
-            router_bias_update_rate=cfg.moe_router_bias_update_rate,
-            router_scaling_factor=cfg.moe_router_scaling_factor,
-            residual_func=cfg.residual_func,
-            residual_heads=cfg.residual_heads,
-            init_mode=cfg.init_mode,
-            init_std=cfg.init_std,
-        )
-
-        self.moe = NormalizedMoE(
-            layer_id=layer_id,
-            model_dim=cfg.model_dim,
-            expert_inter_dim=cfg.expert_inter_dim,
-            num_experts=cfg.num_experts,
-            num_activated_experts=cfg.num_activated_experts,
-            num_shared_experts=cfg.num_shared_experts,
-            expert_backend=cfg.moe_expert_backend,
-            permutation_backend=cfg.moe_permutation_backend,
-            router_score_func=cfg.moe_router_score_func,
-            router_bias=cfg.moe_router_bias,
-            router_bias_update_rate=cfg.moe_router_bias_update_rate,
-            router_scaling_factor=cfg.moe_router_scaling_factor,
-            dropout=cfg.dropout,
-            hidden_dropout=cfg.hidden_dropout,
-            norm_num_groups=cfg.layernorm_num_groups,
-            norm_affine=cfg.norm_affine,
-            layernorm_eps=cfg.layernorm_eps,
-            rmsnorm_eps=cfg.rmsnorm_eps,
-            memory_efficient_norm=cfg.memory_efficient_norm,
-            apply_rmsnorm=cfg.apply_rmsnorm,
-            residual_func=cfg.residual_func,
-            residual_heads=cfg.residual_heads,
-            init_mode=cfg.init_mode,
-            init_std=cfg.init_std
-        )
-
-    def forward(
-        self,
-        x: Tensor,
-        freqs_cis: Optional[Tensor],
-        bos_mask: Optional[Tensor] = None,
-        segments: Optional[Any] = None,
-        moe_router_load_balancing_type: Optional[str] = None,
-        attn_stability_control: int = 0,
-        deterministic: bool = True,
-        cache: Optional[Tuple[Tensor, Tensor, int]] = None,
-    ) -> Tuple[Tensor, Optional[Tensor], Optional[Any]]:
-        if self.fused_block and self.training:
-            fn = TransformerMoVABlockFunction
-            return fn.apply(
-                self.layer_id,
-                x,
-                freqs_cis,
-                bos_mask,
-                segments,
-                self.mova.norm.weight,
-                self.mova.norm.bias,
-                self.mova.wq.weight,
-                self.mova.wk.weight,
-                self.mova.wv.weight,
-                self.mova.wr.weight if self.mova.wr is not None else None,
-                self.mova.wo.weight,
-                self.mova.query_norm.weight if self.mova.qknorm else None,
-                self.mova.key_norm.weight if self.mova.qknorm else None,
-                self.mova.local_heads,
-                self.mova.local_kv_heads,
-                self.mova.head_dim,
-                self.mova.rope_head_dim,
-                self.mova.router.weight,
-                self.mova.n_values,
-                self.mova.topk,
-                self.mova.router.bias,
-                self.mova.value_backend,
-                self.mova.attn_act_func,
-                self.mova.apply_attn_gate,
-                self.mova.attn_gate_fn,
-                self.mova.causal_attn_backend,
-                self.moe.norm.weight,
-                self.moe.norm.bias,
-                self.moe.norm.groups_per_partition,
-                self.moe.fc1.weight if self.moe.fc1 is not None else None,
-                self.moe.fc2.weight if self.moe.fc2 is not None else None,
-                self.moe.fc3.weight if self.moe.fc3 is not None else None,
-                self.moe.router.weight,
-                self.moe.n_experts,
-                self.moe.n_local_experts,
-                self.moe.expert_start_idx,
-                self.moe.expert_end_idx,
-                self.moe.topk,
-                self.moe.permutation_backend,
-                self.moe.router.score_func,
-                self.moe.router.bias,
-                self.moe.router.bias_update_rate,
-                self.moe.router.scaling_factor,
-                moe_router_load_balancing_type,
-                self.moe.experts.weight1,
-                self.moe.experts.weight2,
-                self.moe.experts.weight3,
-                self.moe.experts.backend,
-                self.dropout,
-                self.mova.attention_dropout,
-                self.mova.hidden_dropout,
-                self.layernorm_eps,
-                self.rmsnorm_eps,
-                self.apply_rmsnorm,
-                self.mova.norm.gather_input,
-                self.residual_func,
-                self.residual_heads,
-                attn_stability_control,
-                deterministic,
-                self.recompute_q,
-                self.recompute_kv,
-                self.recompute_attention,
-                self.recompute_fc1_out,
-                self.recompute_fc3_out,
-                self.recompute_router,
-            )
-
-        y, aux_loss_mova, cache = self.mova(
-            x, freqs_cis, bos_mask, segments, attn_stability_control, deterministic, cache, moe_router_load_balancing_type
-        )
-        # MoE
-        out, aux_loss_moe = self.moe(y, moe_router_load_balancing_type)
-        aux_loss = None if aux_loss_mova is None else (aux_loss_mova + aux_loss_moe) * 0.5
-
-        return out, aux_loss, cache
-
-
-class TransformerOutputLayer(nn.Module):
-    def __init__(self, cfg: ModelConf):
-        super().__init__()
-
-        self.model_dim = cfg.model_dim
-        self.output_size = cfg.vocab_size
-        self.apply_rmsnorm = cfg.apply_rmsnorm
-        self.layernorm_eps = cfg.layernorm_eps
-        self.rmsnorm_eps = cfg.rmsnorm_eps
-        self.recompute_logits = cfg.recompute_logits
-
-        norm_cls = GroupRMSNorm if cfg.apply_rmsnorm else GroupLayerNorm
-        norm_eps = cfg.rmsnorm_eps if self.apply_rmsnorm else cfg.layernorm_eps
-        self.final_norm = norm_cls(
-            cfg.model_dim,
-            num_groups=cfg.layernorm_num_groups,
-            elementwise_affine=cfg.norm_affine,
-            eps=norm_eps,
-            memory_efficient=cfg.memory_efficient_norm
-        )
-
-        init_fn = get_init_fn('gaussian', dim=self.model_dim, std=cfg.init_logits_std)
-        self.output = ColumnParallelLinear(
-            self.model_dim,
-            self.output_size,
-            bias=False,
-            input_is_parallel=False,
-            disable_input_reduce=True,
-            gather_output=False,
-            init_method=init_fn
-        )
-
-    def forward(
-        self,
-        x: Tensor,
-        y: Optional[Tensor],
-        mask: Optional[Tensor] = None,
-    ):
-        if self.training:
-            assert y is not None
-            fn = TransformerOutputLayerFunction
-            return fn.apply(
-                x,
-                y,
-                mask,
-                self.final_norm.weight,
-                self.final_norm.bias,
-                self.final_norm.groups_per_partition,
-                self.output.weight,
-                self.layernorm_eps,
-                self.rmsnorm_eps,
-                self.apply_rmsnorm,
-                self.final_norm.gather_input,
-                self.recompute_logits,
-            )
-
-        x = self.final_norm(x)
-        if not self.final_norm.gather_input:
-            x = gather_copy_model_parallel_region(x)
-        logits = self.output(x).float()
-        collector = get_active_health_collector()
-        if collector is not None and collector.enable_logits_stats and y is not None:
-            # Diagnostics must not change tensors saved for checkpoint recomputation.
-            detached_logits = logits.detach()
-            valid_tokens = y.ne(-100)
-            if mask is not None:
-                valid_tokens.logical_and_(mask.to(torch.bool))
-            token_sums = detached_logits.sum(dim=-1)
-            logits_sum = token_sums.masked_fill(~valid_tokens, 0.0).sum()
-            logits_count = valid_tokens.sum() * logits.shape[-1]
-            token_logit_minimums, token_logit_maximums = torch.aminmax(detached_logits, dim=-1)
-            logits_minimum = token_logit_minimums.masked_fill(
-                ~valid_tokens, float("inf")
-            ).min()
-            logits_maximum = token_logit_maximums.masked_fill(
-                ~valid_tokens, -float("inf")
-            ).max()
-            collector.record_logits_stats(
-                logits_sum, logits_count, logits_minimum, logits_maximum,
-            )
-        if y is None:
-            return logits
-        else:
-            loss = vocab_parallel_cross_entropy(logits, y)
-            if mask is not None:
-                loss = loss * mask.to(loss)
-            return loss
 
 
 class Transformer(XLLModel):
@@ -653,7 +75,8 @@ class Transformer(XLLModel):
         moe_router_load_balancing_type: Optional[str] = None,
         attn_stability_control: int = 0,
         deterministic: bool = True,
-        cache: Optional[List[Tuple[Tensor, Tensor, int]]] = None,
+        cache: Optional[List[Tuple[Tuple[Tensor, Tensor, int],
+                                   Tuple[Tensor, Tensor, Tensor]]]] = None,
     ):
         bsz, seq_len = tokens.shape
 
@@ -663,7 +86,9 @@ class Transformer(XLLModel):
         if multi_segments:
             assert cache is None
             bos_mask = get_bos_mask(tokens, self.eos_id, use_eos=True)
-            segments = self.get_segment_arg(bos_mask)
+            segments = self.get_segment_arg(
+                bos_mask, self.causal_attn_backend, self.context_parallel_rank, self.context_parallel_size
+            )
         else:
             bos_mask = None
             segments = None
@@ -684,7 +109,7 @@ class Transformer(XLLModel):
                 token_mask = token_mask[:, start:end] if token_mask is not None else None
         else:
             assert self.context_parallel_size == 1, "inference mode does not support context parallel."
-            cache_len = 0 if cache is None else cache[0][-1]
+            cache_len = 0 if cache is None else cache[0][0][-1]
 
         # embeddings
         emb = self.embed(tokens)
@@ -727,13 +152,14 @@ class Transformer(XLLModel):
         # TODO: causal attn w. xattn backend supports it.
         return False
 
-    def get_segment_arg(self, bos_mask):
+    @staticmethod
+    def get_segment_arg(bos_mask, causal_attn_backend, cp_rank, cp_size):
         bsz, seq_len = bos_mask.shape
-        seq_len = seq_len // self.context_parallel_size
-        start = self.context_parallel_rank * seq_len
-        end = (self.context_parallel_rank + 1) * seq_len
-        if self.causal_attn_backend == 'flash':
-            if self.context_parallel_size > 1:
+        seq_len = seq_len // cp_size
+        start = cp_rank * seq_len
+        end = (cp_rank + 1) * seq_len
+        if causal_attn_backend == 'flash':
+            if cp_size > 1:
                 assert bsz == 1, f"Flash attention does not support context parallel w. bsz {bsz} > 1"
             # query seqlens
             bos_idx_q = torch.nonzero(F.pad(bos_mask[:, (start + 1):end], (1, 0), value=1))
@@ -751,14 +177,14 @@ class Transformer(XLLModel):
             max_seqlen_k = (cu_seqlens_k[1:] - cu_seqlens_k[:-1]).max().item()
             total_seqlen_k = cu_seqlens_k[-1].item()
             return cu_seqlens_q.int(), cu_seqlens_k.int(), max_seqlen_q, max_seqlen_k, total_seqlen_k
-        elif self.causal_attn_backend == 'swift':
+        elif causal_attn_backend == 'swift':
             segment_idx = get_segment_idx_from_bos_mask(bos_mask)
             # B x L1
             q_segment_idx = segment_idx[:, start:end]
             # B x L2
             k_segment_idx = segment_idx[:, :end]
             return q_segment_idx, k_segment_idx
-        elif self.causal_attn_backend == 'xattn':
+        elif causal_attn_backend == 'xattn':
             segment_idx = get_segment_idx_from_bos_mask(bos_mask)
             # B x L1
             q_segment_idx = segment_idx[:, start:end]
@@ -769,7 +195,7 @@ class Transformer(XLLModel):
             total_seqlen_k = torch.sum(segment_idx >= last_qidx, dim=1).max().item()
             return segment_idx, total_seqlen_k
         else:
-            assert self.causal_attn_backend is None
+            assert causal_attn_backend is None
             segment_idx = get_segment_idx_from_bos_mask(bos_mask)
             # B x L1
             q_segment_idx = segment_idx[:, start:end]
@@ -778,103 +204,6 @@ class Transformer(XLLModel):
             # B x L1 x L2
             seg_mask = torch.ne(q_segment_idx.unsqueeze(2), k_segment_idx.unsqueeze(1))
             return seg_mask
-
-    def num_parameters(self):
-        embed_params = self.model_dim * self.vocab_size * 2
-        nk = {"softmax": 1, "softdelta": 2}[self.attn_act_func]
-        attn_params_per_block = self.model_dim * (self.num_heads * 2 + self.num_kv_heads * (nk + 1)) * self.head_dim
-        if self.attn_act_func == 'softdelta':
-            attn_params_per_block += self.model_dim * self.num_heads
-        if self.apply_attn_gate:
-            attn_params_per_block += self.model_dim * self.num_heads * self.head_dim
-        attn_params_per_block += num_params_in_residual(self.residual_func, self.model_dim, self.residual_heads, self.num_heads * self.head_dim)
-        # Norm
-        norm_params_per_block = self.model_dim * (2 if self.apply_rmsnorm else 4)
-        if self.qknorm:
-            norm_params_per_block += (self.num_heads + self.num_kv_heads * nk) * self.head_dim
-        # FFN
-        ffn_params_per_block = self.model_dim * self.ffn_hidden_dim * (3 if self.swiglu else 2)
-        ffn_params_per_block += num_params_in_residual(self.residual_func, self.model_dim, self.residual_heads, self.ffn_hidden_dim)
-
-        activated_params = norm_params_per_block * self.num_layers
-        activated_params += (attn_params_per_block + ffn_params_per_block) * self.num_dense_layers + embed_params
-        total_params = activated_params
-        if self.num_values > 0:
-            mova_qko_params = self.model_dim * (self.num_heads * 2 + self.num_kv_heads * nk) * self.head_dim
-            if self.attn_act_func == 'softdelta':
-                mova_qko_params += self.model_dim * self.num_heads
-            if self.apply_attn_gate:
-                mova_qko_params += self.model_dim * self.num_heads * self.head_dim
-            mova_qko_params += num_params_in_residual(self.residual_func, self.model_dim, self.residual_heads, self.num_heads * self.head_dim)
-            # Value
-            routed_value_params = self.model_dim * self.num_kv_heads * self.head_dim * self.num_values
-            activated_value_params = self.model_dim * self.num_kv_heads * self.head_dim * self.num_activated_values
-            router_params = self.model_dim * self.num_values
-            activated_params += (mova_qko_params + activated_value_params + router_params) * (self.num_layers - self.num_dense_layers)
-            total_params += (mova_qko_params + routed_value_params + router_params) * (self.num_layers - self.num_dense_layers)
-        else:
-            activated_params += attn_params_per_block * (self.num_layers - self.num_dense_layers)
-            total_params += attn_params_per_block * (self.num_layers - self.num_dense_layers)
-        if self.num_experts > 0:
-            shared_expert_params = self.model_dim * self.expert_inter_dim * self.num_shared_experts * 3
-            routed_expert_params = self.model_dim * self.expert_inter_dim * self.num_experts * 3
-            activated_expert_params = self.model_dim * self.expert_inter_dim * self.num_activated_experts * 3
-            router_params = self.model_dim * self.num_experts
-            residual_params = num_params_in_residual(self.residual_func, self.model_dim, self.residual_heads, self.model_dim)
-            activated_params += (shared_expert_params + activated_expert_params + router_params + residual_params) * (self.num_layers - self.num_dense_layers)
-            total_params += (shared_expert_params + routed_expert_params + router_params) * (self.num_layers - self.num_dense_layers)
-        # final norm
-        activated_params += self.model_dim * (1 if self.apply_rmsnorm else 2)
-        total_params += self.model_dim * (1 if self.apply_rmsnorm else 2)
-        return total_params, activated_params, embed_params
-
-    def tflops_per_token(self, seq_len: int):
-        expansion_factor = 6
-        embed_flops = self.model_dim + self.vocab_size
-        logits_flops = self.model_dim * self.vocab_size
-        nk = {"softmax": 1, "softdelta": 2}[self.attn_act_func]
-        norm_flops = self.model_dim * (4 if self.apply_rmsnorm else 8)
-        if self.qknorm:
-            norm_flops += (self.num_heads + self.num_kv_heads * nk) * self.head_dim * 2
-        attn_flops = self.model_dim * (self.num_heads * 2 + self.num_kv_heads * (nk + 1)) * self.head_dim
-
-        # FFN
-        ffn_flops = self.model_dim * self.ffn_hidden_dim * (3 if self.swiglu else 2)
-
-        # residual
-        # TODO
-        res_flops = 0.0
-
-        # MoVA
-        mova_flops = self.model_dim * (self.num_heads * 2 + self.num_kv_heads * nk) * self.head_dim
-        mova_flops += self.model_dim * self.num_kv_heads * self.head_dim * self.num_activated_values
-        mova_flops += self.model_dim * self.num_values
-
-        if self.apply_attn_gate:
-            attn_flops += self.model_dim * self.num_heads * self.head_dim
-            mova_flops += self.model_dim * self.num_heads * self.head_dim
-
-        if self.attn_act_func == 'softmax':
-            attn_flops += self.num_heads * self.head_dim * seq_len
-            mova_flops += self.num_heads * self.head_dim * seq_len
-        elif self.attn_act_func == 'softdelta':
-            attn_flops += self.model_dim * self.num_heads
-            attn_flops += (self.num_heads + self.num_kv_heads) * self.head_dim * seq_len  # qkv - kkv
-            mova_flops += self.model_dim * self.num_heads
-            mova_flops += (self.num_heads + self.num_kv_heads) * self.head_dim * seq_len  # qkv - kkv
-        else:
-            raise ValueError(f"Unknown attention activation function: {self.attn_act_func}")
-
-        # MoE
-        moe_flops = self.model_dim * self.expert_inter_dim * (self.num_activated_experts + self.num_shared_experts) * 3
-        moe_flops += self.model_dim * self.num_experts
-
-        total_tflops = embed_flops + logits_flops + norm_flops
-        total_tflops += self.num_layers * (norm_flops + res_flops)
-        total_tflops += self.num_dense_layers * (attn_flops + ffn_flops)
-        total_tflops += (self.num_layers - self.num_dense_layers) * (moe_flops + (mova_flops if self.num_values > 0 else attn_flops))
-        total_tflops = total_tflops * expansion_factor / 10**12
-        return total_tflops
 
 
 # register some models configurations
