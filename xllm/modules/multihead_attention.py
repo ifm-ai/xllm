@@ -246,7 +246,7 @@ class MultiheadAttention(nn.Module):
         width = self.q_conv.kernel_size - 1
         cdim = self.local_heads * self.head_dim + self.local_kv_heads * (self.head_dim * nk + self.head_dim)
         prev_tensor = torch.empty(
-            (bsz, width * cdim), dtype=torch.float32, device=x.device, requires_grad=self.training
+            (bsz, width * cdim), dtype=x.dtype, device=x.device, requires_grad=self.training
         )
         prev_tensor = recv_from_prev_context_parallel_region(prev_tensor)
         return prev_tensor
@@ -271,9 +271,9 @@ class MultiheadAttention(nn.Module):
         conv_k_size = width * n_kv_heads * kdim * nk
         conv_v_size = width * n_kv_heads * vdim
         conv_q, conv_k, conv_v = torch.split(prev_tensor, [conv_q_size, conv_k_size, conv_v_size], dim=-1)
-        conv_q = conv_q.view(bsz, width, n_heads * kdim).to(x)
-        conv_k = conv_k.view(bsz, width, n_kv_heads * kdim * nk).to(x)
-        conv_v = conv_v.view(bsz, width, n_kv_heads * vdim).to(x)
+        conv_q = conv_q.view(bsz, width, n_heads * kdim)
+        conv_k = conv_k.view(bsz, width, n_kv_heads * kdim * nk)
+        conv_v = conv_v.view(bsz, width, n_kv_heads * vdim)
         return conv_q, conv_k, conv_v
 
     def forward(
