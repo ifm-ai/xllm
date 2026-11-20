@@ -475,6 +475,7 @@ class TrainerConf(Config):
         if self.optim.optimizer == "muon":
             assert self.model.ddp_backend == "fsdp2", "Muon requires FSDP2."
             assert self.dcp_for_optimizer, "Muon requires dcp_for_optimizer (sharded momentum)."
+            assert self.model.num_experts == 0, "Muon supports dense models only (MoE expert layouts are untested in training)."
 
         # MoE
         if self.model.num_experts > 0:

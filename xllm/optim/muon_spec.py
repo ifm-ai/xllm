@@ -1,8 +1,8 @@
 """Muon weight metadata, independent of the optimizer and distributed runtime.
 
 Specs live on modules so parameter replacement by FSDP2 preserves registration.
-The layout helpers describe geometry; supported training currently requires
-TP=CP=1 and dense models. Expert and TP layouts are internal groundwork.
+The layout helpers describe geometry. Training supports dense models with any TP and CP;
+expert layouts are registered but Muon training of MoE models is not supported yet.
 """
 import math
 import re
