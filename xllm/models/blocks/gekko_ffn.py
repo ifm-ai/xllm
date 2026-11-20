@@ -232,9 +232,9 @@ class GekkoBlock(nn.Module):
         tflops_per_token += norm_flops + conv_flops
         # SCA flops
         if attn_act_func == 'softmax':
-            tflops_per_token += (qdim + hdim) * chunk_size
+            tflops_per_token += (qdim + hdim) * chunk_size * 1.5
         elif attn_act_func == 'softdelta':
-            tflops_per_token += (qdim + hdim + kdim) * chunk_size
+            tflops_per_token += (qdim + hdim + kdim) * chunk_size * 1.5
         else:
             raise ValueError(f"Unknown attention activation function: {attn_act_func}")
         # AWM flops
