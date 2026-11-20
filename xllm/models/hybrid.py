@@ -6,37 +6,29 @@ from torch.utils.checkpoint import checkpoint
 
 from xllm.configuration import ConfStore
 from xllm.data.dataset_streamer.tokenizer import Tokenizer
-from xllm.modules import (
-    RotaryEmbedding,
-)
 from xllm.modules.fused_ops import memory_efficient_dropout
-from xllm.modules.model_parallel import (
-    ParallelEmbedding,
-)
+from xllm.modules.rotary_positional_embedding import RotaryEmbedding
+from xllm.modules.model_parallel import ParallelEmbedding
+from xllm.modules.context_parallel import gather_from_context_parallel_region
 from xllm.config import ModelConf
 from xllm.health_metrics import get_active_health_collector
 from xllm.distributed import (
     get_context_parallel_world_size,
     get_context_parallel_rank,
 )
-from xllm.modules.context_parallel import (
-    gather_from_context_parallel_region,
-)
 from xllm.modules.utils import (
     get_bos_mask,
     get_segment_idx_from_bos_mask
 )
 from xllm.models.xllm import XLLModel
-from xllm.models.transformer import (
+from xllm.models.blocks import (
     TransformerBlock,
     TransformerMoEBlock,
     TransformerMoVABlock,
-    Transformer
-)
-from xllm.models.gekko import (
     GekkoBlock,
     GekkoOutputLayer
 )
+from xllm.models.transformer import Transformer
 from xllm.utils import get_init_fn
 
 
