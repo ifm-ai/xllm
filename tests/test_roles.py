@@ -223,3 +223,20 @@ def test_roles_require_fsdp2():
     with pytest.raises(AssertionError, match="require FSDP2"):
         TrainerConf(slurm=SlurmConf(), model=ModelConf(**(MODEL | dict(ddp_backend="fsdp1"))), optim=ADAMW,
                     valid=ValidConf(), tokenizer=TokenizerConf(), dataloader=DataLoaderConfig(), roles=ADAMW_ROLES)
+
+
+def test_restore_keeps_the_built_groups():
+    """A checkpoint's groups can sit in other positions (another role set, a base model without roles): the loaded
+    keys, role included, are replaced by the groups the optimizer was built with."""
+    from xllm.optim import build_optimizer
+    opt, _ = build_optimizer(build("moe"), ADAMW, 10, "fp32", ADAMW_ROLES)
+    roles = [g["role"] for g in opt.param_groups]
+    for group in opt.param_groups:  # as a load copying another layout's keys by position would leave them
+        for key in ("role", "algorithm", "eps", "weight_decay", "betas", "initial_lr"):
+            group.pop(key, None)
+    opt.param_groups[-1]["role"] = "other"
+    restore_optimizer_config(opt, ADAMW, ADAMW_ROLES)
+    assert [g["role"] for g in opt.param_groups] == roles
+    g = {group["role"]: group for group in opt.param_groups}
+    for name, (lr, eps, wd) in ADAMW_WANT.items():
+        assert (g[name]["initial_lr"], g[name]["eps"], g[name]["weight_decay"]) == (lr, eps, wd), name
