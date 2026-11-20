@@ -313,6 +313,16 @@ class MOVAttention(nn.Module):
         bsz, slen, _ = x.shape
         residual = x
 
+        x = self.norm(x)
+        sx = scatter_to_model_parallel_region(x) if self.norm.gather_input else x
+        # B x L x K
+        routing_scores, routing_indices, tokens_per_expert, aux_loss = self.router(sx, load_balancing_type)
+        health_collector = get_active_health_collector()
+        if health_collector is not None:
+            health_collector.record_router_stats(
+                "mova", self.layer_id, tokens_per_expert, routing_scores, self.router.bias, aux_loss,
+            )
+
         if cache is not None:
             cache_attn, cache_conv = cache
             conv_state_q, conv_state_k, conv_state_v = cache_conv
@@ -324,15 +334,6 @@ class MOVAttention(nn.Module):
             conv_state_q, conv_state_k, conv_state_v = None, None, None
             cache_attn, cache_conv = None, None
 
-        x = self.norm(x)
-        sx = scatter_to_model_parallel_region(x) if self.norm.gather_input else x
-        # B x L x K
-        routing_scores, routing_indices, tokens_per_expert, aux_loss = self.router(sx, load_balancing_type)
-        health_collector = get_active_health_collector()
-        if health_collector is not None:
-            health_collector.record_router_stats(
-                "mova", self.layer_id, tokens_per_expert, routing_scores, self.router.bias, aux_loss,
-            )
         # B*L*K
         sorted_indices = torch.argsort(routing_indices.flatten(), stable=True)
         permute_indices = sorted_indices // self.topk
