@@ -14,7 +14,7 @@
   `--optim.muon.weight_decay` (default 0.1). Attention, the FFN, MoE experts and
   shared experts register their projections; linear layers in the blocks that are not
   registered are listed in a warning when the optimizer is built.
-- **Registration API.** Import `register_muon` from `xllm.optim.muon_spec`; model construction does not import the optimizer runtime. Expert layouts and arbitrary block grids describe internal geometry; this release supports dense training with any TP and CP.
+- **Registration API.** Import `register_muon` from `xllm.optim.muon_spec`; model construction does not import the optimizer runtime. Training supports dense and MoE models (one Newton-Schulz block per expert) with any TP / expert parallelism and CP.
 - **Blocks.** A registration names the axes of the weight's two dims as the forward
   rearranges them, which axes form the Newton-Schulz matrix, and the sizes of the inner axes:
 

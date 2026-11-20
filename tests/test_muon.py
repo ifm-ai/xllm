@@ -316,6 +316,71 @@ def check_resume_checkpoint(mesh, dcp):
               f"bit (weights and {kinds}); a fresh optimizer differs by {diff.item():.2e}")
 
 
+def check_reshard_checkpoint(mesh):
+    """DCP resharding (resume on another node count): a checkpoint saved with FSDP over all ranks loads onto meshes
+    with fewer shards and replicas; the whole weights, Muon momenta and AdamW moments equal the saved ones bit for
+    bit, and training goes on (the block plan is rebuilt for the new mesh)."""
+    cfg = optim_conf(optimizer="muon", lr=1e-3, muon_lr=0.02, weight_decay=0.1, beta1=0.9, beta2=0.95, epsilon=1e-8)
+    rank, n = dist.get_rank(), dist.get_world_size()
+
+    def build(seed, m):
+        torch.manual_seed(seed)
+        model = ResumeNet().cuda()
+        fully_shard(model, mesh=m)
+        return model, build_muon(model, cfg)
+
+    def train(model, opt, steps):
+        for step in steps:
+            torch.manual_seed(1000 * step + rank)
+            model(torch.randn(8, 64, device="cuda")).square().mean().backward()
+            opt.step()
+            opt.zero_grad(set_to_none=True)
+
+    def whole(t):
+        return t.full_tensor() if hasattr(t, "full_tensor") else t.clone()
+
+    def full_state(model, opt):
+        names = {id(p): n for n, p in model.named_parameters()}
+        params = {n: whole(p.detach()) for n, p in model.named_parameters()}
+        state = {(names[id(p)], k): whole(v) for p, st in opt.state.items() for k, v in st.items() if torch.is_tensor(v)}
+        return params, state
+
+    obj = [tempfile.mkdtemp(prefix="muon_reshard_", dir=os.environ.get("MUON_TEST_TMPDIR"))]
+    dist.broadcast_object_list(obj, src=0)
+    ckpt = Path(obj[0])
+    first, first_opt = build(0, mesh)
+    train(first, first_opt, range(3))
+    want_params, want_state = full_state(first, first_opt)
+    dist_ckpt.save(get_model_state(first), checkpoint_id=ckpt / "model")
+    dist_ckpt.save(get_sharded_optimizer_state(first, first_opt, True), checkpoint_id=ckpt / "optim")
+    dist.barrier()
+
+    shapes = [(rep, n // rep) for rep in (2, 4) if n % rep == 0 and n // rep > 1]
+    for rep, dp in shapes:  # like models/build.py with replicas: the (cp, dp) mesh, FSDP over dp
+        m = init_device_mesh("cuda", (rep, dp), mesh_dim_names=("cp", "dp"))
+        resumed, resumed_opt = build(1, m)
+        model_state = get_model_state(resumed)
+        dist_ckpt.load(model_state, checkpoint_id=ckpt / "model")
+        set_model_state(resumed, model_state)
+        optim_state = get_sharded_optimizer_state(resumed, resumed_opt, True)
+        dist_ckpt.load(optim_state, checkpoint_id=ckpt / "optim")
+        set_sharded_optimizer_state(resumed, resumed_opt, optim_state, True)
+        restore_optimizer_config(resumed_opt, cfg)
+        got_params, got_state = full_state(resumed, resumed_opt)
+        assert got_state.keys() == want_state.keys(), (rep, dp, sorted(got_state), sorted(want_state))
+        for name, want in want_params.items():
+            assert torch.equal(got_params[name], want), f"reshard to {rep} x {dp}: weight {name} differs"
+        for key, want in want_state.items():
+            assert torch.equal(got_state[key], want), f"reshard to {rep} x {dp}: optimizer state {key} differs"
+        train(resumed, resumed_opt, range(3, 5))
+        assert all(torch.isfinite(p.detach().to_local()).all() for p in resumed.parameters()), (rep, dp)
+    dist.barrier()
+    if rank == 0:
+        shutil.rmtree(ckpt)
+        print(f"reshard: a DCP checkpoint from FSDP over {n} ranks loads onto (replicas x shards) "
+              f"{', '.join(f'{r} x {d}' for r, d in shapes)} with weights, momenta and moments equal bit for bit")
+
+
 def check_tensor_parallel(rep=1, tp=2):
     """TP x FSDP (x replicas, as with context parallel): each TP rank holds its TP-local shard of every weight,
     sharded on dim 0 over its dp group and replicated over `rep` groups (the FSDP mesh's replicate dim, where
@@ -454,6 +519,7 @@ def main():
     check_resume_config_wins(mesh)
     check_resume_checkpoint(mesh, dcp=True)
     check_resume_checkpoint(mesh, dcp=False)
+    check_reshard_checkpoint(mesh)
     check_tensor_parallel()
     check_tensor_parallel(rep=2, tp=2)  # replicas (context parallel) x TP x FSDP
     check_tensor_parallel(rep=2, tp=1)  # replicas x FSDP
