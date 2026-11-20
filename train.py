@@ -27,7 +27,7 @@ from xllm.checkpointing import (
     make_checkpointer,
 )
 from xllm.data.build import build_data_loader
-from xllm.data.dataloader import MultiSourceDataLoader
+from xllm.data.replica import ReplicaBatchIterator, is_replica_reader
 from xllm.data.dataset_streamer.tokenizer import build_tokenizer
 from xllm.distributed import (
     init_signal_handler,
@@ -157,7 +157,7 @@ def get_optim_state(
     dcp,
     scheduler,
     state: State,
-    data_iterator: MultiSourceDataLoader,
+    data_iterator: ReplicaBatchIterator,
     timings: Timings
 ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     optim_state_dict = get_sharded_optimizer_state(model, optimizer, dcp)
@@ -177,7 +177,7 @@ def set_optim_state(
     scheduler,
     reloaded_training_state_dict,
     state: State,
-    data_iterator: MultiSourceDataLoader,
+    data_iterator: ReplicaBatchIterator,
     timings: Timings,
     opt_cfg: OptimConf
 ):
@@ -226,7 +226,10 @@ def main(cfg: TrainerConf):
 
     # tokenizer / data iterator
     tokenizer = build_tokenizer(cfg.tokenizer)
-    data_iterator: MultiSourceDataLoader = build_data_loader(tokenizer, cfg)
+    # one reader per data-parallel replica: its TP and CP ranks train on the same batches
+    data_iterator = ReplicaBatchIterator(
+        build_data_loader(tokenizer, cfg) if is_replica_reader() else None, cfg.batch_size, cfg.seq_len
+    )
 
     # only process 0 prints
     if cfg.slurm.global_rank > 0 and cfg.disable_workers_print:
@@ -390,8 +393,7 @@ def main(cfg: TrainerConf):
     losses: List[float] = []
     aux_losses: List[float] = [] if cfg.moe_router_load_balancing_type is not None else None
     grad_norms: List[float] = []
-    padding_ratios: List[float] = []
-    truncation_ratios: List[float] = []
+    padding_truncation_ratios: List[torch.Tensor] = []
     gc.collect()
     torch.cuda.empty_cache()
 
@@ -399,13 +401,10 @@ def main(cfg: TrainerConf):
         torch.cuda.reset_peak_memory_stats()
         # data loading
         t1 = timer()
-        batch = next(batch_iterator)
-        x = torch.from_numpy(batch.x).cuda()
-        y = torch.from_numpy(batch.y).cuda()
-        mask = None if batch.mask is None else torch.from_numpy(batch.mask).cuda()
+        x, y, mask, batch_ratios = next(batch_iterator)
         if cfg.dataloader.packing_type == "bestfit":
-            padding_ratios.append(batch.padding_ratio)
-            truncation_ratios.append(batch.truncation_ratio)
+            # (padding ratio, truncation ratio) on the GPU, read at logging
+            padding_truncation_ratios.append(batch_ratios)
 
         if cfg.sync_check_freq > 0 and state.step % cfg.sync_check_freq == 0:
             logger.info("Checking batch randomness at step: {}, ...".format(state.step))
@@ -592,8 +591,9 @@ def main(cfg: TrainerConf):
                 f"mem_retries: {int(agg_gpu_info['gpus/num_alloc_retries_MAX'])}"
             )
             if cfg.dataloader.packing_type == "bestfit":
-                padding_ratio = reduce_scalar(np.mean(padding_ratios).item(), op='mean')
-                truncation_ratio = reduce_scalar(np.mean(truncation_ratios).item(), op='mean')
+                padding_ratio, truncation_ratio = torch.stack(padding_truncation_ratios).mean(dim=0).tolist()
+                padding_ratio = reduce_scalar(padding_ratio, op='mean')
+                truncation_ratio = reduce_scalar(truncation_ratio, op='mean')
                 logging_info += (
                     f", padding ratio: {padding_ratio * 100:.3f}% ({cfg.seq_len}), "
                     f"truncation ratio: {truncation_ratio * 100:.3f}% ({cfg.global_batch_size})"
@@ -635,8 +635,7 @@ def main(cfg: TrainerConf):
             if aux_losses is not None:
                 aux_losses.clear()
             grad_norms.clear()
-            padding_ratios.clear()
-            truncation_ratios.clear()
+            padding_truncation_ratios.clear()
             t0 = timer()
 
         # checkpoint
