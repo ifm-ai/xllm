@@ -546,6 +546,9 @@ class TrainerConf(Config):
         if self.optim.optimizer == "muon":
             assert self.model.ddp_backend == "fsdp2", "Muon requires FSDP2."
             assert self.dcp_for_optimizer, "Muon requires dcp_for_optimizer (sharded momentum)."
+        if self.roles.is_set():
+            # FSDP1 flattens the parameters (use_orig_params=False): the modules' role tags would match none of them
+            assert self.model.ddp_backend == "fsdp2", "roles (--roles.*) require FSDP2"
 
         # MoE
         if self.model.num_experts > 0:

@@ -217,3 +217,9 @@ def test_muon_rejects_adamw_matrices(cpu_transport):
     """MoVA's projections are not registered for Muon: with roles they would step with AdamW at Muon's lr."""
     with pytest.raises(ValueError, match="not registered for Muon"):
         muon.build_muon(sharded("mova"), CFG, ROLES)
+
+
+def test_roles_require_fsdp2():
+    with pytest.raises(AssertionError, match="require FSDP2"):
+        TrainerConf(slurm=SlurmConf(), model=ModelConf(**(MODEL | dict(ddp_backend="fsdp1"))), optim=ADAMW,
+                    valid=ValidConf(), tokenizer=TokenizerConf(), dataloader=DataLoaderConfig(), roles=ADAMW_ROLES)
