@@ -24,8 +24,8 @@
 #   VALID_ROOT      validation root with SlimPajama-627B/, AraV6/ and paloma/ (required)
 #   TASK_ROOT       eval task root (required)
 #   WANDB_TEAM      W&B entity (required)
-#   OPTIM           adamw | muon (adamw). Optimizer settings are the config defaults (Muon 1e-3 / wd 0.1 rms_norm,
-#                   AdamW 2e-3 / 0.02, constant, warmup 3000); override with extra flags (e.g. --optim.muon.lr 2e-3)
+#   OPTIM           muon | adamw (muon). The optimizer settings are spelled out in OPTIM_CFGS below (the values are the
+#                   config defaults, the gekko4-0.9B / k2-horizon-0.9B recipe); change them there or with extra flags
 #   TPP             run length in tokens per non-embedding parameter (200)
 #   EVAL_TPP        eval interval in TPP; every eval checkpoint is kept (20)
 #   CKPTS_PER_EVAL  rolling checkpoints per eval interval, bounds work lost to preemption (3)
@@ -36,7 +36,7 @@
 : "${SAVE:?set SAVE}" "${DATA_ROOT:?set DATA_ROOT}" "${TOKENIZER:?set TOKENIZER}" "${VALID_ROOT:?set VALID_ROOT}"
 : "${TASK_ROOT:?set TASK_ROOT}" "${WANDB_TEAM:?set WANDB_TEAM}"
 PYTHON=${PYTHON:-.venv/bin/python}
-OPTIM=${OPTIM:-adamw}
+OPTIM=${OPTIM:-muon}
 TPP=${TPP:-200}
 EVAL_TPP=${EVAL_TPP:-20}
 CKPTS_PER_EVAL=${CKPTS_PER_EVAL:-3}
@@ -189,10 +189,35 @@ TRAINING_CFGS=(
   --cluster_check_level 1
 )
 
-OPTIM_CFGS=()  # optimizer settings: the config defaults (xllm/config.py AdamWConf / MuonConf / OptimConf)
+# Optimizer settings (xllm/config.py OptimConf / AdamWConf / MuonConf; the values here are the defaults).
+OPTIM_CFGS=(
+  # schedule, shared by both parameter groups
+  --optim.scheduler "constant"           # linear | cosine | constant | wsd
+  --optim.warmup 3000                    # steps of linear warmup from lr_init_ratio * lr
+  --optim.lr_init_ratio 1e-4
+  --optim.clip 1.0                       # global gradient-norm clip
+  # AdamW: every parameter with --optim.optimizer adamw; with muon, the rest (embedding, norms, output layer, biases,
+  # convolutions, MoE router)
+  --optim.adamw.lr 2e-3
+  --optim.adamw.weight_decay 0.02
+  --optim.adamw.beta1 0.9
+  --optim.adamw.beta2 0.95
+  --optim.adamw.epsilon 1e-8
+)
 if [ "${OPTIM}" = "muon" ]; then
-  # Muon: weights of the layers registered with register_muon (attention, FFN); AdamW for the rest.
-  OPTIM_CFGS+=(--optim.optimizer "muon" --dcp_for_optimizer "true")
+  # Muon: the weights the layers register with register_muon (attention q/k/v/r per head, o, FFN, MoE experts).
+  # Update W <- (1 - lr * wd) W - lr * scale * NS(momentum); requires FSDP2 and DCP optimizer checkpoints.
+  OPTIM_CFGS+=(
+    --optim.optimizer "muon"
+    --dcp_for_optimizer "true"             # Muon momentum is sharded with the weights: DCP saves and reshards it
+    --optim.muon.lr 1e-3
+    --optim.muon.weight_decay 0.1          # decoupled, applied with the raw lr
+    --optim.muon.momentum 0.95
+    --optim.muon.nesterov "false"
+    --optim.muon.adjust_lr "rms_norm"      # update scale: rms_norm 0.2 sqrt(max(fan_out, fan_in)) (update RMS ~ AdamW's),
+                                           # spectral_norm sqrt(fan_out / fan_in), or none
+    --optim.muon.scale_shape "block"       # fans for that scale: block (each Newton-Schulz block, e.g. one head) or whole
+  )
 fi
 
 VALID_CFGS=(
