@@ -50,7 +50,7 @@
 - **Mesh.** The optimizer takes the mesh from the FSDP2 parameters themselves
   (`param.device_mesh`) and works over its shard dimension.
 - **Step.**
-  1. Each rank updates the momentum of its own shard (`m = mu * m + g`; Nesterov by default, `--optim.muon.nesterov`)
+  1. Each rank updates the momentum of its own shard (`m = mu * m + g`; Nesterov off by default, `--optim.muon.nesterov`)
      and casts the update direction to bf16.
   2. A fixed plan assigns every block to one rank (the one storing most of it, then the least loaded). One
      all-to-all sends each block's pieces to its owner; meanwhile the blocks that lie whole in their owner's
@@ -58,8 +58,8 @@
   3. The owner stacks its blocks by shape and runs one batched
      Newton-Schulz per shape (Polar Express coefficients), then scales each block by its own shape
      (`--optim.muon.scale_shape block`, default) or the whole weight's shape (`whole`):
-     `sqrt(rows / cols)` for `--optim.muon.adjust_lr spectral_norm` (default),
-     `0.2 * sqrt(max(rows, cols))` for `rms_norm`.
+     `0.2 * sqrt(max(rows, cols))` for `--optim.muon.adjust_lr rms_norm` (default),
+     `sqrt(rows / cols)` for `spectral_norm`.
   4. A second all-to-all returns the pieces; each rank applies
      `p = p - lr * (wd * p + update)` to its shard.
 - **Checkpoints.** Momentum and AdamW moments are DTensors like the parameters, so DCP
@@ -74,6 +74,6 @@
   an actual zero gradient still updates state. The fixed collective sequence is preserved.
 
 ```bash
---optim.optimizer muon --optim.muon.lr 0.01 --optim.adamw.lr 2e-3 \
+--optim.optimizer muon --optim.muon.lr 1e-3 --optim.adamw.lr 2e-3 \
 --dcp_for_optimizer true
 ```

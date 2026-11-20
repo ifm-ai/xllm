@@ -55,7 +55,12 @@ NS_COEFFS = (
 )
 
 
-def newton_schulz(X: Tensor, eps: float) -> Tensor:
+# eps of Newton-Schulz's scale s (below): X is first brought to max|x| in [1, 2), so s >= 1 unless the block is all
+# zeros, where s = eps; c / s^4 must stay finite in fp32 (eps >= ~4e-10). Not tied to AdamW's epsilon.
+NS_EPS = 1e-7
+
+
+def newton_schulz(X: Tensor, eps: float = NS_EPS) -> Tensor:
     """U S V^T -> U V^T for a stack of matrices [B, m, n], in fp16, in X's layout.
 
     - The steps run on the smaller Gram matrix: A = X X^T and X <- a X + B X, or for a tall X, A = X^T X and
@@ -204,7 +209,7 @@ class Muon(Optimizer):
         return loss
 
     def _muon_step(self, group: dict):
-        eps = group["eps"]
+        eps = NS_EPS
         live = [i for i, p in enumerate(group["params"]) if p.grad is not None]
         self._momentum(group, live)
         gather = None
@@ -306,7 +311,7 @@ def build_muon(model: nn.Module, cfg: OptimConf) -> Optimizer:
             continue
         seen.add(name)
         fan_out, fan_in = spec.fans(spec.global_shape(tuple(p.shape), tp), per_block=True)
-        logger.info(f"Muon {name} {list(p.shape)} {str(spec)!r}: {len(spec.blocks(tuple(p.shape)))} blocks of "
+        logger.info(f"Muon {name} {list(p.shape)} {str(spec)!r}: {len(spec.blocks(spec.global_shape(tuple(p.shape), tp)))} blocks of "
                     f"fan_out {fan_out} x fan_in {fan_in}, tp_dim {spec.tp_dim}")
     muon_ids = {id(p) for p in muon_params}
     missed = Counter()  # 2-D weights of parallel layers in the blocks left to AdamW, by kind: say which

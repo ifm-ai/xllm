@@ -55,3 +55,10 @@ def test_scale_free(device, shape):
 def test_zero(device):
     out = newton_schulz(torch.zeros(2, 64, 32, dtype=torch.bfloat16, device=device), EPS)
     assert (out == 0).all()
+
+
+@pytest.mark.parametrize("device", DEVICES)
+def test_zero_default_eps(device):
+    """Muon calls Newton-Schulz with its own eps, not AdamW's: a zero block stays zero (an eps of 1e-15 gave NaN)."""
+    out = newton_schulz(torch.zeros(2, 64, 32, dtype=torch.bfloat16, device=device))
+    assert (out == 0).all()

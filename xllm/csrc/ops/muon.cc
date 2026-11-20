@@ -85,6 +85,9 @@ void MuonMomentum(const std::vector<torch::Tensor>& momentum, const std::vector<
   }
   TORCH_CHECK(out[0].scalar_type() == torch::kBFloat16, "expected bf16 outputs");
   if (momentum[0].is_cuda()) {
+    const auto g = grad[0].scalar_type();
+    TORCH_CHECK(g == torch::kFloat || g == torch::kBFloat16 || g == torch::kHalf,
+                "expected fp32, bf16 or fp16 gradients on CUDA, got ", g);
     MuonMomentumCUDA(momentum, grad, out, mu, nesterov);
   } else {
     MuonMomentumCPU(momentum, grad, out, mu, nesterov);

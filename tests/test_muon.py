@@ -87,7 +87,7 @@ def dense_muon(full, specs, grads, cfg):
             out = torch.empty_like(u)
             for b in spec.blocks(tuple(x.shape)):
                 blk = u[b.r0:b.r1, b.c0:b.c1]
-                o = newton_schulz((blk if blk.shape[0] <= blk.shape[1] else blk.mT)[None], cfg.adamw.epsilon)[0]
+                o = newton_schulz((blk if blk.shape[0] <= blk.shape[1] else blk.mT)[None])[0]
                 out[b.r0:b.r1, b.c0:b.c1] = o if blk.shape[0] <= blk.shape[1] else o.mT
             fan_out, fan_in = spec.fans(tuple(x.shape), per_block=cfg.muon.scale_shape == "block")
             scale = 0.2 * math.sqrt(max(fan_out, fan_in)) if cfg.muon.adjust_lr == "rms_norm" else math.sqrt(fan_out / fan_in)

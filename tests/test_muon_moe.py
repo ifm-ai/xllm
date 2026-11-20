@@ -71,7 +71,7 @@ def per_expert_muon(w, grads, n, cfg):
         for e in range(n):
             x = u[e * rows:(e + 1) * rows]
             wide = x.shape[0] <= x.shape[1]
-            o = newton_schulz((x if wide else x.mT)[None], cfg.adamw.epsilon)[0]
+            o = newton_schulz((x if wide else x.mT)[None])[0]
             o = (o if wide else o.mT).float()
             w[e * rows:(e + 1) * rows] += -cfg.muon.lr * math.sqrt(x.shape[0] / x.shape[1]) * o
     return w
