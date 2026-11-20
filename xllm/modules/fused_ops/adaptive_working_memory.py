@@ -514,6 +514,7 @@ def _adaptive_working_memory_bwd(
     kkey = rearrange(kkey, 'bk d l -> bk l d')
     vvalue = rearrange(vvalue, 'bk l d -> bk d l')
     if prev_qkey is not None:
+        prev_qkey_shape, prev_value_shape = prev_qkey.shape, prev_value.shape
         prev_qkey = rearrange(prev_qkey, 'b h c d -> (b h) d c')
         prev_kkey = rearrange(prev_kkey, 'bh d c -> bh c d')
         prev_value = rearrange(prev_value, 'b k c v -> (b k) c v')
@@ -669,6 +670,13 @@ def _adaptive_working_memory_bwd(
         key_grad.masked_fill_(key_mask, value=0.)
 
     if prev_qkey is not None:
+        if prev_key_grad is None:
+            # One chunk and no memory grad from a next rank: the previous chunk is folded into the memory only for a
+            # later chunk, so here it reaches nothing but the log-norm term below.
+            prev_key_grad = torch.zeros(prev_qkey_shape, dtype=qkey.dtype, device=qkey.device)
+            prev_qkey_grad = torch.zeros(prev_qkey_shape, dtype=qkey.dtype, device=qkey.device)
+            prev_value_grad = torch.zeros(prev_value_shape, dtype=out_grad.dtype, device=out_grad.device)
+            prev_gate_grad = torch.zeros_like(prev_gate) if fgate else None
         # B x H x S/H x C -> B x H x C x S/H
         prev_key_grad += rearrange(logsumexp_backward(
             curr_log_norm_term_grad[:, :, :, 0], prev_k_fp32, curr_log_norm_term[:, :, :, 0], dim=3
