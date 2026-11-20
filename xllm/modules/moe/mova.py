@@ -83,6 +83,7 @@ class MOVAttention(nn.Module):
         init_mode: str = 'he',
         init_std: Optional[float] = None,
         stream_norm_eps: Optional[float] = None,  # the input norm's eps in place of rmsnorm_eps / layernorm_eps
+        init_router_std: Optional[float] = None,  # the router's gaussian init std; None: init_fn's
     ):
         super().__init__()
         self.layer_id = layer_id
@@ -140,7 +141,7 @@ class MOVAttention(nn.Module):
             bias_update_rate=router_bias_update_rate,
             score_func=router_score_func,
             scaling_factor=router_scaling_factor,
-            init_method=init_fn
+            init_method=init_fn if init_router_std is None else get_init_fn('gaussian', std=init_router_std)
         )
 
         self.wq = ColumnParallelLinear(

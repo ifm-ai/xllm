@@ -180,6 +180,7 @@ class ModelConf(Config):
     # Initialization
     init_mode: str = 'he'  # he, gaussian, xavier, or none (skipping init)
     init_std: Optional[float] = None  # Init std for gaussian; If None, deriving from input dimensions. he/xavier requires None
+    init_router_std: Optional[float] = None  # Gaussian init std of the MoE / MoVA router weights; None: as the other block matrices
     init_embed_std: Optional[float] = None  # Std used to truncate normal init of embedding weights. If None, = 1 / sqrt(model_dim)
     init_logits_std: Optional[float] = None  # Std used to truncate normal init of output projection weights. If None, = 1 / sqrt(model_dim)
     # Input & output

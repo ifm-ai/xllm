@@ -203,6 +203,16 @@ def test_adamw_router_group(arch):
                                                                "moe.fc1.weight", "moe.fc2.weight", "mova.wo.weight"))}
 
 
+def test_router_init_std():
+    cfg = ModelConf(**(MODEL | MOE | dict(init_router_std=0.002)))
+    from xllm.models.transformer import Transformer
+    torch.manual_seed(0)
+    model = Transformer(cfg, SimpleNamespace(bos_id=1, eos_id=2, pad_id=0))
+    w = model.layers[1].moe.router.weight
+    assert abs(w.std().item() / 0.002 - 1) < 0.1, w.std().item()
+    assert abs(model.layers[1].moe.fc1.weight.std().item() / 0.002 - 1) > 0.5  # the other matrices as before
+
+
 def test_muon_rejects_adamw_matrices(cpu_transport):
     """MoVA's projections are not registered for Muon: with roles they would step with AdamW at Muon's lr."""
     with pytest.raises(ValueError, match="not registered for Muon"):

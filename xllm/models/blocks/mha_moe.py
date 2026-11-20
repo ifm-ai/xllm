@@ -94,6 +94,7 @@ class TransformerMoEBlock(nn.Module):
             init_mode=cfg.init_mode,
             init_std=cfg.init_std,
             stream_norm_eps=cfg.stream_norm_eps,
+            init_router_std=cfg.init_router_std,
         )
 
     def forward(
