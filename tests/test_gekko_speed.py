@@ -86,7 +86,7 @@ def test_decay_timestep_norm(
     x, bos_mask, prev_count, prev_mean, prev_var, weight, bias,
     y_grad, mean_grad, var_grad, num_groups, beta1, beta2, eps, epochs, backend,
 ):
-    tsdn_fwd = xllm_ops.group_timestep_decay_norm_fwd if backend == 'chunkwise' else xllm_ops.group_timestep_decay_norm_cub_fwd
+    tsdn_fwd = xllm_ops.group_timestep_decay_norm_lookback_fwd if backend == 'lookback' else xllm_ops.group_timestep_decay_norm_cub_fwd
     with torch.no_grad():
         # warm up
         for _ in range(100):
@@ -94,8 +94,8 @@ def test_decay_timestep_norm(
                 x, bos_mask, prev_count, prev_mean, prev_var, weight, bias,
                 None, num_groups, beta1, beta2, eps,
             )
-            if backend == 'chunkwise':
-                xllm_ops.group_timestep_decay_norm_bwd(
+            if backend == 'lookback':
+                xllm_ops.group_timestep_decay_norm_lookback_bwd(
                     y_grad, mean_grad, var_grad, x, prev_count, bos_mask, cummean, cumrstd,
                     weight, bias, None, num_groups, beta1, beta2, eps, False
                 )
@@ -121,8 +121,8 @@ def test_decay_timestep_norm(
 
         start = timer()
         for _ in range(epochs):
-            if backend == 'chunkwise':
-                xllm_ops.group_timestep_decay_norm_bwd(
+            if backend == 'lookback':
+                xllm_ops.group_timestep_decay_norm_lookback_bwd(
                     y_grad, mean_grad, var_grad, x, prev_count, bos_mask, cummean, cumrstd,
                     weight, bias, None, num_groups, beta1, beta2, eps, False
                 )
@@ -405,15 +405,15 @@ def test(B: int, L: int, D: int, W: int, H: int, HKV: int, S: int, V: int, chunk
 
     epochs = 1000
     print(f"B={B}, L={L}, D={D}, W={W}, H={H} ({HKV}), S={S}, V={V}, chunk={chunk_size}, AvgL={avg_len}, dtype={dtype}:")
-    # test_decay_timestep_norm(
-    #     x, bos_mask, prev_count, prev_mean, prev_var, norm_w, norm_b,
-    #     y_grad, mean_grad, var_grad, num_groups, 0.999, 0.9999,
-    #     1e-5, epochs, 'chunkwise'
-    # )
     test_decay_timestep_norm(
         x, bos_mask, prev_count, prev_mean, prev_var, norm_w, norm_b,
         y_grad, mean_grad, var_grad, num_groups, 0.999, 0.9999,
         1e-5, epochs, 'cub'
+    )
+    test_decay_timestep_norm(
+        x, bos_mask, prev_count, prev_mean, prev_var, norm_w, norm_b,
+        y_grad, mean_grad, var_grad, num_groups, 0.999, 0.9999,
+        1e-5, epochs, 'lookback'
     )
     ##################################################
     # test_scan_cema(x.transpose(1, 2), hx, p, q, gamma, y_grad.transpose(1, 2), h_grad, bos_mask, epochs, 'cub')

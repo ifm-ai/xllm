@@ -165,7 +165,7 @@ class GekkoOutputLayer(nn.Module):
     def _receive_prev_tensors(self, x):
         bsz, seq_len, _ = x.size()
         n_groups = self.final_norm.groups_per_partition
-        prev_tensor = torch.empty((bsz, n_groups * 2), dtype=x.dtype, device=x.device, requires_grad=self.training)
+        prev_tensor = torch.empty((bsz, n_groups * 2), dtype=torch.float32, device=x.device, requires_grad=self.training)
         prev_tensor = recv_from_prev_context_parallel_region(prev_tensor)
         return prev_tensor
 
@@ -174,7 +174,7 @@ class GekkoOutputLayer(nn.Module):
         prev_tensor = torch.cat([prev_mean, prev_var], dim=-1)
         return prev_tensor
 
-    def _unpack_prev_tensors(self, x, prev_tensor):
+    def _unpack_prev_tensors(self, prev_tensor):
         n_groups = self.final_norm.groups_per_partition
         prev_mean, prev_var = torch.split(prev_tensor, [n_groups, n_groups], dim=-1)
         prev_mean = prev_mean
@@ -220,7 +220,7 @@ class GekkoOutputLayer(nn.Module):
         elif should_recv_from_prev():
             prev_count = self._receive_prev_count(x, bos_mask)
             prev_tensor = self._receive_prev_tensors(x)
-            prev_mean, prev_var = self._unpack_prev_tensors(x, prev_tensor)
+            prev_mean, prev_var = self._unpack_prev_tensors(prev_tensor)
         else:
             prev_count, prev_mean, prev_var = None, None, None
 
