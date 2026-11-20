@@ -121,7 +121,7 @@ class OptimConf(Config):
     lr_init_ratio: float = 1e-4  # The initial LR = lr_init_ratio * lr
     lr_end_ratio: float = 0.1  # The ending LR = lr_end_ratio * lr. Also the end value if using a cosine scheduler
     cycles: float = 1.0  # Cycles of half period of cosine scheduler. 1 means decaying from peak to lr_end_ratio
-    wsd_decay_duration_steps: int = 0  # Number of steps in the WSD decay phase (wsd only, > 0). Decay starts at total_steps - wsd_decay_duration_steps.
+    wsd_decay_duration_steps: int = 0  # Number of steps in the WSD decay phase (wsd only; 0: no decay). Decay starts at total_steps - wsd_decay_duration_steps.
     wsd_decay_style: str = 'cosine'  # The curve type of decay phase in WSD scheduler: cosine or linear
 
     def __post_init__(self):
@@ -129,7 +129,7 @@ class OptimConf(Config):
         assert self.scheduler in ['linear', 'cosine', 'constant', 'wsd']
         assert self.warmup >= 0
         if self.scheduler == 'wsd':
-            assert self.wsd_decay_duration_steps > 0, 'decay duration steps is required for WSD.'
+            assert self.wsd_decay_duration_steps >= 0, 'WSD decay duration must be >= 0 steps.'
 
 
 @dataclass
