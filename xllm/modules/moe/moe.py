@@ -54,7 +54,8 @@ class NormalizedMoE(nn.Module):
         residual_func: str = 'base',
         residual_heads: Optional[int] = None,
         init_mode: str = 'gaussian',
-        init_std: Optional[float] = None
+        init_std: Optional[float] = None,
+        stream_norm_eps: Optional[float] = None,  # the input norm's eps in place of rmsnorm_eps / layernorm_eps
     ):
         super().__init__()
         self.layer_id = layer_id
@@ -77,12 +78,14 @@ class NormalizedMoE(nn.Module):
         self.expert_end_idx = (rank + 1) * self.n_local_experts
 
         norm_cls = GroupRMSNorm if apply_rmsnorm else GroupLayerNorm
-        norm_eps = rmsnorm_eps if apply_rmsnorm else layernorm_eps
+        self.norm_eps = stream_norm_eps
+        if self.norm_eps is None:
+            self.norm_eps = rmsnorm_eps if apply_rmsnorm else layernorm_eps
         self.norm = norm_cls(
             model_dim,
             num_groups=norm_num_groups,
             elementwise_affine=norm_affine,
-            eps=norm_eps,
+            eps=self.norm_eps,
             memory_efficient=memory_efficient_norm,
             disable_input_reduce=True
         )

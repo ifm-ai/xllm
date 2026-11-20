@@ -195,10 +195,10 @@ class ModelConf(Config):
     timenorm_eps: float = 1e-5  # Used in timestep decay normalization.
     layernorm_eps: float = 1e-5
     rmsnorm_eps: float = 1e-6
-    # eps of the RMSNorm / LayerNorm norms that read the residual stream: the attention and FFN pre-norms and the
+    # eps of the RMSNorm / LayerNorm norms that read the residual stream: the attention, FFN, MoE and MoVA pre-norms and the
     # Transformer's final norm (Gekko's others are timestep norms, timenorm_eps). None: rmsnorm_eps / layernorm_eps.
     # With embed_multiplier m, stream_norm_eps = (rmsnorm or layernorm eps)·m² and, for Gekko, timenorm_eps·m² give
-    # exactly the model with the stream unscaled and each branch output scaled by 1/m. Not for MoE / MoVA or ortho.
+    # exactly the model with the stream unscaled and each branch output scaled by 1/m. Not for ortho.
     stream_norm_eps: Optional[float] = None
     apply_rmsnorm: bool = False  # True = RMSNorm, False = LayerNorm
     residual_func: str = "base"  # Residual connection type: base/add means standard addition, ortho for orthogonal residuals.
@@ -242,7 +242,6 @@ class ModelConf(Config):
         assert self.embed_multiplier > 0 and self.embed_multiplier != float('inf'), \
             f'model.embed_multiplier must be finite and > 0, got {self.embed_multiplier}'
         if self.stream_norm_eps is not None:
-            assert self.num_experts == 0 and self.num_values == 0, 'model.stream_norm_eps is not implemented for MoE / MoVA'
             # the ortho residual's norm reads the stream too, with rmsnorm_eps
             assert self.residual_func != 'ortho', 'model.stream_norm_eps is not implemented for residual_func=ortho'
             assert 0 < self.stream_norm_eps < float('inf'), \

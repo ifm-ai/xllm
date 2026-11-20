@@ -4,7 +4,7 @@ A model whose branch outputs are scaled by c (each block's wo and fc2 weights ×
 embed_multiplier m = 1/c, stream_norm_eps = (rmsnorm or layernorm eps)·m² and (Gekko) timenorm_eps·m²: the second
 model's residual stream is the first's × m, every read of the stream is a norm, and with the eps scaled by m² each
 norm computes the same output. With c a power of 2 the loss, every gradient and the inference logits match bit for
-bit, for RMSNorm and LayerNorm, fused and unfused. Without the eps scaling they don't.
+bit, for RMSNorm and LayerNorm, fused and unfused, dense, MoE and MoVA. Without the eps scaling they don't.
 
     PYTHONPATH=. pytest -q tests/test_stream_norm_eps.py                                   # one GPU
     PYTHONPATH=. torchrun --nproc_per_node=2 -m pytest -q tests/test_stream_norm_eps.py    # tensor parallel 2
@@ -37,7 +37,12 @@ TRANSFORMER = ModelConf(
     swiglu=True, qknorm=True, apply_rmsnorm=True, causal_attn_backend="flash", init_mode="he", vocab_size=1024,
     ddp_backend="fsdp2",
 )
-BRANCH_OUT = ("gda.wo.weight", "attention.wo.weight", "nffn.fc2.weight")
+MOE = dict(num_experts=4, num_activated_experts=2, num_shared_experts=1, expert_inter_dim=512, num_dense_layers=1)
+MOE_TRANSFORMER = replace(TRANSFORMER, **MOE)
+MOVA_TRANSFORMER = replace(TRANSFORMER, num_values=4, num_activated_values=2, **MOE)
+# the branch outputs: the attention / MoVA output projections, the FFN's, the routed and shared experts' down projections
+BRANCH_OUT = ("gda.wo.weight", "attention.wo.weight", "nffn.fc2.weight", "mova.wo.weight", "moe.experts.weight2",
+              "moe.fc2.weight")
 gpu = pytest.mark.skipif(not torch.cuda.is_available(), reason="the kernels need a GPU")
 
 
@@ -83,11 +88,14 @@ def data(cfg):
 def loss_and_grads(cfg, branch_scale=1.0):
     model = build(cfg, branch_scale).train()
     tokens, targets = data(cfg)
-    loss, _, _ = model(tokens=tokens, targets=targets, multi_segments=False)
-    loss = loss.float().sum()
+    # MoE / MoVA: with the load-balancing loss, which reads the pre-norm's output too
+    balancing = "dot" if cfg.num_experts else None
+    loss, aux, _ = model(tokens=tokens, targets=targets, multi_segments=False, moe_router_load_balancing_type=balancing)
+    loss = loss.float().sum() + (0.01 * aux.float() if aux is not None else 0)
     loss.backward()
     # dL/d(c·W) = dL/dW / c: compare the branch model's wo / fc2 gradients times c
-    grads = {n: p.grad * (branch_scale if n.endswith(BRANCH_OUT) else 1.0) for n, p in model.named_parameters()}
+    grads = {n: None if p.grad is None else p.grad * (branch_scale if n.endswith(BRANCH_OUT) else 1.0)
+             for n, p in model.named_parameters()}
     return loss, grads
 
 
@@ -102,43 +110,38 @@ def logits(cfg, branch_scale=1.0):
 
 
 NORMS = [dict(apply_rmsnorm=True), dict(apply_rmsnorm=False)]
-ARCHS = [GEKKO, TRANSFORMER]
+ARCHS = [GEKKO, TRANSFORMER, MOE_TRANSFORMER, MOVA_TRANSFORMER]
+ARCH_IDS = ["gekko", "transformer", "moe", "mova"]
 
 
 @gpu
 @pytest.mark.parametrize("fused", [False, True])
 @pytest.mark.parametrize("norm", NORMS, ids=["rmsnorm", "layernorm"])
-@pytest.mark.parametrize("base", ARCHS, ids=["gekko", "transformer"])
+@pytest.mark.parametrize("base", ARCHS, ids=ARCH_IDS)
 def test_training_matches_branch_scale(base, norm, fused):
     base = replace(base, fused_block=fused, **norm)
     want_loss, want = loss_and_grads(base, branch_scale=C)
     got_loss, got = loss_and_grads(exact(base))
     assert torch.equal(got_loss, want_loss), (got_loss.item(), want_loss.item())
-    differ = [n for n in want if not torch.equal(got[n], want[n])]
+    differ = [n for n in want if (got[n] is None) != (want[n] is None) or
+              (want[n] is not None and not torch.equal(got[n], want[n]))]
     assert differ == [], differ
 
     # the same model with the eps left as they are is a slightly different model
     plain_loss, plain = loss_and_grads(replace(base, embed_multiplier=1 / C))
-    assert not torch.equal(plain_loss, want_loss) or any(not torch.equal(plain[n], want[n]) for n in want)
+    assert not torch.equal(plain_loss, want_loss) or any(
+        want[n] is not None and not torch.equal(plain[n], want[n]) for n in want)
 
 
 @gpu
 @pytest.mark.skipif(CP > 1, reason="inference does not support context parallel")
 @pytest.mark.parametrize("norm", NORMS, ids=["rmsnorm", "layernorm"])
-@pytest.mark.parametrize("base", ARCHS, ids=["gekko", "transformer"])
+@pytest.mark.parametrize("base", ARCHS, ids=ARCH_IDS)
 def test_inference_matches_branch_scale(base, norm):
     base = replace(base, **norm)
     want = logits(base, branch_scale=C)
     assert torch.equal(logits(exact(base)), want)
     assert not torch.equal(logits(replace(base, embed_multiplier=1 / C)), want)
-
-
-@pytest.mark.parametrize("moe", [dict(num_experts=4, num_activated_experts=2),
-                                 dict(num_experts=4, num_activated_experts=2, num_values=4, num_activated_values=2)],
-                         ids=["moe", "mova"])
-def test_stream_norm_eps_rejects_moe(moe):
-    with pytest.raises(AssertionError, match="MoE / MoVA"):
-        ModelConf(arch="transformer", stream_norm_eps=1e-6, **moe)
 
 
 def test_stream_norm_eps_rejects_ortho():
