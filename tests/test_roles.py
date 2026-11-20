@@ -1,4 +1,4 @@
-"""Per-role optimizer hyperparameters with Muon (RolesConf, xllm/optim/roles.py). CPU.
+"""Per-role optimizer hyperparameters with Muon or AdamW (RolesConf, xllm/optim/roles.py). CPU.
 
     PYTHONPATH=. pytest -q tests/test_roles.py
 
@@ -121,6 +121,59 @@ def test_invalid_values(roles, match):
 def test_rejects(cpu_transport):
     with pytest.raises(ValueError, match="roles.hidden_matrix.eps"):
         muon.build_muon(sharded("transformer"), CFG, RolesConf(hidden_matrix=RoleConf(eps=1e-9)))
-    with pytest.raises(AssertionError, match="optim.optimizer=muon"):
-        TrainerConf(slurm=SlurmConf(), model=ModelConf(**MODEL), optim=OptimConf(optimizer="adamw"),
-                    valid=ValidConf(), tokenizer=TokenizerConf(), dataloader=DataLoaderConfig(), roles=ROLES)
+
+
+ADAMW = OptimConf(optimizer="adamw", adamw=AdamWConf(lr=2e-3, epsilon=1e-8, weight_decay=0.1))
+# with AdamW, hidden_matrix is an AdamW group and takes an eps
+ADAMW_ROLES = RolesConf(embed=RoleConf(lr=2e-3, eps=2.5e-9, weight_decay=0.0),
+                        hidden_matrix=RoleConf(lr=5e-4, eps=1.25e-9, weight_decay=0.4),
+                        hidden_vector=RoleConf(lr=1e-3, eps=1.25e-9), readout=RoleConf(lr=5e-4, weight_decay=0.4))
+ADAMW_WANT = {  # group: (lr, eps, weight_decay)
+    "embed": (2e-3, 2.5e-9, 0.0),
+    "hidden_matrix": (5e-4, 1.25e-9, 0.4),
+    "hidden_vector": (1e-3, 1.25e-9, 0.1),
+    "final_norm": (2e-3, 1e-8, 0.1),
+    "readout": (5e-4, 1e-8, 0.4),
+}
+
+
+@pytest.mark.parametrize("arch", ["transformer", "gekko"])
+def test_adamw_groups(arch):
+    """AdamW steps one group per role; unset values are optim.adamw's, and a resume applies them again."""
+    from xllm.optim import build_optimizer
+    model = build(arch)
+    opt, _ = build_optimizer(model, ADAMW, 10, "fp32", ADAMW_ROLES)
+    assert isinstance(opt, torch.optim.AdamW)
+
+    def check(lr_key):
+        g = {group["role"]: group for group in opt.param_groups}
+        assert set(g) == set(ADAMW_WANT)
+        for name, (lr, eps, wd) in ADAMW_WANT.items():
+            assert math.isclose(g[name][lr_key], lr, rel_tol=1e-12), (name, g[name][lr_key])
+            assert g[name]["eps"] == eps and g[name]["weight_decay"] == wd, (name, g[name])
+            assert g[name]["betas"] == (ADAMW.adamw.beta1, ADAMW.adamw.beta2)
+        assert sum(len(group["params"]) for group in opt.param_groups) == len(list(model.parameters()))
+
+    check("initial_lr")
+    for group in opt.param_groups:
+        group.update(initial_lr=1.0, eps=1.0, weight_decay=1.0)
+    restore_optimizer_config(opt, ADAMW, ADAMW_ROLES)
+    check("initial_lr")
+    with pytest.raises(ValueError, match="pass the roles"):
+        restore_optimizer_config(opt, ADAMW)
+    for p in model.parameters():
+        p.grad = torch.randn_like(p)
+    opt.step()
+
+
+def test_adamw_without_roles_is_unchanged():
+    from xllm.optim import build_optimizer
+    opt, _ = build_optimizer(build("transformer"), ADAMW, 10, "fp32", RolesConf())
+    assert len(opt.param_groups) == 1 and "role" not in opt.param_groups[0]
+    restore_optimizer_config(opt, ADAMW, RolesConf())  # no roles: the upstream AdamW resume, nothing applied
+    assert opt.param_groups[0]["eps"] == 1e-8
+
+
+def test_trainer_accepts_adamw_roles():
+    TrainerConf(slurm=SlurmConf(), model=ModelConf(**MODEL), optim=ADAMW, valid=ValidConf(), tokenizer=TokenizerConf(),
+                dataloader=DataLoaderConfig(), roles=ADAMW_ROLES)

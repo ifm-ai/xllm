@@ -375,7 +375,7 @@ def main(cfg: TrainerConf):
             set_sharded_optimizer_state(model, optimizer, reloaded_optim_state_dict, cfg.dcp_for_optimizer)
             del reloaded_optim_state_dict
 
-    if cfg.optim.optimizer == "muon":
+    if cfg.optim.optimizer == "muon" or cfg.roles.is_set():
         restore_optimizer_config(optimizer, cfg.optim, cfg.roles)
         # Full resume uses the restored scheduler position; base-model loading
         # keeps the newly constructed schedule, including its warmup LR.
@@ -531,10 +531,11 @@ def main(cfg: TrainerConf):
             aux_loss = aux_loss.item()
             aux_losses.append(aux_loss)
         grad_norms.append(grad_norm)
-        if cfg.optim.optimizer == "muon":
-            # muon and adamw, or with roles muon and one AdamW group per role
+        group_lrs = {}
+        if cfg.optim.optimizer == "muon" or cfg.roles.is_set():
+            # muon and adamw, or with roles muon (if any) and one AdamW group per role; lr is muon's or hidden_matrix's
             group_lrs = {group.get("role") or group["algorithm"]: float(group["lr"]) for group in optimizer.param_groups}
-            curr_lr = group_lrs.pop("muon")
+            curr_lr = group_lrs.pop("muon" if cfg.optim.optimizer == "muon" else "hidden_matrix")
         else:
             curr_lr = float(optimizer.param_groups[0]["lr"])
         assert math.isfinite(curr_loss), f"loss is not finite:{curr_loss}"
@@ -544,7 +545,7 @@ def main(cfg: TrainerConf):
         optim_metrics = {
             "step": state.step,
             "lr": curr_lr,
-            **({f"{name}_lr": lr for name, lr in group_lrs.items()} if cfg.optim.optimizer == "muon" else {}),
+            **{f"{name}_lr": lr for name, lr in group_lrs.items()},
             "avg_loss": reduce_scalar(curr_loss, op='mean'),
             "max_loss": reduce_scalar(curr_loss, op='max'),
         }

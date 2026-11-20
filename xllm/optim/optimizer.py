@@ -25,15 +25,19 @@ def rescale_grads(model: nn.Module, scale: float):
 
 def build_optimizer(model: nn.Module, cfg: OptimConf, total_steps: int, param_dtype: str,
                     roles: Optional[RolesConf] = None):
-    """roles: per-role hyperparameters (xllm/optim/roles.py), Muon only; unset: the plain groups."""
+    """roles: per-role hyperparameters (xllm/optim/roles.py); unset: the plain groups."""
     logger.info("Starting build of optimizer...")
     if cfg.optimizer == "muon":
         from .muon import build_muon
         optimizer = build_muon(model, cfg, roles)
     else:
-        assert roles is None or not roles.is_set(), "roles require optim.optimizer=muon"
+        if roles is not None and roles.is_set():
+            from .roles import adamw_param_groups
+            params = adamw_param_groups(model, cfg, roles)
+        else:
+            params = model.parameters()
         optimizer = AdamW(
-            model.parameters(),
+            params,
             lr=cfg.adamw.lr,
             betas=(cfg.adamw.beta1, cfg.adamw.beta2),
             weight_decay=cfg.adamw.weight_decay,
@@ -52,13 +56,14 @@ def restore_optimizer_config(optimizer, cfg: OptimConf, roles: Optional[RolesCon
 
     Loading the optimizer alone restores checkpoint values. Training calls this
     after loading state; the scheduler separately determines the current LRs.
-    The standalone AdamW path retains upstream's existing resume behavior.
+    The standalone AdamW path without roles retains upstream's existing resume behavior.
     With roles (xllm/optim/roles.py), a group's values are its role's: the Muon group's hidden_matrix's.
     """
-    if cfg.optimizer != "muon":
+    has_roles = any("role" in group for group in optimizer.param_groups)
+    if cfg.optimizer != "muon" and not has_roles and (roles is None or not roles.is_set()):
         return
     from .muon import adamw_group, muon_group
-    if any("role" in group for group in optimizer.param_groups) and (roles is None or not roles.is_set()):
+    if has_roles and (roles is None or not roles.is_set()):
         raise ValueError("restore_optimizer_config: the optimizer has per-role groups; pass the roles it was built with")
     roles = roles or RolesConf()
     for group in optimizer.param_groups:

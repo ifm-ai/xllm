@@ -387,20 +387,20 @@ class ValidConf(Config):
 
 @dataclass
 class RoleConf(Config):
-    """One role's optimizer hyperparameters (optim.optimizer=muon). None: the configured optim.* value."""
-    lr: Optional[float] = None  # In place of optim.adamw.lr (AdamW roles) or optim.muon.lr (hidden_matrix)
-    eps: Optional[float] = None  # In place of optim.adamw.epsilon; AdamW roles only
+    """One role's optimizer hyperparameters. None: the configured optim.* value."""
+    lr: Optional[float] = None  # In place of optim.adamw.lr (AdamW roles) or optim.muon.lr (hidden_matrix with Muon)
+    eps: Optional[float] = None  # In place of optim.adamw.epsilon; AdamW roles only (not hidden_matrix with Muon)
     weight_decay: Optional[float] = None  # In place of optim.adamw.weight_decay (hidden_matrix: optim.muon.weight_decay); 0 turns it off
 
 
 @dataclass
 class RolesConf(Config):
-    """Per-role optimizer hyperparameters (optim.optimizer=muon). Modules tag their parameters with a role
-    (register_role, xllm/optim/roles.py); AdamW steps one param group per role, Muon its matrices at
-    hidden_matrix's values. All unset: the optimizer's two plain groups. Scaling rules (muP, Complete(d)P) are the
+    """Per-role optimizer hyperparameters. Modules tag their parameters with a role (register_role,
+    xllm/optim/roles.py); AdamW steps one param group per role, and with optim.optimizer=muon Muon steps its
+    matrices at hidden_matrix's values. All unset: the optimizer's plain groups. Scaling rules (muP, Complete(d)P) are the
     launcher's: it sets these values, model.embed_multiplier and the init stds per model size."""
     embed: RoleConf = field(default_factory=RoleConf)
-    hidden_matrix: RoleConf = field(default_factory=RoleConf)  # the Muon matrices in the blocks
+    hidden_matrix: RoleConf = field(default_factory=RoleConf)  # the weight matrices in the blocks (Muon's with muon)
     hidden_vector: RoleConf = field(default_factory=RoleConf)  # norm gains, biases, gekko's conv kernels in the blocks
     final_norm: RoleConf = field(default_factory=RoleConf)
     readout: RoleConf = field(default_factory=RoleConf)
@@ -429,7 +429,7 @@ class TrainerConf(Config):
     valid: ValidConf
     tokenizer: TokenizerConf
     dataloader: DataLoaderConfig  # Configs for multi-source data loading.
-    roles: RolesConf = field(default_factory=RolesConf)  # Per-role lr / eps / weight decay (optim.optimizer=muon)
+    roles: RolesConf = field(default_factory=RolesConf)  # Per-role lr / eps / weight decay
 
     # Training data / iterator
     data: str = ""  # Comma seperated data mix. Each mix is formatted as path:weight:json_key:source_format. Weights need not sum to 1.
@@ -544,9 +544,6 @@ class TrainerConf(Config):
         if self.optim.optimizer == "muon":
             assert self.model.ddp_backend == "fsdp2", "Muon requires FSDP2."
             assert self.dcp_for_optimizer, "Muon requires dcp_for_optimizer (sharded momentum)."
-
-        if self.roles.is_set():
-            assert self.optim.optimizer == "muon", "roles (--roles.*) require optim.optimizer=muon"
 
         # MoE
         if self.model.num_experts > 0:
