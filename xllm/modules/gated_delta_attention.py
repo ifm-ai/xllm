@@ -36,6 +36,7 @@ from xllm.modules.fused_ops import (
     memory_efficient_dropout,
 )
 from xllm.utils import get_init_fn
+from xllm.optim.muon_spec import register_muon
 
 
 class GatedDeltaAttention(nn.Module):
@@ -268,6 +269,14 @@ class GatedDeltaAttention(nn.Module):
             residual_func, 2 * layer_id + 1, mdim, num_heads=residual_heads,
             num_features=hdim, eps=rmsnorm_eps, init_std=init_std
         )
+
+        # Muon (xllm/optim/muon.py): one Newton-Schulz block per head (each of a kv head's two softdelta
+        # keys is its own block; wr holds a head's gate rows and, for softdelta, its forget logit); wo is whole
+        register_muon(self.wq, layout="(h d) m", fan_out="d", fan_in="m", d=self.head_dim, tp_dim=0)
+        register_muon(self.wk, layout="(h d) m", fan_out="d", fan_in="m", d=self.head_dim, tp_dim=0)
+        register_muon(self.wv, layout="(h d) m", fan_out="d", fan_in="m", d=self.v_head_dim, tp_dim=0)
+        register_muon(self.wr, layout="(h d) m", fan_out="d", fan_in="m", d=rdim // self.num_heads, tp_dim=0)
+        register_muon(self.wo, tp_dim=1)
 
     def _receive_prev_count(self, x, bos_mask):
         bsz, seq_len, _ = x.size()
