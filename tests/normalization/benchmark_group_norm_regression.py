@@ -5,8 +5,10 @@ python -m tests.normalization.benchmark_group_norm_regression \
     --output /tmp/group_norm_performance.json
 
 Uses CUDA graphs to measure device execution, alternating baseline/current order
-between rounds. Outputs and gradients must also match the baseline exactly.
-Run without other GPU workloads. This does not measure Python/host dispatch time.
+between rounds. Outputs and gradients must also match the baseline: bit for bit by
+default, or within the rounding of their dtype with --match close, for a change that
+reorders reductions. Run without other GPU workloads. This does not measure
+Python/host dispatch time.
 """
 
 import argparse
@@ -20,6 +22,10 @@ import types
 
 import torch
 
+# (atol, rtol) by output dtype for --match close: about a unit in the last place of each 16-bit type, and float32
+# statistics and outputs that differ only in the order of their sums.
+CLOSE = {torch.float32: (1e-5, 1e-4), torch.float16: (3e-3, 1e-2), torch.bfloat16: (7e-3, 1e-2)}
+
 
 def load_baseline(path):
     package = types.ModuleType("group_norm_baseline")
@@ -31,7 +37,9 @@ def load_baseline(path):
     return module.ops
 
 
-def operations(ops, norm, x, dy, gamma, beta, groups, affine, memory_efficient):
+def operations(ops, norm, x, dy, gamma, beta, groups, affine, memory_efficient, state=None):
+    """The forward and backward calls of one case. The backward differentiates `state`, the outputs of a forward call
+    (this build's when not given), so that the backward calls of two builds read the same tensors."""
     channels = x.shape[-1]
     eps = 1e-5
     if norm == "layer":
@@ -41,7 +49,8 @@ def operations(ops, norm, x, dy, gamma, beta, groups, affine, memory_efficient):
         else:
             def forward():
                 return ops.group_layer_norm_fwd(x, channels, groups, eps)
-        y, mean, rstd = forward()
+        state = state or forward()
+        y, mean, rstd = state
         x_or_y = y if memory_efficient else x
         if affine:
             def backward():
@@ -58,7 +67,8 @@ def operations(ops, norm, x, dy, gamma, beta, groups, affine, memory_efficient):
         else:
             def forward():
                 return ops.group_rms_norm_fwd(x, channels, groups, eps)
-        y, rstd = forward()
+        state = state or forward()
+        y, rstd = state
         x_or_y = y if memory_efficient else x
         if affine:
             def backward():
@@ -68,7 +78,7 @@ def operations(ops, norm, x, dy, gamma, beta, groups, affine, memory_efficient):
             def backward():
                 return (ops.group_rms_norm_bwd(
                     dy, x_or_y, channels, groups, rstd, memory_efficient),)
-    return {"forward": forward, "backward": backward}
+    return {"forward": forward, "backward": backward, "state": state}
 
 
 def capture(function, unroll):
@@ -106,6 +116,8 @@ def main():
     parser.add_argument("--rounds", type=int, default=7)
     parser.add_argument("--unroll", type=int, default=16)
     parser.add_argument("--replays", type=int, default=4)
+    parser.add_argument("--match", choices=("exact", "close"), default="exact",
+                        help="how the outputs must match the baseline's: bit for bit, or within dtype rounding")
     args = parser.parse_args()
     if any(size < 65 or size > 8192 for size in args.sizes):
         parser.error("the pre-change extension requires sizes in [65, 8192]")
@@ -120,7 +132,7 @@ def main():
     report = {
         "gpu": torch.cuda.get_device_name(), "torch": torch.__version__,
         "baseline": str(args.baseline.resolve()), "current": xllm_extension.__file__,
-        "rounds": args.rounds, "unroll": args.unroll, "replays": args.replays,
+        "rounds": args.rounds, "unroll": args.unroll, "replays": args.replays, "match": args.match,
         "timing": "CUDA graph replay, alternating baseline/current order; microseconds per operation",
         "results": [],
     }
@@ -137,12 +149,13 @@ def main():
             gamma = 0.5 + torch.rand(channels, device="cuda", dtype=dtype)
             beta = 0.25 * torch.randn_like(gamma)
             old = operations(baseline, norm, x, dy, gamma, beta, groups, affine, memory_efficient)
-            new = operations(current, norm, x, dy, gamma, beta, groups, affine, memory_efficient)
+            new = operations(current, norm, x, dy, gamma, beta, groups, affine, memory_efficient, old["state"])
             row = {"norm": norm, "size": size, "rows": rows, "groups": groups,
                    "dtype": dtype_name, "affine": affine, "memory_efficient": memory_efficient}
             for phase in ("forward", "backward"):
                 for expected, actual in zip(old[phase](), new[phase]()):
-                    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+                    atol, rtol = CLOSE[actual.dtype] if args.match == "close" else (0, 0)
+                    torch.testing.assert_close(actual, expected, atol=atol, rtol=rtol)
                 graphs = {"baseline": capture(old[phase], args.unroll),
                           "current": capture(new[phase], args.unroll)}
                 for graph in graphs.values():

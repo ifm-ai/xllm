@@ -1,5 +1,9 @@
 #include "group_layer_norm.h"
 
+#ifdef XLLM_BLACKWELL
+#include "group_norm/native.h"
+#endif
+
 namespace xllm {
 namespace ops {
 
@@ -9,12 +13,20 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> GroupLayerNormFwdAffine(
   TORCH_CHECK(x.device().type() == torch::kCUDA);
   TORCH_CHECK(gamma.device().type() == torch::kCUDA);
   TORCH_CHECK(beta.device().type() == torch::kCUDA);
+#ifdef XLLM_BLACKWELL
+  if (blackwell::Supported(x))
+    return blackwell::GroupLayerNormFwdAffine(x, num_channels, num_groups, gamma, beta, eps);
+#endif
   return GroupLayerNormCUDAFwdAffine(x, num_channels, num_groups, gamma, beta, eps);
 }
 
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> GroupLayerNormFwd(
     const torch::Tensor& x, int64_t num_channels, int64_t num_groups, double eps) {
   TORCH_CHECK(x.device().type() == torch::kCUDA);
+#ifdef XLLM_BLACKWELL
+  if (blackwell::Supported(x))
+    return blackwell::GroupLayerNormFwd(x, num_channels, num_groups, eps);
+#endif
   return GroupLayerNormCUDAFwd(x, num_channels, num_groups, eps);
 }
 
@@ -28,6 +40,11 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> GroupLayerNormBwdAffine(
   TORCH_CHECK(rstd.device().type() == torch::kCUDA);
   TORCH_CHECK(gamma.device().type() == torch::kCUDA);
   TORCH_CHECK(beta.device().type() == torch::kCUDA);
+#ifdef XLLM_BLACKWELL
+  if (blackwell::Supported(x))
+    return blackwell::GroupLayerNormBwdAffine(y_grad, x, num_channels, num_groups, mean, rstd, gamma, beta,
+                                              memory_efficient);
+#endif
   return GroupLayerNormCUDABwdAffine(y_grad, x, num_channels, num_groups, mean, rstd, gamma, beta, memory_efficient);
 }
 
@@ -39,6 +56,10 @@ torch::Tensor GroupLayerNormBwd(
   TORCH_CHECK(x.device().type() == torch::kCUDA);
   TORCH_CHECK(mean.device().type() == torch::kCUDA);
   TORCH_CHECK(rstd.device().type() == torch::kCUDA);
+#ifdef XLLM_BLACKWELL
+  if (blackwell::Supported(x))
+    return blackwell::GroupLayerNormBwd(y_grad, x, num_channels, num_groups, mean, rstd, memory_efficient);
+#endif
   return GroupLayerNormCUDABwd(y_grad, x, num_channels, num_groups, mean, rstd, memory_efficient);
 }
 

@@ -1,3 +1,4 @@
+import glob
 import os
 from setuptools import setup
 
@@ -59,6 +60,19 @@ CSRCS = [
     os.path.join(PATH, "xllm/csrc/transformer_engine/common/common.cu")
 ]
 
+# The group-norm kernels for data-center Blackwell (compute capability 10.x: B200, B300) in xllm/csrc/ops/group_norm/
+# are built only when every CUDA target is 10.x; the group-norm ops then send the calls those kernels serve to them and
+# keep their portable kernels for everything else. Without TORCH_CUDA_ARCH_LIST, torch builds for the visible GPUs.
+_archs = os.environ.get("TORCH_CUDA_ARCH_LIST", "").replace(";", " ").split()
+_build_blackwell = bool(_archs) and all(arch.split(".")[0] == "10" for arch in _archs)
+if not _archs and torch.cuda.is_available():
+    _build_blackwell = torch.cuda.device_count() > 0 and all(
+        torch.cuda.get_device_capability(i)[0] == 10 for i in range(torch.cuda.device_count())
+    )
+if _build_blackwell:
+    CSRCS += sorted(glob.glob(os.path.join(PATH, "xllm/csrc/ops/group_norm/*.cu")))
+    CSRCS += sorted(glob.glob(os.path.join(PATH, "xllm/csrc/ops/group_norm/*.cpp")))
+
 INCLUDE_DIRS = [
     os.path.join(PATH, "xllm/csrc"),
     os.path.join(PATH, "xllm/csrc/transformer_engine"),
@@ -68,6 +82,9 @@ CXX_FLAGS = [
     "-O3",
     f"-std={get_torch_cxx_standard()}",
 ]
+
+if _build_blackwell:
+    CXX_FLAGS.append("-DXLLM_BLACKWELL")
 
 NVCC_FLAGS = [
     "--expt-relaxed-constexpr",

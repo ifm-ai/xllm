@@ -1,5 +1,9 @@
 #include "group_rms_norm.h"
 
+#ifdef XLLM_BLACKWELL
+#include "group_norm/native.h"
+#endif
+
 namespace xllm {
 namespace ops {
 
@@ -8,12 +12,20 @@ std::tuple<torch::Tensor, torch::Tensor> GroupRMSNormFwdAffine(
     const torch::Tensor& gamma, double eps) {
   TORCH_CHECK(x.device().type() == torch::kCUDA);
   TORCH_CHECK(gamma.device().type() == torch::kCUDA);
+#ifdef XLLM_BLACKWELL
+  if (blackwell::Supported(x))
+    return blackwell::GroupRMSNormFwdAffine(x, num_channels, num_groups, gamma, eps);
+#endif
   return GroupRMSNormCUDAFwdAffine(x, num_channels, num_groups, gamma, eps);
 }
 
 std::tuple<torch::Tensor, torch::Tensor> GroupRMSNormFwd(
     const torch::Tensor& x, int64_t num_channels, int64_t num_groups, double eps) {
   TORCH_CHECK(x.device().type() == torch::kCUDA);
+#ifdef XLLM_BLACKWELL
+  if (blackwell::Supported(x))
+    return blackwell::GroupRMSNormFwd(x, num_channels, num_groups, eps);
+#endif
   return GroupRMSNormCUDAFwd(x, num_channels, num_groups, eps);
 }
 
@@ -26,6 +38,10 @@ std::tuple<torch::Tensor, torch::Tensor> GroupRMSNormBwdAffine(
   TORCH_CHECK(x.device().type() == torch::kCUDA);
   TORCH_CHECK(rstd.device().type() == torch::kCUDA);
   TORCH_CHECK(gamma.device().type() == torch::kCUDA);
+#ifdef XLLM_BLACKWELL
+  if (blackwell::Supported(x))
+    return blackwell::GroupRMSNormBwdAffine(y_grad, x, num_channels, num_groups, rstd, gamma, memory_efficient);
+#endif
   return GroupRMSNormCUDABwdAffine(y_grad, x, num_channels, num_groups, rstd, gamma, memory_efficient);
 }
 
@@ -36,6 +52,10 @@ torch::Tensor GroupRMSNormBwd(
   TORCH_CHECK(y_grad.device().type() == torch::kCUDA);
   TORCH_CHECK(x.device().type() == torch::kCUDA);
   TORCH_CHECK(rstd.device().type() == torch::kCUDA);
+#ifdef XLLM_BLACKWELL
+  if (blackwell::Supported(x))
+    return blackwell::GroupRMSNormBwd(y_grad, x, num_channels, num_groups, rstd, memory_efficient);
+#endif
   return GroupRMSNormCUDABwd(y_grad, x, num_channels, num_groups, rstd, memory_efficient);
 }
 
