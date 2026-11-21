@@ -52,7 +52,7 @@ class HybridGekko(XLLModel):
 
         init_fn = get_init_fn('gaussian', dim=self.model_dim, std=cfg.init_embed_std)
         self.embed = wrap(ParallelEmbedding(
-            self.vocab_size, self.model_dim, scale_emb=cfg.scale_emb, gather_output=False, init_method=init_fn
+            self.vocab_size, self.model_dim, embed_multiplier=cfg.embed_multiplier, gather_output=False, init_method=init_fn
         ))
         self.causal_conv_width = cfg.causal_conv_width
         self.apply_bias_term = cfg.apply_bias_term
