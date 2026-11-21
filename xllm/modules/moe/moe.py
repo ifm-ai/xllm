@@ -190,12 +190,9 @@ class NormalizedMoE(nn.Module):
         permuted_x = torch.index_select(x, 0, permute_indices)
         x = all_to_all_expert_parallel_region(permuted_x, input_splits, output_splits)
         # B' x D
-        if curr_bsz > 0:
-            x = rearrange(x, '(w b) d -> b (w d)', w=world_size)
-            y2 = self.experts(x, group_sizes)
-            y2 = rearrange(y2, 'b (w d) -> (w b) d', w=world_size)
-        else:
-            y2 = x
+        x = rearrange(x, '(w b) d -> b (w d)', w=world_size)
+        y2 = self.experts(x, group_sizes)
+        y2 = rearrange(y2, 'b (w d) -> (w b) d', w=world_size)
         y2 = all_to_all_expert_parallel_region(y2, output_splits, input_splits)
         # permute y2
         y2 = fused_permute_y(sorted_indices, y2, routing_scores, bsz, slen, self.topk, self.permutation_backend)
