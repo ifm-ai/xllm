@@ -262,6 +262,8 @@ class MOVAttention(nn.Module):
             num_features=self.n_heads * self.head_dim, eps=rmsnorm_eps, init_std=init_std
         )
 
+        #TODO: register Muon
+
     def _receive_prev_tensors(self, x):
         bsz, seq_len, _ = x.size()
         nk = {"softmax": 1, "softdelta": 2}[self.attn_act_func]
