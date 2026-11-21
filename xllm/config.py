@@ -82,12 +82,11 @@ class SlurmConf(Config):
 @dataclass
 class AdamWConf(Config):
     # AdamW: every parameter with optimizer=adamw; with optimizer=muon, those Muon does not take (embedding, norms, head).
-    # Defaults = the gekko4-0.9B / k2-horizon-0.9B recipe.
-    lr: float = 2e-3  # learning rate after warmup
+    lr: float = 1e-3  # learning rate after warmup
     beta1: float = 0.9
     beta2: float = 0.95
     epsilon: float = 1e-8
-    weight_decay: float = 0.02  # decoupled weight decay
+    weight_decay: float = 0.1  # decoupled weight decay
 
     def __post_init__(self):
         assert self.lr >= 0 and self.weight_decay >= 0 and self.epsilon > 0
