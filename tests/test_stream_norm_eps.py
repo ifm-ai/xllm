@@ -144,3 +144,41 @@ def test_stream_norm_eps_rejects_moe(moe):
 def test_stream_norm_eps_rejects_ortho():
     with pytest.raises(AssertionError, match="ortho"):
         ModelConf(arch="transformer", stream_norm_eps=1e-6, residual_func="ortho", residual_heads=4)
+
+
+# the warnings: embed_multiplier is only a reparameterization when every eps that reads the stream carries m^2
+M = 2.0
+MULT = dict(apply_rmsnorm=True, embed_multiplier=M)
+SCALED = ModelConf().rmsnorm_eps * M * M
+
+
+def test_warns_without_stream_norm_eps(caplog):
+    with caplog.at_level("WARNING"):
+        ModelConf(arch="transformer", **MULT)
+    assert "without model.stream_norm_eps" in caplog.text
+
+
+def test_warns_when_stream_norm_eps_does_not_match_embed_multiplier(caplog):
+    with caplog.at_level("WARNING"):
+        ModelConf(arch="transformer", stream_norm_eps=SCALED * 3, **MULT)
+    assert "embed_multiplier^2" in caplog.text
+
+
+def test_no_warning_for_transformer_when_scaled(caplog):
+    with caplog.at_level("WARNING"):
+        ModelConf(arch="transformer", stream_norm_eps=SCALED, **MULT)
+    assert caplog.text == ""
+
+
+def test_warns_when_gekko_timenorm_eps_left_at_default(caplog):
+    """The gap this guards: the stream norms are scaled but Gekko's timestep norms, which also read the stream,
+    are not. The old `elif` could not warn here, because stream_norm_eps was set."""
+    with caplog.at_level("WARNING"):
+        ModelConf(arch="gekko", stream_norm_eps=SCALED, **MULT)
+    assert "timenorm_eps" in caplog.text
+
+
+def test_no_warning_for_gekko_when_timenorm_eps_scaled_too(caplog):
+    with caplog.at_level("WARNING"):
+        ModelConf(arch="gekko", stream_norm_eps=SCALED, timenorm_eps=ModelConf().timenorm_eps * M * M, **MULT)
+    assert caplog.text == ""
