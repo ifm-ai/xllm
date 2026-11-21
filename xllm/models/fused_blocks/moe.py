@@ -13,9 +13,8 @@ from xllm.modules.fused_ops import (
     memory_efficient_dropout_bwd,
 )
 from xllm.modules.moe.router import calc_probs
+from xllm.modules.moe.dedup import token_rank_hits, build_dedup_plan, masked_gather_sum
 from .utils import (
-    fused_permute_y_fwd,
-    fused_permute_y_bwd_y_grad,
     fused_permute_y_bwd_scores_grad,
     grouped_experts_fwd,
     grouped_experts_bwd,
@@ -69,7 +68,6 @@ def moe_fwd(
     # N
     tokens_per_expert = torch.bincount(routing_indices_flat, minlength=n_experts)
     sorted_indices = torch.argsort(routing_indices_flat, stable=True)
-    permute_indices = sorted_indices // topk
 
     if router_load_balancing_type is None:
         aux_loss = None
@@ -87,14 +85,21 @@ def moe_fwd(
 
     rank = get_model_parallel_rank()
     world_size = get_model_parallel_world_size()
-    group_sizes = tokens_per_expert[expert_start_idx:expert_end_idx].tolist()
-    input_splits = tokens_per_expert.view(-1, n_local_experts).sum(dim=1).tolist()
+    # B*L x TP
+    hits = token_rank_hits(routing_indices_flat, n_local_experts, topk, world_size)
+    # N + TP
+    counts = torch.cat([tokens_per_expert, hits.sum(dim=0)]).tolist()
+    expert_counts, dest_counts = counts[:n_experts], counts[n_experts:]
+    group_sizes = expert_counts[expert_start_idx:expert_end_idx]
+    input_splits = [sum(expert_counts[r * n_local_experts:(r + 1) * n_local_experts]) for r in range(world_size)]
     curr_bsz = input_splits[rank]
     output_splits = [curr_bsz for _ in range(world_size)]
+    plan = build_dedup_plan(hits, sorted_indices, topk, rank, dest_counts, sum(input_splits[:rank]), curr_bsz)
 
-    # B*L*K x D/TP
-    permuted_x = torch.index_select(xf.view(bsz * seq_len, -1), 0, permute_indices)
-    xp, handle_xp = all_to_all(permuted_x, input_splits, output_splits, parallel_region='model', async_op=True)
+    # each token's slice goes once to every rank holding one of its experts
+    # S x D/TP
+    send_x = torch.index_select(xf.view(bsz * seq_len, -1), 0, plan.send_tokens)
+    xu, handle_xu = all_to_all(send_x, plan.send_splits, plan.recv_splits, parallel_region='model', async_op=True)
 
     if fc3_w is not None:
         h3, handle_h3 = all_reduce(F.linear(xf, fc3_w), parallel_region='model', async_op=True)
@@ -108,25 +113,32 @@ def moe_fwd(
     else:
         h1s = None
 
-    if handle_xp is not None:
-        handle_xp.wait()
+    if handle_xu is not None:
+        handle_xu.wait()
+    del send_x
 
-    # B' x D
+    # B' x D: local tokens, rebuilt
+    xu = rearrange(xu, '(w b) d -> b (w d)', w=world_size)
     if curr_bsz > 0:
         ew1 = rearrange(expert_w1, '(n s) d -> n s d', n=n_local_experts)
         ew2 = rearrange(expert_w2, '(n s) d -> n s d', n=n_local_experts)
         ew3 = rearrange(expert_w3, '(n s) d -> n s d', n=n_local_experts)
-        xp = rearrange(xp, '(w b) d -> b (w d)', w=world_size)
+        # P x D: one row per local (token, expert) pair, in expert order
+        xp = torch.index_select(xu, 0, plan.pair_rows)
+        del xu
         y2, _, _, _, _, expert_hidden_rng_state = grouped_experts_fwd(
             xp, ew1, ew2, ew3, group_sizes, expert_backend,
             memory_efficient=True, dropout=hidden_dropout,
         )
-        y2 = rearrange(y2, 'b (w d) -> (w b) d', w=world_size)
+        # B' x D: experts' outputs scaled by their routing scores and summed per token
+        pair_scores = topk_scores.reshape(-1)[plan.pair_slots]
+        y2 = masked_gather_sum(y2, plan.pair_table, pair_scores, moe_permutation_backend)
     else:
-        y2 = xp
+        y2 = xu
         expert_hidden_rng_state = None
+    y2 = rearrange(y2, 'b (w d) -> (w b) d', w=world_size)
 
-    y2, handle_y2 = all_to_all(y2, output_splits, input_splits, parallel_region='model', async_op=True)
+    y2, handle_y2 = all_to_all(y2, plan.recv_splits, plan.send_splits, parallel_region='model', async_op=True)
 
     if h3 is not None:
         assert h1s is not None
@@ -145,15 +157,16 @@ def moe_fwd(
     if handle_y2 is not None:
         handle_y2.wait()
 
-    # permute y2
-    y2, _ = fused_permute_y_fwd(sorted_indices, y2, topk_scores, bsz, seq_len, topk, moe_permutation_backend)
+    # B x L x D/TP: add up the parts returned by each rank
+    y2 = masked_gather_sum(y2, plan.home_table, None, moe_permutation_backend).view(bsz, seq_len, -1)
 
     # combine shared expert
     out = torch.add(y1, y2, out=y2) if y1 is not None else y2
 
     return (
         out, aux_loss, (original_scores, routing_indices, org_topk_scores, tokens_per_expert), (h1, h3),
-        (group_sizes, input_splits, output_splits, curr_bsz), (expert_hidden_rng_state, shared_hidden_rng_state)
+        (group_sizes, input_splits, output_splits, curr_bsz, dest_counts),
+        (expert_hidden_rng_state, shared_hidden_rng_state)
     )
 
 
@@ -162,10 +175,11 @@ def moe_bwd(
     router_w, router_bias, router_bias_update_rate, routing_score_func, routing_scaling_factor, router_load_balancing_type,
     h1, h3, fc1_w, fc2_w, fc3_w, n_experts, n_local_experts, topk, expert_w1, expert_w2, expert_w3,
     expert_backend, moe_permutation_backend, hidden_dropout, group_sizes, input_splits, output_splits, curr_bsz,
-    expert_hidden_rng_state, shared_hidden_rng_state, gather_before_norm,
+    dest_counts, expert_hidden_rng_state, shared_hidden_rng_state, gather_before_norm,
 ):
     bsz, seq_len, _ = xf.size()
     world_size = len(output_splits)
+    rank = get_model_parallel_rank()
     # recompute router
     if original_scores is None:
         routing_logits = F.linear(xf, router_w).to(torch.float32)
@@ -200,19 +214,25 @@ def moe_bwd(
     scaled_topk_scores = (topk_scores * routing_scaling_factor if routing_scaling_factor else topk_scores).to(xf)
 
     # B*L*K
-    sorted_indices = torch.argsort(routing_indices.flatten(), stable=True)
+    routing_indices_flat = routing_indices.flatten()
+    sorted_indices = torch.argsort(routing_indices_flat, stable=True)
+    inverse_indices = torch.empty_like(sorted_indices)
+    inverse_indices[sorted_indices] = torch.arange(sorted_indices.numel(), device=sorted_indices.device)
+    # rebuilt from the routing rather than kept from forward: cheap, and no extra state to save
+    hits = token_rank_hits(routing_indices_flat, n_local_experts, topk, world_size)
+    plan = build_dedup_plan(hits, sorted_indices, topk, rank, dest_counts, sum(input_splits[:rank]), curr_bsz)
 
-    # recompute xp
-    # B*L*K x D/TP
-    permute_indices = sorted_indices // topk
-    permuted_x = torch.index_select(xf.view(bsz * seq_len, -1), 0, permute_indices)
-    xp, handle_xp = all_to_all(permuted_x, input_splits, output_splits, parallel_region='model', async_op=True)
+    # recompute xp: each token's slice goes once to every rank holding one of its experts
+    # S x D/TP
+    send_x = torch.index_select(xf.view(bsz * seq_len, -1), 0, plan.send_tokens)
+    xu, handle_xu = all_to_all(send_x, plan.send_splits, plan.recv_splits, parallel_region='model', async_op=True)
 
-    # B*L*K x D/TP
-    y2_grad, inverse_indices = fused_permute_y_bwd_y_grad(
-        out_grad, sorted_indices, scaled_topk_scores, bsz, seq_len, topk, moe_permutation_backend
+    # the output gradient goes the same way, unscaled; the owner applies the routing scores
+    # S x D/TP
+    send_grad = torch.index_select(out_grad.reshape(bsz * seq_len, -1), 0, plan.send_tokens)
+    yu_grad, handle_y2_grad = all_to_all(
+        send_grad, plan.send_splits, plan.recv_splits, parallel_region='model', async_op=True
     )
-    y2_grad, handle_y2_grad = all_to_all(y2_grad, input_splits, output_splits, parallel_region='model', async_op=True)
 
     if original_scores is None:
         # Router indices
@@ -252,49 +272,63 @@ def moe_bwd(
         h_grad, fc2_w_grad, h1s = None, None, None
         handle_h, h_noise = None, None
 
-    if handle_xp is not None:
-        handle_xp.wait()
+    if handle_xu is not None:
+        handle_xu.wait()
+    del send_x
 
-    # B' x D
+    # B' x D: local tokens, rebuilt
+    xu = rearrange(xu, '(w b) d -> b (w d)', w=world_size)
     if curr_bsz > 0:
         ew1 = rearrange(expert_w1, '(n s) d -> n s d', n=n_local_experts)
         ew2 = rearrange(expert_w2, '(n s) d -> n s d', n=n_local_experts)
         ew3 = rearrange(expert_w3, '(n s) d -> n s d', n=n_local_experts)
-        xp = rearrange(xp, '(w b) d -> b (w d)', w=world_size)
+        # P x D: one row per local (token, expert) pair, in expert order
+        xp = torch.index_select(xu, 0, plan.pair_rows)
+        del xu
         y2, eh1, eh1s, eh3, eh, expert_hidden_noise = grouped_experts_fwd(
             xp, ew1, ew2, ew3, group_sizes, expert_backend, False, hidden_dropout, expert_hidden_rng_state
         )
-        y2 = rearrange(y2, 'b (w d) -> (w b) d', w=world_size)
     else:
-        y2 = xp
+        xp = y2 = xu
         eh1, eh1s, eh3, eh = None, None, None, None
         ew1, ew2, ew3 = None, None, None
         expert_hidden_noise = None
 
+    # per-pair expert outputs return to their tokens for the routing scores' gradient
+    y2 = rearrange(y2, 'b (w d) -> (w b) d', w=world_size)
     y2, handle_y2 = all_to_all(y2, output_splits, input_splits, parallel_region='model', async_op=True)
 
     if handle_y2_grad is not None:
         handle_y2_grad.wait()
+    del send_grad
 
-    # B*L*K x D/TP
+    # B' x D: output gradient of the local tokens, rebuilt
+    yu_grad = rearrange(yu_grad, '(w b) d -> b (w d)', w=world_size)
     if curr_bsz > 0:
-        y2_grad = rearrange(y2_grad, '(w b) d -> b (w d)', w=world_size)
+        # P x D: scaled by each pair's routing score
+        pair_scores = scaled_topk_scores.reshape(-1)[plan.pairs]
+        y2_grad = torch.index_select(yu_grad, 0, plan.pair_rows).mul_(pair_scores.unsqueeze(1))
+        del yu_grad
         xp_grad, ew1_grad, ew2_grad, ew3_grad = grouped_experts_bwd(
             y2_grad, xp, ew1, ew2, ew3, eh1, eh1s, eh3, eh, group_sizes, expert_backend,
             True, hidden_dropout, expert_hidden_rng_state, expert_hidden_noise
         )
-        xp_grad = rearrange(xp_grad, 'b (w d) -> (w b) d', w=world_size)
+        # B' x D: summed per local token
+        xu_grad = masked_gather_sum(xp_grad, plan.pair_table, None, moe_permutation_backend)
         ew1_grad = rearrange(ew1_grad, 'n s d -> (n s) d')
         ew2_grad = rearrange(ew2_grad, 'n s d -> (n s) d')
         ew3_grad = rearrange(ew3_grad, 'n s d -> (n s) d')
     else:
-        xp_grad = y2_grad
+        xu_grad = yu_grad
         # FSDP must reduce the same parameters even when this rank has no expert tokens.
         ew1_grad = torch.zeros_like(expert_w1)
         ew2_grad = torch.zeros_like(expert_w2)
         ew3_grad = torch.zeros_like(expert_w3)
 
-    xp_grad, handle_xp_grad = all_to_all(xp_grad, output_splits, input_splits, parallel_region='model', async_op=True)
+    xu_grad = rearrange(xu_grad, 'b (w d) -> (w b) d', w=world_size)
+    xf_grad_parts, handle_xp_grad = all_to_all(
+        xu_grad, plan.recv_splits, plan.send_splits, parallel_region='model', async_op=True
+    )
 
     if fc1_w is not None:
         if handle_h is not None:
@@ -374,10 +408,9 @@ def moe_bwd(
     # xf grad from expert
     if handle_xp_grad is not None:
         handle_xp_grad.wait()
-    # re-order
-    xp_grad = torch.index_select(xp_grad, 0, inverse_indices)
-    # B x L x K x D/TP -> B x L x D/TP
-    xf_grad = xp_grad.view(bsz, seq_len, topk, -1).sum(dim=2)
+    # B x L x D/TP: add up the parts returned by each rank
+    xf_grad = masked_gather_sum(xf_grad_parts, plan.home_table, None, moe_permutation_backend)
+    xf_grad = xf_grad.view(bsz, seq_len, -1)
 
     if xf_grad_shared is not None:
         xf_grad = torch.add(xf_grad, xf_grad_shared, out=xf_grad)

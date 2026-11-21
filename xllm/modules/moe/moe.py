@@ -24,7 +24,7 @@ from xllm.health_metrics import get_active_health_collector
 from xllm.utils import get_init_fn
 from .router import TopKRouter
 from .expert import Expert
-from .permute import fused_permute_y
+from .dedup import token_rank_hits, build_dedup_plan, gather_rows, weighted_sum
 
 
 class NormalizedMoE(nn.Module):
@@ -178,27 +178,35 @@ class NormalizedMoE(nn.Module):
         routing_indices = routing_indices.flatten()
         # B*L*K
         sorted_indices = torch.argsort(routing_indices, stable=True)
-        permute_indices = sorted_indices // self.topk
-        # N
-        group_sizes = tokens_per_expert[self.expert_start_idx:self.expert_end_idx].tolist()
-        input_splits = tokens_per_expert.view(-1, self.n_local_experts).sum(dim=1).tolist()
-        curr_bsz = input_splits[rank]
-        output_splits = [curr_bsz for _ in range(world_size)]
+        # B*L x TP
+        hits = token_rank_hits(routing_indices, self.n_local_experts, self.topk, world_size)
+        # N + TP
+        counts = torch.cat([tokens_per_expert, hits.sum(dim=0)]).tolist()
+        expert_counts, dest_counts = counts[:self.n_experts], counts[self.n_experts:]
+        group_sizes = expert_counts[self.expert_start_idx:self.expert_end_idx]
+        pair_start = sum(expert_counts[:self.expert_start_idx])
+        plan = build_dedup_plan(
+            hits, sorted_indices, self.topk, rank, dest_counts, pair_start, sum(group_sizes)
+        )
+        backend = self.permutation_backend
 
-        # routed experts
-        # B*L*K x D/TP
-        permuted_x = torch.index_select(x, 0, permute_indices)
-        x = all_to_all_expert_parallel_region(permuted_x, input_splits, output_splits)
-        # B' x D
-        if curr_bsz > 0:
-            x = rearrange(x, '(w b) d -> b (w d)', w=world_size)
-            y2 = self.experts(x, group_sizes)
-            y2 = rearrange(y2, 'b (w d) -> (w b) d', w=world_size)
-        else:
-            y2 = x
-        y2 = all_to_all_expert_parallel_region(y2, output_splits, input_splits)
-        # permute y2
-        y2 = fused_permute_y(sorted_indices, y2, routing_scores, bsz, slen, self.topk, self.permutation_backend)
+        # routed experts: each token's slice goes once to every rank holding one of its experts
+        # S x D/TP
+        x = gather_rows(x, plan.send_tokens, plan.home_table, backend)
+        x = all_to_all_expert_parallel_region(x, plan.send_splits, plan.recv_splits)
+        # B' x D: local tokens, rebuilt
+        x = rearrange(x, '(w b) d -> b (w d)', w=world_size)
+        # P x D: one row per local (token, expert) pair, in expert order
+        x = gather_rows(x, plan.pair_rows, plan.pair_table, backend)
+        y2 = self.experts(x, group_sizes) if x.size(0) > 0 else x
+        # B' x D: experts' outputs scaled by their routing scores and summed per token
+        weights = routing_scores.reshape(-1).index_select(0, plan.pair_slots.flatten()).view_as(plan.pair_slots)
+        y2 = weighted_sum(y2, plan.pair_table, weights, plan.pair_rows, plan.pair_cols, backend)
+        y2 = rearrange(y2, 'b (w d) -> (w b) d', w=world_size)
+        y2 = all_to_all_expert_parallel_region(y2, plan.recv_splits, plan.send_splits)
+        # B x L x D/TP: add up the parts returned by each rank
+        y2 = weighted_sum(y2, plan.home_table, None, plan.send_tokens, plan.send_ranks, backend)
+        y2 = y2.view(bsz, slen, -1)
 
         # combine shared expert
         y = y1 + y2 if y1 is not None else y2
