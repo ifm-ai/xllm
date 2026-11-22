@@ -74,6 +74,11 @@ def param_groups(model: nn.Module, cfg: OptimConf, roles: RolesConf, muon_params
             group["role"] = role
             groups.append(group)
     assert sum(len(g["params"]) for g in groups) == len(muon_params)
+    stray = {role_of[id(p)] for p in adamw_params} & set(MATRIX_ROLES)
+    if stray:  # a matrix role's lr is a Muon-scale value, so an AdamW tensor must never carry one
+        names = [n for n, p in model.named_parameters() if role_of[id(p)] in stray and id(p) not in {id(q) for q in muon_params}]
+        raise ValueError(f"roles: {sorted(stray)} are Muon's roles, but these tensors are not register_muon'd and "
+                         f"would step with AdamW at a Muon learning rate: {names[:5]}")
     for role in ROLES:
         params = [p for p in adamw_params if role_of[id(p)] == role]
         if params:

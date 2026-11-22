@@ -239,3 +239,16 @@ def test_the_router_is_not_a_muon_role(cpu_transport):
     or it would step with AdamW at a Muon lr."""
     from xllm.optim.roles import MATRIX_ROLES
     assert "router" not in MATRIX_ROLES
+
+
+def test_a_matrix_role_on_an_adamw_tensor_is_rejected(cpu_transport):
+    """The guard that makes the MoVA mistake loud: a Muon role on a tensor Muon does not step."""
+    import xllm.optim.roles as roles_lib
+    model = sharded("transformer")
+    tagged = next(m for m in model.modules() if "param_roles" in vars(m) and
+                  any(r == "hidden_vector" for r in vars(m)["param_roles"].values()))
+    name = next(n for n, r in vars(tagged)["param_roles"].items() if r == "hidden_vector")
+    vars(tagged)["param_roles"][name] = "attn_qkv"  # an AdamW tensor wearing a Muon role
+    with pytest.raises(ValueError, match="would step with AdamW at a Muon learning rate"):
+        muon.build_muon(model, CFG, ROLES)
+    assert roles_lib.MATRIX_ROLES  # the constant the guard reads
