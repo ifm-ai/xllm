@@ -33,6 +33,7 @@ from xllm.modules.multihead_attention import (
     CausalSoftdeltaAttention
 )
 from xllm.modules.fused_ops import memory_efficient_dropout
+from xllm.optim.muon_spec import register_muon
 from .router import TopKRouter
 from .permute.permute_ops import fused_permute_y
 
@@ -262,7 +263,16 @@ class MOVAttention(nn.Module):
             num_features=self.n_heads * self.head_dim, eps=rmsnorm_eps, init_std=init_std
         )
 
-        #TODO: register Muon
+        # Muon (xllm/optim/muon.py): one Newton-Schulz block per head (each of a kv head's two softdelta
+        # keys is its own block; wr holds a head's gate rows and, for softdelta, its forget logit), one
+        # per value expert and kv head in wv; wo is whole; the router stays with AdamW
+        for w in (self.wq, self.wk):
+            register_muon(w, layout="(h d) m", fan_out="d", fan_in="m", d=self.head_dim, tp_dim=0)
+        register_muon(self.wv, layout="(n h d) m", fan_out="d", fan_in="m",
+                      h=self.n_kv_heads, d=self.head_dim, tp_dim=1)
+        if self.wr is not None:
+            register_muon(self.wr, layout="(h d) m", fan_out="d", fan_in="m", d=rdim // self.n_heads, tp_dim=0)
+        register_muon(self.wo, tp_dim=1)
 
     def _receive_prev_tensors(self, x):
         bsz, seq_len, _ = x.size()
