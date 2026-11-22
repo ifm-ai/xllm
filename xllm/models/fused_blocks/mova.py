@@ -111,14 +111,10 @@ def mova_fwd(
     permute_indices = sorted_indices // topk
     # N
     group_sizes = tokens_per_expert.tolist()
-    # B*L*K x D/TP
-    permuted_sx = torch.index_select(sx.view(bsz * seq_len, -1), 0, permute_indices)
-    # B*L*K x V
-    wv = rearrange(wv, '(n v) d -> n v d', n=n_values)
-    xv = multi_group_matmul_fwd(permuted_sx, wv, group_sizes, True, value_backend)
-    # B*L*K x V/TP
-    xv, handle_xv = reduce_scatter(xv, parallel_region='model', async_op=True)
 
+    # The tolist() above drains the GPU queue. k and r are issued before the value GroupedGEMM so the
+    # GPU has work while the CPU issues the GEMM's per-group launches (te backend); q comes after it to
+    # overlap with the xv reduce-scatter.
     if handle_mx is not None:
         handle_mx.wait()
         mx = reshape_gathered_tensor_along_specific_dim(mx, gather_dim=2)
@@ -161,17 +157,13 @@ def mova_fwd(
     else:
         r = g = None
 
-    # compute v
-    if handle_xv is not None:
-        handle_xv.wait()
-
-    # permute xv
-    xv_, _ = fused_permute_y_fwd(
-        sorted_indices, F.silu(xv), topk_scores, bsz, seq_len, topk, moe_permutation_backend,
-    )
-    # B x L x H x D
-    xv_ = xv_.view(bsz, seq_len, local_kv_heads, head_dim)
-    xv_, handle_xv = all_gather(xv_, parallel_region='context', async_op=True)
+    # B*L*K x D/TP
+    permuted_sx = torch.index_select(sx.view(bsz * seq_len, -1), 0, permute_indices)
+    # B*L*K x V
+    wv = rearrange(wv, '(n v) d -> n v d', n=n_values)
+    xv = multi_group_matmul_fwd(permuted_sx, wv, group_sizes, True, value_backend)
+    # B*L*K x V/TP
+    xv, handle_xv = reduce_scatter(xv, parallel_region='model', async_op=True)
 
     # compute q
     xq = F.linear(mx, wq)
@@ -183,6 +175,18 @@ def mova_fwd(
     if health_collector is not None and layer_id is not None:
         # Local post-qk-norm, post-RoPE heads, before K is gathered across context ranks.
         health_collector.record_query_key_stats(layer_id, xq_, local_xk)
+
+    # compute v
+    if handle_xv is not None:
+        handle_xv.wait()
+
+    # permute xv
+    xv_, _ = fused_permute_y_fwd(
+        sorted_indices, F.silu(xv), topk_scores, bsz, seq_len, topk, moe_permutation_backend,
+    )
+    # B x L x H x D
+    xv_ = xv_.view(bsz, seq_len, local_kv_heads, head_dim)
+    xv_, handle_xv = all_gather(xv_, parallel_region='context', async_op=True)
 
     if handle_xk is not None:
         handle_xk.wait()
