@@ -265,6 +265,6 @@ ConfStore["hybrid-gekko-7B"] = ModelConf(
     apply_attn_gate=True, attn_gate_func='softplus', apply_conv_in_causal_attn=True,
     rope_head_dim=128, rope_base=500000, apply_nope_in_causal_attn=True,
     causal_conv_width=4, causal_conv_weight_normalization=True, ffn_hidden_dim=8192, swiglu=True,
-    layernorm_num_groups=4, timenorm_num_groups=48, apply_rmsnorm=True,
+    layernorm_num_groups=4, timenorm_num_groups=56, apply_rmsnorm=True,
     timenorm_eps=1e-5, layernorm_eps=1e-5, rmsnorm_eps=1e-6
 )
