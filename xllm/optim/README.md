@@ -20,14 +20,16 @@
 
   ```python
   register_muon(self.wo, tp_dim=1)                           # a linear layer: one matrix
-  register_muon(self.wq, layout="(h k d) m", fan_out="k d", fan_in="m", k=nq, d=self.head_dim, tp_dim=0)
+  register_muon(self.wk, layout="(h d) m", fan_out="d", fan_in="m", d=self.head_dim, tp_dim=0)
+  register_muon(self.wv, layout="(n h d) m", fan_out="d", fan_in="m", h=n_kv_heads, d=self.head_dim, tp_dim=1)
   register_muon(self, "weight2", "(n s) d", fan_out="s", fan_in="d", s=self.model_dim, tp_dim=0)
   ```
 
   Parentheses flatten several axes into one dim, outer first. The `fan_out` / `fan_in` axes
   (innermost in their dim) are the matrix rows / columns; every other axis indexes separate
-  blocks, each orthogonalized and scaled on its own: here one block per head (both softdelta
-  queries of a head together) and one per expert. Each dim's outermost axis is inferred from
+  blocks, each orthogonalized and scaled on its own: here one block per head_dim rows of `wk`
+  (each of a kv head's two softdelta keys on its own), one per value expert and kv head of the
+  MoVA `wv` (a row-parallel weight, so `tp_dim=1`) and one per expert. Each dim's outermost axis is inferred from
   the global shape and cannot be given, so a tensor-parallel local count cannot slip in.
   Putting an axis in `fan_out` / `fan_in` makes it part of the matrix (`fan_out="h d"` on `wq`:
   all heads as one matrix). `tp_dim` is the dim tensor parallelism splits (0 for a
