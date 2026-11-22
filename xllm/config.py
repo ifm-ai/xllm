@@ -114,6 +114,9 @@ class OptimConf(Config):
     optimizer: str = "adamw"  # adamw, or muon (Muon for linear weights in the blocks, AdamW for the rest)
     adamw: AdamWConf = field(default_factory=AdamWConf)
     muon: MuonConf = field(default_factory=MuonConf)
+    # The embedding and the readout weight step with weight_decay 0, in a param group of their own. Both are AdamW
+    # under either optimizer (neither is register_muon'd), so this applies to optimizer adamw and muon alike.
+    no_weight_decay_embed_readout: bool = False
     warmup: int = 3000  # Num of steps for LR warmup. 0 means no warmup
     clip: float = 1.0  # Global gradient L2 norm clipping threshold, before applying loss scale.
     scheduler: str = "constant"  # LR scheduler: linear, cosine, constant, or wsd (warmup-stable-decay)

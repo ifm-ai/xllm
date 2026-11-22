@@ -98,13 +98,18 @@ def newton_schulz(X: Tensor, eps: float = NS_EPS) -> Tensor:
 
 
 def group_hparams(cfg: OptimConf, algorithm: str) -> dict:
-    """Param-group hyperparameters that OptimConf sets for "muon" or "adamw" (single source of truth)."""
+    """Param-group hyperparameters that OptimConf sets for "muon", "adamw" or "adamw_no_wd" (single source of truth).
+
+    "adamw_no_wd" is the group optim.no_weight_decay_embed_readout exempts: AdamW's values with weight_decay 0.
+    Keeping it here is what makes a resume reapply the 0 rather than the configured decay.
+    """
     if algorithm == "muon":
         m = cfg.muon
         return {"lr": m.lr, "momentum": m.momentum, "nesterov": m.nesterov, "adjust_lr": m.adjust_lr,
                 "scale_shape": m.scale_shape, "weight_decay": m.weight_decay}
     a = cfg.adamw
-    return {"lr": a.lr, "betas": (a.beta1, a.beta2), "weight_decay": a.weight_decay}
+    weight_decay = 0.0 if algorithm == "adamw_no_wd" else a.weight_decay
+    return {"lr": a.lr, "betas": (a.beta1, a.beta2), "weight_decay": weight_decay}
 
 
 class Muon(Optimizer):
@@ -114,10 +119,18 @@ class Muon(Optimizer):
     all-to-all sends the slices back into u; each rank applies its update."""
 
     def __init__(self, muon_params: list[nn.Parameter], specs: list[MuonSpec], adamw_params: list[nn.Parameter],
-                 mesh: DeviceMesh, cfg: OptimConf, tp_group: dist.ProcessGroup | None = None):
-        """specs[i]: muon_params[i]'s Blocks (register_muon); tp_group: the TP group, if any (params are then TP-local)."""
+                 mesh: DeviceMesh, cfg: OptimConf, tp_group: dist.ProcessGroup | None = None,
+                 no_decay_params: list[nn.Parameter] | None = None):
+        """specs[i]: muon_params[i]'s Blocks (register_muon); tp_group: the TP group, if any (params are then TP-local).
+
+        no_decay_params: AdamW params that step with weight_decay 0, in a group of their own. The muon group stays
+        first, as the rest of this class and train.py assume.
+        """
         groups = [dict(params=muon_params, algorithm="muon", **group_hparams(cfg, "muon")),
                   dict(params=adamw_params, algorithm="adamw", **group_hparams(cfg, "adamw"))]
+        if no_decay_params:
+            groups.append(dict(params=no_decay_params, algorithm="adamw_no_wd",
+                               **group_hparams(cfg, "adamw_no_wd")))
         super().__init__(groups, {"eps": cfg.adamw.epsilon})
         self._ranks(mesh, tp_group)
         self.w = [_local(p) for p in muon_params]  # shards: weights, momenta (state, from the first gradient), directions
@@ -297,8 +310,12 @@ def _buffer(views: list[list[Tensor]]) -> tuple[list[Tensor], Tensor, list[Tenso
     return flat, buf, packed, [sum(t.numel() for t in ts) for ts in views]
 
 
-def build_muon(model: nn.Module, cfg: OptimConf) -> Optimizer:
-    """The model must be wrapped with FSDP2; Muon works over the shard dimension of the mesh its parameters live on."""
+def build_muon(model: nn.Module, cfg: OptimConf, no_decay_params: list[nn.Parameter] | None = None) -> Optimizer:
+    """The model must be wrapped with FSDP2; Muon works over the shard dimension of the mesh its parameters live on.
+
+    no_decay_params: params to step with weight_decay 0 (optim.no_weight_decay_embed_readout), taken out of the
+    AdamW group into one of their own.
+    """
     from xllm.distributed import get_model_parallel_group, get_model_parallel_world_size
     from xllm.modules.model_parallel import ColumnParallelLinear, RowParallelLinear
     tp = get_model_parallel_world_size()
@@ -320,9 +337,13 @@ def build_muon(model: nn.Module, cfg: OptimConf) -> Optimizer:
             missed[name_pattern(f"{fqn}.weight")] += 1
     if missed:
         logger.warning(f"Muon: unregistered weights use AdamW: {dict(missed)}")
+    no_decay = list(no_decay_params or [])
+    if no_decay:
+        exempt = {id(p) for p in no_decay}
+        adamw_params = [p for p in adamw_params if id(p) not in exempt]
     mesh = muon_params[0].device_mesh
     optimizer = Muon(muon_params, specs, adamw_params, mesh if mesh.ndim == 1 else mesh["dp"], cfg,
-                     tp_group=get_model_parallel_group() if tp > 1 else None)
+                     tp_group=get_model_parallel_group() if tp > 1 else None, no_decay_params=no_decay)
     logger.info(f"Muon: {len(muon_params)} matrices / {len(optimizer.blocks)} blocks / "
                 f"{sum(p.numel() for p in muon_params)} params; AdamW: {len(adamw_params)} tensors / "
                 f"{sum(p.numel() for p in adamw_params)} params")

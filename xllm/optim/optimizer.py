@@ -21,19 +21,34 @@ def rescale_grads(model: nn.Module, scale: float):
         p.grad /= scale
 
 
+def embed_readout_params(model: nn.Module) -> list[nn.Parameter]:
+    """The embedding and the readout weight: the tensors optim.no_weight_decay_embed_readout exempts.
+
+    Both are AdamW-stepped under either optimizer, since neither is ever register_muon'd. Looked up by attribute
+    (model.embed, model.output.output), which transformer, gekko and hybrid all have, and which survives FSDP2's
+    wrap because it shards modules in place. A model class that no longer has them raises here rather than quietly
+    exempting nothing: this flag's failure mode is a run that looks fine while the embedding is still decaying.
+    """
+    return [p for module in (model.embed, model.output.output) for p in module.parameters()]
+
+
 def build_optimizer(model: nn.Module, cfg: OptimConf, total_steps: int, param_dtype: str):
+    from .muon import group_hparams
     logger.info("Starting build of optimizer...")
+    no_decay = embed_readout_params(model) if cfg.no_weight_decay_embed_readout else []
+    if no_decay:
+        logger.info(f"optim.no_weight_decay_embed_readout: {len(no_decay)} tensors "
+                    f"({sum(p.numel() for p in no_decay)} params) step with weight_decay 0")
     if cfg.optimizer == "muon":
         from .muon import build_muon
-        optimizer = build_muon(model, cfg)
+        optimizer = build_muon(model, cfg, no_decay)
     else:
-        optimizer = AdamW(
-            model.parameters(),
-            lr=cfg.adamw.lr,
-            betas=(cfg.adamw.beta1, cfg.adamw.beta2),
-            weight_decay=cfg.adamw.weight_decay,
-            eps=cfg.adamw.epsilon,
-        )
+        exempt = {id(p) for p in no_decay}
+        groups = [dict(params=[p for p in model.parameters() if id(p) not in exempt],
+                       **group_hparams(cfg, "adamw"))]
+        if no_decay:
+            groups.append(dict(params=no_decay, **group_hparams(cfg, "adamw_no_wd")))
+        optimizer = AdamW(groups, eps=cfg.adamw.epsilon)
 
     # scheduler
     scheduler = build_lr_scheduler(optimizer, cfg, total_steps)
