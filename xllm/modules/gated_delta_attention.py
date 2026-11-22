@@ -283,13 +283,16 @@ class GatedDeltaAttention(nn.Module):
 
         # roles (xllm/optim/roles.py): the matrices as in attention; biases, norm gains and the depthwise
         # causal-conv kernels as the blocks' vectors
-        for w in (self.wq, self.wk, self.wv, self.wr, self.wo):
+        for w, role in ((self.wq, "attn_qkv"), (self.wk, "attn_qkv"), (self.wv, "attn_qkv"),
+                        (self.wr, "hidden_matrix"), (self.forget_gate, "hidden_matrix"), (self.wo, "attn_out")):
             if w is not None:
-                register_role(w, "weight", "hidden_matrix")
+                register_role(w, "weight", role)
         for module in (self.wv, self.wr, self.q_conv, self.k_conv, self.v_conv, self.timenorm):
             register_role(module, "bias", "hidden_vector")
-        for module in (self.q_conv, self.k_conv, self.v_conv, self.timenorm, self.query_norm, self.key_norm):
+        for module in (self.q_conv, self.k_conv, self.v_conv, self.timenorm):
             register_role(module, "weight", "hidden_vector")
+        for module in (self.query_norm, self.key_norm):
+            register_role(module, "weight", "qk_norm")
 
     def _receive_prev_count(self, x, bos_mask):
         bsz, seq_len, _ = x.size()

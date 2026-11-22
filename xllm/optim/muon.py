@@ -140,13 +140,23 @@ class Muon(Optimizer):
                  mesh: DeviceMesh, cfg: OptimConf, tp_group: dist.ProcessGroup | None = None,
                  param_groups: list[dict] | None = None):
         """specs[i]: muon_params[i]'s Blocks (register_muon); tp_group: the TP group, if any (params are then TP-local).
-        param_groups: the optimizer's groups, the Muon group (of muon_params) first; roles build one per role
-        (xllm/optim/roles.py). Default: the Muon group and one AdamW group, at the configured values."""
+        param_groups: the optimizer's groups, the Muon ones (holding muon_params between them) first; roles build
+        one per role (xllm/optim/roles.py). Default: one Muon group and one AdamW group, at the configured values.
+
+        The per-shard state (w, m, u) and the block plan are flat over muon_params, so each Muon group carries
+        `index`, its parameters' positions in that flat list; `index` rides along in the group, which is how it
+        survives a state_dict round trip."""
         if param_groups is None:
             param_groups = [muon_group(cfg, muon_params), adamw_group(cfg, adamw_params)]
-        assert param_groups[0]["algorithm"] == "muon" and len(param_groups[0]["params"]) == len(muon_params)
+        assert param_groups[0]["algorithm"] == "muon", "the Muon groups come first"
+        muon_groups = [g for g in param_groups if g["algorithm"] == "muon"]
+        assert sum(len(g["params"]) for g in muon_groups) == len(muon_params)
+        flat = {id(p): i for i, p in enumerate(muon_params)}
+        for group in muon_groups:
+            group["index"] = [flat[id(p)] for p in group["params"]]
         super().__init__(param_groups, {"eps": cfg.adamw.epsilon})
         self._ranks(mesh, tp_group)
+        self.muon_params = list(muon_params)
         self.w = [_local(p) for p in muon_params]  # shards: weights, momenta (state, from the first gradient), directions
         self.m: list[Tensor | None] = [None] * len(muon_params)
         self.u = [torch.empty_like(w, dtype=torch.bfloat16) for w in self.w]
@@ -154,8 +164,17 @@ class Muon(Optimizer):
 
     def load_state_dict(self, state_dict: dict):
         super().load_state_dict(state_dict)
-        self.m = [_local(self.state[p]["momentum"]) if "momentum" in self.state[p] else None
-                  for p in self.param_groups[0]["params"]]
+        # torch replaces the live groups with the checkpoint's, so `index` is whatever that checkpoint held: missing
+        # for one written before the Muon groups were split, and stale if a retag moved a tensor between two groups
+        # of the same size. Rebuild it from the parameters this optimizer actually has.
+        flat = {id(p): i for i, p in enumerate(self.muon_params)}
+        self.m = [None] * len(self.muon_params)
+        for group in self.param_groups:
+            if group["algorithm"] == "muon":
+                group["index"] = [flat[id(p)] for p in group["params"]]
+                for p, i in zip(group["params"], group["index"]):
+                    if "momentum" in self.state[p]:
+                        self.m[i] = _local(self.state[p]["momentum"])
 
     def _ranks(self, mesh: DeviceMesh, tp_group: dist.ProcessGroup | None):
         """The process group over the dp x TP plane that shards a weight, my rank in it, each rank's (dp index, tp index)."""
@@ -228,17 +247,22 @@ class Muon(Optimizer):
         if closure is not None:
             with torch.enable_grad():
                 loss = closure()
+        muon_groups = [group for group in self.param_groups if group["algorithm"] == "muon"]
+        if muon_groups:
+            self._muon_step(muon_groups)
         for group in self.param_groups:
-            if group["algorithm"] == "muon":
-                self._muon_step(group)
-            else:
+            if group["algorithm"] != "muon":
                 self._adamw_step(group)
         return loss
 
-    def _muon_step(self, group: dict):
+    def _muon_step(self, groups: list[dict]):
+        """One pass for every Muon group: the momenta first, then the orthogonalization, which is the same work
+        whatever the groups' lr and weight decay are, then each group's update at its own values. The groups do not
+        each get their own pass, or the all-to-alls would run once per group and lose the batching across weights."""
         eps = NS_EPS
-        live = [i for i, p in enumerate(group["params"]) if p.grad is not None]
-        self._momentum(group, live)
+        work = [(group, [i for i in group["index"] if self.muon_params[i].grad is not None]) for group in groups]
+        for group, live in work:
+            self._momentum(group, live)
         gather = None
         if self.has_remote:  # my slices of the remote blocks go to their owners while the local blocks are done
             xllm_ops.batched_copy_(self.mine_packed, self.mine)
@@ -256,19 +280,22 @@ class Muon(Optimizer):
             xllm_ops.batched_copy_(self.theirs_packed, self.theirs)  # and back the way they came
             dist.all_to_all_single(self.mine_buf, self.theirs_buf, self.mine_sizes, self.theirs_sizes, group=self.group)
             xllm_ops.batched_copy_(self.mine, self.mine_packed)
-        self._update(group, live)
+        for group, live in work:
+            self._update(group, live)
 
     def _momentum(self, group: dict, live: list[int]):
         """m <- mu m + g on the shards (fp32); the bf16 directions (Nesterov: g + mu m) into u, for the params with a
-        gradient (live). No gradient: zeros, no state, no decay (as with AdamW); the plan stays fixed."""
-        params = group["params"]
-        for i, p in enumerate(params):
+        gradient (live). No gradient: zeros, no state, no decay (as with AdamW); the plan stays fixed.
+
+        live indexes the flat muon_params, as group["index"] does."""
+        for i in group["index"]:
+            p = self.muon_params[i]
             if p.grad is None:
                 self.u[i].zero_()
             elif self.m[i] is None:
                 self.state[p]["momentum"] = torch.zeros_like(p, dtype=torch.float32)
                 self.m[i] = _local(self.state[p]["momentum"])
-        xllm_ops.muon_momentum_([self.m[i] for i in live], [_local(params[i].grad) for i in live],
+        xllm_ops.muon_momentum_([self.m[i] for i in live], [_local(self.muon_params[i].grad) for i in live],
                                 [self.u[i] for i in live], group["momentum"], group["nesterov"])
 
     def _update(self, group: dict, live: list[int]):

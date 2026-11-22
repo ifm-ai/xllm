@@ -91,10 +91,11 @@ class NormalizedFeedForwardNetwork(nn.Module):
             num_features=ffn_hidden_dim, eps=rmsnorm_eps, init_std=init_std
         )
 
-        for fc, tp_dim in ((self.fc1, 0), (self.fc2, 1), (self.fc3, 0)):  # column, row, column parallel
-            if fc is not None:
+        # roles: ffn_in reads the residual stream (swiglu's gate and up), ffn_out writes back (xllm/optim/roles.py)
+        for fc, tp_dim, role in ((self.fc1, 0, "ffn_in"), (self.fc2, 1, "ffn_out"), (self.fc3, 0, "ffn_in")):
+            if fc is not None:  # column, row, column parallel
                 register_muon(fc, tp_dim=tp_dim)  # Muon, one matrix (xllm/optim/muon.py)
-                register_role(fc, "weight", "hidden_matrix")  # xllm/optim/roles.py
+                register_role(fc, "weight", role)
         register_role(self.norm, "weight", "hidden_vector")
         register_role(self.norm, "bias", "hidden_vector")
 

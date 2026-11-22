@@ -15,6 +15,7 @@ from xllm.distributed import (
     get_hybrid_shard_data_parallel_world_size
 )
 from xllm.distributed.utils import divide_and_check_no_remainder
+from xllm.optim.roles import register_role
 
 
 def all_reduce(x: torch.Tensor, world_size: int, group: torch.distributed.ProcessGroup, async_op: bool = False):
@@ -256,6 +257,9 @@ class TopKRouter(torch.nn.Module):
         else:
             self.register_buffer("bias", None)
         self.bias_update_rate = bias_update_rate
+        # roles (xllm/optim/roles.py): a matrix, but never register_muon'd, so it steps with AdamW in its own role.
+        # `bias` is a buffer, not a parameter, so it has no role.
+        register_role(self, "weight", "router")
 
         # Initialize weight.
         master_weight = torch.empty(num_experts, in_features, dtype=self.weight.dtype, requires_grad=False)

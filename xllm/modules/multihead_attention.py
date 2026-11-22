@@ -250,14 +250,19 @@ class MultiheadAttention(nn.Module):
             register_muon(self.wr, layout="(h d) m", fan_out="d", fan_in="m", d=rdim // self.n_heads, tp_dim=0)
         register_muon(self.wo, tp_dim=1)
 
-        # roles (xllm/optim/roles.py)
-        for w in (self.wq, self.wk, self.wv, self.wr, self.wo):
+        # roles (xllm/optim/roles.py): one per tensor, as Complete(d)P groups them; wr has no type there, so it
+        # stays in hidden_matrix with the other block matrices the paper does not name
+        for w, role in ((self.wq, "attn_qkv"), (self.wk, "attn_qkv"), (self.wv, "attn_qkv"),
+                        (self.wr, "hidden_matrix"), (self.wo, "attn_out")):
             if w is not None:
-                register_role(w, "weight", "hidden_matrix")
-        for norm in (self.norm, self.query_norm, self.key_norm):
+                register_role(w, "weight", role)
+        for norm, role in ((self.norm, "hidden_vector"), (self.query_norm, "qk_norm"), (self.key_norm, "qk_norm")):
             if norm is not None:
-                register_role(norm, "weight", "hidden_vector")
-                register_role(norm, "bias", "hidden_vector")
+                register_role(norm, "weight", role)
+                register_role(norm, "bias", role)
+        for conv in (self.q_conv, self.k_conv, self.v_conv):  # apply_conv_in_causal_attn, as the gekko blocks tag theirs
+            if conv is not None:
+                register_role(conv, "weight", "hidden_vector")
 
     def _receive_prev_tensors(self, x):
         bsz, seq_len, _ = x.size()

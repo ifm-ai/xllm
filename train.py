@@ -532,9 +532,10 @@ def main(cfg: TrainerConf):
             aux_losses.append(aux_loss)
         grad_norms.append(grad_norm)
         if cfg.optim.optimizer == "muon":
-            # muon and adamw, or with roles muon and one AdamW group per role
+            # muon and adamw, or with roles one group per matrix role and one AdamW group per role
             group_lrs = {group.get("role") or group["algorithm"]: float(group["lr"]) for group in optimizer.param_groups}
-            curr_lr = group_lrs.pop("muon")
+            first_muon = next(g for g in optimizer.param_groups if g["algorithm"] == "muon")
+            curr_lr = group_lrs.pop(first_muon.get("role") or "muon")  # with roles the Muon groups are named by role
         else:
             curr_lr = float(optimizer.param_groups[0]["lr"])
         assert math.isfinite(curr_loss), f"loss is not finite:{curr_loss}"

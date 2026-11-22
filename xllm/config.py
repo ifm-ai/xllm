@@ -356,20 +356,28 @@ class ValidConf(Config):
 @dataclass
 class RoleConf(Config):
     """One role's optimizer hyperparameters (optim.optimizer=muon). None: the configured optim.* value."""
-    lr: Optional[float] = None  # In place of optim.adamw.lr (AdamW roles) or optim.muon.lr (hidden_matrix)
+    lr: Optional[float] = None  # In place of optim.adamw.lr (AdamW roles) or optim.muon.lr (the matrix roles)
     eps: Optional[float] = None  # In place of optim.adamw.epsilon; AdamW roles only
-    weight_decay: Optional[float] = None  # In place of optim.adamw.weight_decay (hidden_matrix: optim.muon.weight_decay); 0 turns it off
+    weight_decay: Optional[float] = None  # In place of optim.adamw.weight_decay (matrix roles: optim.muon.weight_decay); 0 turns it off
 
 
 @dataclass
 class RolesConf(Config):
     """Per-role optimizer hyperparameters (optim.optimizer=muon). Modules tag their parameters with a role
-    (register_role, xllm/optim/roles.py); AdamW steps one param group per role, Muon its matrices at
-    hidden_matrix's values. All unset: the optimizer's two plain groups. Scaling rules (muP, Complete(d)P) are the
-    launcher's: it sets these values, model.embed_multiplier and the init stds per model size."""
+    (register_role, xllm/optim/roles.py); AdamW steps one param group per role, and Muon one group per matrix
+    role (attn_qkv, attn_out, ffn_in, ffn_out, hidden_matrix). All unset: the optimizer's two plain groups.
+    Scaling rules (muP, Complete(d)P) are the launcher's: it sets these values, model.embed_multiplier and the
+    init stds per model size."""
     embed: RoleConf = field(default_factory=RoleConf)
-    hidden_matrix: RoleConf = field(default_factory=RoleConf)  # the Muon matrices in the blocks
-    hidden_vector: RoleConf = field(default_factory=RoleConf)  # norm gains, biases, gekko's conv kernels in the blocks
+    # the Muon matrices in the blocks, one role per tensor (Complete(d)P, arXiv 2512.22382 D.3)
+    attn_qkv: RoleConf = field(default_factory=RoleConf)  # wq, wk, wv (attention and gekko alike)
+    attn_out: RoleConf = field(default_factory=RoleConf)  # wo
+    ffn_in: RoleConf = field(default_factory=RoleConf)  # fc1, fc3: the matrices reading the stream (swiglu's gate, up)
+    ffn_out: RoleConf = field(default_factory=RoleConf)  # fc2: the matrix writing back
+    hidden_matrix: RoleConf = field(default_factory=RoleConf)  # the block matrices with no Complete(d)P type: wr, forget_gate
+    router: RoleConf = field(default_factory=RoleConf)  # the MoE router's weight and bias: a matrix, but AdamW's
+    qk_norm: RoleConf = field(default_factory=RoleConf)  # query_norm, key_norm
+    hidden_vector: RoleConf = field(default_factory=RoleConf)  # the blocks' other norm gains, biases, conv kernels
     final_norm: RoleConf = field(default_factory=RoleConf)
     readout: RoleConf = field(default_factory=RoleConf)
     other: RoleConf = field(default_factory=RoleConf)  # parameters no module tags (MoE)

@@ -13,6 +13,7 @@ from xllm.distributed import (
 from xllm.distributed.utils import divide_and_check_no_remainder
 from xllm.utils import get_init_fn
 from xllm.optim.muon_spec import register_muon
+from xllm.optim.roles import register_role
 from xllm.modules.fused_ops import memory_efficient_dropout
 from xllm.modules.fused_ops import mgmm
 
@@ -87,6 +88,10 @@ class Expert(nn.Module):
         register_muon(self, "weight1", "(n s) d", fan_out="s", fan_in="d", s=self.inter_dim, tp_dim=0)
         register_muon(self, "weight3", "(n s) d", fan_out="s", fan_in="d", s=self.inter_dim, tp_dim=0)
         register_muon(self, "weight2", "(n s) d", fan_out="s", fan_in="d", s=self.model_dim, tp_dim=0)  # s = model dim here
+
+        # roles (xllm/optim/roles.py): weight1 and weight3 read the stream (gate, up), weight2 writes back
+        for name, role in (("weight1", "ffn_in"), ("weight3", "ffn_in"), ("weight2", "ffn_out")):
+            register_role(self, name, role)
 
     def forward(self, x: torch.Tensor, group_sizes: List[int]) -> torch.Tensor:
         w1 = rearrange(self.weight1, '(n s) d -> n s d', n=self.n_local_experts)
