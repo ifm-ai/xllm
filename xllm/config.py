@@ -3,6 +3,7 @@ from logging import getLogger
 from typing import Optional
 from pathlib import Path
 from typing import List, Dict
+import math
 import os
 import json
 import math
@@ -194,6 +195,11 @@ class ModelConf(Config):
     timenorm_eps: float = 1e-5  # Used in timestep decay normalization.
     layernorm_eps: float = 1e-5
     rmsnorm_eps: float = 1e-6
+    # eps of the RMSNorm / LayerNorm norms that read the residual stream: the attention and FFN pre-norms and the
+    # Transformer's final norm (Gekko's others are timestep norms, timenorm_eps). None: rmsnorm_eps / layernorm_eps.
+    # With embed_multiplier m, stream_norm_eps = (rmsnorm or layernorm eps)·m² and, for Gekko, timenorm_eps·m² give
+    # exactly the model with the stream unscaled and each branch output scaled by 1/m. Not for MoE / MoVA or ortho.
+    stream_norm_eps: Optional[float] = None
     apply_rmsnorm: bool = False  # True = RMSNorm, False = LayerNorm
     residual_func: str = "base"  # Residual connection type: base/add means standard addition, ortho for orthogonal residuals.
     residual_heads: Optional[int] = None  # Num of feature groups for orthogonal residuals. Required when using residual_func='ortho'.
@@ -235,6 +241,33 @@ class ModelConf(Config):
         assert self.ddp_backend in ['fsdp1', 'fsdp2']
         assert self.embed_multiplier > 0 and self.embed_multiplier != float('inf'), \
             f'model.embed_multiplier must be finite and > 0, got {self.embed_multiplier}'
+        if self.stream_norm_eps is not None:
+            assert self.num_experts == 0 and self.num_values == 0, 'model.stream_norm_eps is not implemented for MoE / MoVA'
+            # the ortho residual's norm reads the stream too, with rmsnorm_eps
+            assert self.residual_func != 'ortho', 'model.stream_norm_eps is not implemented for residual_func=ortho'
+            assert 0 < self.stream_norm_eps < float('inf'), \
+                f'model.stream_norm_eps must be finite and > 0, got {self.stream_norm_eps}'
+        if self.embed_multiplier != 1:
+            # the exact reparameterization needs every eps that reads the stream scaled by embed_multiplier^2
+            scale = self.embed_multiplier ** 2
+            if self.stream_norm_eps is None:
+                logger.warning(f'model.embed_multiplier {self.embed_multiplier} without model.stream_norm_eps: the '
+                               f'stream norms act with eps / embed_multiplier^2 (and Gekko\'s timestep norms, '
+                               f'timenorm_eps)')
+            else:
+                want = (self.rmsnorm_eps if self.apply_rmsnorm else self.layernorm_eps) * scale
+                if not math.isclose(self.stream_norm_eps, want, rel_tol=1e-9):
+                    logger.warning(f'model.stream_norm_eps {self.stream_norm_eps} is not (rmsnorm or layernorm eps) '
+                                   f'* embed_multiplier^2 = {want}: this is not the model with the stream unscaled '
+                                   f'and each branch output scaled by 1 / embed_multiplier')
+                # Gekko and hybrid read the stream through their timestep norms too, on timenorm_eps, which the recipe
+                # sets. Still at its default is the one case we can tell apart from a deliberate choice.
+                default_timenorm = self.__dataclass_fields__['timenorm_eps'].default
+                if self.arch in ('gekko', 'hybrid') and self.timenorm_eps == default_timenorm:
+                    logger.warning(f'model.stream_norm_eps is set but model.timenorm_eps is still its default '
+                                   f'{default_timenorm}: {self.arch} reads the residual stream through its timestep '
+                                   f'norms as well, so they need timenorm_eps * embed_multiplier^2 = '
+                                   f'{default_timenorm * scale} for the exact reparameterization')
 
         assert self.causal_attn_backend in [None, "swift", "flash", 'xattn']
         assert self.sca_backend in ["swift", "flash", 'xattn']

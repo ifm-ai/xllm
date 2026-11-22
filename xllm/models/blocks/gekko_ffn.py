@@ -26,7 +26,6 @@ class GekkoBlock(nn.Module):
         self.recompute_fc3_out = cfg.recompute_fc3_out
         self.apply_rmsnorm = cfg.apply_rmsnorm
         self.timenorm_eps = cfg.timenorm_eps
-        self.layernorm_eps = cfg.layernorm_eps
         self.rmsnorm_eps = cfg.rmsnorm_eps
 
         self.gda = GatedDeltaAttention(
@@ -75,6 +74,7 @@ class GekkoBlock(nn.Module):
             layernorm_eps=cfg.layernorm_eps,
             rmsnorm_eps=cfg.rmsnorm_eps,
             apply_rmsnorm=cfg.apply_rmsnorm,
+            stream_norm_eps=cfg.stream_norm_eps,
             memory_efficient_norm=cfg.memory_efficient_norm,
             residual_func=cfg.residual_func,
             residual_heads=cfg.residual_heads,
@@ -150,7 +150,7 @@ class GekkoBlock(nn.Module):
                 self.gda.hidden_dropout,
                 self.nffn.swiglu,
                 self.timenorm_eps,
-                self.layernorm_eps,
+                self.nffn.norm_eps,
                 self.rmsnorm_eps,
                 self.apply_rmsnorm,
                 self.residual_func,

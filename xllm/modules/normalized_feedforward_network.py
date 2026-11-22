@@ -32,6 +32,7 @@ class NormalizedFeedForwardNetwork(nn.Module):
         rmsnorm_eps: float = 1e-6,
         memory_efficient_norm: bool = False,
         apply_rmsnorm: bool = False,
+        stream_norm_eps: Optional[float] = None,  # the input norm's eps in place of rmsnorm_eps / layernorm_eps
         residual_func: str = 'base',
         residual_heads: Optional[int] = None,
         init_mode: str = 'gaussian',
@@ -49,12 +50,14 @@ class NormalizedFeedForwardNetwork(nn.Module):
         self.init_std = init_std
 
         norm_cls = GroupRMSNorm if apply_rmsnorm else GroupLayerNorm
-        norm_eps = rmsnorm_eps if apply_rmsnorm else layernorm_eps
+        self.norm_eps = stream_norm_eps
+        if self.norm_eps is None:
+            self.norm_eps = rmsnorm_eps if apply_rmsnorm else layernorm_eps
         self.norm = norm_cls(
             model_dim,
             num_groups=norm_num_groups,
             elementwise_affine=norm_affine,
-            eps=norm_eps,
+            eps=self.norm_eps,
             memory_efficient=memory_efficient_norm
         )
 
