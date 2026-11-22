@@ -375,6 +375,7 @@ class RolesConf(Config):
     ffn_in: RoleConf = field(default_factory=RoleConf)  # fc1, fc3: the matrices reading the stream (swiglu's gate, up)
     ffn_out: RoleConf = field(default_factory=RoleConf)  # fc2: the matrix writing back
     hidden_matrix: RoleConf = field(default_factory=RoleConf)  # the block matrices with no Complete(d)P type: wr, forget_gate
+    router: RoleConf = field(default_factory=RoleConf)  # the MoE router's weight and bias: a matrix, but AdamW's
     qk_norm: RoleConf = field(default_factory=RoleConf)  # query_norm, key_norm
     hidden_vector: RoleConf = field(default_factory=RoleConf)  # the blocks' other norm gains, biases, conv kernels
     final_norm: RoleConf = field(default_factory=RoleConf)

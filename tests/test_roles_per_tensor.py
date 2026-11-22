@@ -206,3 +206,36 @@ def test_the_lr_logging_finds_the_headline_group(cpu_transport):
         first_muon = next(g for g in groups if g["algorithm"] == "muon")
         curr_lr = group_lrs.pop(first_muon.get("role") or "muon")
         assert curr_lr == first_muon["lr"]
+
+
+MOE = dict(num_experts=4, num_activated_experts=2, num_shared_experts=1, expert_inter_dim=96, moe_expert_backend="sequential",
+           moe_permutation_backend="torch")
+
+
+def test_moe_tensors_get_the_ffn_roles():
+    """The routed experts and the shared expert are the FFN's matrices, so they take ffn_in / ffn_out like the
+    dense FFN does; the router is a matrix AdamW steps, so it has a role of its own.
+
+    Transformer only: gekko and hybrid ignore model.num_experts and keep the dense nffn."""
+    from types import SimpleNamespace
+    from xllm.config import ModelConf
+    from tests.test_roles import MODEL
+    from xllm.models.transformer import Transformer as cls
+    cfg = ModelConf(**(MODEL | MOE))
+    found = roles_of(cls(cfg, SimpleNamespace(bos_id=1, eos_id=2, pad_id=0)))
+    assert [name for name, role in found.items() if role == "other"] == []
+    want = {"weight1": "ffn_in", "weight3": "ffn_in", "weight2": "ffn_out", "router.weight": "router"}
+    checked = 0
+    for name, role in found.items():
+        for suffix, expected in want.items():
+            if name.endswith(suffix):
+                assert role == expected, f"{name}: {role}, want {expected}"
+                checked += 1
+    assert checked >= len(want), f"only matched {checked} of the MoE tensors"
+
+
+def test_the_router_is_not_a_muon_role(cpu_transport):
+    """A matrix role's lr is a Muon-scale value. The router is never register_muon'd, so it must not carry one,
+    or it would step with AdamW at a Muon lr."""
+    from xllm.optim.roles import MATRIX_ROLES
+    assert "router" not in MATRIX_ROLES
