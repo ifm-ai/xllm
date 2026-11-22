@@ -53,7 +53,7 @@ def restore_optimizer_config(optimizer, cfg: OptimConf, roles: Optional[RolesCon
     Loading the optimizer alone restores checkpoint values. Training calls this
     after loading state; the scheduler separately determines the current LRs.
     The standalone AdamW path retains upstream's existing resume behavior.
-    With roles (xllm/optim/roles.py), a group's values are its role's: the Muon group's hidden_matrix's.
+    With roles (xllm/optim/roles.py), every group's values are its role's, the Muon groups included.
     """
     if cfg.optimizer != "muon":
         return
@@ -62,12 +62,11 @@ def restore_optimizer_config(optimizer, cfg: OptimConf, roles: Optional[RolesCon
         raise ValueError("restore_optimizer_config: the optimizer has per-role groups; pass the roles it was built with")
     roles = roles or RolesConf()
     for group in optimizer.param_groups:
+        r = getattr(roles, group["role"]) if "role" in group else RoleConf()
         if group["algorithm"] == "muon":
-            r = roles.hidden_matrix
             configured = muon_group(cfg, [], lr=r.lr, weight_decay=r.weight_decay)
             configured["eps"] = cfg.adamw.epsilon  # Muon's Newton-Schulz eps
         else:
-            r = getattr(roles, group["role"]) if "role" in group else RoleConf()
             configured = adamw_group(cfg, [], lr=r.lr, eps=r.eps, weight_decay=r.weight_decay)
         values = {key: value for key, value in configured.items() if key not in ("params", "algorithm")}
         values["initial_lr"] = values.pop("lr")
