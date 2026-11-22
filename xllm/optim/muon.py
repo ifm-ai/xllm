@@ -29,7 +29,7 @@ from torch.distributed.device_mesh import DeviceMesh
 from torch.optim import Optimizer
 from torch.optim.adamw import adamw
 
-from xllm.config import OptimConf
+from xllm.config import OptimConf, RolesConf
 
 from .muon_spec import Block, MuonSpec, box_index, name_pattern, split_muon_params
 
@@ -107,6 +107,29 @@ def group_hparams(cfg: OptimConf, algorithm: str) -> dict:
     return {"lr": a.lr, "betas": (a.beta1, a.beta2), "weight_decay": a.weight_decay}
 
 
+def muon_group(cfg: OptimConf, params: list, lr: float | None = None, weight_decay: float | None = None) -> dict:
+    """The Muon matrices' param group at the configured values; lr / weight_decay replace them when given."""
+    group = dict(params=params, algorithm="muon", **group_hparams(cfg, "muon"))
+    if lr is not None:
+        group["lr"] = lr
+    if weight_decay is not None:
+        group["weight_decay"] = weight_decay
+    return group
+
+
+def adamw_group(cfg: OptimConf, params: list, lr: float | None = None, eps: float | None = None,
+                weight_decay: float | None = None) -> dict:
+    """An AdamW param group at the configured values; lr / eps / weight_decay replace them when given."""
+    group = dict(params=params, algorithm="adamw", eps=cfg.adamw.epsilon, **group_hparams(cfg, "adamw"))
+    if lr is not None:
+        group["lr"] = lr
+    if eps is not None:
+        group["eps"] = eps
+    if weight_decay is not None:
+        group["weight_decay"] = weight_decay
+    return group
+
+
 class Muon(Optimizer):
     """Muon for FSDP2 parameters sharded on dim 0, with AdamW for the rest. Each step: momentum on every shard into
     bf16 update directions u; an all-to-all sends the remote blocks' slices to their owners while the local blocks
@@ -114,11 +137,15 @@ class Muon(Optimizer):
     all-to-all sends the slices back into u; each rank applies its update."""
 
     def __init__(self, muon_params: list[nn.Parameter], specs: list[MuonSpec], adamw_params: list[nn.Parameter],
-                 mesh: DeviceMesh, cfg: OptimConf, tp_group: dist.ProcessGroup | None = None):
-        """specs[i]: muon_params[i]'s Blocks (register_muon); tp_group: the TP group, if any (params are then TP-local)."""
-        groups = [dict(params=muon_params, algorithm="muon", **group_hparams(cfg, "muon")),
-                  dict(params=adamw_params, algorithm="adamw", **group_hparams(cfg, "adamw"))]
-        super().__init__(groups, {"eps": cfg.adamw.epsilon})
+                 mesh: DeviceMesh, cfg: OptimConf, tp_group: dist.ProcessGroup | None = None,
+                 param_groups: list[dict] | None = None):
+        """specs[i]: muon_params[i]'s Blocks (register_muon); tp_group: the TP group, if any (params are then TP-local).
+        param_groups: the optimizer's groups, the Muon group (of muon_params) first; roles build one per role
+        (xllm/optim/roles.py). Default: the Muon group and one AdamW group, at the configured values."""
+        if param_groups is None:
+            param_groups = [muon_group(cfg, muon_params), adamw_group(cfg, adamw_params)]
+        assert param_groups[0]["algorithm"] == "muon" and len(param_groups[0]["params"]) == len(muon_params)
+        super().__init__(param_groups, {"eps": cfg.adamw.epsilon})
         self._ranks(mesh, tp_group)
         self.w = [_local(p) for p in muon_params]  # shards: weights, momenta (state, from the first gradient), directions
         self.m: list[Tensor | None] = [None] * len(muon_params)
@@ -297,8 +324,10 @@ def _buffer(views: list[list[Tensor]]) -> tuple[list[Tensor], Tensor, list[Tenso
     return flat, buf, packed, [sum(t.numel() for t in ts) for ts in views]
 
 
-def build_muon(model: nn.Module, cfg: OptimConf) -> Optimizer:
-    """The model must be wrapped with FSDP2; Muon works over the shard dimension of the mesh its parameters live on."""
+def build_muon(model: nn.Module, cfg: OptimConf, roles: RolesConf | None = None) -> Optimizer:
+    """The model must be wrapped with FSDP2; Muon works over the shard dimension of the mesh its parameters live on.
+    roles: one AdamW group per role and the Muon group at hidden_matrix's values (xllm/optim/roles.py); unset: the
+    two plain groups."""
     from xllm.distributed import get_model_parallel_group, get_model_parallel_world_size
     from xllm.modules.model_parallel import ColumnParallelLinear, RowParallelLinear
     tp = get_model_parallel_world_size()
@@ -321,8 +350,12 @@ def build_muon(model: nn.Module, cfg: OptimConf) -> Optimizer:
     if missed:
         logger.warning(f"Muon: unregistered weights use AdamW: {dict(missed)}")
     mesh = muon_params[0].device_mesh
+    groups = None  # the two plain groups
+    if roles is not None and roles.is_set():
+        from .roles import param_groups
+        groups = param_groups(model, cfg, roles, muon_params, adamw_params)
     optimizer = Muon(muon_params, specs, adamw_params, mesh if mesh.ndim == 1 else mesh["dp"], cfg,
-                     tp_group=get_model_parallel_group() if tp > 1 else None)
+                     tp_group=get_model_parallel_group() if tp > 1 else None, param_groups=groups)
     logger.info(f"Muon: {len(muon_params)} matrices / {len(optimizer.blocks)} blocks / "
                 f"{sum(p.numel() for p in muon_params)} params; AdamW: {len(adamw_params)} tensors / "
                 f"{sum(p.numel() for p in adamw_params)} params")

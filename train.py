@@ -185,7 +185,8 @@ def set_optim_state(
     # the scheduler keeps its position
     scheduler_state = dict(reloaded_training_state_dict["scheduler"])
     assert len(scheduler_state["base_lrs"]) == len(scheduler.base_lrs), \
-        f"checkpoint has {len(scheduler_state['base_lrs'])} param groups, the optimizer {len(scheduler.base_lrs)}"
+        f"checkpoint has {len(scheduler_state['base_lrs'])} param groups, the optimizer {len(scheduler.base_lrs)} " \
+        "(turning --roles on or off, or giving more parameters a role, changes the groups)"
     scheduler_state["base_lrs"] = list(scheduler.base_lrs)
     # Loading LambdaLR does not update the optimizer's current LR. Recompute
     # it at the restored position so the first resumed step uses the new bases.
@@ -275,7 +276,7 @@ def main(cfg: TrainerConf):
     tflops_per_token = model.tflops_per_token(cfg.seq_len)
 
     # build optimizer / scheduler
-    optimizer, scheduler = build_optimizer(model, cfg.optim, cfg.steps, cfg.dtype)
+    optimizer, scheduler = build_optimizer(model, cfg.optim, cfg.steps, cfg.dtype, roles=cfg.roles)
 
     # setup loggers
     enable_loggers = cfg.slurm.is_master and not cfg.disable_logging
@@ -375,7 +376,7 @@ def main(cfg: TrainerConf):
             del reloaded_optim_state_dict
 
     if cfg.optim.optimizer == "muon":
-        restore_optimizer_config(optimizer, cfg.optim)
+        restore_optimizer_config(optimizer, cfg.optim, cfg.roles)
         # Full resume uses the restored scheduler position; base-model loading
         # keeps the newly constructed schedule, including its warmup LR.
         for group, lr in zip(optimizer.param_groups, scheduler.get_last_lr()):
@@ -531,8 +532,9 @@ def main(cfg: TrainerConf):
             aux_losses.append(aux_loss)
         grad_norms.append(grad_norm)
         if cfg.optim.optimizer == "muon":
-            group_lrs = {group["algorithm"]: float(group["lr"]) for group in optimizer.param_groups}
-            curr_lr = group_lrs["muon"]
+            # muon and adamw, or with roles muon and one AdamW group per role
+            group_lrs = {group.get("role") or group["algorithm"]: float(group["lr"]) for group in optimizer.param_groups}
+            curr_lr = group_lrs.pop("muon")
         else:
             curr_lr = float(optimizer.param_groups[0]["lr"])
         assert math.isfinite(curr_loss), f"loss is not finite:{curr_loss}"
@@ -542,7 +544,7 @@ def main(cfg: TrainerConf):
         optim_metrics = {
             "step": state.step,
             "lr": curr_lr,
-            **({"adamw_lr": group_lrs["adamw"]} if cfg.optim.optimizer == "muon" else {}),
+            **({f"{name}_lr": lr for name, lr in group_lrs.items()} if cfg.optim.optimizer == "muon" else {}),
             "avg_loss": reduce_scalar(curr_loss, op='mean'),
             "max_loss": reduce_scalar(curr_loss, op='max'),
         }

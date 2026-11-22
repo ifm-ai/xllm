@@ -14,6 +14,7 @@ from xllm.modules.rms_norm import GroupRMSNorm
 from xllm.modules.residual import build_residual
 from xllm.utils import get_init_fn
 from xllm.optim.muon_spec import register_muon
+from xllm.optim.roles import register_role
 
 
 class NormalizedFeedForwardNetwork(nn.Module):
@@ -93,6 +94,9 @@ class NormalizedFeedForwardNetwork(nn.Module):
         for fc, tp_dim in ((self.fc1, 0), (self.fc2, 1), (self.fc3, 0)):  # column, row, column parallel
             if fc is not None:
                 register_muon(fc, tp_dim=tp_dim)  # Muon, one matrix (xllm/optim/muon.py)
+                register_role(fc, "weight", "hidden_matrix")  # xllm/optim/roles.py
+        register_role(self.norm, "weight", "hidden_vector")
+        register_role(self.norm, "bias", "hidden_vector")
 
     def forward(
         self,
