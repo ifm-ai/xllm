@@ -175,6 +175,14 @@ def _layer_matrix_counts(layer: Any, paths: _MatrixParameterPaths) -> Tuple[int,
     return matrix_counts(layer, len(_MATRIX_PARAMETER_PATHS))
 
 
+def _norm_gain_path(module_name: str) -> str:
+    """The metric path of one norm module: layers.7.attention.norm -> layer_007/attention/norm."""
+    parts = module_name.split(".")
+    if parts[0] == "layers":
+        return "/".join((f"layer_{int(parts[1]):03d}", *parts[2:]))
+    return "/".join(parts[1:] if parts[0] == "output" else parts)
+
+
 def active_collector() -> Optional["HealthMetricCollector"]:
     return _ACTIVE_COLLECTOR
 
@@ -258,6 +266,7 @@ class HealthMetricCollector:
         enable_gradient_norms: bool = False,
         enable_logits_stats: bool = False,
         enable_gekko_stats: bool = False,
+        enable_norm_gains: bool = False,
         router_stats_layers: Optional[Dict[str, list[int]]] = None,
     ):
         self.enabled = enabled
@@ -268,6 +277,7 @@ class HealthMetricCollector:
         self.enable_gradient_norms = enable_gradient_norms
         self.enable_logits_stats = enable_logits_stats
         self.enable_gekko_stats = enable_gekko_stats
+        self.enable_norm_gains = enable_norm_gains
         self.router_stats_layers = {
             family: sorted(layers) for family, layers in (router_stats_layers or {}).items()
         }
@@ -288,6 +298,7 @@ class HealthMetricCollector:
             torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor,
         ]] = None
         self.router_stats_records: Dict[str, Dict[int, _RouterRecord]] = {}
+        self.norm_gain_records: Dict[str, _LocalStats] = {}
 
     def begin_step(self, step: int) -> None:
         global _ACTIVE_COLLECTOR
@@ -299,6 +310,7 @@ class HealthMetricCollector:
         self.expected_matrix_norm_records = None
         self.logits_stats_record = None
         self.router_stats_records = {}
+        self.norm_gain_records = {}
         self.recording = self.enabled and step % self.freq == 0
         _ACTIVE_COLLECTOR = self if self.recording else None
 
@@ -737,6 +749,32 @@ class HealthMetricCollector:
             )
         self._check_matrix_norm_records(num_matrices)
 
+    @torch.no_grad()
+    def record_norm_gains(self, model: Any) -> None:
+        """Record every RMSNorm gain: one value per channel, so summarise each as RMS and extrema."""
+        if not self.recording or not self.enable_norm_gains:
+            return
+        if self.norm_gain_records:
+            raise RuntimeError("Duplicate norm gain records")
+        # Imported here: xllm.modules imports this module, so a module-level import would be circular.
+        from xllm.modules.rms_norm import GroupRMSNorm
+
+        for name, module in model.named_modules():
+            if not isinstance(module, GroupRMSNorm) or module.weight is None:
+                continue
+            weight = module.weight
+            # Each rank holds a shard; its sum of squares and count inflate together under
+            # replication, so their ratio, and the extrema, survive the packed reductions exactly.
+            gains = (weight.to_local() if isinstance(weight, DTensor) else weight).detach().float() + 1.0
+            empty = gains.new_tensor(float("inf"))  # a rank with no elements of this gain
+            minimum, maximum = torch.aminmax(gains) if gains.numel() else (empty, -empty)
+            path = _norm_gain_path(name)
+            if path in self.norm_gain_records:
+                raise RuntimeError(f"Duplicate norm gain records for {path}")
+            self.norm_gain_records[path] = (gains.square().sum(), minimum, maximum, gains.numel())
+        if not self.norm_gain_records:
+            raise RuntimeError("Norm gains are enabled but the model has no RMSNorm gains")
+
     def _clear_records(self) -> None:
         self.decoder_layer_activation_records = {}
         self.query_key_stats_records = {}
@@ -745,6 +783,7 @@ class HealthMetricCollector:
         self.expected_matrix_norm_records = None
         self.logits_stats_record = None
         self.router_stats_records = {}
+        self.norm_gain_records = {}
 
     @staticmethod
     def _packed_norm_summaries(
@@ -793,6 +832,8 @@ class HealthMetricCollector:
                 )
         if self.enable_logits_stats and self.logits_stats_record is None:
             problems.append(f"Missing logit statistics at step {step}")
+        if self.enable_norm_gains and not self.norm_gain_records:
+            problems.append(f"Missing norm gain records at step {step}")
         if (self.enable_weight_norms or self.enable_gradient_norms) and (
             self.expected_matrix_norm_records is None
             or self._num_matrix_norm_records() != self.expected_matrix_norm_records
@@ -871,6 +912,8 @@ class HealthMetricCollector:
                         ("mean", "min", "max"), stats,
                     ))
 
+        norm_gains = [(f"norm_gains/{path}", stats) for path, stats in self.norm_gain_records.items()]
+        entries.extend((prefix, ("rms", "min", "max"), stats) for prefix, stats in norm_gains)
         sums = torch.stack([stats[0] for _, _, stats in entries]).double()
         counts = torch.tensor(
             [stats[3] for _, _, stats in entries],
@@ -961,6 +1004,9 @@ class HealthMetricCollector:
                 if ratio_count == 0:
                     for stat in ("mean", "min", "max"):
                         metrics[f"{prefix}/awk_update_ratio/{stat}"] = float("nan")
+
+        for prefix, _ in norm_gains:  # the entry packed squares, so its mean is still to be rooted
+            metrics[f"{prefix}/rms"] = math.sqrt(max(metrics[f"{prefix}/rms"], 0.0))
 
         if logits_index is not None:
             logit_sum, logit_count, logit_minimum, logit_maximum = torch.stack((
