@@ -43,9 +43,9 @@ def build(arch):
     if arch in ("moe", "mova"):
         from xllm.models.transformer import Transformer as cls
         cfg = ModelConf(**(MODEL | MOE | (dict(num_values=4, num_activated_values=2) if arch == "mova" else {})))
-    elif arch == "gekko":
+    elif arch in ("gekko", "gekko_awm"):
         from xllm.models.gekko import Gekko as cls
-        cfg = ModelConf(**(MODEL | dict(arch="gekko", init_mode="he")))
+        cfg = ModelConf(**(MODEL | dict(arch="gekko", init_mode="he") | (dict(apply_awm_gate=True) if arch == "gekko_awm" else {})))
     else:
         from xllm.models.transformer import Transformer as cls
         cfg = ModelConf(**MODEL)
@@ -77,7 +77,7 @@ def assert_values(opt, lr_key="lr"):
         assert g[name]["weight_decay"] == wd, (name, g[name]["weight_decay"])
 
 
-@pytest.mark.parametrize("arch", ["transformer", "gekko", "moe", "mova"])
+@pytest.mark.parametrize("arch", ["transformer", "gekko", "gekko_awm", "moe", "mova"])
 def test_every_parameter_has_a_role(arch):
     model = build(arch)
     tags = roles_lib.param_roles(model)
