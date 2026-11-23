@@ -201,6 +201,7 @@ class GekkoBlock(nn.Module):
         y, cache = self.gda(
             x, freqs_cis, bos_mask, segment_idx, prev_segment_count, attn_stability_control, deterministic, cache
         )
+        health.record_activation(self.layer_id, y, "attention")
         out = self.nffn(y)
         return out, None, cache
 

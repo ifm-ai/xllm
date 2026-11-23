@@ -130,6 +130,7 @@ class TransformerBlockFunction(torch.autograd.Function):
 
         # residual
         xo = torch.add(xh, residual, out=xh)
+        health.record_activation(layer_id, xo, "attention")
         residual = xo
 
         xo_ = xo

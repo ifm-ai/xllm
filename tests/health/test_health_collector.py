@@ -41,7 +41,7 @@ def test_only_every_freq_th_step_is_recorded_and_logged(enabled, freq, sampled):
     for step in range(1, 7):
         active, logged = _step(collector, step)
         assert active == (step in sampled)
-        assert logged == ([(step, {f"activation_stats/layer_000/{s}": float(step) for s in STATS})] if step in sampled else [])
+        assert logged == ([(step, {f"activation_stats/layer_000/ffn/{s}": float(step) for s in STATS})] if step in sampled else [])
 
 
 def test_flush_logs_once_per_sampled_step():
@@ -63,7 +63,7 @@ def test_begin_step_discards_an_abandoned_step():
 
     _, logged = _step(collector, 1)
 
-    assert logged[0][1]["activation_stats/layer_000/mean"] == 1.0
+    assert logged[0][1]["activation_stats/layer_000/ffn/mean"] == 1.0
 
 
 # Record validation
@@ -76,6 +76,7 @@ SCALAR = torch.tensor(1.0)
 @pytest.mark.parametrize("flags, record, error", [
     ({}, lambda c: [c.record_activation(0, ONES) for _ in range(2)], "Duplicate activation"),
     ({}, lambda c: c.record_activation(0, torch.empty(0)), "Empty activation"),
+    ({}, lambda c: c.record_activation(0, ONES, "mlp"), "Unknown activation point"),
     ({"enable_query_key_stats": True}, lambda c: [c.record_query_key_stats(0, ONES, ONES) for _ in range(2)], "Duplicate query/key"),
     ({"enable_query_key_stats": True}, lambda c: c.record_query_key_stats(0, torch.empty(0), ONES), "Empty query/key"),
     ({"enable_query_key_stats": True}, lambda c: c.record_query_key_stats(0, SCALAR, SCALAR), "head dimension"),
@@ -131,7 +132,7 @@ def test_families_that_are_off_are_ignored():
     collector.end_forward()
     logged = {}
     collector.flush(SimpleNamespace(log=lambda metrics, step: logged.update(metrics)), 1)
-    assert set(logged) == {f"activation_stats/layer_000/{s}" for s in STATS}
+    assert set(logged) == {f"activation_stats/layer_000/ffn/{s}" for s in STATS}
 
 
 # Incomplete steps are skipped, together, with a warning
@@ -187,7 +188,7 @@ def test_flush_uses_one_agreement_and_three_packed_reductions(monkeypatch):
 
     metrics = logged_metrics(model, TOKENS, TARGETS, MASK, loss_scale=1.0, **ALL_FLAGS)
 
-    entries = 2 * 5  # per layer: activations, q, q head-L2, k, k head-L2
+    entries = 2 * 6  # per layer: two activation points, q, q head-L2, k, k head-L2
     norms = 2 * 2 * len(MATRICES)  # weight and gradient norms
     assert [(name, op) for name, op, _ in calls] == [
         ("all_reduce", dist.ReduceOp.MAX), ("reduce", dist.ReduceOp.SUM), ("reduce", dist.ReduceOp.MIN), ("reduce", dist.ReduceOp.MAX),
@@ -204,7 +205,7 @@ def test_everything_enabled_logs_the_documented_metric_names_as_floats():
 
     expected = {f"logits_stats/{s}" for s in STATS}
     for layer in ("layer_000", "layer_001"):
-        expected |= {f"activation_stats/{layer}/{s}" for s in STATS}
+        expected |= {f"activation_stats/{layer}/{point}/{s}" for point in ("attention", "ffn") for s in STATS}
         expected |= {f"{qk}_stats/{layer}/{s}" for qk in ("q", "k") for s in (*STATS, "vector_l2_mean", "vector_l2_min", "vector_l2_max")}
         expected |= {f"{family}/{layer}/{path}/l2" for family in ("weight_norms", "gradient_norms") for path in MATRICES}
     assert set(metrics) == expected
@@ -234,7 +235,7 @@ def test_flush_writes_one_jsonl_row_through_a_real_metric_logger(tmp_path):
     mlogger.close()
 
     rows = [json.loads(line) for line in (tmp_path / "metrics.health.jsonl").read_text().splitlines()]
-    assert len(rows) == 1 and rows[0]["global_step"] == 7 and rows[0]["activation_stats/layer_000/mean"] == 2.0
+    assert len(rows) == 1 and rows[0]["global_step"] == 7 and rows[0]["activation_stats/layer_000/ffn/mean"] == 2.0
 
 
 # Two real ranks: statistics reduce globally, only rank 0 logs, and a bad rank makes every rank skip
@@ -288,7 +289,7 @@ def test_two_ranks_reduce_globally_log_on_rank_zero_and_skip_together(tmp_path):
     assert rank1["logged"] == []
     assert [step for step, _ in rank0["logged"]] == [1, 3]  # step 2 skipped on both ranks, no hang
     step1 = rank0["logged"][0][1]
-    assert [step1[f"activation_stats/layer_000/{s}"] for s in STATS] == pytest.approx([18 / 5, -5.0, 10.0])
+    assert [step1[f"activation_stats/layer_000/ffn/{s}"] for s in STATS] == pytest.approx([18 / 5, -5.0, 10.0])
     assert [step1[f"logits_stats/{s}"] for s in STATS] == pytest.approx([8 / 4, -1.0, 9.0])
     assert {k: v for k, v in step1.items() if k.startswith("weight_norms/")} == pytest.approx(rank0["full_norms"], rel=1e-5)
     # Router loads sum to [4, 2, 0, 4]; entropy averages over all 3 tokens; aux loss averages over ranks.

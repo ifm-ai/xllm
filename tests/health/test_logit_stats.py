@@ -87,7 +87,7 @@ def test_all_tokens_masked_logs_nan_logit_stats_and_keeps_the_rest(caplog):
 
     assert all(math.isnan(value) for value in _logits_stats(metrics))
     assert "No valid logits" in caplog.text
-    assert "activation_stats/layer_000/mean" in metrics
+    assert "activation_stats/layer_000/ffn/mean" in metrics
 
 
 def test_logit_stats_are_not_collected_when_disabled():
