@@ -1,4 +1,4 @@
-"""Per-role optimizer hyperparameters with Muon (RolesConf, xllm/optim/roles.py). CPU.
+"""Per-role AdamW values with Muon (AdamWConf's role fields, xllm/optim/roles.py). CPU.
 
     PYTHONPATH=. pytest -q tests/test_roles.py
 
@@ -11,26 +11,27 @@ import pytest
 import torch
 
 import xllm.optim.muon as muon
-from xllm.config import (
-    AdamWConf, DataLoaderConfig, ModelConf, MuonConf, OptimConf, RoleConf, RolesConf, SlurmConf, TokenizerConf, TrainerConf, ValidConf,
-)
+from xllm.config import AdamWConf, AdamWRoleConf, ModelConf, MuonConf, OptimConf
 from xllm.optim import restore_optimizer_config
 from xllm.optim import roles as roles_lib
 from tests.test_muon_missing_grad import LocalMesh, cpu_transport  # noqa: F401 (fixture)
 
-CFG = OptimConf(optimizer="muon", adamw=AdamWConf(lr=2e-3, epsilon=1e-8, weight_decay=0.1),
-                muon=MuonConf(lr=0.01, weight_decay=0.05))
 MODEL = dict(model_dim=64, num_layers=2, num_heads=4, ffn_hidden_dim=128, vocab_size=32, init_mode="gaussian",
              swiglu=True)
-# a recipe at one size: embedding, readout and block vectors without decay, the final norm at the plain values
-ROLES = RolesConf(embed=RoleConf(lr=6.4e-2, weight_decay=0.0), hidden_matrix=RoleConf(lr=8e-3),
-                  hidden_vector=RoleConf(lr=1.6e-2, eps=2.5e-9, weight_decay=0.0),
-                  readout=RoleConf(lr=2.75e-3, weight_decay=0.0))
+# a recipe at one size: embedding, readout and block vectors without decay, the final norm at the plain values.
+# The Muon matrices are optim.muon's, not a role.
+PLAIN = AdamWConf(lr=2e-3, epsilon=1e-8, weight_decay=0.1)
+CFG = OptimConf(optimizer="muon", muon=MuonConf(lr=8e-3, weight_decay=0.05),
+                adamw=AdamWConf(lr=2e-3, epsilon=1e-8, weight_decay=0.1,
+                                embed=AdamWRoleConf(lr=6.4e-2, weight_decay=0.0),
+                                hidden_vector=AdamWRoleConf(lr=1.6e-2, epsilon=2.5e-9, weight_decay=0.0),
+                                readout=AdamWRoleConf(lr=2.75e-3, weight_decay=0.0)))
+CFG_PLAIN = OptimConf(optimizer="muon", muon=MuonConf(lr=8e-3, weight_decay=0.05), adamw=PLAIN)
 WANT = {  # group: (lr, eps, weight_decay)
-    "muon": (8e-3, 1e-8, 0.05),  # hidden_matrix's lr; muon.weight_decay; Newton-Schulz eps is adamw.epsilon
+    "muon": (8e-3, 1e-8, 0.05),  # optim.muon's lr and weight decay; Newton-Schulz eps is adamw.epsilon
     "embed": (6.4e-2, 1e-8, 0.0),
     "hidden_vector": (1.6e-2, 2.5e-9, 0.0),
-    "final_norm": (2e-3, 1e-8, 0.1),
+    "final_norm": (2e-3, 1e-8, 0.1),  # unset: the configured optim.adamw values
     "readout": (2.75e-3, 1e-8, 0.0),
 }
 
@@ -78,49 +79,50 @@ def test_every_parameter_has_a_role(arch):
     assert [n for n, p in model.named_parameters() if tags[id(p)] == "other"] == []
 
 
+def test_hidden_matrix_is_tagged_but_not_configurable():
+    """Muon's matrices keep their tag (it cross-checks register_muon), and AdamWConf has no field for it."""
+    assert "hidden_matrix" in roles_lib.ROLES
+    assert "hidden_matrix" not in AdamWConf().roles()
+    tags = roles_lib.param_roles(build("transformer"))
+    assert "hidden_matrix" in set(tags.values())
+
+
 @pytest.mark.parametrize("arch", ["transformer", "gekko"])
 def test_optimizer_groups(cpu_transport, arch):
-    """Muon steps at hidden_matrix's values, AdamW one group per role; unset values are the configured ones, and a
+    """Muon steps at optim.muon's values, AdamW one group per role; unset values are the configured ones, and a
     resume applies them again whatever the checkpoint held."""
     model = sharded(arch)
-    opt = muon.build_muon(model, CFG, ROLES)
+    opt = muon.build_muon(model, CFG)
     cpu_transport(opt)
     assert_values(opt)
     for group in opt.param_groups:
         group.update(initial_lr=1.0, eps=1.0, weight_decay=1.0)
-    restore_optimizer_config(opt, CFG, ROLES)
+    restore_optimizer_config(opt, CFG)  # cfg carries the roles: nothing extra to pass
     assert_values(opt, lr_key="initial_lr")
     for p in model.parameters():
         p.grad = torch.randn_like(p)
     opt.step()
 
 
-def test_restore_needs_the_roles(cpu_transport):
-    """Resuming a per-role optimizer without its roles would reset every group to the plain values."""
-    opt = muon.build_muon(sharded("transformer"), CFG, ROLES)
-    with pytest.raises(ValueError, match="pass the roles"):
-        restore_optimizer_config(opt, CFG)
-
-
 def test_without_roles_the_groups_are_unchanged(cpu_transport):
-    opt = muon.build_muon(sharded("transformer"), CFG, RolesConf())
+    opt = muon.build_muon(sharded("transformer"), CFG_PLAIN)
     assert [g["algorithm"] for g in opt.param_groups] == ["muon", "adamw"]
     assert "role" not in opt.param_groups[1]
+    restore_optimizer_config(opt, CFG_PLAIN)
+    assert opt.param_groups[0]["lr"] == 8e-3 and opt.param_groups[1]["lr"] == 2e-3
 
 
-@pytest.mark.parametrize("roles, match", [
-    (dict(readout=RoleConf(lr=-1.0)), "roles.readout.lr must be finite and >= 0"),
-    (dict(embed=RoleConf(eps=0.0)), "roles.embed.eps must be finite and > 0"),
-    (dict(final_norm=RoleConf(weight_decay=float("nan"))), "roles.final_norm.weight_decay"),
+@pytest.mark.parametrize("role, match", [
+    (dict(readout=AdamWRoleConf(lr=-1.0)), "optim.adamw.readout.lr must be finite and >= 0"),
+    (dict(embed=AdamWRoleConf(epsilon=0.0)), "optim.adamw.embed.epsilon must be finite and > 0"),
+    (dict(final_norm=AdamWRoleConf(weight_decay=float("nan"))), "optim.adamw.final_norm.weight_decay"),
 ])
-def test_invalid_values(roles, match):
+def test_invalid_values(role, match):
     with pytest.raises(ValueError, match=match):
-        RolesConf(**roles)
+        AdamWConf(**role)
 
 
-def test_rejects(cpu_transport):
-    with pytest.raises(ValueError, match="roles.hidden_matrix.eps"):
-        muon.build_muon(sharded("transformer"), CFG, RolesConf(hidden_matrix=RoleConf(eps=1e-9)))
+def test_roles_require_muon():
     with pytest.raises(AssertionError, match="optim.optimizer=muon"):
-        TrainerConf(slurm=SlurmConf(), model=ModelConf(**MODEL), optim=OptimConf(optimizer="adamw"),
-                    valid=ValidConf(), tokenizer=TokenizerConf(), dataloader=DataLoaderConfig(), roles=ROLES)
+        OptimConf(optimizer="adamw", adamw=AdamWConf(embed=AdamWRoleConf(lr=1e-2)))
+    OptimConf(optimizer="adamw", adamw=PLAIN)  # no roles set: fine

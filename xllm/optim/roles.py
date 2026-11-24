@@ -1,21 +1,22 @@
-"""Parameter roles (RolesConf in xllm/config.py): per-role lr / eps / weight decay with Muon.
+"""Parameter roles (AdamWConf's role fields, xllm/config.py): per-role AdamW lr / epsilon / weight decay with Muon.
 
 A module declares the role of each parameter in its __init__ (register_role). The tag lives on the module, so it
 survives FSDP2 replacing the parameters, as register_muon's specs; a parameter no module tags is in role `other`.
-param_groups() builds the optimizer's groups: the Muon matrices in one group at hidden_matrix's values, and one
-AdamW group per role. A value a role leaves unset is the configured optim.* one. No --roles.*: the optimizer's two
-plain groups, as before.
+param_groups() builds the optimizer's groups: the Muon matrices in one group at optim.muon's values, and one AdamW
+group per role, at optim.adamw's values unless --optim.adamw.<role>.* replaces them. No role set: the optimizer's
+two plain groups, as before.
 """
-from dataclasses import fields
 from logging import getLogger
 from typing import Dict, List
 
 from torch import nn
 
-from xllm.config import OptimConf, RolesConf
+from xllm.config import AdamWRoleConf, OptimConf
 
 logger = getLogger()
-ROLES = tuple(f.name for f in fields(RolesConf))
+# every role a module may tag. optim.adamw holds the values of the roles AdamW steps; hidden_matrix is Muon's, and
+# its values are optim.muon's, so it is not a field of AdamWConf.
+ROLES = ("embed", "hidden_matrix", "hidden_vector", "final_norm", "readout", "other")
 
 
 def register_role(module: nn.Module, name: str, role: str):
@@ -39,10 +40,10 @@ def param_roles(model: nn.Module) -> Dict[int, str]:
     return {id(p): tagged.get(id(p), "other") for p in model.parameters()}
 
 
-def param_groups(model: nn.Module, cfg: OptimConf, roles: RolesConf, muon_params: List[nn.Parameter],
+def param_groups(model: nn.Module, cfg: OptimConf, muon_params: List[nn.Parameter],
                  adamw_params: List[nn.Parameter]) -> List[Dict]:
-    """The optimizer's param groups with roles: the Muon matrices in one group at hidden_matrix's values, then one
-    AdamW group per role that has parameters. A value the role leaves unset is the configured optim.* one."""
+    """The optimizer's param groups with roles: the Muon matrices in one group at optim.muon's values, then one
+    AdamW group per role that has parameters, at optim.adamw's values unless the role replaces them."""
     from .muon import adamw_group, muon_group
     role_of = param_roles(model)
     untagged = [n for n, p in model.named_parameters() if role_of[id(p)] == "other"]
@@ -52,18 +53,14 @@ def param_groups(model: nn.Module, cfg: OptimConf, roles: RolesConf, muon_params
     muon_roles = {role_of[id(p)] for p in muon_params}
     if not muon_roles <= {"hidden_matrix", "other"}:
         raise ValueError(f"roles: Muon steps only hidden_matrix (and untagged) weights, got {sorted(muon_roles)}")
-    if "other" in muon_roles and (roles.other.lr is not None or roles.other.weight_decay is not None):
-        raise ValueError("roles.other: untagged Muon weights (MoE) step in the Muon group, at hidden_matrix's values")
-    if roles.hidden_matrix.eps is not None:
-        raise ValueError("roles.hidden_matrix.eps: Muon has no eps to set")
 
-    matrix = roles.hidden_matrix
-    groups = [muon_group(cfg, muon_params, lr=matrix.lr, weight_decay=matrix.weight_decay)]
+    groups = [muon_group(cfg, muon_params)]
     for role in ROLES:
         params = [p for p in adamw_params if role_of[id(p)] == role]
         if params:
-            r = getattr(roles, role)
-            group = adamw_group(cfg, params, lr=r.lr, eps=r.eps, weight_decay=r.weight_decay)
+            # hidden_matrix is not a field of AdamWConf: a matrix register_muon missed steps at the plain values
+            r = getattr(cfg.adamw, role, AdamWRoleConf())
+            group = adamw_group(cfg, params, lr=r.lr, eps=r.epsilon, weight_decay=r.weight_decay)
             group["role"] = role
             groups.append(group)
 

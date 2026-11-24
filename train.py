@@ -186,7 +186,7 @@ def set_optim_state(
     scheduler_state = dict(reloaded_training_state_dict["scheduler"])
     assert len(scheduler_state["base_lrs"]) == len(scheduler.base_lrs), \
         f"checkpoint has {len(scheduler_state['base_lrs'])} param groups, the optimizer {len(scheduler.base_lrs)} " \
-        "(turning --roles on or off, or giving more parameters a role, changes the groups)"
+        "(turning --optim.adamw.<role>.* on or off, or giving more parameters a role, changes the groups)"
     scheduler_state["base_lrs"] = list(scheduler.base_lrs)
     # Loading LambdaLR does not update the optimizer's current LR. Recompute
     # it at the restored position so the first resumed step uses the new bases.
@@ -276,7 +276,7 @@ def main(cfg: TrainerConf):
     tflops_per_token = model.tflops_per_token(cfg.seq_len)
 
     # build optimizer / scheduler
-    optimizer, scheduler = build_optimizer(model, cfg.optim, cfg.steps, cfg.dtype, roles=cfg.roles)
+    optimizer, scheduler = build_optimizer(model, cfg.optim, cfg.steps, cfg.dtype)
 
     # setup loggers
     enable_loggers = cfg.slurm.is_master and not cfg.disable_logging
@@ -376,7 +376,7 @@ def main(cfg: TrainerConf):
             del reloaded_optim_state_dict
 
     if cfg.optim.optimizer == "muon":
-        restore_optimizer_config(optimizer, cfg.optim, cfg.roles)
+        restore_optimizer_config(optimizer, cfg.optim)
         # Full resume uses the restored scheduler position; base-model loading
         # keeps the newly constructed schedule, including its warmup LR.
         for group, lr in zip(optimizer.param_groups, scheduler.get_last_lr()):
