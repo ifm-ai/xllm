@@ -8,6 +8,7 @@ from xllm.modules import (
 )
 from xllm.modules.residual import num_params_in_residual
 from xllm.config import ModelConf
+from xllm.metrics import health
 
 from xllm.models.fused_blocks import TransformerBlockFunction
 
@@ -152,6 +153,7 @@ class TransformerBlock(nn.Module):
         y, cache = self.attention(
             x, freqs_cis, bos_mask, segments, attn_stability_control, deterministic, cache
         )
+        health.record_activation(self.layer_id, y, "attention")
         # FFN
         out = self.nffn(y)
 

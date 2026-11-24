@@ -8,6 +8,7 @@ from xllm.modules import (
 )
 from xllm.modules.residual import num_params_in_residual
 from xllm.config import ModelConf
+from xllm.metrics import health
 from xllm.models.fused_blocks import (
     TransformerMoVABlockFunction,
 )
@@ -191,6 +192,7 @@ class TransformerMoVABlock(nn.Module):
         y, aux_loss_mova, cache = self.mova(
             x, freqs_cis, bos_mask, segments, attn_stability_control, deterministic, cache, moe_router_load_balancing_type
         )
+        health.record_activation(self.layer_id, y, "attention")
         # MoE
         out, aux_loss_moe = self.moe(y, moe_router_load_balancing_type)
         aux_loss = None if aux_loss_mova is None else (aux_loss_mova + aux_loss_moe) * 0.5

@@ -8,6 +8,7 @@ from xllm.modules import (
 )
 from xllm.modules.residual import num_params_in_residual
 from xllm.config import ModelConf
+from xllm.metrics import health
 from xllm.models.fused_blocks import GekkoBlockFunction
 
 
@@ -168,6 +169,7 @@ class GekkoBlock(nn.Module):
         y, cache = self.gda(
             x, freqs_cis, bos_mask, segment_idx, prev_segment_count, attn_stability_control, deterministic, cache
         )
+        health.record_activation(self.layer_id, y, "attention")
         out = self.nffn(y)
         return out, None, cache
 

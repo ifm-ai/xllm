@@ -219,6 +219,25 @@ def _weight_norms(model):
     return {name: value for name, value in logged.items() if name.startswith("weight_norms/")}
 
 
+def test_gekko_block_records_its_attention_output(monkeypatch):
+    """The Gekko block records what its attention sublayer returned, before the FFN runs."""
+    block = _gekko_block()
+    attention = torch.full((1, 4, 8), 2.0)
+    monkeypatch.setattr(block.gda, "forward", lambda *args, **kwargs: (attention, None))
+    monkeypatch.setattr(block.nffn, "forward", lambda y: y * 3.0)
+    collector = HealthMetricCollector(enabled=True, freq=1, num_layers=1)
+    collector.begin_step(1)
+
+    out, _, _ = block(torch.zeros(1, 4, 8), None)
+    collector.record_activation(0, out)  # the model's layer loop records the block output
+    collector.end_forward()
+    logged = {}
+    collector.flush(SimpleNamespace(log=lambda metrics, step: logged.update(metrics)), 1)
+
+    assert logged["activation_stats/layer_000/attention/mean"] == 2.0
+    assert logged["activation_stats/layer_000/ffn/mean"] == 6.0
+
+
 @pytest.mark.usefixtures("single_process_group")
 @pytest.mark.parametrize("backend", ["fsdp1", "fsdp2"])
 @pytest.mark.parametrize("overrides, optional", [

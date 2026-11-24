@@ -384,6 +384,7 @@ class GekkoBlockFunction(torch.autograd.Function):
 
         # residual
         xo = torch.add(xh, residual, out=xh)
+        health.record_activation(layer_id, xo, "attention")
         residual = xo
 
         if send_to_next:

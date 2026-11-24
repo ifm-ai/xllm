@@ -59,6 +59,11 @@ _GEKKO_OPTIONAL_MATRIX_PARAMETER_PATHS = (
     ("nffn.norm.bias", "mlp/norm/bias"),
 )
 
+# Residual-stream points each decoder layer records, in packing order, and the metric name each
+# gets. Only "ffn", the layer output, is required; any other point is presence-driven, like kq:
+# every layer records it or no layer does. On MoE and MoVA layers "ffn" is after the MoE.
+_ACTIVATION_POINTS = ("attention", "ffn")
+_REQUIRED_ACTIVATION_POINT = "ffn"
 _MatrixParameterPaths = Tuple[Tuple[str, str], ...]
 _MatrixNormBlock = Tuple[Tuple[str, ...], torch.Tensor, Optional[str]]
 
@@ -179,9 +184,9 @@ def active_collector() -> Optional["HealthMetricCollector"]:
     return _ACTIVE_COLLECTOR
 
 
-def record_activation(layer_idx: int, x: torch.Tensor) -> None:
+def record_activation(layer_idx: int, x: torch.Tensor, point: str = "ffn") -> None:
     if _ACTIVE_COLLECTOR is not None:
-        _ACTIVE_COLLECTOR.record_activation(layer_idx, x)
+        _ACTIVE_COLLECTOR.record_activation(layer_idx, x, point)
 
 
 def record_query_key_stats(
@@ -276,7 +281,7 @@ class HealthMetricCollector:
             raise ValueError(f"Unknown router statistics families: {sorted(unknown)}")
         self.step: Optional[int] = None
         self.recording = False
-        self.decoder_layer_activation_records: Dict[int, _LocalStats] = {}
+        self.decoder_layer_activation_records: Dict[str, Dict[int, _LocalStats]] = {}
         self.query_key_stats_records: Dict[int, Dict[str, _LocalStats]] = {}
         self.gekko_stats_records: Dict[int, Dict[str, _LocalStats]] = {}
         # One block per parameter: (metric names, squared l2 of each logical matrix in it, dashboard prefix).
@@ -313,15 +318,19 @@ class HealthMetricCollector:
         return x.sum(dtype=torch.float32), min_, max_, x.numel()
 
     @torch.no_grad()
-    def record_activation(self, layer_idx: int, x: torch.Tensor) -> None:
+    def record_activation(self, layer_idx: int, x: torch.Tensor, point: str = "ffn") -> None:
+        """Record the residual stream after one sublayer: "attention", or "ffn" for the layer output."""
         if not self.recording:
             return
-        if layer_idx in self.decoder_layer_activation_records:
-            raise RuntimeError(f"Duplicate activation statistics for layer {layer_idx}")
+        if point not in _ACTIVATION_POINTS:
+            raise RuntimeError(f"Unknown activation point {point!r} for layer {layer_idx}")
+        records = self.decoder_layer_activation_records.setdefault(point, {})
+        if layer_idx in records:
+            raise RuntimeError(f"Duplicate activation statistics for layer {layer_idx} ({point})")
         if x.numel() == 0:
             raise RuntimeError(f"Empty activation tensor for layer {layer_idx}")
 
-        self.decoder_layer_activation_records[layer_idx] = self._local_stats(x)
+        records[layer_idx] = self._local_stats(x)
 
     @torch.no_grad()
     def record_query_key_stats(
@@ -774,11 +783,18 @@ class HealthMetricCollector:
         self.recording = False
         layers = list(range(self.num_layers))
         problems = []
-        if step != self.step or sorted(self.decoder_layer_activation_records) != layers:
-            problems.append(
-                f"Expected {self.num_layers} activation records at step {self.step}, "
-                f"got layers {sorted(self.decoder_layer_activation_records)} at step {step}"
-            )
+        if step != self.step:
+            problems.append(f"Recorded step {self.step} but flushed at step {step}")
+        activation_points = []
+        for point in _ACTIVATION_POINTS:
+            recorded = sorted(self.decoder_layer_activation_records.get(point, {}))
+            if recorded == layers:
+                activation_points.append(point)
+            elif recorded or point == _REQUIRED_ACTIVATION_POINT:
+                problems.append(
+                    f"Expected {self.num_layers} activation records ({point}) at step {self.step}, "
+                    f"got layers {recorded} at step {step}"
+                )
         if self.enable_query_key_stats and sorted(self.query_key_stats_records) != layers:
             problems.append(
                 f"Expected {self.num_layers} query/key records at step {self.step}, "
@@ -846,11 +862,12 @@ class HealthMetricCollector:
         entries = []
         for layer_idx in layers:
             layer = f"layer_{layer_idx:03d}"
-            entries.append((
-                f"activation_stats/{layer}",
-                ("mean", "min", "max"),
-                self.decoder_layer_activation_records[layer_idx],
-            ))
+            for point in activation_points:
+                entries.append((
+                    f"activation_stats/{layer}/{point}",
+                    ("mean", "min", "max"),
+                    self.decoder_layer_activation_records[point][layer_idx],
+                ))
             if self.enable_query_key_stats:
                 qk_stats = self.query_key_stats_records[layer_idx]
                 for name in ("q", "k", *(("kq",) if "kq" in qk_stats else ())):
