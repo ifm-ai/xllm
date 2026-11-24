@@ -282,11 +282,8 @@ class GatedDeltaAttention(nn.Module):
             register_muon(self.forget_gate, layout="m (h d)", fan_out="d", fan_in="m", d=self.head_dim, tp_dim=0)
         register_muon(self.wo, tp_dim=1)
 
-        # roles (xllm/optim/roles.py): the matrices as in attention; biases, norm gains and the depthwise
-        # causal-conv kernels as the blocks' vectors
-        for w in (self.wq, self.wk, self.wv, self.wr, self.wo):
-            if w is not None:
-                register_role(w, "weight", "hidden_matrix")
+        # roles (xllm/optim/roles.py): the matrices are Muon's and carry no role (optim.muon's values); biases,
+        # norm gains and the depthwise causal-conv kernels are the blocks' vectors
         for module in (self.wv, self.wr, self.q_conv, self.k_conv, self.v_conv, self.timenorm):
             register_role(module, "bias", "hidden_vector")
         for module in (self.q_conv, self.k_conv, self.v_conv, self.timenorm, self.query_norm, self.key_norm):

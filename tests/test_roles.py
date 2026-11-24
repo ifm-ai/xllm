@@ -73,18 +73,34 @@ def assert_values(opt, lr_key="lr"):
 
 
 @pytest.mark.parametrize("arch", ["transformer", "gekko"])
-def test_every_parameter_has_a_role(arch):
+def test_only_muon_matrices_have_no_role(arch):
+    """Every parameter AdamW steps carries a role; Muon's matrices carry none, and take optim.muon's values."""
+    from xllm.optim.muon_spec import split_muon_params
     model = build(arch)
+    muon_params, _, _, _ = split_muon_params(model)
+    muon_ids = {id(p) for p in muon_params}
     tags = roles_lib.param_roles(model)
-    assert [n for n, p in model.named_parameters() if tags[id(p)] == "other"] == []
+    untagged = {n for n, p in model.named_parameters() if tags[id(p)] == "other"}
+    assert untagged == {n for n, p in model.named_parameters() if id(p) in muon_ids}
 
 
-def test_hidden_matrix_is_tagged_but_not_configurable():
-    """Muon's matrices keep their tag (it cross-checks register_muon), and AdamWConf has no field for it."""
-    assert "hidden_matrix" in roles_lib.ROLES
-    assert "hidden_matrix" not in AdamWConf().roles()
-    tags = roles_lib.param_roles(build("transformer"))
-    assert "hidden_matrix" in set(tags.values())
+def test_roles_are_the_adamw_config_fields():
+    """ROLES and AdamWConf's role fields must not drift apart; Muon is not among them."""
+    assert roles_lib.ROLES == tuple(AdamWConf().roles())
+    assert "hidden_matrix" not in roles_lib.ROLES
+
+
+def test_a_muon_weight_with_a_role_is_rejected(cpu_transport):
+    """register_muon and register_role are written separately, so they can disagree: a tagged weight handed to
+    Muon would silently step at optim.muon's values instead of its role's."""
+    from xllm.optim.muon_spec import register_muon
+    model = sharded("transformer")
+    tags = roles_lib.param_roles(model)
+    readout = next(m for m in model.modules()
+                   if getattr(m, "weight", None) is not None and tags.get(id(m.weight)) == "readout")
+    register_muon(readout, tp_dim=None)
+    with pytest.raises(ValueError, match="must carry no role"):
+        muon.build_muon(model, CFG)
 
 
 @pytest.mark.parametrize("arch", ["transformer", "gekko"])

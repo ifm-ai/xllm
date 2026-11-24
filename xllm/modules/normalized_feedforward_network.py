@@ -93,8 +93,7 @@ class NormalizedFeedForwardNetwork(nn.Module):
 
         for fc, tp_dim in ((self.fc1, 0), (self.fc2, 1), (self.fc3, 0)):  # column, row, column parallel
             if fc is not None:
-                register_muon(fc, tp_dim=tp_dim)  # Muon, one matrix (xllm/optim/muon.py)
-                register_role(fc, "weight", "hidden_matrix")  # xllm/optim/roles.py
+                register_muon(fc, tp_dim=tp_dim)  # Muon, one matrix (xllm/optim/muon.py); Muon's weights have no role
         register_role(self.norm, "weight", "hidden_vector")
         register_role(self.norm, "bias", "hidden_vector")
 
