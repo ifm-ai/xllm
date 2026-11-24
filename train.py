@@ -307,6 +307,7 @@ def main(cfg: TrainerConf):
         enable_gradient_norms=cfg.health.gradient_norms,
         enable_logits_stats=cfg.health.logits_stats,
         enable_gekko_stats=cfg.health.gekko_stats,
+        enable_norm_gains=cfg.health.norm_gains,
         router_stats_layers=router_stats_layers,
     )
 
@@ -470,6 +471,7 @@ def main(cfg: TrainerConf):
         train_loss.backward()
         if enable_health:
             health_collector.record_matrix_norms(model, gradient_scale=state.scale)
+            health_collector.record_norm_gains(model)
 
         # grad clip
         s_clip = timer()

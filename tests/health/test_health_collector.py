@@ -12,7 +12,7 @@ import tests.health.helpers as helpers
 import xllm.distributed.initialize as parallel_state
 from xllm.metrics import health
 from tests.health.helpers import MASK, MATRICES, TARGETS, TOKENS, logged_metrics, shard, tiny_transformer
-from xllm.metrics.health import HealthMetricCollector
+from xllm.metrics.health import HealthMetricCollector, _norm_gain_path
 from xllm.metrics.metric_logger import MetricLogger
 from xllm.modules.rms_norm import GroupRMSNorm
 
@@ -248,10 +248,24 @@ def _rank(rank, world_size, rendezvous, out_dir):
     try:
         collector = HealthMetricCollector(
             enabled=True, freq=1, num_layers=1, enable_logits_stats=True, enable_weight_norms=True,
+            enable_norm_gains=True,
             router_stats_layers={"moe": [0]},
         )
         model = tiny_transformer(1)
         result["full_norms"] = {f"weight_norms/layer_000/{p}/l2": model.layers[0].get_parameter(f).norm().item() for p, f in MATRICES.items()}
+        norms = {n: m for n, m in model.named_modules() if isinstance(m, GroupRMSNorm)}
+        with torch.no_grad():  # a spread of gains, so a mis-sharded reduction cannot pass
+            for i, module in enumerate(norms.values()):
+                module.weight.copy_(torch.linspace(-0.3, 0.5 * (i + 1), module.weight.numel()))
+        result["full_gains"] = {
+            f"norm_gains/{_norm_gain_path(name)}/{stat}": value
+            for name, module in norms.items()
+            for stat, value in zip(
+                ("rms", "min", "max"),
+                ((module.weight + 1.0).square().mean().sqrt().item(),
+                 (module.weight + 1.0).min().item(), (module.weight + 1.0).max().item()),
+            )
+        }
         model = shard(model, "fsdp2")
         activations = {1: ([1.0, 3.0], [-5.0, 9.0, 10.0]), 2: ([1.0], None), 3: ([1.0], [1.0])}  # step -> per-rank
         logits = {1: ((6.0, 3, -1.0, 4.0), (2.0, 1, 0.0, 9.0))}  # step -> per-rank (sum, count, min, max)
@@ -268,6 +282,7 @@ def _rank(rank, world_size, rendezvous, out_dir):
             collector.record_router_stats("moe", 0, torch.tensor(loads), torch.tensor(scores), aux_loss=torch.tensor(aux_loss))
             collector.end_forward()
             collector.record_matrix_norms(model)
+            collector.record_norm_gains(model)
             collector.flush(logger, step)
     finally:
         with open(f"{out_dir}/rank{rank}.json", "w") as f:
@@ -291,6 +306,7 @@ def test_two_ranks_reduce_globally_log_on_rank_zero_and_skip_together(tmp_path):
     assert [step1[f"activation_stats/layer_000/{s}"] for s in STATS] == pytest.approx([18 / 5, -5.0, 10.0])
     assert [step1[f"logits_stats/{s}"] for s in STATS] == pytest.approx([8 / 4, -1.0, 9.0])
     assert {k: v for k, v in step1.items() if k.startswith("weight_norms/")} == pytest.approx(rank0["full_norms"], rel=1e-5)
+    assert {k: v for k, v in step1.items() if k.startswith("norm_gains/")} == pytest.approx(rank0["full_gains"], rel=1e-5)
     # Router loads sum to [4, 2, 0, 4]; entropy averages over all 3 tokens; aux loss averages over ranks.
     entropy = lambda p: -sum(x * math.log(x) for x in p if x > 0)  # noqa: E731
     assert {k: v for k, v in step1.items() if k.startswith("moe_")} == pytest.approx({

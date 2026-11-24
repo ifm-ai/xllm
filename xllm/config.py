@@ -363,11 +363,12 @@ class HealthConf(Config):
     gekko_stats: bool = False
     moe_stats: bool = False
     mova_stats: bool = False
+    norm_gains: bool = False
 
     def check(self, model: ModelConf) -> None:
         families = (
             self.query_key_stats, self.weight_norms, self.gradient_norms, self.logits_stats,
-            self.gekko_stats, self.moe_stats, self.mova_stats,
+            self.gekko_stats, self.moe_stats, self.mova_stats, self.norm_gains,
         )
         if not self.enabled:
             assert not any(families), "Health statistics require health.enabled=true"
@@ -381,6 +382,8 @@ class HealthConf(Config):
         assert not self.moe_stats or model.num_experts > 0, "MoE statistics require model.num_experts > 0"
         assert not self.mova_stats or model.num_values > 0, "MoVA statistics require model.num_values > 0"
         assert not (self.weight_norms or self.gradient_norms) or model.swiglu, "Matrix norms require SwiGLU"
+        # FSDP1 keeps the gains inside flat parameters, where a per-channel minimum is not reachable.
+        assert not self.norm_gains or model.ddp_backend == "fsdp2", "Norm gains require model.ddp_backend=fsdp2"
 
 
 @dataclass

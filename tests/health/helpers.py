@@ -100,6 +100,8 @@ def logged_metrics(model, tokens=TOKENS, targets=None, token_mask=None, train=Fa
         (output.float().square().mean() * loss_scale).backward()
     if flags.get("enable_weight_norms") or flags.get("enable_gradient_norms"):
         collector.record_matrix_norms(model, gradient_scale=gradient_scale)
+    if flags.get("enable_norm_gains"):
+        collector.record_norm_gains(model)
     logged = {}
     collector.flush(SimpleNamespace(log=lambda metrics, step, **_: logged.update(metrics)), 1)
     return logged
