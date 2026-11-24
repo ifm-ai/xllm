@@ -2,6 +2,7 @@ import math
 from typing import List, Dict, Any, Tuple
 from timeit import default_timer as timer
 from dataclasses import dataclass
+from contextlib import ExitStack
 from logging import getLogger
 from pathlib import Path
 import gc
@@ -60,7 +61,7 @@ from xllm.utils import (
 from xllm.models import build_model
 from xllm.optim import build_optimizer, rescale_grads, restore_optimizer_config
 from xllm.metrics.monitor import GPUMonitor, Timings
-from xllm.metrics.metric_logger import MetricLogger, build_mlogger
+from xllm.metrics.metric_logger import AsyncMetricWriter, MetricLogger, build_mlogger
 from xllm.metrics.health import HealthMetricCollector
 from xllm.modules.moe.moe import moe_layer_ids
 from xllm.modules.moe.mova import mova_layer_ids
@@ -214,21 +215,31 @@ def set_optim_state(
 
 
 def main(cfg: TrainerConf):
+    with ExitStack() as cleanup:
+        _train(cfg, cleanup)
+
+
+def _train(cfg: TrainerConf, cleanup: ExitStack):
     gc.disable()
     t_start = timer()
 
     # initialize distributed mode / signal handler / model parallel
     initialize_run(cfg)
 
-    # setup wandb
+    # setup wandb (in the metric writer process when it is enabled)
+    use_async_metric_writer = cfg.async_metric_writer and cfg.slurm.is_master and not cfg.disable_logging
+    wandb_init_kwargs = None
     if has_wandb and cfg.slurm.is_master and cfg.log_wandb:
-        # wandb.require(experiment="service")
-        wandb.init(project=cfg.wandb_project, entity=cfg.wandb_entity,
-                   name=cfg.wandb_name or Path(cfg.dump_dir).name,
-                   config={
-                       "training": cfg.to_dict(),
-                       "provenance": collect_provenance(cfg),
-                   })
+        wandb_init_kwargs = dict(
+            project=cfg.wandb_project, entity=cfg.wandb_entity,
+            name=cfg.wandb_name or Path(cfg.dump_dir).name,
+            config={
+                "training": cfg.to_dict(),
+                "provenance": collect_provenance(cfg),
+            },
+        )
+        if not use_async_metric_writer:
+            wandb.init(**wandb_init_kwargs)
 
     # random seed & enable tf32
     manual_seed(cfg)
@@ -288,9 +299,14 @@ def main(cfg: TrainerConf):
     if enable_health:
         to_log.append("health")
 
+    async_metric_writer = (
+        cleanup.enter_context(AsyncMetricWriter(wandb_init_kwargs=wandb_init_kwargs))
+        if use_async_metric_writer else None
+    )
     mloggers: Dict[str, MetricLogger] = {
         k: build_mlogger(
-            cfg.dump_dir, k, enable_loggers, enable_wandb, enable_prefix_keys=k != "health"
+            cfg.dump_dir, k, enable_loggers, enable_wandb, enable_prefix_keys=k != "health",
+            async_writer=async_metric_writer,
         ) for k in to_log
     }
     router_stats_layers = {}
@@ -651,7 +667,10 @@ def main(cfg: TrainerConf):
             mloggers["cluster_checks"].log(agg_gpu_info, state.step)
             timings.logging += timer() - s_logging
             s_logging = timer()  # update logging time
-            mloggers["timings"].log(timings.get_stats(), state.step)
+            timing_metrics = timings.get_stats()
+            if async_metric_writer is not None:
+                timing_metrics.update(async_metric_writer.get_stats(reset=True))
+            mloggers["timings"].log(timing_metrics, state.step)
 
             checkpointer.check_ok()  # check if background checkpointing is ok
 
@@ -709,11 +728,15 @@ def main(cfg: TrainerConf):
             t0 = timer()
 
         timings.eval += timer() - s_eval
+        if async_metric_writer is not None:
+            async_metric_writer.flush()
 
     # end of training
     logger.info(f"Reached {cfg.steps} steps.")
     data_iterator.close()
     checkpointer.close()
+    if async_metric_writer is not None:
+        async_metric_writer.close()
     for mlogger in mloggers.values():
         mlogger.close()
     torch.distributed.destroy_process_group()
