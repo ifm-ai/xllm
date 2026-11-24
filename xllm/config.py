@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from logging import getLogger
 from typing import Optional
 from pathlib import Path
@@ -80,26 +80,55 @@ class SlurmConf(Config):
 
 
 @dataclass
-class OptimConf(Config):
-    lr: float = 1e-3  # AdamW learning rate after warmup
-    warmup: int = 2000  # Num of steps for LR warmup. 0 means no warmup
-    weight_decay: float = 0.1  # Decoupled weight decay
-    epsilon: float = 1e-8
+class AdamWConf(Config):
+    # AdamW: every parameter with optimizer=adamw; with optimizer=muon, those Muon does not take (embedding, norms, head).
+    lr: float = 1e-3  # learning rate after warmup
     beta1: float = 0.9
-    beta2: float = 0.98
+    beta2: float = 0.95
+    epsilon: float = 1e-8
+    weight_decay: float = 0.1  # decoupled weight decay
+
+    def __post_init__(self):
+        assert self.lr >= 0 and self.weight_decay >= 0 and self.epsilon > 0
+
+
+@dataclass
+class MuonConf(Config):
+    # Muon: the linear weights in the blocks (optimizer=muon). Defaults = the gekko4-0.9B recipe (lr 1e-3, wd 0.1,
+    # Kimi rms_norm scale, no Nesterov): best of the 16.8M-token-batch lr x wd sweeps.
+    lr: float = 1e-3  # learning rate after warmup
+    momentum: float = 0.95
+    nesterov: bool = False  # Nesterov momentum (Keller Jordan Muon, Moonlight)
+    adjust_lr: str = "rms_norm"  # update scale: spectral_norm sqrt(fan_out / fan_in), rms_norm 0.2 sqrt(max(fan_out, fan_in)), or none (1)
+    scale_shape: str = "block"  # shape whose fans give adjust_lr's scale: block (each Newton-Schulz block, e.g. one head) or whole (the whole weight)
+    weight_decay: float = 0.1  # decoupled weight decay
+
+    def __post_init__(self):
+        assert self.adjust_lr in ["spectral_norm", "rms_norm", "none"]
+        assert self.scale_shape in ["block", "whole"]
+        assert self.lr >= 0 and self.weight_decay >= 0
+
+
+@dataclass
+class OptimConf(Config):
+    optimizer: str = "adamw"  # adamw, or muon (Muon for linear weights in the blocks, AdamW for the rest)
+    adamw: AdamWConf = field(default_factory=AdamWConf)
+    muon: MuonConf = field(default_factory=MuonConf)
+    warmup: int = 3000  # Num of steps for LR warmup. 0 means no warmup
     clip: float = 1.0  # Global gradient L2 norm clipping threshold, before applying loss scale.
-    scheduler: str = "cosine"  # LR scheduler: linear, cosine, constant, or wsd (warmup-stable-decay)
+    scheduler: str = "constant"  # LR scheduler: linear, cosine, constant, or wsd (warmup-stable-decay)
     lr_init_ratio: float = 1e-4  # The initial LR = lr_init_ratio * lr
-    lr_end_ratio: float = 0.01  # The ending LR = lr_end_ratio * lr. Also the end value if using a cosine scheduler
+    lr_end_ratio: float = 0.1  # The ending LR = lr_end_ratio * lr. Also the end value if using a cosine scheduler
     cycles: float = 1.0  # Cycles of half period of cosine scheduler. 1 means decaying from peak to lr_end_ratio
-    wsd_decay_duration_steps: Optional[int] = None  # Number of steps in the WSD decay phase. Decay starts at total_steps - wsd_decay_duration_steps.
+    wsd_decay_duration_steps: int = 0  # Number of steps in the WSD decay phase (wsd only; 0: no decay). Decay starts at total_steps - wsd_decay_duration_steps.
     wsd_decay_style: str = 'cosine'  # The curve type of decay phase in WSD scheduler: cosine or linear
 
     def __post_init__(self):
+        assert self.optimizer in ['adamw', 'muon']
         assert self.scheduler in ['linear', 'cosine', 'constant', 'wsd']
         assert self.warmup >= 0
         if self.scheduler == 'wsd':
-            assert self.wsd_decay_duration_steps is not None, 'decay duration steps is required for WSD.'
+            assert self.wsd_decay_duration_steps >= 0, 'WSD decay duration must be >= 0 steps.'
 
 
 @dataclass
@@ -108,6 +137,7 @@ class ModelConf(Config):
     ddp_backend: str = 'fsdp2'  # Distributed parameter sharding implementation: fsdp1 or fsdp2
     num_layers: int = 8
     model_dim: int = 1024  # Dimensions of token hidden state and residual stream
+    full_attn_layer_list: Optional[str] = None  # Comma separated list of full attention layer indices
     # Attention
     chunk_size: int = 2048  # Used for local attention, memory update in Gekko and prefilling.
     num_heads: int = 1  # Number of Query attention heads
@@ -128,7 +158,7 @@ class ModelConf(Config):
     # MoE & MoVA
     num_values: int = 0  # Num of value projections available for routing to in MoVA. 0 means MoVA off. Requires using MoE as well when using MoVA.
     num_activated_values: int = 0  # Num of activated value projections per token (top-k) in MoVA
-    mova_backend: str = 'sequential'  # sequential, nested, torch, or te
+    mova_backend: str = 'torch'  # sequential, nested, torch, or te
     num_experts: int = 0  # Num of experts to be routed in each MoE layer (not counting shared experts). 0 means using dense FFN
     num_activated_experts: int = 0  # Num of activated experts per token (top-k)
     num_shared_experts: int = 0  # Num of shared experts for each token, in addition to routed experts
@@ -138,12 +168,13 @@ class ModelConf(Config):
     moe_router_bias: bool = False  # Whether to include the router bias, only affects top-k selection.
     moe_router_bias_update_rate: Optional[float] = None  # Update rate for the router bias during backprop
     moe_router_scaling_factor: Optional[float] = None  # The scaling factor for outputs from selected experts. None means no scaling
-    moe_expert_backend: str = 'sequential'  # sequential, nested, torch, or te
-    moe_permutation_backend: str = 'torch'  # Token permutation and unpermutation backend: torch or triton
+    moe_expert_backend: str = 'torch'  # sequential, nested, torch, or te
+    moe_permutation_backend: str = 'triton'  # Token permutation and unpermutation backend: torch or triton
     # Causal conv1d
     causal_conv_width: int = 4  # Width of Q/K/V causal convolution kernel in Gekko. Currently supports 1-4 tokens
     causal_conv_backend: str = 'triton'  # triton or fla
     causal_conv_weight_normalization: bool = True  # Whether to apply softmax normalization for causal convolution weights
+    apply_conv_in_causal_attn: bool = False  # Whether to apply causal convs on qkv of MHA
     # Initialization
     init_mode: str = 'he'  # he, gaussian, xavier, or none (skipping init)
     init_std: Optional[float] = None  # Init std for gaussian; If None, deriving from input dimensions. he/xavier requires None
@@ -155,7 +186,7 @@ class ModelConf(Config):
     timenorm_num_groups: int = 32  # Num of groups of features used in timestep decay normalization in Gekko.
     timenorm_beta1: float = 0.999  # Used in timestep decay normalization.
     timenorm_beta2: float = 0.9999  # Used in timestep decay normalization.
-    timenorm_backend: str = 'cub'  # cub or chunkwise
+    timenorm_backend: str = 'lookback'  # cub or lookback
     layernorm_num_groups: int = 1  # Num of groups of features in LayerNorm/RMSNorm.
     memory_efficient_norm: bool = False  # Whether to use norm output for backward to save activation memory. Unsupported by 'cub' timestep norm backend.
     norm_affine: bool = True  # Enable learnable scaling in attention/FFN input norms (plus bias for LayerNorm).
@@ -168,13 +199,14 @@ class ModelConf(Config):
     # Rope base
     rope_base: float = 100000  # RoPE frequency base
     rope_head_dim: Optional[int] = None  # RoPE dimensions per Q/K head. None means full head_dim, 0 disables RoPE.
+    apply_nope_in_causal_attn: bool = False  # Remove RoPE in causal attention if True.
     # Dropout rates
     dropout: float = 0.0  # Dropout rate for embeddings and for sublayer outputs before residual connections.
     hidden_dropout: float = 0.0  # Dropout rate for attention activations before output projection and for FFN intermediate activations.
     attention_dropout: float = 0.0  # Dropout rate for attention weights after softmax.
 
     swiglu: bool = False  # Whether to use SwiGLU in dense FFN. Otherwise uses SiLU.
-    scale_emb: bool = False  # Whether to scale embedding output by sqrt(model_dim).
+    embed_multiplier: float = 1.0  # Multiplier on the embedding output (the former scale_emb: sqrt(model_dim)).
     layerwise_ckpt: bool = False  # Whether to enable activation checkpointing for each layer to save memory by recomputing forward during backprop.
 
     fused_block: bool = False  # Whether to use custom fused forward/backward implementations for training blocks; incompatible with layerwise_ckpt.
@@ -189,16 +221,26 @@ class ModelConf(Config):
 
     recompute_logits: bool = False  # Whether to recompute logits in output layer. Independent of fused_block. True = recompute logits and compute grad_X/grad_W during backward, False = precompute grad_X/grad_W during forward.
 
+    @property
+    def full_attention_layers(self) -> Optional[List[int]]:
+        if self.full_attn_layer_list is None:
+            return None
+
+        layers = [int(layer_id) for layer_id in self.full_attn_layer_list.split(',')]
+        return layers
+
     def __post_init__(self):
-        assert self.arch in ['transformer', 'gekko']
+        assert self.arch in ['transformer', 'gekko', 'hybrid']
         assert self.ddp_backend in ['fsdp1', 'fsdp2']
+        assert self.embed_multiplier > 0 and self.embed_multiplier != float('inf'), \
+            f'model.embed_multiplier must be finite and > 0, got {self.embed_multiplier}'
 
         assert self.causal_attn_backend in [None, "swift", "flash", 'xattn']
         assert self.sca_backend in ["swift", "flash", 'xattn']
         assert self.mova_backend in ['sequential', 'nested', 'torch', 'te']
         assert self.moe_expert_backend in ['sequential', 'nested', 'torch', 'te']
         assert self.moe_permutation_backend in ['torch', 'triton']
-        assert self.timenorm_backend in ['cub', 'chunkwise']
+        assert self.timenorm_backend in ['cub', 'lookback']
         assert self.causal_conv_backend in ['fla', 'triton']
 
         if self.fused_block:
@@ -231,7 +273,13 @@ class ModelConf(Config):
         assert 0 <= self.attention_dropout < 1
         assert 0 <= self.hidden_dropout < 1
 
-        if self.arch == 'transformer':
+        if self.apply_nope_in_causal_attn:
+            assert self.arch == 'hybrid', 'NoPE requires hybrid architecture'
+
+        if self.arch == 'hybrid':
+            assert self.full_attn_layer_list is not None
+
+        if self.arch in ['transformer', 'hybrid']:
             if self.fused_block:
                 assert self.causal_attn_backend is not None, 'requiring efficient attention when using fused block'
 
@@ -446,6 +494,10 @@ class TrainerConf(Config):
         if self.dtype == "fp16":
             assert self.loss_rescaling, "loss rescaling needed for fp16!"
 
+        if self.optim.optimizer == "muon":
+            assert self.model.ddp_backend == "fsdp2", "Muon requires FSDP2."
+            assert self.dcp_for_optimizer, "Muon requires dcp_for_optimizer (sharded momentum)."
+
         # MoE
         if self.model.num_experts > 0:
             assert self.model.num_experts % self.model_parallel_size == 0, f"{self.model.num_experts}/{self.model_parallel_size}"
@@ -473,6 +525,6 @@ class TrainerConf(Config):
         if self.model.arch == 'transformer':
             assert self.model.layernorm_num_groups == 1 or self.model.layernorm_num_groups % self.model_parallel_size == 0, \
                 f"{self.model.layernorm_num_groups}/{self.model_parallel_size}"
-        elif self.model.arch in ['gekko']:
+        elif self.model.arch in ['gekko', 'hybrid']:
             assert self.model.layernorm_num_groups % self.model_parallel_size == 0, \
                 f"{self.model.layernorm_num_groups}/{self.model_parallel_size}"

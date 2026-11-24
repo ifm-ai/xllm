@@ -151,20 +151,28 @@ class GekkoBlockFunction(torch.autograd.Function):
         send_to_next = should_send_to_next()
         sca_scale = 1.0 / math.sqrt(head_dim)
 
+        if bos_mask is not None:
+            full_length = bos_mask.shape[1]
+            curr = full_length - seq_len
+            prev = curr - attention_chunk_size if recv_from_prev else curr
+            bos_mask_curr = bos_mask[:, curr:]
+            bos_mask = bos_mask[:, prev:]
+            segment_idx = segment_idx[:, prev:]
+        else:
+            bos_mask_curr = None
+
         # recv prev mean & var & count for tsn
         if recv_from_prev:
             prev_mean_var, handle_tsn = recv_prev_mean_var(x, timenorm_local_groups)
             prev_count, handle_count = recv_prev_count(x, bos_mask)
-            bos_mask_curr = bos_mask[:, attention_chunk_size:] if bos_mask is not None else None
             handle_tsn.wait()
             prev_mean, prev_var = torch.unbind(prev_mean_var, dim=2)
             if handle_count is not None:
                 handle_count.wait()
         else:
-            bos_mask_curr = bos_mask
             prev_count = timenorm_prior_count.expand(bsz).contiguous()
-            prev_mean = timenorm_prior_mean.type_as(x).expand(bsz, -1).contiguous()
-            prev_var = timenorm_prior_logv_or_var.type_as(x).expand(bsz, -1).contiguous()
+            prev_mean = timenorm_prior_mean.expand(bsz, -1).float().contiguous()
+            prev_var = timenorm_prior_logv_or_var.expand(bsz, -1).float().contiguous()
 
         # Timestep Normalization
         # start to recv tensors for conv_kv & sca
@@ -590,6 +598,7 @@ class GekkoBlockFunction(torch.autograd.Function):
         out_rng_state = ctx.out_rng_state
 
         if recv_from_prev and bos_mask is not None:
+            assert bos_mask.shape[1] == 2 * attention_chunk_size
             bos_mask_curr = bos_mask[:, attention_chunk_size:]
         else:
             bos_mask_curr = bos_mask
@@ -1106,8 +1115,8 @@ class GekkoOutputLayerFunction(torch.autograd.Function):
                 handle2.wait()
         else:
             prev_count = timenorm_prior_count.expand(bsz).contiguous()
-            prev_mean = timenorm_prior_mean.type_as(x).expand(bsz, -1).contiguous()
-            prev_var = timenorm_prior_logv_or_var.type_as(x).expand(bsz, -1).contiguous()
+            prev_mean = timenorm_prior_mean.expand(bsz, -1).float().contiguous()
+            prev_var = timenorm_prior_logv_or_var.expand(bsz, -1).float().contiguous()
 
         # Final Timestep Normalization
         # B x L x D

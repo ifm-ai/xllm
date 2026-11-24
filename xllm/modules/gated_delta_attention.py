@@ -36,6 +36,7 @@ from xllm.modules.fused_ops import (
     memory_efficient_dropout,
 )
 from xllm.utils import get_init_fn
+from xllm.optim.muon_spec import register_muon
 
 
 class GatedDeltaAttention(nn.Module):
@@ -87,6 +88,7 @@ class GatedDeltaAttention(nn.Module):
         self.v_head_dim = self.head_dim if v_head_dim is None else v_head_dim
         self.rope_head_dim = self.head_dim if rope_head_dim is None else rope_head_dim
         self.attn_act_func = attn_act_func
+        self.apply_bias_term = apply_bias_term
 
         assert self.num_heads % self.num_kv_heads == 0
         assert 0 <= self.rope_head_dim <= self.head_dim
@@ -268,6 +270,17 @@ class GatedDeltaAttention(nn.Module):
             num_features=hdim, eps=rmsnorm_eps, init_std=init_std
         )
 
+        # Muon (xllm/optim/muon.py): one Newton-Schulz block per head (each of a kv head's two softdelta
+        # keys is its own block; wr holds a head's gate rows and, for softdelta, its forget logit; the AWM
+        # forget gate, stored [in, out], one per kv head's head_dim output columns); wo is whole
+        register_muon(self.wq, layout="(h d) m", fan_out="d", fan_in="m", d=self.head_dim, tp_dim=0)
+        register_muon(self.wk, layout="(h d) m", fan_out="d", fan_in="m", d=self.head_dim, tp_dim=0)
+        register_muon(self.wv, layout="(h d) m", fan_out="d", fan_in="m", d=self.v_head_dim, tp_dim=0)
+        register_muon(self.wr, layout="(h d) m", fan_out="d", fan_in="m", d=rdim // self.num_heads, tp_dim=0)
+        if self.forget_gate is not None:
+            register_muon(self.forget_gate, layout="m (h d)", fan_out="d", fan_in="m", d=self.head_dim, tp_dim=0)
+        register_muon(self.wo, tp_dim=1)
+
     def _receive_prev_count(self, x, bos_mask):
         bsz, seq_len, _ = x.size()
         context_rank = get_context_parallel_rank()
@@ -339,8 +352,6 @@ class GatedDeltaAttention(nn.Module):
             [n_groups, n_groups, conv_q_size, conv_k_size, conv_v_size, ksize, ksize, ksize, vsize, agsize, msize, lntsize],
             dim=-1
         )
-        prev_mean = prev_mean.to(x)
-        prev_var = prev_var.to(x)
         conv_q = conv_q.view(bsz, width, n_heads * kdim).to(x)
         conv_k = conv_k.view(bsz, width, n_kv_heads * kdim * nk).to(x)
         conv_v = conv_v.view(bsz, width, n_kv_heads * vdim).to(x)
@@ -392,10 +403,15 @@ class GatedDeltaAttention(nn.Module):
             prev_aqk, prev_akk, prev_ag, memory, log_norm_term = None, None, None, None, None
             cache_sca, cache_awk, cache_norm, cache_conv = None, None, None, None
 
-        if prev_v is not None and bos_mask is not None:
-            bos_mask_curr = bos_mask[:, self.chunk_size:]
+        if bos_mask is not None:
+            full_length = bos_mask.shape[1]
+            curr = full_length - seq_len
+            prev = curr if prev_v is None else curr - self.chunk_size
+            bos_mask_curr = bos_mask[:, curr:]
+            bos_mask = bos_mask[:, prev:]
+            segment_idx = segment_idx[:, prev:]
         else:
-            bos_mask_curr = bos_mask
+            bos_mask_curr = None
 
         # B x L x D/TP
         x, prev_count, prev_mean, prev_var = self.timenorm(x, bos_mask_curr, prev_count, prev_mean, prev_var)

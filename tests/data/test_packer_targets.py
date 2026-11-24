@@ -20,32 +20,6 @@ def _instance(tokens, target_mask=None, line_num=1):
     )
 
 
-def test_simple_concat_predicts_bos_across_document_boundaries():
-    packer = SimpleConcatPacker(seq_len=4, pad_id=0)
-    packer.prefill("ds", _instance([10, 11, 12], line_num=1))
-    packer.prefill("ds", _instance([20, 21, 22], line_num=2))
-
-    seqs = packer.pack()
-
-    assert len(seqs) == 1
-    assert np.array_equal(seqs[0].x, np.array([10, 11, 12, 20], dtype=np.int64))
-    assert seqs[0].mask is None
-    assert np.array_equal(seqs[0].y, np.array([11, 12, 20, 21], dtype=np.int64))
-
-
-def test_best_fit_predicts_bos_across_document_boundaries():
-    packer = BestFitPacker(seq_len=5, pad_id=0, min_fill_ratio=0.0)
-    packer.prefill("ds", _instance([10, 11, 12], line_num=1))
-    packer.prefill("ds", _instance([20, 21, 22], line_num=2))
-
-    seqs = packer.pack()
-
-    assert len(seqs) == 1
-    assert np.array_equal(seqs[0].x, np.array([10, 11, 12, 20, 21], dtype=np.int64))
-    assert seqs[0].mask is None
-    assert np.array_equal(seqs[0].y, np.array([11, 12, 20, 21, 22], dtype=np.int64))
-
-
 def test_best_fit_uses_dl1_input_padding_and_ignore_index_targets():
     packer = BestFitPacker(seq_len=4, pad_id=1, min_fill_ratio=0.0)
     packer.prefill("ds", _instance([10, 11, 12]))

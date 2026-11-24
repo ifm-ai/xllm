@@ -35,7 +35,7 @@ from .distributed import (
 def multihead_attention_fwd(
     layer_id, mx, freqs_cis, bos_mask, segments,
     wq, wk, wv, wr, wo, q_norm_w, k_norm_w,
-    head_dim, rope_head_dim, local_heads, local_kv_heads,
+    head_dim, rope_head_dim, apply_nope, local_heads, local_kv_heads,
     attn_act_func, apply_attn_gate, attn_gate_func, eps,
     dropout, attention_dropout, hidden_dropout,
     causal_attn_backend, stability_control, recompute_attn,
@@ -56,13 +56,19 @@ def multihead_attention_fwd(
     xk_ = rmsnorm_fwd(xk, k_norm_w, local_kv_heads * nk, eps)[0] if k_norm_w is not None else xk
     xk_ = rearrange(xk_, 'b l (k s) -> b l k s', k=local_kv_heads)
     if attn_act_func == 'softmax':
-        xk_ = apply_rope(xk_, freqs_cis, head_dim, rope_head_dim, False)
+        if apply_nope:
+            assert freqs_cis is None
+        else:
+            xk_ = apply_rope(xk_, freqs_cis, head_dim, rope_head_dim, False)
         kq_ = None
     else:
         assert attn_act_func == 'softdelta'
         kq_ = xk_[:, :, :, :head_dim]
         xk_ = xk_[:, :, :, head_dim:]
-        kq_, xk_ = apply_ropes(kq_, xk_, freqs_cis, head_dim, rope_head_dim, False)
+        if apply_nope:
+            assert freqs_cis is None
+        else:
+            kq_, xk_ = apply_ropes(kq_, xk_, freqs_cis, head_dim, rope_head_dim, False)
     local_xk = xk_  # the all-gather below replaces xk_ with every context rank's keys
     xk_, handle_xk = all_gather(xk_, parallel_region='context', async_op=True)
 
@@ -70,7 +76,8 @@ def multihead_attention_fwd(
     xq = F.linear(mx, wq)
     xq_ = rmsnorm_fwd(xq, q_norm_w, local_heads, eps)[0] if q_norm_w is not None else xq
     xq_ = rearrange(xq_, 'b l (h s) -> b l h s', h=local_heads)
-    xq_ = apply_rope(xq_, freqs_cis, head_dim, rope_head_dim, False)
+    if not apply_nope:
+        xq_ = apply_rope(xq_, freqs_cis, head_dim, rope_head_dim, False)
     # Local post-qk-norm, post-RoPE heads, before K is gathered across context ranks.
     health.record_query_key_stats(layer_id, xq_, local_xk)
 
@@ -123,8 +130,8 @@ def multihead_attention_fwd(
 
 
 def multihead_attention_bwd(
-    attn_grad, r_grad, attn_for_bwd, attn_readers, attn_lse, xq_, kq_, xk_, xv_,
-    total_seqlen_k, end_seq, freqs_cis, bos_mask, segments, local_kv_heads, rope_head_dim,
+    attn_grad, r_grad, attn_for_bwd, attn_readers, attn_lse, xq_, kq_, xk_, xv_, total_seqlen_k, end_seq,
+    freqs_cis, bos_mask, segments, local_kv_heads, rope_head_dim, apply_nope,
     xq, xk, xq_rstd, xk_rstd, rmx, g, mx, q_norm_w, k_norm_w, wq, wk, wv, wr,
     attn_scale, attn_act_func, apply_attn_gate, attn_gate_func, attention_dropout, flash_rng_state,
     causal_attn_backend, stability_control, deterministic,
@@ -181,7 +188,8 @@ def multihead_attention_bwd(
         mx_grad_r = None
 
     # compute xq_grad
-    xq_grad = apply_rope(xq_grad, freqs_cis, head_dim, rope_head_dim, True)
+    if not apply_nope:
+        xq_grad = apply_rope(xq_grad, freqs_cis, head_dim, rope_head_dim, True)
     if q_norm_w is not None:
         xq_grad = rearrange(xq_grad, 'b l h s -> b l (h s)')
         xq_grad, q_norm_w_grad = rmsnorm_bwd(xq_grad, xq, xq_rstd, q_norm_w, local_heads)
@@ -195,9 +203,11 @@ def multihead_attention_bwd(
     if handle_xk is not None:
         handle_xk.wait()
 
-    xk_grad = apply_rope(xk_grad, freqs_cis, head_dim, rope_head_dim, True)
+    if not apply_nope:
+        xk_grad = apply_rope(xk_grad, freqs_cis, head_dim, rope_head_dim, True)
     if kq_ is not None:
-        kq_grad = apply_rope(kq_grad, freqs_cis, head_dim, rope_head_dim, True)
+        if not apply_nope:
+            kq_grad = apply_rope(kq_grad, freqs_cis, head_dim, rope_head_dim, True)
         xk_grad = torch.cat([kq_grad, xk_grad], dim=-1)
 
     if k_norm_w is not None:
@@ -256,7 +266,7 @@ def multihead_attention_bwd(
 
 def multihead_attention_recompute(
     attn_out, attn_readers, attn_lse, xq, xk, xv, end_seq, mx, freqs_cis, bos_mask, segments,
-    wq, wk, wv, wr, q_norm_w, k_norm_w, head_dim, rope_head_dim, local_heads, local_kv_heads,
+    wq, wk, wv, wr, q_norm_w, k_norm_w, head_dim, rope_head_dim, apply_nope, local_heads, local_kv_heads,
     attn_scale, attn_act_func, apply_attn_gate, attn_gate_func, eps,
     attention_dropout, attn_rng_state, causal_attn_backend, stability_control
 ):
@@ -279,13 +289,15 @@ def multihead_attention_recompute(
     xk_, xk_rstd = rmsnorm_fwd(xk, k_norm_w, local_kv_heads * nk, eps) if k_norm_w is not None else (xk, None)
     xk_ = rearrange(xk_, 'b l (k s) -> b l k s', k=local_kv_heads)
     if attn_act_func == 'softmax':
-        xk_ = apply_rope(xk_, freqs_cis, head_dim, rope_head_dim, False)
+        if not apply_nope:
+            xk_ = apply_rope(xk_, freqs_cis, head_dim, rope_head_dim, False)
         kq_ = None
     else:
         assert attn_act_func == 'softdelta'
         kq_ = xk_[:, :, :, :head_dim]
         xk_ = xk_[:, :, :, head_dim:]
-        kq_, xk_ = apply_ropes(kq_, xk_, freqs_cis, head_dim, rope_head_dim, False)
+        if not apply_nope:
+            kq_, xk_ = apply_ropes(kq_, xk_, freqs_cis, head_dim, rope_head_dim, False)
     xk_, handle_xk = all_gather(xk_, parallel_region='context', async_op=True)
 
     # compute q
@@ -293,7 +305,8 @@ def multihead_attention_recompute(
         xq = F.linear(mx, wq)
     xq_, xq_rstd = rmsnorm_fwd(xq, q_norm_w, local_heads, eps) if q_norm_w is not None else (xq, None)
     xq_ = rearrange(xq_, 'b l (h s) -> b l h s', h=local_heads)
-    xq_ = apply_rope(xq_, freqs_cis, head_dim, rope_head_dim, False)
+    if not apply_nope:
+        xq_ = apply_rope(xq_, freqs_cis, head_dim, rope_head_dim, False)
 
     if wr is not None:
         rg = rearrange(F.linear(mx, wr, None), 'b l (h s) -> b l h s', h=local_heads)

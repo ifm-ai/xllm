@@ -8,9 +8,11 @@
 #include "ops/fftconv.h"
 #include "ops/group_rms_norm.h"
 #include "ops/group_layer_norm.h"
+#include "ops/muon.h"
 #include "ops/sequence_norm.h"
 #include "ops/timestep_norm.h"
 #include "ops/timestep_decay_norm_cub.h"
+#include "ops/timestep_decay_norm_lookback.h"
 #include "utils.h"
 
 #include <transformer_engine/common.h>
@@ -38,9 +40,11 @@ PYBIND11_MODULE(xllm_extension, m) {
   ops::DefineFFTConvOp(m_ops);
   ops::DefineGroupLayerNormOp(m_ops);
   ops::DefineGroupRMSNormOp(m_ops);
+  ops::DefineMuonOp(m_ops);
   ops::DefineSequenceNormOp(m_ops);
   ops::DefineTimestepNormOp(m_ops);
   ops::DefineTimestepDecayNormCubOp(m_ops);
+  ops::DefineTimestepDecayNormLookbackOp(m_ops);
 }
 
 }  // namespace xllm

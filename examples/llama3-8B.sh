@@ -91,15 +91,15 @@ TRAINING_CFGS=(
 )
 
 OPTIM_CFGS=(
-  --optim.lr ${LR}
+  --optim.adamw.lr ${LR}
   --optim.scheduler ${LR_SCHD}
   --optim.lr_init_ratio 1e-4
   --optim.lr_end_ratio 0.1
-  --optim.beta1 0.9
-  --optim.beta2 0.95
+  --optim.adamw.beta1 0.9
+  --optim.adamw.beta2 0.95
   --optim.clip 1.0
   --optim.warmup 3000
-  --optim.weight_decay ${WD}
+  --optim.adamw.weight_decay ${WD}
 )
 
 VALID_CFGS=(

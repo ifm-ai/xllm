@@ -58,7 +58,7 @@ from xllm.utils import (
     collect_provenance,
 )
 from xllm.models import build_model
-from xllm.optim import build_optimizer, rescale_grads
+from xllm.optim import build_optimizer, rescale_grads, restore_optimizer_config
 from xllm.metrics.monitor import GPUMonitor, Timings
 from xllm.metrics.metric_logger import MetricLogger, build_mlogger
 from xllm.metrics.health import HealthMetricCollector
@@ -182,9 +182,21 @@ def set_optim_state(
     timings: Timings,
     opt_cfg: OptimConf
 ):
-    # setting LR manually to support overwriting during training from the same state
-    reloaded_training_state_dict["scheduler"]["base_lrs"] = [opt_cfg.lr]
-    scheduler.load_state_dict(reloaded_training_state_dict["scheduler"])
+    # base LRs come from the config (one per param group), so LRs can change on resume;
+    # the scheduler keeps its position
+    scheduler_state = dict(reloaded_training_state_dict["scheduler"])
+    assert len(scheduler_state["base_lrs"]) == len(scheduler.base_lrs), \
+        f"checkpoint has {len(scheduler_state['base_lrs'])} param groups, the optimizer {len(scheduler.base_lrs)}"
+    scheduler_state["base_lrs"] = list(scheduler.base_lrs)
+    # Loading LambdaLR does not update the optimizer's current LR. Recompute
+    # it at the restored position so the first resumed step uses the new bases.
+    scheduler_state["_last_lr"] = [
+        base * fn(scheduler_state["last_epoch"])
+        for base, fn in zip(scheduler.base_lrs, scheduler.lr_lambdas)
+    ]
+    scheduler.load_state_dict(scheduler_state)
+    for group, lr in zip(scheduler.optimizer.param_groups, scheduler.get_last_lr()):
+        group["lr"] = lr
     state.step, state.scale, state.scale_updates, state.clip_cumulative = (
         reloaded_training_state_dict["step"],
         reloaded_training_state_dict["scale"],
@@ -363,6 +375,13 @@ def main(cfg: TrainerConf):
             set_sharded_optimizer_state(model, optimizer, reloaded_optim_state_dict, cfg.dcp_for_optimizer)
             del reloaded_optim_state_dict
 
+    if cfg.optim.optimizer == "muon":
+        restore_optimizer_config(optimizer, cfg.optim)
+        # Full resume uses the restored scheduler position; base-model loading
+        # keeps the newly constructed schedule, including its warmup LR.
+        for group, lr in zip(optimizer.param_groups, scheduler.get_last_lr()):
+            group["lr"] = lr
+
     # check gpu nodes
     check_cluster(
         dump_dir=Path(cfg.dump_dir), global_rank=cfg.slurm.global_rank, check_level=cfg.cluster_check_level, step=0
@@ -512,7 +531,11 @@ def main(cfg: TrainerConf):
             aux_loss = aux_loss.item()
             aux_losses.append(aux_loss)
         grad_norms.append(grad_norm)
-        curr_lr = float(optimizer.param_groups[0]["lr"])
+        if cfg.optim.optimizer == "muon":
+            group_lrs = {group["algorithm"]: float(group["lr"]) for group in optimizer.param_groups}
+            curr_lr = group_lrs["muon"]
+        else:
+            curr_lr = float(optimizer.param_groups[0]["lr"])
         assert math.isfinite(curr_loss), f"loss is not finite:{curr_loss}"
 
         n_tokens = float(cfg.global_batch_size) * cfg.seq_len / 1e9 * state.step
@@ -520,6 +543,7 @@ def main(cfg: TrainerConf):
         optim_metrics = {
             "step": state.step,
             "lr": curr_lr,
+            **({"adamw_lr": group_lrs["adamw"]} if cfg.optim.optimizer == "muon" else {}),
             "avg_loss": reduce_scalar(curr_loss, op='mean'),
             "max_loss": reduce_scalar(curr_loss, op='max'),
         }
