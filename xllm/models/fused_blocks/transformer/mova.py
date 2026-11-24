@@ -51,6 +51,7 @@ class TransformerMoVABlockFunction(torch.autograd.Function):
         local_kv_heads: int,
         head_dim: int,
         rope_head_dim: int,
+        apply_nope: bool,
         mova_router_w: torch.Tensor,
         n_values: int,
         mova_topk: int,
@@ -124,7 +125,7 @@ class TransformerMoVABlockFunction(torch.autograd.Function):
         xqkv, attn_out, xh, aux_loss_mova, rng_states, routing_state, end_seq = mova_fwd(
             layer_id, mx, freqs_cis, bos_mask, segments,
             wq, wk, wv, wr, wo, q_norm_w, k_norm_w,
-            head_dim, rope_head_dim, local_heads, local_kv_heads,
+            head_dim, rope_head_dim, apply_nope, local_heads, local_kv_heads,
             rmsnorm_eps, gather_before_norm, mova_router_w, mova_router_bias,
             routing_score_func, routing_scaling_factor, router_load_balancing_type,
             n_values, mova_topk, value_backend, moe_permutation_backend,
@@ -236,6 +237,7 @@ class TransformerMoVABlockFunction(torch.autograd.Function):
         ctx.local_kv_heads = local_kv_heads
         ctx.head_dim = head_dim
         ctx.rope_head_dim = rope_head_dim
+        ctx.apply_nope = apply_nope
         ctx.norm_local_groups = norm_local_groups
         ctx.value_backend = value_backend
         # MoVA
@@ -343,6 +345,7 @@ class TransformerMoVABlockFunction(torch.autograd.Function):
         local_kv_heads = ctx.local_kv_heads
         head_dim = ctx.head_dim
         rope_head_dim = ctx.rope_head_dim
+        apply_nope = ctx.apply_nope
         norm_local_groups = ctx.norm_local_groups
 
         # MoVA
@@ -477,7 +480,7 @@ class TransformerMoVABlockFunction(torch.autograd.Function):
             mova_router_w, routing_score_func, routing_scaling_factor,
             n_values, mova_topk, value_backend, moe_permutation_backend,
             mx, freqs_cis, bos_mask, segments, wq, wk, wv, wr, q_norm_w, k_norm_w,
-            head_dim, rope_head_dim, local_heads, local_kv_heads, rmsnorm_eps,
+            head_dim, rope_head_dim, apply_nope, local_heads, local_kv_heads, rmsnorm_eps,
             attn_scale, attn_act_func, apply_attn_gate, attn_gate_func,
             attention_dropout, attn_rng_state, causal_attn_backend, attn_stability_control
         )
@@ -523,7 +526,7 @@ class TransformerMoVABlockFunction(torch.autograd.Function):
         x_grad, wq_grad, wk_grad, wv_grad, wr_grad, \
         q_norm_w_grad, k_norm_w_grad, attn_norm_w_grad, attn_norm_b_grad, mova_router_w_grad = mova_bwd(
             attn_r_grad, r_grad, aux_loss_grad, attn_out, attn_readers, attn_lse, xq_, kq_, xk_, xv_,
-            total_seqlen_k, end_seq, freqs_cis, bos_mask, segments,local_kv_heads, rope_head_dim,
+            total_seqlen_k, end_seq, freqs_cis, bos_mask, segments,local_kv_heads, rope_head_dim, apply_nope,
             xq, xk, xv, xvv_, xq_rstd , xk_rstd, rmx, g, mx, q_norm_w, k_norm_w, wq, wk, wv, wr,
             attn_scale, attn_act_func, apply_attn_gate, attn_gate_func, attention_dropout,
             flash_rng_state, causal_attn_backend, attn_stability_control, deterministic,
@@ -556,6 +559,7 @@ class TransformerMoVABlockFunction(torch.autograd.Function):
             None,  # local_kv_heads
             None,  # head_dim
             None,  # rope_head_dim
+            None,  # apply_nope
             mova_router_w_grad,
             None,  # n_values
             None,  # mova_topk

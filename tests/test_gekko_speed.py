@@ -36,8 +36,9 @@ def awk_fwd(
     xk = xk.transpose(1, 2)
     xv = xv.transpose(1, 2)
     return adaptive_working_memory_fwd(
-        xq, xk, xk, xv, chunk_size, memory, log_norm_term, prev_k, prev_k, prev_v,
-        segment_idx, prev_segment_count, ortho, 1e-6
+        xq, xk, xk, xv, None, chunk_size, memory, log_norm_term,
+        prev_k, prev_k, prev_v, None,
+        segment_idx, prev_segment_count, False, ortho, 1e-6
     )
 
 
@@ -62,8 +63,8 @@ def awk_bwd(
     xv = xv.transpose(1, 2)
     y_grad = y_grad.transpose(1, 2)
     memory_outs, lnt_outs, kv_outs, kk_outs, prev_outs = adaptive_working_memory_accum_fwd(
-        xq, xk, xk, xv, chunk_size, memory, log_norm_term, prev_k, prev_k, prev_v,
-        segment_idx, prev_segment_count, ortho, 1e-6, False
+        xq, xk, xk, xv, None, chunk_size, memory, log_norm_term, prev_k, prev_k, prev_v, None,
+        segment_idx, prev_segment_count, False, ortho, 1e-6, False
     )
     accum_memory, memory_residual, memory_mask = memory_outs
     log_norm_term, curr_log_norm_term, accum_log_norm_term, ratio = lnt_outs
@@ -72,12 +73,12 @@ def awk_bwd(
     prev_kkey, prev_k_fp32, prev_kk_fp32, prev_k_mask = prev_outs
     return adaptive_working_memory_bwd(
         y_grad, mem_grad, lnt_grad,
-        xq, xk, awk_kkey, xv, chunk_size,
+        xq, xk, awk_kkey, xv, None, chunk_size,
         awk_rvalue, awk_rvalue_rstd, awk_vvalue, awk_avalue,
         ak_fp32, akk_fp32, awk_key_mask,
         accum_memory, memory_residual, memory_mask,
         log_norm_term, curr_log_norm_term, accum_log_norm_term, ratio, awk_out_mask,
-        prev_k, prev_kkey, prev_v, prev_k_fp32, prev_kk_fp32, prev_k_mask, ortho
+        prev_k, prev_kkey, prev_v, None, prev_k_fp32, prev_kk_fp32, prev_k_mask, False, ortho
     )
 
 
@@ -85,7 +86,7 @@ def test_decay_timestep_norm(
     x, bos_mask, prev_count, prev_mean, prev_var, weight, bias,
     y_grad, mean_grad, var_grad, num_groups, beta1, beta2, eps, epochs, backend,
 ):
-    tsdn_fwd = xllm_ops.group_timestep_decay_norm_fwd if backend == 'chunkwise' else xllm_ops.group_timestep_decay_norm_cub_fwd
+    tsdn_fwd = xllm_ops.group_timestep_decay_norm_lookback_fwd if backend == 'lookback' else xllm_ops.group_timestep_decay_norm_cub_fwd
     with torch.no_grad():
         # warm up
         for _ in range(100):
@@ -93,8 +94,8 @@ def test_decay_timestep_norm(
                 x, bos_mask, prev_count, prev_mean, prev_var, weight, bias,
                 None, num_groups, beta1, beta2, eps,
             )
-            if backend == 'chunkwise':
-                xllm_ops.group_timestep_decay_norm_bwd(
+            if backend == 'lookback':
+                xllm_ops.group_timestep_decay_norm_lookback_bwd(
                     y_grad, mean_grad, var_grad, x, prev_count, bos_mask, cummean, cumrstd,
                     weight, bias, None, num_groups, beta1, beta2, eps, False
                 )
@@ -120,8 +121,8 @@ def test_decay_timestep_norm(
 
         start = timer()
         for _ in range(epochs):
-            if backend == 'chunkwise':
-                xllm_ops.group_timestep_decay_norm_bwd(
+            if backend == 'lookback':
+                xllm_ops.group_timestep_decay_norm_lookback_bwd(
                     y_grad, mean_grad, var_grad, x, prev_count, bos_mask, cummean, cumrstd,
                     weight, bias, None, num_groups, beta1, beta2, eps, False
                 )
@@ -220,11 +221,11 @@ def test_causal_conv1d(
             print(f'{backend} causal conv1d w. hx bwd: {delta:.2f}s')
 
 
-def test_flash_sliding_window_attention_speed(
-    query, key, value, out_grad, chunk_size, scale, epochs
+def test_flash_full_attention_speed(
+    query, key, value, out_grad, scale, epochs
 ):
     with torch.no_grad():
-        window_size = (chunk_size, 0)
+        window_size = (-1, -1)
         q_grad, k_grad, v_grad = torch.empty_like(query), torch.empty_like(key), torch.empty_like(value)
         # warm up
         for _ in range(100):
@@ -254,7 +255,7 @@ def test_flash_sliding_window_attention_speed(
         torch.cuda.synchronize()
 
         delta = timer() - start
-        print(f'flash3 SWA fwd: {delta:.2f}s')
+        print(f'flash3 fwd: {delta:.2f}s')
 
         start = timer()
         for _ in range(epochs):
@@ -266,7 +267,7 @@ def test_flash_sliding_window_attention_speed(
         torch.cuda.synchronize()
 
         delta = timer() - start
-        print(f'flash3 SWA bwd: {delta:.2f}s')
+        print(f'flash3 bwd: {delta:.2f}s')
 
 
 def test_sliding_chunk_attention(
@@ -316,7 +317,7 @@ def test_adaptive_working_memory(
     with torch.no_grad():
         # warm up
         for _ in range(100):
-            out, _, mem, lnt = awk_fwd(
+            out, mem, lnt = awk_fwd(
                 query, key, value, None, None, None, None,
                 chunk_size, segment_idx, None, ortho
             )
@@ -328,7 +329,7 @@ def test_adaptive_working_memory(
 
         start = timer()
         for _ in range(epochs):
-            out, _, mem, lnt = awk_fwd(
+            out, mem, lnt = awk_fwd(
                 query, key, value, None, None, None, None,
                 chunk_size, segment_idx, None, ortho,
             )
@@ -404,15 +405,15 @@ def test(B: int, L: int, D: int, W: int, H: int, HKV: int, S: int, V: int, chunk
 
     epochs = 1000
     print(f"B={B}, L={L}, D={D}, W={W}, H={H} ({HKV}), S={S}, V={V}, chunk={chunk_size}, AvgL={avg_len}, dtype={dtype}:")
-    # test_decay_timestep_norm(
-    #     x, bos_mask, prev_count, prev_mean, prev_var, norm_w, norm_b,
-    #     y_grad, mean_grad, var_grad, num_groups, 0.999, 0.9999,
-    #     1e-5, epochs, 'chunkwise'
-    # )
     test_decay_timestep_norm(
         x, bos_mask, prev_count, prev_mean, prev_var, norm_w, norm_b,
         y_grad, mean_grad, var_grad, num_groups, 0.999, 0.9999,
         1e-5, epochs, 'cub'
+    )
+    test_decay_timestep_norm(
+        x, bos_mask, prev_count, prev_mean, prev_var, norm_w, norm_b,
+        y_grad, mean_grad, var_grad, num_groups, 0.999, 0.9999,
+        1e-5, epochs, 'lookback'
     )
     ##################################################
     # test_scan_cema(x.transpose(1, 2), hx, p, q, gamma, y_grad.transpose(1, 2), h_grad, bos_mask, epochs, 'cub')
@@ -427,7 +428,7 @@ def test(B: int, L: int, D: int, W: int, H: int, HKV: int, S: int, V: int, chunk
     if S <= 256 and V <= 256:
         test_sliding_chunk_attention(query, key, value, out_grad, chunk_size, bos_mask, segment_idx, 0, 'xattn', epochs)
         if S == V and dtype in ['bf16', 'fp16']:
-            test_flash_sliding_window_attention_speed(query, key, value, out_grad, chunk_size * 2, 1.0 / math.sqrt(D), epochs)
+            test_flash_full_attention_speed(query, key, value, out_grad, 1.0 / math.sqrt(D), epochs)
 
     test_adaptive_working_memory(query, key, value, out_grad, mem_grad, lnt_grad, chunk_size, segment_idx, False, epochs)
     # test_adaptive_working_memory(query, key, value, out_grad, mem_grad, lnt_grad, chunk_size, segment_idx, True, epochs)

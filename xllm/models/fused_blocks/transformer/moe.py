@@ -51,6 +51,7 @@ class TransformerMoEBlockFunction(torch.autograd.Function):
         local_kv_heads: int,
         head_dim: int,
         rope_head_dim: int,
+        apply_nope: bool,
         attn_act_func: str,
         apply_attn_gate: bool,
         attn_gate_func: str,
@@ -121,7 +122,7 @@ class TransformerMoEBlockFunction(torch.autograd.Function):
         xqkv, attn_out, xh, rng_states, end_seq = multihead_attention_fwd(
             layer_id, mx, freqs_cis, bos_mask, segments,
             wq, wk, wv, wr, wo, q_norm_w, k_norm_w,
-            head_dim, rope_head_dim, local_heads, local_kv_heads,
+            head_dim, rope_head_dim, apply_nope, local_heads, local_kv_heads,
             attn_act_func, apply_attn_gate, attn_gate_func, rmsnorm_eps,
             dropout, attention_dropout, hidden_dropout,
             causal_attn_backend, attn_stability_control, recompute_attention,
@@ -221,6 +222,7 @@ class TransformerMoEBlockFunction(torch.autograd.Function):
         ctx.local_kv_heads = local_kv_heads
         ctx.head_dim = head_dim
         ctx.rope_head_dim = rope_head_dim
+        ctx.apply_nope = apply_nope
         ctx.norm_local_groups = norm_local_groups
         ctx.n_experts = n_experts
         ctx.n_local_experts = n_local_experts
@@ -315,6 +317,7 @@ class TransformerMoEBlockFunction(torch.autograd.Function):
         local_kv_heads = ctx.local_kv_heads
         head_dim = ctx.head_dim
         rope_head_dim = ctx.rope_head_dim
+        apply_nope = ctx.apply_nope
         norm_local_groups = ctx.norm_local_groups
 
         n_experts = ctx.n_experts
@@ -436,7 +439,7 @@ class TransformerMoEBlockFunction(torch.autograd.Function):
 
         attn_outs, q_outs, k_outs, v_outs, handle_kv, attn_gate_outs = multihead_attention_recompute(
             attn_out, attn_readers, attn_lse, xq, xk, xv, end_seq, mx, freqs_cis, bos_mask, segments,
-            wq, wk, wv, wr, q_norm_w, k_norm_w, head_dim, rope_head_dim, local_heads, local_kv_heads,
+            wq, wk, wv, wr, q_norm_w, k_norm_w, head_dim, rope_head_dim, apply_nope, local_heads, local_kv_heads,
             attn_scale, attn_act_func, apply_attn_gate, attn_gate_func, rmsnorm_eps,
             attention_dropout, attn_rng_state, causal_attn_backend, attn_stability_control
         )
@@ -477,8 +480,8 @@ class TransformerMoEBlockFunction(torch.autograd.Function):
         attn_r_grad = attn_r_grad.view(bsz, seq_len, local_heads, head_dim)
         x_grad, wq_grad, wk_grad, wv_grad, wr_grad, \
             q_norm_w_grad, k_norm_w_grad, attn_norm_w_grad, attn_norm_b_grad = multihead_attention_bwd(
-            attn_r_grad, r_grad, attn_out, attn_readers, attn_lse, xq_, kq_, xk_, xv_,
-            total_seqlen_k, end_seq, freqs_cis, bos_mask, segments, local_kv_heads, rope_head_dim,
+            attn_r_grad, r_grad, attn_out, attn_readers, attn_lse, xq_, kq_, xk_, xv_, total_seqlen_k, end_seq,
+            freqs_cis, bos_mask, segments, local_kv_heads, rope_head_dim, apply_nope,
             xq, xk, xq_rstd, xk_rstd, rmx, g, mx, q_norm_w, k_norm_w, wq, wk, wv, wr,
             attn_scale, attn_act_func, apply_attn_gate, attn_gate_func, attention_dropout, flash_rng_state,
             causal_attn_backend, attn_stability_control, deterministic,
@@ -508,6 +511,7 @@ class TransformerMoEBlockFunction(torch.autograd.Function):
             None,  # local_kv_heads
             None,  # head_dim
             None,  # rope_head_dim
+            None,  # apply_nope
             None,  # attn_act_func
             None,  # apply_attn_gate
             None,  # attn_gate_func
