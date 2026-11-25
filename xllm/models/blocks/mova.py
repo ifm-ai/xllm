@@ -31,7 +31,6 @@ class TransformerMoVABlock(nn.Module):
         self.apply_nope = cfg.apply_nope_in_causal_attn
         self.apply_causal_conv = cfg.apply_conv_in_causal_attn
         self.apply_rmsnorm = cfg.apply_rmsnorm
-        self.layernorm_eps = cfg.layernorm_eps
         self.rmsnorm_eps = cfg.rmsnorm_eps
 
         if self.fused_block:
@@ -75,6 +74,7 @@ class TransformerMoVABlock(nn.Module):
             residual_heads=cfg.residual_heads,
             init_mode=cfg.init_mode,
             init_std=cfg.init_std,
+            stream_eps_scale=cfg.stream_eps_scale,
         )
 
         self.moe = NormalizedMoE(
@@ -101,7 +101,8 @@ class TransformerMoVABlock(nn.Module):
             residual_func=cfg.residual_func,
             residual_heads=cfg.residual_heads,
             init_mode=cfg.init_mode,
-            init_std=cfg.init_std
+            init_std=cfg.init_std,
+            stream_eps_scale=cfg.stream_eps_scale,
         )
 
     def forward(
@@ -172,7 +173,7 @@ class TransformerMoVABlock(nn.Module):
                 self.dropout,
                 self.mova.attention_dropout,
                 self.mova.hidden_dropout,
-                self.layernorm_eps,
+                self.moe.norm_eps,  # both pre-norms' eps
                 self.rmsnorm_eps,
                 self.apply_rmsnorm,
                 self.mova.norm.gather_input,
