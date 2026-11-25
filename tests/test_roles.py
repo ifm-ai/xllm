@@ -41,6 +41,10 @@ def build(arch):
     if arch == "gekko":
         from xllm.models.gekko import Gekko as cls
         cfg = ModelConf(**(MODEL | dict(arch="gekko", init_mode="he")))
+    elif arch == "hybrid":
+        from xllm.models.hybrid import HybridGekko as cls
+        cfg = ModelConf(**(MODEL | dict(arch="hybrid", init_mode="he", full_attn_layer_list="1",
+                                        apply_conv_in_causal_attn=True, apply_attn_gate=True, qknorm=True)))
     else:
         from xllm.models.transformer import Transformer as cls
         cfg = ModelConf(**MODEL)
@@ -72,7 +76,7 @@ def assert_values(opt, lr_key="lr"):
         assert g[name]["weight_decay"] == wd, (name, g[name]["weight_decay"])
 
 
-@pytest.mark.parametrize("arch", ["transformer", "gekko"])
+@pytest.mark.parametrize("arch", ["transformer", "gekko", "hybrid"])
 def test_only_muon_matrices_have_no_role(arch):
     """Every parameter AdamW steps carries a role; Muon's matrices carry none, and take optim.muon's values."""
     from xllm.optim.muon_spec import split_muon_params
@@ -103,7 +107,7 @@ def test_a_muon_weight_with_a_role_is_rejected(cpu_transport):
         muon.build_muon(model, CFG)
 
 
-@pytest.mark.parametrize("arch", ["transformer", "gekko"])
+@pytest.mark.parametrize("arch", ["transformer", "gekko", "hybrid"])
 def test_optimizer_groups(cpu_transport, arch):
     """Muon steps at optim.muon's values, AdamW one group per role; unset values are the configured ones, and a
     resume applies them again whatever the checkpoint held."""

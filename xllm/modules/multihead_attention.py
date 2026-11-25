@@ -251,10 +251,10 @@ class MultiheadAttention(nn.Module):
         register_muon(self.wo, tp_dim=1)
 
         # roles (xllm/optim/roles.py): the matrices are Muon's and carry no role (optim.muon's values)
-        for norm in (self.norm, self.query_norm, self.key_norm):
-            if norm is not None:
-                register_role(norm, "weight", "hidden_vector")
-                register_role(norm, "bias", "hidden_vector")
+        for module in (self.norm, self.query_norm, self.key_norm, self.q_conv, self.k_conv, self.v_conv):
+            if module is not None:
+                register_role(module, "weight", "hidden_vector")
+                register_role(module, "bias", "hidden_vector")
 
     def _receive_prev_tensors(self, x):
         bsz, seq_len, _ = x.size()
