@@ -1,0 +1,68 @@
+# Common to all three drafts
+# Backbone: hybrid Gekko (as the hybrid-gekko presets)
+--model.arch "hybrid"
+--model.chunk_size 4096
+--model.head_dim 128
+--model.v_head_dim 128
+--model.num_kv_heads 8
+--model.qknorm "true"
+--model.apply_attn_gate "true"
+--model.attn_gate_func "softplus"
+--model.apply_conv_in_causal_attn "true"
+--model.rope_head_dim 128
+--model.rope_base 500000
+--model.apply_nope_in_causal_attn "true"
+--model.causal_conv_width 4
+--model.causal_conv_weight_normalization "true"
+--model.swiglu "true"
+--model.apply_rmsnorm "true"
+--model.layernorm_num_groups 1
+--model.timenorm_eps 1e-05
+--model.layernorm_eps 1e-05
+--model.rmsnorm_eps 1e-06
+# MoE: QB router (PR #33); moe_router_bias must be false with QB
+--model.num_dense_layers 3
+--model.num_shared_experts 1
+--model.moe_router_type "dynamic_qb"
+--model.moe_router_bias "false"
+--model.moe_router_score_func "sigmoid"
+--model.moe_router_dynamic_qb_update_method "average"
+--model.moe_router_dynamic_qb_decay 0.3
+--model.moe_router_dynamic_qb_globalnorm "true"
+# Residual: iHC (PR #41); no fused block for iHC + MoE
+--model.residual_func "ihc"
+--model.fused_block "false"
+
+# hybrid-gekko-moe-400B-A: 404B total, 21.4B active (non-embedding, as in the k2-horizon-375B-a23B name); 8 of 64 layers full attention
+--model.num_layers 64
+--model.full_attn_layer_list "7,15,23,31,39,47,55,63"
+--model.model_dim 6144
+--model.num_heads 48
+--model.timenorm_num_groups 96
+--model.ffn_hidden_dim 16384
+--model.num_experts 288
+--model.num_activated_experts 8
+--model.expert_inter_dim 1216
+
+# hybrid-gekko-moe-400B-B-latent: 406B total, 22.9B active (non-embedding, as in the k2-horizon-375B-a23B name); 8 of 64 layers full attention
+--model.num_layers 64
+--model.full_attn_layer_list "7,15,23,31,39,47,55,63"
+--model.model_dim 6144
+--model.num_heads 48
+--model.timenorm_num_groups 96
+--model.ffn_hidden_dim 16384
+--model.num_experts 288
+--model.num_activated_experts 8
+--model.expert_inter_dim 1216
+--model.moe_latent_alpha 4
+
+# hybrid-gekko-moe-400B-C-deep: 402B total, 20.2B active (non-embedding, as in the k2-horizon-375B-a23B name); 10 of 80 layers full attention
+--model.num_layers 80
+--model.full_attn_layer_list "7,15,23,31,39,47,55,63,71,79"
+--model.model_dim 5120
+--model.num_heads 40
+--model.timenorm_num_groups 80
+--model.ffn_hidden_dim 13824
+--model.num_experts 288
+--model.num_activated_experts 8
+--model.expert_inter_dim 1152
