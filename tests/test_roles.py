@@ -84,14 +84,14 @@ def test_only_muon_matrices_have_no_role(arch):
     muon_params, _, _, _ = split_muon_params(model)
     muon_ids = {id(p) for p in muon_params}
     tags = roles_lib.param_roles(model)
-    untagged = {n for n, p in model.named_parameters() if tags[id(p)] == "other"}
+    untagged = {n for n, p in model.named_parameters() if tags[id(p)] is None}
     assert untagged == {n for n, p in model.named_parameters() if id(p) in muon_ids}
 
 
 def test_roles_are_the_adamw_config_fields():
     """ROLES and AdamWConf's role fields must not drift apart; Muon is not among them."""
     assert roles_lib.ROLES == tuple(AdamWConf().roles())
-    assert "hidden_matrix" not in roles_lib.ROLES
+    assert "hidden_matrix" not in roles_lib.ROLES and "other" not in roles_lib.ROLES
 
 
 def test_a_muon_weight_with_a_role_is_rejected(cpu_transport):
@@ -146,3 +146,23 @@ def test_roles_require_muon():
     with pytest.raises(AssertionError, match="optim.optimizer=muon"):
         OptimConf(optimizer="adamw", adamw=AdamWConf(embed=AdamWRoleConf(lr=1e-2)))
     OptimConf(optimizer="adamw", adamw=PLAIN)  # no roles set: fine
+
+
+def test_untagged_adamw_params_use_default_adamw_group(cpu_transport):
+    """Untagged AdamW parameters go in one plain adamw group without a role key, at optim.adamw's values."""
+    model = sharded("transformer")
+    extra = torch.nn.Parameter(torch.zeros(4))
+    extra.device_mesh = OneRankMesh()
+    model.extra = extra
+    opt = muon.build_muon(model, CFG)
+    g = groups(opt)
+    assert "adamw" in g and "role" not in g["adamw"]
+    assert g["adamw"]["params"] == [extra]
+    assert math.isclose(g["adamw"]["lr"], CFG.adamw.lr, rel_tol=1e-12)
+    assert math.isclose(g["adamw"]["eps"], CFG.adamw.epsilon, rel_tol=1e-12)
+    assert g["adamw"]["weight_decay"] == CFG.adamw.weight_decay
+    g["adamw"].update(initial_lr=1.0, eps=1.0, weight_decay=1.0)
+    restore_optimizer_config(opt, CFG)
+    assert math.isclose(g["adamw"]["initial_lr"], CFG.adamw.lr, rel_tol=1e-12)
+    assert math.isclose(g["adamw"]["eps"], CFG.adamw.epsilon, rel_tol=1e-12)
+    assert g["adamw"]["weight_decay"] == CFG.adamw.weight_decay

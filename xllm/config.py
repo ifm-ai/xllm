@@ -104,7 +104,6 @@ class AdamWConf(Config):
     hidden_vector: AdamWRoleConf = field(default_factory=AdamWRoleConf)  # norm gains, biases, gekko's conv kernels in the blocks
     final_norm: AdamWRoleConf = field(default_factory=AdamWRoleConf)
     readout: AdamWRoleConf = field(default_factory=AdamWRoleConf)
-    other: AdamWRoleConf = field(default_factory=AdamWRoleConf)  # parameters no module tags (MoE)
 
     def roles(self) -> Dict[str, "AdamWRoleConf"]:
         """role -> its values, for the roles AdamW steps."""
