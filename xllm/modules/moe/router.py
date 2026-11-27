@@ -128,6 +128,22 @@ class TopKRouting(torch.autograd.Function):
 
         bsz, seq_len, _ = x.shape
 
+        scores_grad = scores_grad.float()
+        if scaling_factor is not None:
+            scores_grad = scores_grad * scaling_factor
+
+        scores = torch.gather(original_scores, dim=-1, index=indices)
+        if topk > 1:
+            scores_denom = scores.sum(dim=-1, keepdim=True)
+            scores = scores / scores_denom
+            scores_grad = (scores_grad - (scores_grad * scores).sum(dim=-1, keepdim=True)) / scores_denom
+
+        original_scores_grad = torch.zeros_like(original_scores).scatter(-1, indices, scores_grad)
+        original_scores_grad, handle_scores = all_reduce(
+            original_scores_grad, get_model_parallel_world_size(), get_model_parallel_group(), async_op=True
+        )
+
+        # aux loss grad
         if load_balancing_type is None:
             assert aux_loss_grad is None
             original_scores_grad_aux = None
@@ -151,30 +167,21 @@ class TopKRouting(torch.autograd.Function):
                 original_scores_grad_aux = (probs_grad - (probs_grad * probs).sum(dim=-1, keepdim=True)) / org_scores_denom
             else:
                 raise ValueError(f"Unknown score function: {score_func}.")
-            # every TP rank adds this whole term and the logits-gradient all-reduce sums the ranks: add a 1/TP share
-            original_scores_grad_aux = original_scores_grad_aux / get_model_parallel_world_size()
 
         # reduce tokens/expert for router bias updating
         if router_bias is not None:
             group = get_hybrid_shard_data_parallel_group()
-            world_size = get_hybrid_shard_data_parallel_world_size()
-            tokens_per_expert, handle_bias = all_reduce(tokens_per_expert, world_size, group, async_op=True)
+            tokens_per_expert, handle_bias = all_reduce(
+                tokens_per_expert, get_hybrid_shard_data_parallel_world_size(), group, async_op=True
+            )
         else:
             handle_bias = None
 
-        scores_grad = scores_grad.float()
-        if scaling_factor is not None:
-            scores_grad = scores_grad * scaling_factor
+        if handle_scores is not None:
+            handle_scores.wait()
 
-        scores = torch.gather(original_scores, dim=-1, index=indices)
-        if topk > 1:
-            scores_denom = scores.sum(dim=-1, keepdim=True)
-            scores = scores / scores_denom
-            scores_grad = (scores_grad - (scores_grad * scores).sum(dim=-1, keepdim=True)) / scores_denom
-
-        original_scores_grad = torch.zeros_like(original_scores).scatter(-1, indices, scores_grad)
         if original_scores_grad_aux is not None:
-            original_scores_grad = original_scores_grad + original_scores_grad_aux
+            original_scores_grad = torch.add(original_scores_grad, original_scores_grad_aux, out=original_scores_grad)
 
         if score_func == 'softmax':
             logits_grad = torch.ops.aten._softmax_backward_data(
@@ -185,19 +192,6 @@ class TopKRouting(torch.autograd.Function):
         else:
             raise ValueError(f"Unknown score function: {score_func}.")
 
-        world_size = get_model_parallel_world_size()
-        group = get_model_parallel_group()
-        logits_grad, handle_logits = all_reduce(logits_grad, world_size, group, async_op=True)
-        # update router bias
-        if router_bias is not None:
-            if handle_bias is not None:
-                handle_bias.wait()
-            average_tokens = tokens_per_expert.sum() / n_experts
-            bias_update = torch.sign(average_tokens - tokens_per_expert)
-            router_bias.add_(bias_update, alpha=bias_update_rate)
-
-        if handle_logits is not None:
-            handle_logits.wait()
         # B*L x N
         logits_grad = logits_grad.to(x).view(bsz * seq_len, -1)
         # B*L x D/TP
@@ -207,6 +201,14 @@ class TopKRouting(torch.autograd.Function):
         # (B*L x N) x (N x D/TP) -> B*L x D/TP
         x_grad = logits_grad.matmul(weight)
         x_grad = x_grad.view(bsz, seq_len, -1)
+
+        # update router bias
+        if router_bias is not None:
+            if handle_bias is not None:
+                handle_bias.wait()
+            average_tokens = tokens_per_expert.sum() / n_experts
+            bias_update = torch.sign(average_tokens - tokens_per_expert)
+            router_bias.add_(bias_update, alpha=bias_update_rate)
 
         return x_grad, w_grad, None, None, None, None, None, None, None
 
