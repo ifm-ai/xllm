@@ -318,6 +318,15 @@ def moe_bwd(
     topk_scores_grad = fused_permute_y_bwd_scores_grad(
         out_grad, inverse_indices, y2, bsz, seq_len, topk, moe_permutation_backend
     )
+    topk_scores_grad = topk_scores_grad.float()
+    if routing_scaling_factor is not None:
+        topk_scores_grad = topk_scores_grad * routing_scaling_factor
+
+    if topk > 1:
+        topk_scores_grad = (topk_scores_grad - (topk_scores_grad * topk_scores).sum(dim=-1, keepdim=True)) / topk_scores_denom
+
+    original_scores_grad = torch.zeros_like(original_scores).scatter(-1, routing_indices, topk_scores_grad)
+    original_scores_grad, handle_scores = all_reduce(original_scores_grad, parallel_region='model', async_op=True)
 
     if router_load_balancing_type is None:
         assert aux_loss_grad is None
@@ -342,36 +351,12 @@ def moe_bwd(
             original_scores_grad_aux = (probs_grad - (probs_grad * probs).sum(dim=-1, keepdim=True)) / org_scores_denom
         else:
             raise ValueError(f"Unknown score function: {routing_score_func}.")
-        # every TP rank adds this whole term and the logits-gradient all-reduce sums the ranks: add a 1/TP share
-        original_scores_grad_aux = original_scores_grad_aux / get_model_parallel_world_size()
 
     # reduce tokens/expert for router bias updating
     if router_bias is not None:
         tokens_per_expert, handle_bias = all_reduce(tokens_per_expert, parallel_region='hybrid_shard', async_op=True)
     else:
         handle_bias = None
-
-    topk_scores_grad = topk_scores_grad.float()
-    if routing_scaling_factor is not None:
-        topk_scores_grad = topk_scores_grad * routing_scaling_factor
-
-    if topk > 1:
-        topk_scores_grad = (topk_scores_grad - (topk_scores_grad * topk_scores).sum(dim=-1, keepdim=True)) / topk_scores_denom
-
-    original_scores_grad = torch.zeros_like(original_scores).scatter(-1, routing_indices, topk_scores_grad)
-    if original_scores_grad_aux is not None:
-        original_scores_grad = original_scores_grad + original_scores_grad_aux
-
-    if routing_score_func == 'softmax':
-        routing_logits_grad = torch.ops.aten._softmax_backward_data(
-            original_scores_grad, original_scores, -1, torch.float32
-        )
-    elif routing_score_func == 'sigmoid':
-        routing_logits_grad = torch.ops.aten.sigmoid_backward(original_scores_grad, original_scores)
-    else:
-        raise ValueError(f"Unknown score function: {routing_score_func}.")
-
-    routing_logits_grad, handle_logits = all_reduce(routing_logits_grad, parallel_region='model', async_op=True)
 
     # xf grad from expert
     if handle_xp_grad is not None:
@@ -384,16 +369,20 @@ def moe_bwd(
     if xf_grad_shared is not None:
         xf_grad = torch.add(xf_grad, xf_grad_shared, out=xf_grad)
 
-    # update router bias
-    if router_bias is not None:
-        if handle_bias is not None:
-            handle_bias.wait()
-        average_tokens = tokens_per_expert.sum() / n_experts
-        bias_update = torch.sign(average_tokens - tokens_per_expert)
-        router_bias.add_(bias_update, alpha=router_bias_update_rate)
+    if handle_scores is not None:
+        handle_scores.wait()
 
-    if handle_logits is not None:
-        handle_logits.wait()
+    if original_scores_grad_aux is not None:
+        original_scores_grad = torch.add(original_scores_grad, original_scores_grad_aux, out=original_scores_grad)
+
+    if routing_score_func == 'softmax':
+        routing_logits_grad = torch.ops.aten._softmax_backward_data(
+            original_scores_grad, original_scores, -1, torch.float32
+        )
+    elif routing_score_func == 'sigmoid':
+        routing_logits_grad = torch.ops.aten.sigmoid_backward(original_scores_grad, original_scores)
+    else:
+        raise ValueError(f"Unknown score function: {routing_score_func}.")
 
     routing_logits_grad = routing_logits_grad.to(xf)
     # (B x L x N) x (N x D/TP) -> B x L x D/TP
@@ -409,6 +398,14 @@ def moe_bwd(
     routing_logits_grad = routing_logits_grad.view(bsz * seq_len, -1)
     # (N x B*L) x (B*L x D/TP) -> N x D/TP
     router_w_grad = routing_logits_grad.t().matmul(xf_flat)
+
+    # update router bias
+    if router_bias is not None:
+        if handle_bias is not None:
+            handle_bias.wait()
+        average_tokens = tokens_per_expert.sum() / n_experts
+        bias_update = torch.sign(average_tokens - tokens_per_expert)
+        router_bias.add_(bias_update, alpha=router_bias_update_rate)
 
     if handle_xf is not None:
         handle_xf.wait()

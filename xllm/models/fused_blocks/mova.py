@@ -7,7 +7,6 @@ from einops import rearrange
 from xllm.distributed import (
     get_context_parallel_rank,
     get_context_parallel_world_size,
-    get_model_parallel_world_size,
 )
 from xllm.distributed.utils import reshape_gathered_tensor_along_specific_dim
 from xllm.health_metrics import get_active_health_collector
@@ -335,6 +334,15 @@ def mova_bwd(
     topk_scores_grad = fused_permute_y_bwd_scores_grad(
         xv_grad_, inverse_indices, xvv_, bsz, seq_len, topk, moe_permutation_backend
     )
+    topk_scores_grad = topk_scores_grad.float()
+    if routing_scaling_factor is not None:
+        topk_scores_grad = topk_scores_grad * routing_scaling_factor
+
+    if topk > 1:
+        topk_scores_grad = (topk_scores_grad - (topk_scores_grad * topk_scores).sum(dim=-1, keepdim=True)) / topk_scores_denom
+
+    original_scores_grad = torch.zeros_like(original_scores).scatter(-1, routing_indices, topk_scores_grad)
+    original_scores_grad, handle_scores = all_reduce(original_scores_grad, parallel_region='model', async_op=True)
 
     if router_load_balancing_type is None:
         assert aux_loss_grad is None
@@ -359,36 +367,12 @@ def mova_bwd(
             original_scores_grad_aux = (probs_grad - (probs_grad * probs).sum(dim=-1, keepdim=True)) / org_scores_denom
         else:
             raise ValueError(f"Unknown score function: {routing_score_func}.")
-        # every TP rank adds this whole term and the logits-gradient all-reduce sums the ranks: add a 1/TP share
-        original_scores_grad_aux = original_scores_grad_aux / get_model_parallel_world_size()
 
     # reduce tokens/expert for router bias updating
     if router_bias is not None:
         tokens_per_expert, handle_bias = all_reduce(tokens_per_expert, parallel_region='hybrid_shard', async_op=True)
     else:
         handle_bias = None
-
-    topk_scores_grad = topk_scores_grad.float()
-    if routing_scaling_factor is not None:
-        topk_scores_grad = topk_scores_grad * routing_scaling_factor
-
-    if topk > 1:
-        topk_scores_grad = (topk_scores_grad - (topk_scores_grad * topk_scores).sum(dim=-1, keepdim=True)) / topk_scores_denom
-
-    original_scores_grad = torch.zeros_like(original_scores).scatter(-1, routing_indices, topk_scores_grad)
-    if original_scores_grad_aux is not None:
-        original_scores_grad = original_scores_grad + original_scores_grad_aux
-
-    if routing_score_func == 'softmax':
-        routing_logits_grad = torch.ops.aten._softmax_backward_data(
-            original_scores_grad, original_scores, -1, torch.float32
-        )
-    elif routing_score_func == 'sigmoid':
-        routing_logits_grad = torch.ops.aten.sigmoid_backward(original_scores_grad, original_scores)
-    else:
-        raise ValueError(f"Unknown score function: {routing_score_func}.")
-
-    routing_logits_grad, handle_logits = all_reduce(routing_logits_grad, parallel_region='model', async_op=True)
 
     if handle_xv is not None:
         handle_xv.wait()
@@ -401,16 +385,21 @@ def mova_bwd(
     # B x L x K x D/TP -> B x L x D/TP
     sx_grad = sx_grad.view(bsz, seq_len, topk, -1).sum(2)
 
-    # update router bias
-    if router_bias is not None:
-        if handle_bias is not None:
-            handle_bias.wait()
-        average_tokens = tokens_per_expert.sum() / n_values
-        bias_update = torch.sign(average_tokens - tokens_per_expert)
-        router_bias.add_(bias_update, alpha=router_bias_update_rate)
+    if handle_scores is not None:
+        handle_scores.wait()
 
-    if handle_logits is not None:
-        handle_logits.wait()
+    if original_scores_grad_aux is not None:
+        original_scores_grad = original_scores_grad + original_scores_grad_aux
+
+    if routing_score_func == 'softmax':
+        routing_logits_grad = torch.ops.aten._softmax_backward_data(
+            original_scores_grad, original_scores, -1, torch.float32
+        )
+    elif routing_score_func == 'sigmoid':
+        routing_logits_grad = torch.ops.aten.sigmoid_backward(original_scores_grad, original_scores)
+    else:
+        raise ValueError(f"Unknown score function: {routing_score_func}.")
+
     routing_logits_grad = routing_logits_grad.to(sx)
     # (B x L x N) x (N x D/TP) -> B x L x D/TP
     sx_grad_router = routing_logits_grad.matmul(router_w)
@@ -428,6 +417,14 @@ def mova_bwd(
     mx_flat = mx.flatten(end_dim=-2)
     wq_grad = xq_grad.t().matmul(mx_flat)
     wr_grad = None if rmx_grad is None else rmx_grad.t().matmul(mx_flat)
+
+    # update router bias
+    if router_bias is not None:
+        if handle_bias is not None:
+            handle_bias.wait()
+        average_tokens = tokens_per_expert.sum() / n_values
+        bias_update = torch.sign(average_tokens - tokens_per_expert)
+        router_bias.add_(bias_update, alpha=router_bias_update_rate)
 
     if handle_smx is not None:
         handle_smx.wait()
