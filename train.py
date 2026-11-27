@@ -64,6 +64,7 @@ from xllm.health_metrics import HealthMetricCollector
 from xllm.modules.moe.moe import moe_layer_ids
 from xllm.modules.moe.mova import mova_layer_ids
 from xllm.configuration import cfg_from_cli
+from xllm.base_model_check import check_base_model_config, explicit_model_fields
 try:
     import wandb
     has_wandb = True
@@ -351,6 +352,8 @@ def main(cfg: TrainerConf):
         reloaded_training_state_dict = torch.load(training_state_path, map_location="cpu", weights_only=False)
         set_optim_state(scheduler, reloaded_training_state_dict, state, data_iterator, timings, cfg.optim)
     elif cfg.base_model_dir is not None:
+        # the weights carry no config: fail on a config that differs from the one saved with them
+        check_base_model_config(cfg.base_model_dir, cfg.model.to_dict(), explicit_model_fields())
         base_model_path, base_optim_path = get_base_model_checkpoint_path(
             cfg.base_model_dir, cfg.slurm.global_rank, cfg.fully_sharded_size, cfg.dcp_for_optimizer
         )
