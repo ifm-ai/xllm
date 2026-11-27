@@ -86,7 +86,7 @@ class TransformerMoVABlockFunction(torch.autograd.Function):
         dropout: float,
         attention_dropout: float,
         hidden_dropout: float,
-        layernorm_eps: float,
+        stream_norm_eps: float,  # the eps of the norms that read the residual stream
         rmsnorm_eps: float,
         apply_rmsnorm: bool,
         gather_before_norm: bool,
@@ -119,7 +119,7 @@ class TransformerMoVABlockFunction(torch.autograd.Function):
             if moe_norm_b is not None:
                 moe_norm_b, handle_moe_norm_b = all_gather(moe_norm_b, parallel_region='model', async_op=True)
 
-        mx, _, _ = layer_or_rmsnorm_fwd(x_, attn_norm_w, attn_norm_b, norm_local_groups, layernorm_eps, rmsnorm_eps, apply_rmsnorm)
+        mx, _, _ = layer_or_rmsnorm_fwd(x_, attn_norm_w, attn_norm_b, norm_local_groups, stream_norm_eps, stream_norm_eps, apply_rmsnorm)
 
         # MoVA forward
         xqkv, attn_out, xh, aux_loss_mova, rng_states, routing_state, end_seq = mova_fwd(
@@ -168,7 +168,7 @@ class TransformerMoVABlockFunction(torch.autograd.Function):
                 handle_moe_norm_b.wait()
                 moe_norm_b = reshape_gathered_tensor_along_specific_dim(moe_norm_b, gather_dim=0)
 
-        xf, _, _ = layer_or_rmsnorm_fwd(xo_, moe_norm_w, moe_norm_b, norm_local_groups, layernorm_eps, rmsnorm_eps, apply_rmsnorm)
+        xf, _, _ = layer_or_rmsnorm_fwd(xo_, moe_norm_w, moe_norm_b, norm_local_groups, stream_norm_eps, stream_norm_eps, apply_rmsnorm)
         if gather_before_norm:
             xf = scatter(xf, parallel_region='model')
 
@@ -268,7 +268,7 @@ class TransformerMoVABlockFunction(torch.autograd.Function):
         ctx.output_splits = output_splits
         ctx.curr_bsz = curr_bsz
         # misc
-        ctx.layernorm_eps = layernorm_eps
+        ctx.stream_norm_eps = stream_norm_eps
         ctx.rmsnorm_eps = rmsnorm_eps
         ctx.attn_act_func = attn_act_func
         ctx.apply_attn_gate = apply_attn_gate
@@ -380,7 +380,7 @@ class TransformerMoVABlockFunction(torch.autograd.Function):
         dropout = ctx.dropout
         attention_dropout = ctx.attention_dropout
         hidden_dropout = ctx.hidden_dropout
-        layernorm_eps = ctx.layernorm_eps
+        stream_norm_eps = ctx.stream_norm_eps
         rmsnorm_eps = ctx.rmsnorm_eps
         apply_rmsnorm = ctx.apply_rmsnorm
         gather_before_norm = ctx.gather_before_norm
@@ -417,7 +417,7 @@ class TransformerMoVABlockFunction(torch.autograd.Function):
             x_, handle_x = all_gather(x, parallel_region='model', async_op=True)
 
         xf, xo_mean, xo_invvar = layer_or_rmsnorm_fwd(
-            xo_, moe_norm_w, moe_norm_b, norm_local_groups, layernorm_eps, rmsnorm_eps, apply_rmsnorm
+            xo_, moe_norm_w, moe_norm_b, norm_local_groups, stream_norm_eps, stream_norm_eps, apply_rmsnorm
         )
         if gather_before_norm:
             xf = scatter(xf, parallel_region='model')
@@ -436,7 +436,7 @@ class TransformerMoVABlockFunction(torch.autograd.Function):
 
         # recompute mx
         mx, x_mean, x_invvar = layer_or_rmsnorm_fwd(
-            x_, attn_norm_w, attn_norm_b, norm_local_groups, layernorm_eps, rmsnorm_eps, apply_rmsnorm
+            x_, attn_norm_w, attn_norm_b, norm_local_groups, stream_norm_eps, stream_norm_eps, apply_rmsnorm
         )
         if not gather_before_norm:
             sx = mx
@@ -604,7 +604,7 @@ class TransformerMoVABlockFunction(torch.autograd.Function):
             None,  # dropout
             None,  # attention_dropout
             None,  # hidden_dropout
-            None,  # layernorm_eps
+            None,  # stream_norm_eps
             None,  # rmsnorm_eps
             None,  # apply_rmsnorm
             None,  # gather_before_norm

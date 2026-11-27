@@ -65,6 +65,7 @@ class TransformerMoEBlock(nn.Module):
             residual_heads=cfg.residual_heads,
             init_mode=cfg.init_mode,
             init_std=cfg.init_std,
+            stream_norm_eps=cfg.stream_norm_eps,
         )
 
         self.moe = NormalizedMoE(
@@ -91,7 +92,9 @@ class TransformerMoEBlock(nn.Module):
             residual_func=cfg.residual_func,
             residual_heads=cfg.residual_heads,
             init_mode=cfg.init_mode,
-            init_std=cfg.init_std
+            init_std=cfg.init_std,
+            stream_norm_eps=cfg.stream_norm_eps,
+            init_router_std=cfg.init_router_std,
         )
 
     def forward(
@@ -157,7 +160,7 @@ class TransformerMoEBlock(nn.Module):
                 self.dropout,
                 self.attention.attention_dropout,
                 self.attention.hidden_dropout,
-                self.layernorm_eps,
+                self.moe.norm_eps,  # both pre-norms' eps
                 self.rmsnorm_eps,
                 self.apply_rmsnorm,
                 self.attention.norm.gather_input,

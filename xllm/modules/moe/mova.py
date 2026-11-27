@@ -7,6 +7,7 @@ from einops import rearrange
 
 from xllm.health_metrics import get_active_health_collector
 from xllm.utils import get_init_fn
+from xllm.optim.roles import register_role
 from xllm.distributed.utils import divide_and_check_no_remainder
 from xllm.distributed import (
     get_model_parallel_world_size,
@@ -81,6 +82,8 @@ class MOVAttention(nn.Module):
         residual_heads: Optional[int] = None,
         init_mode: str = 'he',
         init_std: Optional[float] = None,
+        stream_norm_eps: Optional[float] = None,  # the input norm's eps in place of rmsnorm_eps / layernorm_eps
+        init_router_std: Optional[float] = None,  # the router's gaussian init std; None: init_fn's
     ):
         super().__init__()
         self.layer_id = layer_id
@@ -117,12 +120,14 @@ class MOVAttention(nn.Module):
         self.init_std = init_std
 
         norm_cls = GroupRMSNorm if apply_rmsnorm else GroupLayerNorm
-        norm_eps = rmsnorm_eps if apply_rmsnorm else layernorm_eps
+        self.norm_eps = stream_norm_eps
+        if self.norm_eps is None:
+            self.norm_eps = rmsnorm_eps if apply_rmsnorm else layernorm_eps
         self.norm = norm_cls(
             mdim,
             num_groups=norm_num_groups,
             elementwise_affine=norm_affine,
-            eps=norm_eps,
+            eps=self.norm_eps,
             memory_efficient=memory_efficient_norm
         )
 
@@ -136,7 +141,7 @@ class MOVAttention(nn.Module):
             bias_update_rate=router_bias_update_rate,
             score_func=router_score_func,
             scaling_factor=router_scaling_factor,
-            init_method=init_fn
+            init_method=init_fn if init_router_std is None else get_init_fn('gaussian', std=init_router_std)
         )
 
         self.wq = ColumnParallelLinear(
@@ -273,6 +278,20 @@ class MOVAttention(nn.Module):
         if self.wr is not None:
             register_muon(self.wr, layout="(h d) m", fan_out="d", fan_in="m", d=rdim // self.n_heads, tp_dim=0)
         register_muon(self.wo, tp_dim=1)
+
+
+        # roles (xllm/optim/roles.py)
+        for w in (self.wq, self.wk, self.wv, self.wr, self.wo):
+            if w is not None:
+                register_role(w, "weight", "hidden_matrix")
+        for conv in (self.q_conv, self.k_conv, self.v_conv):  # depthwise kernels, as Gekko's
+            if conv is not None:
+                register_role(conv, "weight", "hidden_vector")
+        for norm in (self.norm, self.query_norm, self.key_norm):
+            if norm is not None:
+                register_role(norm, "weight", "hidden_vector")
+                register_role(norm, "bias", "hidden_vector")
+        register_role(self.router, "weight", "router")
 
     def _receive_prev_tensors(self, x):
         bsz, seq_len, _ = x.size()

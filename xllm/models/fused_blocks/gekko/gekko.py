@@ -125,7 +125,7 @@ class GekkoBlockFunction(torch.autograd.Function):
         hidden_dropout: float,
         swiglu: bool,
         timenorm_eps: float,
-        layernorm_eps: float,
+        ffn_norm_eps: float,  # the FFN pre-norm's eps (LayerNorm or RMSNorm)
         rmsnorm_eps: float,
         apply_rmsnorm: bool,
         residual_func: str,
@@ -398,7 +398,7 @@ class GekkoBlockFunction(torch.autograd.Function):
             handle8.wait()
             handle9.wait()
 
-        xf, _, _ = layer_or_rmsnorm_fwd(xo, ffn_norm_w, ffn_norm_b, ffn_norm_local_groups, layernorm_eps, rmsnorm_eps, apply_rmsnorm)
+        xf, _, _ = layer_or_rmsnorm_fwd(xo, ffn_norm_w, ffn_norm_b, ffn_norm_local_groups, ffn_norm_eps, ffn_norm_eps, apply_rmsnorm)
 
         # FFN & SwiGLU
         xf, _ = all_gather(xf, parallel_region='model', async_op=False)
@@ -472,7 +472,7 @@ class GekkoBlockFunction(torch.autograd.Function):
         ctx.hidden_dropout = hidden_dropout
         ctx.swiglu = swiglu
         ctx.timenorm_eps = timenorm_eps
-        ctx.layernorm_eps = layernorm_eps
+        ctx.ffn_norm_eps = ffn_norm_eps
         ctx.rmsnorm_eps = rmsnorm_eps
         ctx.apply_rmsnorm = apply_rmsnorm
         ctx.residual_func = residual_func
@@ -580,7 +580,7 @@ class GekkoBlockFunction(torch.autograd.Function):
         hidden_dropout = ctx.hidden_dropout
         swiglu = ctx.swiglu
         timenorm_eps = ctx.timenorm_eps
-        layernorm_eps = ctx.layernorm_eps
+        ffn_norm_eps = ctx.ffn_norm_eps
         rmsnorm_eps = ctx.rmsnorm_eps
         apply_rmsnorm = ctx.apply_rmsnorm
         residual_func = ctx.residual_func
@@ -605,7 +605,7 @@ class GekkoBlockFunction(torch.autograd.Function):
 
         # recompute xf
         xf, xo_mean, xo_invvar = layer_or_rmsnorm_fwd(
-            xo, ffn_norm_w, ffn_norm_b, ffn_norm_local_groups, layernorm_eps, rmsnorm_eps, apply_rmsnorm
+            xo, ffn_norm_w, ffn_norm_b, ffn_norm_local_groups, ffn_norm_eps, ffn_norm_eps, apply_rmsnorm
         )
         xf, handle_xf = all_gather(xf, parallel_region='model', async_op=True)
 
@@ -1059,7 +1059,7 @@ class GekkoBlockFunction(torch.autograd.Function):
             None,  # hidden dropout
             None,  # swiglu
             None,  # timenorm_eps
-            None,  # layernorm_eps
+            None,  # ffn_norm_eps
             None,  # rmsnorm_eps
             None,  # apply_rmsnorm
             None,  # residual_func

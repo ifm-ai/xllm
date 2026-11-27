@@ -27,6 +27,7 @@ from xllm.models.fused_blocks import (
     GekkoOutputLayerFunction
 )
 from xllm.utils import get_init_fn
+from xllm.optim.roles import register_role
 
 
 class TransformerOutputLayer(nn.Module):
@@ -36,17 +37,18 @@ class TransformerOutputLayer(nn.Module):
         self.model_dim = cfg.model_dim
         self.output_size = cfg.vocab_size
         self.apply_rmsnorm = cfg.apply_rmsnorm
-        self.layernorm_eps = cfg.layernorm_eps
         self.rmsnorm_eps = cfg.rmsnorm_eps
         self.recompute_logits = cfg.recompute_logits
 
         norm_cls = GroupRMSNorm if cfg.apply_rmsnorm else GroupLayerNorm
-        norm_eps = cfg.rmsnorm_eps if self.apply_rmsnorm else cfg.layernorm_eps
+        self.norm_eps = cfg.stream_norm_eps
+        if self.norm_eps is None:
+            self.norm_eps = cfg.rmsnorm_eps if self.apply_rmsnorm else cfg.layernorm_eps
         self.final_norm = norm_cls(
             cfg.model_dim,
             num_groups=cfg.layernorm_num_groups,
             elementwise_affine=cfg.norm_affine,
-            eps=norm_eps,
+            eps=self.norm_eps,
             memory_efficient=cfg.memory_efficient_norm
         )
 
@@ -60,6 +62,10 @@ class TransformerOutputLayer(nn.Module):
             gather_output=False,
             init_method=init_fn
         )
+        # roles (xllm/optim/roles.py)
+        register_role(self.final_norm, "weight", "final_norm")
+        register_role(self.final_norm, "bias", "final_norm")
+        register_role(self.output, "weight", "readout")
 
     def forward(
         self,
@@ -78,7 +84,7 @@ class TransformerOutputLayer(nn.Module):
                 self.final_norm.bias,
                 self.final_norm.groups_per_partition,
                 self.output.weight,
-                self.layernorm_eps,
+                self.norm_eps,
                 self.rmsnorm_eps,
                 self.apply_rmsnorm,
                 self.final_norm.gather_input,
@@ -150,6 +156,10 @@ class GekkoOutputLayer(nn.Module):
         init_fn = get_init_fn('gaussian', dim=self.model_dim, std=cfg.init_logits_std)
         self.output = ColumnParallelLinear(self.model_dim, self.output_size, bias=False,
                                            input_is_parallel=True, gather_output=False, init_method=init_fn)
+        # roles (xllm/optim/roles.py)
+        register_role(self.final_norm, "weight", "final_norm")
+        register_role(self.final_norm, "bias", "final_norm")
+        register_role(self.output, "weight", "readout")
 
         self.context_parallel_rank = get_context_parallel_rank()
 

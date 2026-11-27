@@ -13,6 +13,7 @@ from xllm.distributed import (
 from xllm.distributed.utils import divide_and_check_no_remainder
 from xllm.utils import get_init_fn
 from xllm.modules.model_parallel import reduce_scatter_model_parallel_region
+from xllm.optim.roles import register_role
 
 
 def _init_affine_weight(
@@ -94,6 +95,8 @@ class ForgetGate(nn.Module):
         self.alphabet = nn.Parameter(torch.empty(self.output_size_per_partition * 2))
         _init_affine_weight(self.weight, in_features, out_features, init_fn)
         _init_alphabet(self.alphabet, out_features)
+        register_role(self, "weight", "hidden_matrix")  # xllm/optim/roles.py
+        register_role(self, "alphabet", "hidden_vector")
 
     def forward(self, x: Tensor, prev_length: int) -> Optional[Tensor]:
         bsz, seq_len, _ = x.shape

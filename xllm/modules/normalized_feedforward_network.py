@@ -14,6 +14,7 @@ from xllm.modules.rms_norm import GroupRMSNorm
 from xllm.modules.residual import build_residual
 from xllm.utils import get_init_fn
 from xllm.optim.muon_spec import register_muon
+from xllm.optim.roles import register_role
 
 
 class NormalizedFeedForwardNetwork(nn.Module):
@@ -31,6 +32,7 @@ class NormalizedFeedForwardNetwork(nn.Module):
         rmsnorm_eps: float = 1e-6,
         memory_efficient_norm: bool = False,
         apply_rmsnorm: bool = False,
+        stream_norm_eps: Optional[float] = None,  # the input norm's eps in place of rmsnorm_eps / layernorm_eps
         residual_func: str = 'base',
         residual_heads: Optional[int] = None,
         init_mode: str = 'gaussian',
@@ -48,12 +50,14 @@ class NormalizedFeedForwardNetwork(nn.Module):
         self.init_std = init_std
 
         norm_cls = GroupRMSNorm if apply_rmsnorm else GroupLayerNorm
-        norm_eps = rmsnorm_eps if apply_rmsnorm else layernorm_eps
+        self.norm_eps = stream_norm_eps
+        if self.norm_eps is None:
+            self.norm_eps = rmsnorm_eps if apply_rmsnorm else layernorm_eps
         self.norm = norm_cls(
             model_dim,
             num_groups=norm_num_groups,
             elementwise_affine=norm_affine,
-            eps=norm_eps,
+            eps=self.norm_eps,
             memory_efficient=memory_efficient_norm
         )
 
@@ -93,6 +97,9 @@ class NormalizedFeedForwardNetwork(nn.Module):
         for fc, tp_dim in ((self.fc1, 0), (self.fc2, 1), (self.fc3, 0)):  # column, row, column parallel
             if fc is not None:
                 register_muon(fc, tp_dim=tp_dim)  # Muon, one matrix (xllm/optim/muon.py)
+                register_role(fc, "weight", "hidden_matrix")  # xllm/optim/roles.py
+        register_role(self.norm, "weight", "hidden_vector")
+        register_role(self.norm, "bias", "hidden_vector")
 
     def forward(
         self,
