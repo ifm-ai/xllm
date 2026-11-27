@@ -10,10 +10,10 @@ import torch.multiprocessing as mp
 
 import tests.health.helpers as helpers
 import xllm.distributed.initialize as parallel_state
-import xllm.health_metrics as health_metrics
+from xllm.metrics import health
 from tests.health.helpers import MASK, MATRICES, TARGETS, TOKENS, logged_metrics, shard, tiny_transformer
-from xllm.health_metrics import HealthMetricCollector, get_active_health_collector
-from xllm.metrics import MetricLogger
+from xllm.metrics.health import HealthMetricCollector
+from xllm.metrics.metric_logger import MetricLogger
 from xllm.modules.rms_norm import GroupRMSNorm
 
 STATS = ("mean", "min", "max")
@@ -24,11 +24,11 @@ def _step(collector, step, layers=None):
     """One step: begin, record an activation per layer, end forward, flush. Returns (was active, logged)."""
     logged = []
     collector.begin_step(step)
-    active = get_active_health_collector() is collector
+    active = health.active_collector() is collector
     for layer_idx in range(collector.num_layers) if layers is None else layers:
         collector.record_activation(layer_idx, torch.tensor([float(step)]))
     collector.end_forward()
-    assert get_active_health_collector() is None
+    assert health.active_collector() is None
     collector.flush(SimpleNamespace(log=lambda metrics, step: logged.append((step, metrics))), step)
     return active, logged
 
@@ -181,7 +181,7 @@ def _recording(name, calls):
 def test_flush_uses_one_agreement_and_three_packed_reductions(monkeypatch):
     calls = []
     for name in ("all_reduce", "reduce"):
-        monkeypatch.setattr(health_metrics.dist, name, _recording(name, calls))
+        monkeypatch.setattr(health.dist, name, _recording(name, calls))
     model = shard(tiny_transformer(2), "fsdp2")
     calls.clear()
 

@@ -11,7 +11,7 @@ from xllm.modules.rotary_positional_embedding import RotaryEmbedding
 from xllm.modules.model_parallel import ParallelEmbedding
 from xllm.modules.context_parallel import gather_from_context_parallel_region
 from xllm.config import ModelConf
-from xllm.health_metrics import get_active_health_collector
+from xllm.metrics import health
 from xllm.distributed import (
     get_context_parallel_world_size,
     get_context_parallel_rank,
@@ -137,7 +137,6 @@ class Gekko(XLLModel):
         freq_cis = None if self.rope is None else self.rope.get_freqs_cis(start, end, x.device)
 
         aux_loss_sum = None
-        health_collector = get_active_health_collector()
         for i, layer in enumerate(self.layers):
             layer_cache = cache_layers[i] if cache is not None else None
             if self.layerwise_ckpt:
@@ -152,8 +151,7 @@ class Gekko(XLLModel):
                     moe_router_load_balancing_type, attn_stability_control, deterministic, layer_cache
                 )
 
-            if health_collector is not None:
-                health_collector.record_activation(i, x)
+            health.record_activation(i, x)
 
             if aux_loss is not None:
                 aux_loss_sum = aux_loss if aux_loss_sum is None else aux_loss_sum + aux_loss

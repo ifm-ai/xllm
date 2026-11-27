@@ -9,7 +9,7 @@ from xllm.distributed import (
     get_context_parallel_world_size,
 )
 from xllm.distributed.utils import reshape_gathered_tensor_along_specific_dim
-from xllm.health_metrics import get_active_health_collector
+from xllm.metrics import health
 from xllm.modules.fused_ops import (
     memory_efficient_dropout_fwd,
 )
@@ -78,10 +78,8 @@ def multihead_attention_fwd(
     xq_ = rearrange(xq_, 'b l (h s) -> b l h s', h=local_heads)
     if not apply_nope:
         xq_ = apply_rope(xq_, freqs_cis, head_dim, rope_head_dim, False)
-    health_collector = get_active_health_collector()
-    if health_collector is not None and layer_id is not None:
-        # Local post-qk-norm, post-RoPE heads, before K is gathered across context ranks.
-        health_collector.record_query_key_stats(layer_id, xq_, local_xk)
+    # Local post-qk-norm, post-RoPE heads, before K is gathered across context ranks.
+    health.record_query_key_stats(layer_id, xq_, local_xk)
 
     if wr is not None:
         rg = rearrange(F.linear(mx, wr, None), 'b l (h s) -> b l h s', h=local_heads)

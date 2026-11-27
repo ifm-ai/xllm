@@ -16,7 +16,7 @@ from xllm.modules.utils import (
     get_segment_idx_from_bos_mask,
 )
 from xllm.config import ModelConf
-from xllm.health_metrics import get_active_health_collector
+from xllm.metrics import health
 from xllm.distributed import (
     get_context_parallel_world_size,
     get_context_parallel_rank,
@@ -118,7 +118,6 @@ class Transformer(XLLModel):
         freq_cis = None if self.rope is None else self.rope.get_freqs_cis(cache_len, cache_len + seq_len, x.device)
 
         aux_loss_sum = None
-        health_collector = get_active_health_collector()
         for i, layer in enumerate(self.layers):
             layer_cache = cache[i] if cache is not None else None
             if self.layerwise_ckpt:
@@ -133,8 +132,7 @@ class Transformer(XLLModel):
                     attn_stability_control, deterministic, layer_cache
                 )
 
-            if health_collector is not None:
-                health_collector.record_activation(i, x)
+            health.record_activation(i, x)
 
             if aux_loss is not None:
                 aux_loss_sum = aux_loss if aux_loss_sum is None else aux_loss_sum + aux_loss

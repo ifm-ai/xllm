@@ -5,7 +5,7 @@ from torch import nn, Tensor
 import torch.nn.functional as F
 from einops import rearrange
 
-from xllm.health_metrics import get_active_health_collector
+from xllm.metrics import health
 from xllm.utils import get_init_fn
 from xllm.distributed.utils import divide_and_check_no_remainder
 from xllm.distributed import (
@@ -329,11 +329,7 @@ class MOVAttention(nn.Module):
         sx = scatter_to_model_parallel_region(x) if self.norm.gather_input else x
         # B x L x K
         routing_scores, routing_indices, tokens_per_expert, aux_loss = self.router(sx, load_balancing_type)
-        health_collector = get_active_health_collector()
-        if health_collector is not None:
-            health_collector.record_router_stats(
-                "mova", self.layer_id, tokens_per_expert, routing_scores, self.router.bias, aux_loss,
-            )
+        health.record_router_stats("mova", self.layer_id, tokens_per_expert, routing_scores, self.router.bias, aux_loss)
 
         if cache is not None:
             cache_attn, cache_conv = cache

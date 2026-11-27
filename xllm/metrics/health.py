@@ -7,7 +7,7 @@ import torch.distributed as dist
 from torch.distributed.tensor import DTensor, Replicate, Shard
 
 from xllm.distributed.initialize import get_model_parallel_rank
-from xllm.matrix_norms import (
+from xllm.metrics.matrix_norms import (
     MatrixSlice,
     dtensor_squared_l2,
     flat_slice_squared_l2,
@@ -17,7 +17,7 @@ from xllm.matrix_norms import (
 )
 
 if TYPE_CHECKING:
-    from xllm.metrics import MetricLogger
+    from xllm.metrics.metric_logger import MetricLogger
 
 logger = getLogger()
 
@@ -175,8 +175,58 @@ def _layer_matrix_counts(layer: Any, paths: _MatrixParameterPaths) -> Tuple[int,
     return matrix_counts(layer, len(_MATRIX_PARAMETER_PATHS))
 
 
-def get_active_health_collector() -> Optional["HealthMetricCollector"]:
+def active_collector() -> Optional["HealthMetricCollector"]:
     return _ACTIVE_COLLECTOR
+
+
+def record_activation(layer_idx: int, x: torch.Tensor) -> None:
+    if _ACTIVE_COLLECTOR is not None:
+        _ACTIVE_COLLECTOR.record_activation(layer_idx, x)
+
+
+def record_query_key_stats(
+    layer_idx: Optional[int], q: torch.Tensor, k: torch.Tensor, kq: Optional[torch.Tensor] = None,
+) -> None:
+    if _ACTIVE_COLLECTOR is not None and layer_idx is not None:
+        _ACTIVE_COLLECTOR.record_query_key_stats(layer_idx, q, k, kq=kq)
+
+
+def record_router_stats(
+    family: str, layer_idx: int, tokens_per_route: torch.Tensor, topk_scores: torch.Tensor,
+    router_bias: Optional[torch.Tensor] = None, aux_loss: Optional[torch.Tensor] = None,
+) -> None:
+    if _ACTIVE_COLLECTOR is not None:
+        _ACTIVE_COLLECTOR.record_router_stats(family, layer_idx, tokens_per_route, topk_scores, router_bias, aux_loss)
+
+
+def logits_stats_enabled() -> bool:
+    return _ACTIVE_COLLECTOR is not None and _ACTIVE_COLLECTOR.enable_logits_stats
+
+
+def record_logits(logits: torch.Tensor, targets: Optional[torch.Tensor], mask: Optional[torch.Tensor]) -> None:
+    """Record logit statistics over tokens that have a target and are not masked out."""
+    if not logits_stats_enabled() or targets is None:
+        return
+    # Diagnostics must not change tensors saved for checkpoint recomputation.
+    logits = logits.detach()
+    valid = targets.ne(-100)
+    if mask is not None:
+        valid.logical_and_(mask.to(torch.bool))
+    minimums, maximums = torch.aminmax(logits, dim=-1)
+    record_logits_stats(
+        logits.sum(dim=-1).masked_fill(~valid, 0.0).sum(),
+        valid.sum() * logits.shape[-1],
+        minimums.masked_fill(~valid, float("inf")).min(),
+        maximums.masked_fill(~valid, -float("inf")).max(),
+    )
+
+
+def record_logits_stats(
+    logits_sum: torch.Tensor, logits_count: torch.Tensor,
+    logits_minimum: torch.Tensor, logits_maximum: torch.Tensor,
+) -> None:
+    if _ACTIVE_COLLECTOR is not None:
+        _ACTIVE_COLLECTOR.record_logits_stats(logits_sum, logits_count, logits_minimum, logits_maximum)
 
 
 def _pack_extrema(values: list[torch.Tensor]) -> torch.Tensor:

@@ -20,7 +20,7 @@ from xllm.modules.fused_ops import memory_efficient_dropout
 from xllm.modules.layer_norm import GroupLayerNorm
 from xllm.modules.rms_norm import GroupRMSNorm
 from xllm.modules.residual import build_residual
-from xllm.health_metrics import get_active_health_collector
+from xllm.metrics import health
 from xllm.utils import get_init_fn
 from xllm.optim.muon_spec import register_muon
 from .router import TopKRouter
@@ -171,11 +171,7 @@ class NormalizedMoE(nn.Module):
         world_size = get_model_parallel_world_size()
         # B x L x K
         routing_scores, routing_indices, tokens_per_expert, aux_loss = self.router(x, load_balancing_type)
-        health_collector = get_active_health_collector()
-        if health_collector is not None:
-            health_collector.record_router_stats(
-                "moe", self.layer_id, tokens_per_expert, routing_scores, self.router.bias, aux_loss,
-            )
+        health.record_router_stats("moe", self.layer_id, tokens_per_expert, routing_scores, self.router.bias, aux_loss)
         # B*L x D/TP
         x = x.view(bsz * slen, -1)
         # B*L*K

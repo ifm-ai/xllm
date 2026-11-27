@@ -7,7 +7,7 @@ import torch
 from tests.health.helpers import stats
 from xllm.config import ModelConf
 from xllm.distributed import FullyShardedDataParallel
-from xllm.health_metrics import HealthMetricCollector
+from xllm.metrics.health import HealthMetricCollector
 from xllm.models.gekko import GekkoBlock
 
 # The Gekko hooks run inside fused CUDA kernels, so the statistics tests feed the collector exactly the

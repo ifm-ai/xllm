@@ -5,11 +5,11 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-import xllm.metrics as metrics_module
+import xllm.metrics.metric_logger as metrics_module
 from tests.health.helpers import TOKENS, shard, tiny_transformer
 from tests.health.test_routed_matrix_norms import CONFIGS, routed_group  # noqa: F401  (fixture)
-from xllm.health_metrics import HealthMetricCollector
-from xllm.metrics import MetricLogger
+from xllm.metrics.health import HealthMetricCollector
+from xllm.metrics.metric_logger import MetricLogger
 
 
 def logged_payloads(model):
