@@ -36,17 +36,16 @@ class TransformerOutputLayer(nn.Module):
         self.model_dim = cfg.model_dim
         self.output_size = cfg.vocab_size
         self.apply_rmsnorm = cfg.apply_rmsnorm
-        self.layernorm_eps = cfg.layernorm_eps
         self.rmsnorm_eps = cfg.rmsnorm_eps
         self.recompute_logits = cfg.recompute_logits
 
         norm_cls = GroupRMSNorm if cfg.apply_rmsnorm else GroupLayerNorm
-        norm_eps = cfg.rmsnorm_eps if self.apply_rmsnorm else cfg.layernorm_eps
+        self.norm_eps = (cfg.rmsnorm_eps if self.apply_rmsnorm else cfg.layernorm_eps) * cfg.stream_eps_scale
         self.final_norm = norm_cls(
             cfg.model_dim,
             num_groups=cfg.layernorm_num_groups,
             elementwise_affine=cfg.norm_affine,
-            eps=norm_eps,
+            eps=self.norm_eps,
             memory_efficient=cfg.memory_efficient_norm
         )
 
@@ -78,7 +77,7 @@ class TransformerOutputLayer(nn.Module):
                 self.final_norm.bias,
                 self.final_norm.groups_per_partition,
                 self.output.weight,
-                self.layernorm_eps,
+                self.norm_eps,
                 self.rmsnorm_eps,
                 self.apply_rmsnorm,
                 self.final_norm.gather_input,
@@ -143,7 +142,7 @@ class GekkoOutputLayer(nn.Module):
 
         self.final_norm = TimestepDecayNorm(
             self.model_dim, cfg.timenorm_num_groups, cfg.timenorm_beta1, cfg.timenorm_beta2,
-            eps=cfg.timenorm_eps, backend=cfg.timenorm_backend,
+            eps=cfg.timenorm_eps * cfg.stream_eps_scale, backend=cfg.timenorm_backend,
             memory_efficient=cfg.memory_efficient_norm
         )
 

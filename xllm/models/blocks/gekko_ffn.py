@@ -25,8 +25,6 @@ class GekkoBlock(nn.Module):
         self.recompute_fc1_out = cfg.recompute_fc1_out
         self.recompute_fc3_out = cfg.recompute_fc3_out
         self.apply_rmsnorm = cfg.apply_rmsnorm
-        self.timenorm_eps = cfg.timenorm_eps
-        self.layernorm_eps = cfg.layernorm_eps
         self.rmsnorm_eps = cfg.rmsnorm_eps
 
         self.gda = GatedDeltaAttention(
@@ -61,6 +59,7 @@ class GekkoBlock(nn.Module):
             residual_heads=cfg.residual_heads,
             init_mode=cfg.init_mode,
             init_std=cfg.init_std,
+            stream_eps_scale=cfg.stream_eps_scale,
         )
 
         self.nffn = NormalizedFeedForwardNetwork(
@@ -80,6 +79,7 @@ class GekkoBlock(nn.Module):
             residual_heads=cfg.residual_heads,
             init_mode=cfg.init_mode,
             init_std=cfg.init_std,
+            stream_eps_scale=cfg.stream_eps_scale,
         )
 
     def forward(
@@ -149,8 +149,8 @@ class GekkoBlock(nn.Module):
                 self.gda.attention_dropout,
                 self.gda.hidden_dropout,
                 self.nffn.swiglu,
-                self.timenorm_eps,
-                self.layernorm_eps,
+                self.gda.timenorm.eps,
+                self.nffn.norm_eps,
                 self.rmsnorm_eps,
                 self.apply_rmsnorm,
                 self.residual_func,

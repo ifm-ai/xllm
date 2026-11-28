@@ -81,6 +81,7 @@ class MOVAttention(nn.Module):
         residual_heads: Optional[int] = None,
         init_mode: str = 'he',
         init_std: Optional[float] = None,
+        stream_eps_scale: float = 1.0,  # embed_multiplier^2: scales eps of norms that read the residual stream
     ):
         super().__init__()
         self.layer_id = layer_id
@@ -117,12 +118,12 @@ class MOVAttention(nn.Module):
         self.init_std = init_std
 
         norm_cls = GroupRMSNorm if apply_rmsnorm else GroupLayerNorm
-        norm_eps = rmsnorm_eps if apply_rmsnorm else layernorm_eps
+        self.norm_eps = (rmsnorm_eps if apply_rmsnorm else layernorm_eps) * stream_eps_scale
         self.norm = norm_cls(
             mdim,
             num_groups=norm_num_groups,
             elementwise_affine=norm_affine,
-            eps=norm_eps,
+            eps=self.norm_eps,
             memory_efficient=memory_efficient_norm
         )
 
@@ -260,7 +261,7 @@ class MOVAttention(nn.Module):
 
         self.residual = build_residual(
             residual_func, 2 * layer_id + 1, mdim, num_heads=residual_heads,
-            num_features=self.n_heads * self.head_dim, eps=rmsnorm_eps, init_std=init_std
+            num_features=self.n_heads * self.head_dim, eps=rmsnorm_eps * stream_eps_scale, init_std=init_std
         )
 
         # Muon (xllm/optim/muon.py): one Newton-Schulz block per head (each of a kv head's two softdelta
