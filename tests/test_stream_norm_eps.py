@@ -150,11 +150,11 @@ def test_stream_vs_inbranch_norm_eps(base, norm):
 
     for layer in model.layers:
         if hasattr(layer, "gda"):
-            assert math.isclose(layer.gda.timenorm.eps, want_time, rel_tol=1e-12)
-            assert math.isclose(layer.gda.query_norm.eps, cfg.rmsnorm_eps, rel_tol=1e-12)
-            assert math.isclose(layer.gda.key_norm.eps, cfg.rmsnorm_eps, rel_tol=1e-12)
-            assert math.isclose(layer.gda.attn_norm.eps, cfg.rmsnorm_eps, rel_tol=1e-12)
-            assert math.isclose(layer.gda.adaptive_working_memory.eps, cfg.rmsnorm_eps, rel_tol=1e-12)
+            assert math.isclose(layer.gca.timenorm.eps, want_time, rel_tol=1e-12)
+            assert math.isclose(layer.gca.query_norm.eps, cfg.rmsnorm_eps, rel_tol=1e-12)
+            assert math.isclose(layer.gca.key_norm.eps, cfg.rmsnorm_eps, rel_tol=1e-12)
+            assert math.isclose(layer.gca.attn_norm.eps, cfg.rmsnorm_eps, rel_tol=1e-12)
+            assert math.isclose(layer.gca.adaptive_working_memory.eps, cfg.rmsnorm_eps, rel_tol=1e-12)
         if hasattr(layer, "attention"):
             assert math.isclose(layer.attention.norm.eps, want_norm, rel_tol=1e-12)
             assert math.isclose(layer.attention.norm_eps, want_norm, rel_tol=1e-12)

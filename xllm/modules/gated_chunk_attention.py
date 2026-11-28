@@ -40,9 +40,9 @@ from xllm.optim.muon_spec import register_muon
 from xllm.optim.roles import register_role
 
 
-class GatedDeltaAttention(nn.Module):
-    """Gated Delta Attention.
-    See "" for more details.
+class GatedChunkAttention(nn.Module):
+    """
+        Gated Chunk Attention: gated sliding chunk attention with AWM
     """
 
     def __init__(

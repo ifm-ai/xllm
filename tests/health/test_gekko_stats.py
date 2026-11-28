@@ -242,7 +242,7 @@ def test_gekko_weight_norms_cover_every_present_parameter(monkeypatch, backend, 
 @pytest.mark.usefixtures("single_process_group")
 def test_a_missing_required_gekko_parameter_is_an_error(monkeypatch):
     block = _gekko_block()
-    block.gda.q_conv.register_parameter("weight", None)
+    block.gca.q_conv.register_parameter("weight", None)
 
     with pytest.raises(RuntimeError, match="Expected 16 matrix parameters for layer 0, found 15"):
         _weight_norms(_shard_block(block, "fsdp2", monkeypatch))

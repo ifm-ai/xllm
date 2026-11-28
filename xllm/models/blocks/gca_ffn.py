@@ -3,7 +3,7 @@ from torch import Tensor
 from torch import nn
 
 from xllm.modules import (
-    GatedDeltaAttention,
+    GatedChunkAttention,
     NormalizedFeedForwardNetwork,
 )
 from xllm.modules.residual import num_params_in_residual
@@ -27,7 +27,7 @@ class GekkoBlock(nn.Module):
         self.apply_rmsnorm = cfg.apply_rmsnorm
         self.rmsnorm_eps = cfg.rmsnorm_eps
 
-        self.gda = GatedDeltaAttention(
+        self.gca = GatedChunkAttention(
             layer_id=layer_id,
             mdim=cfg.model_dim,
             n_heads=cfg.num_heads,
@@ -106,50 +106,50 @@ class GekkoBlock(nn.Module):
                 bos_mask,
                 segment_idx,
                 prev_segment_count,
-                self.gda.timenorm.weight,
-                self.gda.timenorm.bias,
-                self.gda.timenorm.prior_count,
-                self.gda.timenorm.prior_mean,
-                self.gda.timenorm.prior_var,
-                self.gda.timenorm.groups_per_partition,
-                self.gda.timenorm.beta1,
-                self.gda.timenorm.beta2,
-                self.gda.timenorm_backend,
-                self.gda.wq.weight,
-                self.gda.wk.weight,
-                self.gda.wv.weight,
-                self.gda.wv.bias,
-                self.gda.wr.weight,
-                self.gda.wr.bias,
-                self.gda.wo.weight,
-                self.gda.q_conv.weight,
-                self.gda.k_conv.weight,
-                self.gda.v_conv.weight,
-                self.gda.causal_conv_backend,
-                self.gda.q_conv.normalize_weight,
-                self.gda.query_norm.weight,
-                self.gda.key_norm.weight,
-                self.gda.local_heads,
-                self.gda.local_kv_heads,
-                self.gda.chunk_size,
-                self.gda.head_dim,
-                self.gda.v_head_dim,
-                self.gda.rope_head_dim,
-                self.gda.attn_act_func,
-                self.gda.attn_gate_fn,
-                self.gda.sca_backend,
-                self.gda.awm_orthogonal_update,
+                self.gca.timenorm.weight,
+                self.gca.timenorm.bias,
+                self.gca.timenorm.prior_count,
+                self.gca.timenorm.prior_mean,
+                self.gca.timenorm.prior_var,
+                self.gca.timenorm.groups_per_partition,
+                self.gca.timenorm.beta1,
+                self.gca.timenorm.beta2,
+                self.gca.timenorm_backend,
+                self.gca.wq.weight,
+                self.gca.wk.weight,
+                self.gca.wv.weight,
+                self.gca.wv.bias,
+                self.gca.wr.weight,
+                self.gca.wr.bias,
+                self.gca.wo.weight,
+                self.gca.q_conv.weight,
+                self.gca.k_conv.weight,
+                self.gca.v_conv.weight,
+                self.gca.causal_conv_backend,
+                self.gca.q_conv.normalize_weight,
+                self.gca.query_norm.weight,
+                self.gca.key_norm.weight,
+                self.gca.local_heads,
+                self.gca.local_kv_heads,
+                self.gca.chunk_size,
+                self.gca.head_dim,
+                self.gca.v_head_dim,
+                self.gca.rope_head_dim,
+                self.gca.attn_act_func,
+                self.gca.attn_gate_fn,
+                self.gca.sca_backend,
+                self.gca.awm_orthogonal_update,
                 self.nffn.norm.weight,
                 self.nffn.norm.bias,
                 self.nffn.norm.groups_per_partition,
                 self.nffn.fc1.weight,
                 self.nffn.fc2.weight,
                 self.nffn.fc3.weight if self.nffn.swiglu else None,
-                self.gda.dropout,
-                self.gda.attention_dropout,
-                self.gda.hidden_dropout,
+                self.gca.dropout,
+                self.gca.attention_dropout,
+                self.gca.hidden_dropout,
                 self.nffn.swiglu,
-                self.gda.timenorm.eps,
+                self.gca.timenorm.eps,
                 self.nffn.norm.eps,
                 self.rmsnorm_eps,
                 self.apply_rmsnorm,
@@ -165,27 +165,27 @@ class GekkoBlock(nn.Module):
                 self.recompute_fc3_out,
             )
 
-        y, cache = self.gda(
+        y, cache = self.gca(
             x, freqs_cis, bos_mask, segment_idx, prev_segment_count, attn_stability_control, deterministic, cache
         )
         out = self.nffn(y)
         return out, None, cache
 
     def num_parameters(self):
-        model_dim = self.gda.mdim
-        head_dim = self.gda.head_dim
-        v_head_dim = self.gda.v_head_dim
-        n_heads = self.gda.num_heads
-        n_kv_heads = self.gda.num_kv_heads
-        apply_bias_term = self.gda.apply_bias_term
-        conv_width = self.gda.q_conv.kernel_size
-        attn_act_func = self.gda.attn_act_func
+        model_dim = self.gca.mdim
+        head_dim = self.gca.head_dim
+        v_head_dim = self.gca.v_head_dim
+        n_heads = self.gca.num_heads
+        n_kv_heads = self.gca.num_kv_heads
+        apply_bias_term = self.gca.apply_bias_term
+        conv_width = self.gca.q_conv.kernel_size
+        attn_act_func = self.gca.attn_act_func
         ffn_hidden_dim = self.nffn.hidden_dim
         swiglu = self.nffn.swiglu
         # GDA
         gda_params = model_dim * (n_heads + n_kv_heads) * (head_dim + v_head_dim)
         # AWM forget gate
-        if self.gda.forget_gate:
+        if self.gca.forget_gate:
             gda_params += (model_dim + 2) * n_kv_heads * head_dim
         # out proj
         gda_params += model_dim * n_heads * v_head_dim
@@ -210,14 +210,14 @@ class GekkoBlock(nn.Module):
         return total_params, activated_params
 
     def tflops_per_token(self, seq_len: int):
-        chunk_size = self.gda.chunk_size
-        model_dim = self.gda.mdim
-        head_dim = self.gda.head_dim
-        v_head_dim = self.gda.v_head_dim
-        n_heads = self.gda.num_heads
-        n_kv_heads = self.gda.num_kv_heads
-        conv_width = self.gda.q_conv.kernel_size
-        attn_act_func = self.gda.attn_act_func
+        chunk_size = self.gca.chunk_size
+        model_dim = self.gca.mdim
+        head_dim = self.gca.head_dim
+        v_head_dim = self.gca.v_head_dim
+        n_heads = self.gca.num_heads
+        n_kv_heads = self.gca.num_kv_heads
+        conv_width = self.gca.q_conv.kernel_size
+        attn_act_func = self.gca.attn_act_func
 
         qdim = n_heads * head_dim
         kdim = n_kv_heads * head_dim

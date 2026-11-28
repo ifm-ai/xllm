@@ -3,7 +3,7 @@ from .rms_norm import GroupRMSNorm
 from .normalized_feedforward_network import NormalizedFeedForwardNetwork
 from .rotary_positional_embedding import RotaryEmbedding, apply_rotary_embeddings
 from .moving_average_gated_attention import MovingAverageGatedAttention
-from .gated_delta_attention import GatedDeltaAttention
+from .gated_chunk_attention import GatedChunkAttention
 from .timestep_norm import TimestepNorm
 from .timestep_decay_norm import TimestepDecayNorm
 from .multihead_attention import MultiheadAttention
@@ -14,7 +14,7 @@ __all__ = [
     "GroupLayerNorm",
     "GroupRMSNorm",
     "MovingAverageGatedAttention",
-    "GatedDeltaAttention",
+    "GatedChunkAttention",
     "NormalizedFeedForwardNetwork",
     "MOVAttention",
     "NormalizedMoE",
