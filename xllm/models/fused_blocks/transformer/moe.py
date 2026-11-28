@@ -81,7 +81,7 @@ class TransformerMoEBlockFunction(torch.autograd.Function):
         dropout: float,
         attention_dropout: float,
         hidden_dropout: float,
-        stream_norm_eps: float,  # the eps of the norms that read the residual stream
+        stream_norm_eps: float,
         rmsnorm_eps: float,
         apply_rmsnorm: bool,
         gather_before_norm: bool,
@@ -114,7 +114,9 @@ class TransformerMoEBlockFunction(torch.autograd.Function):
             if moe_norm_b is not None:
                 moe_norm_b, handle_moe_norm_b = all_gather(moe_norm_b, parallel_region='model', async_op=True)
 
-        mx, _, _ = layer_or_rmsnorm_fwd(x_, attn_norm_w, attn_norm_b, norm_local_groups, stream_norm_eps, stream_norm_eps, apply_rmsnorm)
+        mx, _, _ = layer_or_rmsnorm_fwd(
+            x_, attn_norm_w, attn_norm_b, norm_local_groups, stream_norm_eps, apply_rmsnorm
+        )
         if not gather_before_norm:
             mx, _ = all_gather(mx, parallel_region='model', async_op=False)
 
@@ -156,7 +158,9 @@ class TransformerMoEBlockFunction(torch.autograd.Function):
                 handle_moe_norm_b.wait()
                 moe_norm_b = reshape_gathered_tensor_along_specific_dim(moe_norm_b, gather_dim=0)
 
-        xf, _, _ = layer_or_rmsnorm_fwd(xo_, moe_norm_w, moe_norm_b, norm_local_groups, stream_norm_eps, stream_norm_eps, apply_rmsnorm)
+        xf, _, _ = layer_or_rmsnorm_fwd(
+            xo_, moe_norm_w, moe_norm_b, norm_local_groups, stream_norm_eps, apply_rmsnorm
+        )
         if gather_before_norm:
             xf = scatter(xf, parallel_region='model')
 
@@ -379,7 +383,7 @@ class TransformerMoEBlockFunction(torch.autograd.Function):
             x_, handle_x = all_gather(x, parallel_region='model', async_op=True)
 
         xf, xo_mean, xo_invvar = layer_or_rmsnorm_fwd(
-            xo_, moe_norm_w, moe_norm_b, norm_local_groups, stream_norm_eps, stream_norm_eps, apply_rmsnorm
+            xo_, moe_norm_w, moe_norm_b, norm_local_groups, stream_norm_eps, apply_rmsnorm
         )
         if gather_before_norm:
             xf = scatter(xf, parallel_region='model')
@@ -394,7 +398,7 @@ class TransformerMoEBlockFunction(torch.autograd.Function):
 
         # recompute mx
         mx, x_mean, x_invvar = layer_or_rmsnorm_fwd(
-            x_, attn_norm_w, attn_norm_b, norm_local_groups, stream_norm_eps, stream_norm_eps, apply_rmsnorm
+            x_, attn_norm_w, attn_norm_b, norm_local_groups, stream_norm_eps, apply_rmsnorm
         )
         if not gather_before_norm:
             mx, handle_mx = all_gather(mx, parallel_region='model', async_op=True)

@@ -36,16 +36,15 @@ class TransformerOutputLayer(nn.Module):
         self.model_dim = cfg.model_dim
         self.output_size = cfg.vocab_size
         self.apply_rmsnorm = cfg.apply_rmsnorm
-        self.rmsnorm_eps = cfg.rmsnorm_eps
         self.recompute_logits = cfg.recompute_logits
 
         norm_cls = GroupRMSNorm if cfg.apply_rmsnorm else GroupLayerNorm
-        self.norm_eps = (cfg.rmsnorm_eps if self.apply_rmsnorm else cfg.layernorm_eps) * cfg.stream_eps_scale
+        norm_eps = (cfg.rmsnorm_eps if self.apply_rmsnorm else cfg.layernorm_eps) * cfg.stream_eps_scale
         self.final_norm = norm_cls(
             cfg.model_dim,
             num_groups=cfg.layernorm_num_groups,
             elementwise_affine=cfg.norm_affine,
-            eps=self.norm_eps,
+            eps=norm_eps,
             memory_efficient=cfg.memory_efficient_norm
         )
 
@@ -77,8 +76,7 @@ class TransformerOutputLayer(nn.Module):
                 self.final_norm.bias,
                 self.final_norm.groups_per_partition,
                 self.output.weight,
-                self.norm_eps,
-                self.rmsnorm_eps,
+                self.final_norm.eps,
                 self.apply_rmsnorm,
                 self.final_norm.gather_input,
                 self.recompute_logits,

@@ -125,7 +125,7 @@ class GekkoBlockFunction(torch.autograd.Function):
         hidden_dropout: float,
         swiglu: bool,
         timenorm_eps: float,
-        ffn_norm_eps: float,  # the FFN pre-norm's eps (LayerNorm or RMSNorm)
+        ffn_norm_eps: float,
         rmsnorm_eps: float,
         apply_rmsnorm: bool,
         residual_func: str,
@@ -398,7 +398,9 @@ class GekkoBlockFunction(torch.autograd.Function):
             handle8.wait()
             handle9.wait()
 
-        xf, _, _ = layer_or_rmsnorm_fwd(xo, ffn_norm_w, ffn_norm_b, ffn_norm_local_groups, ffn_norm_eps, ffn_norm_eps, apply_rmsnorm)
+        xf, _, _ = layer_or_rmsnorm_fwd(
+            xo, ffn_norm_w, ffn_norm_b, ffn_norm_local_groups, ffn_norm_eps, apply_rmsnorm
+        )
 
         # FFN & SwiGLU
         xf, _ = all_gather(xf, parallel_region='model', async_op=False)
@@ -605,7 +607,7 @@ class GekkoBlockFunction(torch.autograd.Function):
 
         # recompute xf
         xf, xo_mean, xo_invvar = layer_or_rmsnorm_fwd(
-            xo, ffn_norm_w, ffn_norm_b, ffn_norm_local_groups, ffn_norm_eps, ffn_norm_eps, apply_rmsnorm
+            xo, ffn_norm_w, ffn_norm_b, ffn_norm_local_groups, ffn_norm_eps, apply_rmsnorm
         )
         xf, handle_xf = all_gather(xf, parallel_region='model', async_op=True)
 

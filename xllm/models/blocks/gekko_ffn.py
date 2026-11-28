@@ -53,13 +53,13 @@ class GekkoBlock(nn.Module):
             timenorm_backend=cfg.timenorm_backend,
             timenorm_eps=cfg.timenorm_eps,
             rmsnorm_eps=cfg.rmsnorm_eps,
+            stream_eps_scale=cfg.stream_eps_scale,
             apply_bias_term=cfg.apply_bias_term,
             memory_efficient_norm=cfg.memory_efficient_norm,
             residual_func=cfg.residual_func,
             residual_heads=cfg.residual_heads,
             init_mode=cfg.init_mode,
             init_std=cfg.init_std,
-            stream_eps_scale=cfg.stream_eps_scale,
         )
 
         self.nffn = NormalizedFeedForwardNetwork(
@@ -73,13 +73,13 @@ class GekkoBlock(nn.Module):
             norm_affine=cfg.norm_affine,
             layernorm_eps=cfg.layernorm_eps,
             rmsnorm_eps=cfg.rmsnorm_eps,
+            stream_eps_scale=cfg.stream_eps_scale,
             apply_rmsnorm=cfg.apply_rmsnorm,
             memory_efficient_norm=cfg.memory_efficient_norm,
             residual_func=cfg.residual_func,
             residual_heads=cfg.residual_heads,
             init_mode=cfg.init_mode,
             init_std=cfg.init_std,
-            stream_eps_scale=cfg.stream_eps_scale,
         )
 
     def forward(
@@ -150,7 +150,7 @@ class GekkoBlock(nn.Module):
                 self.gda.hidden_dropout,
                 self.nffn.swiglu,
                 self.gda.timenorm.eps,
-                self.nffn.norm_eps,
+                self.nffn.norm.eps,
                 self.rmsnorm_eps,
                 self.apply_rmsnorm,
                 self.residual_func,

@@ -71,13 +71,13 @@ class GatedDeltaAttention(nn.Module):
         timenorm_backend: str = 'cub',
         timenorm_eps: float = 1e-5,
         rmsnorm_eps: float = 1e-6,
+        stream_eps_scale: float = 1.0,
         apply_bias_term: bool = False,
         memory_efficient_norm: bool = False,
         residual_func: str = 'base',
         residual_heads: Optional[int] = None,
         init_mode: str = 'he',
         init_std: Optional[float] = None,
-        stream_eps_scale: float = 1.0,  # embed_multiplier^2: scales eps of norms that read the residual stream
     ):
         super().__init__()
         self.layer_id = layer_id
