@@ -8,10 +8,10 @@ from xllm.modules import (
 )
 from xllm.modules.residual import num_params_in_residual
 from xllm.config import ModelConf
-from xllm.models.fused_blocks import GekkoGCABlockFunction
+from xllm.models.fused_blocks import GCABlockFunction
 
 
-class GekkoGCABlock(nn.Module):
+class GCABlock(nn.Module):
     def __init__(self, cfg: ModelConf, layer_id: int):
         super().__init__()
         self.layer_id = layer_id
@@ -98,7 +98,7 @@ class GekkoGCABlock(nn.Module):
                               Tensor]] = None,
     ) -> Tuple[Tensor, Optional[Tensor], Optional[Any]]:
         if self.fused_block and self.training:
-            fn = GekkoGCABlockFunction
+            fn = GCABlockFunction
             return fn.apply(
                 self.layer_id,
                 x,

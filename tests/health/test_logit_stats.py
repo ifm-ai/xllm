@@ -6,7 +6,7 @@ import torch
 import torch.nn.functional as F
 
 import xllm.models.fused_blocks.cross_entropy as cross_entropy
-import xllm.models.fused_blocks.gekko.gekko as gekko_fused
+import xllm.models.fused_blocks.gekko.gca as gekko_fused
 import xllm.models.fused_blocks.transformer.transformer as transformer_fused
 from tests.health.helpers import (
     MASK, TARGETS, TOKENS, logged_metrics, make_layers_identity, set_embeddings, stats, tiny_transformer,

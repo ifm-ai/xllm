@@ -8,7 +8,7 @@ from tests.health.helpers import stats
 from xllm.config import ModelConf
 from xllm.distributed import FullyShardedDataParallel
 from xllm.health_metrics import HealthMetricCollector
-from xllm.models.gekko import GekkoGCABlock
+from xllm.models.gekko import GCABlock
 
 # The Gekko hooks run inside fused CUDA kernels, so the statistics tests feed the collector exactly the
 # tensors the hooks pass, shaped (batch, seq, heads, head_dim); the norm tests use a real GekkoBlock.
@@ -192,14 +192,14 @@ def _gekko_block(**overrides):
     )
     cfg.update(overrides)
     torch.manual_seed(0)
-    return GekkoGCABlock(ModelConf(**cfg), layer_id=0)
+    return GCABlock(ModelConf(**cfg), layer_id=0)
 
 
 def _shard_block(block, backend, monkeypatch):
     """Shard one decoder layer. FSDP1 builds its handles on the first forward, so run an identity one."""
     if backend == "fsdp1":
         wrapped = FullyShardedDataParallel(block, device_id=torch.device("cpu"))
-        monkeypatch.setattr(GekkoGCABlock, "forward", lambda self, x, *args, **kwargs: (x, None, None))
+        monkeypatch.setattr(GCABlock, "forward", lambda self, x, *args, **kwargs: (x, None, None))
         wrapped(torch.zeros(1, 4, 8))
         return wrapped
     from torch.distributed.device_mesh import init_device_mesh

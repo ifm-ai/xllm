@@ -149,7 +149,7 @@ def check_model_blocks():
     wo / FFN whole; experts one per expert, shared experts whole."""
     import dataclasses
     from xllm.configuration import ConfStore
-    from xllm.models.gekko import GekkoGCABlock
+    from xllm.models.gekko import GCABlock
     from xllm.models.transformer import TransformerBlock, TransformerMoEBlock
 
     def expected(parent, attr, shape):
@@ -165,8 +165,8 @@ def check_model_blocks():
     # (config, block, overrides, registered weights: the marked ones, plus experts and shared experts)
     # softdelta (ifm #58): no wg; the transformer gets a wr (the per-head forget logits)
     cases = [("k2-horizon-0.9B", TransformerBlock, {}, 7), ("k2-horizon-0.9B", TransformerBlock, {"attn_act_func": "softdelta"}, 8),
-             ("gekko-0.9B", GekkoGCABlock, {}, 8), ("gekko-0.9B", GekkoGCABlock, {"attn_act_func": "softdelta"}, 8),
-             ("gekko-4B", GekkoGCABlock, {}, 8), ("k2-horizon-moe-36B-a4B", TransformerMoEBlock, {}, 11)]
+             ("gekko-0.9B", GCABlock, {}, 8), ("gekko-0.9B", GCABlock, {"attn_act_func": "softdelta"}, 8),
+             ("gekko-4B", GCABlock, {}, 8), ("k2-horizon-moe-36B-a4B", TransformerMoEBlock, {}, 11)]
     for name, cls, overrides, n_registered in cases:
         block = cls(dataclasses.replace(ConfStore[name], **overrides), layer_id=0)
         checked = []

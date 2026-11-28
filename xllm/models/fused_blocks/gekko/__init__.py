@@ -1,4 +1,4 @@
-from .gekko import (
-    GekkoGCABlockFunction,
+from .gca import (
+    GCABlockFunction,
     GekkoOutputLayerFunction
 )
