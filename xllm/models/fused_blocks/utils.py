@@ -336,15 +336,14 @@ def layer_or_rmsnorm_fwd(
     weight: Optional[Tensor],
     bias: Optional[Tensor],
     num_groups: int,
-    layernorm_eps: float,
-    rmsnorm_eps: float,
+    eps: float,
     apply_rmsnorm: bool,
 ) -> Tuple[Tensor, Tensor, Optional[Tensor]]:
     if apply_rmsnorm:
         x_mean = None
-        y, x_invvar = rmsnorm_fwd(x, weight, num_groups, rmsnorm_eps)
+        y, x_invvar = rmsnorm_fwd(x, weight, num_groups, eps)
     else:
-        y, x_mean, x_invvar = layernorm_fwd(x, weight, bias, num_groups, layernorm_eps)
+        y, x_mean, x_invvar = layernorm_fwd(x, weight, bias, num_groups, eps)
 
     return y, x_mean, x_invvar
 

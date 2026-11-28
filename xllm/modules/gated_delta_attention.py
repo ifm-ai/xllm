@@ -71,6 +71,7 @@ class GatedDeltaAttention(nn.Module):
         timenorm_backend: str = 'cub',
         timenorm_eps: float = 1e-5,
         rmsnorm_eps: float = 1e-6,
+        stream_eps_scale: float = 1.0,
         apply_bias_term: bool = False,
         memory_efficient_norm: bool = False,
         residual_func: str = 'base',
@@ -118,7 +119,7 @@ class GatedDeltaAttention(nn.Module):
 
         self.timenorm = TimestepDecayNorm(
             mdim, timenorm_num_groups, timenorm_beta1, timenorm_beta2,
-            eps=timenorm_eps, backend=timenorm_backend,
+            eps=timenorm_eps * stream_eps_scale, backend=timenorm_backend,
             memory_efficient=memory_efficient_norm
         )
 
@@ -267,7 +268,7 @@ class GatedDeltaAttention(nn.Module):
 
         self.residual = build_residual(
             residual_func, 2 * layer_id + 1, mdim, num_heads=residual_heads,
-            num_features=hdim, eps=rmsnorm_eps, init_std=init_std
+            num_features=hdim, eps=rmsnorm_eps * stream_eps_scale, init_std=init_std
         )
 
         # Muon (xllm/optim/muon.py): one Newton-Schulz block per head (each of a kv head's two softdelta

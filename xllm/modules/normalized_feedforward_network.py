@@ -29,6 +29,7 @@ class NormalizedFeedForwardNetwork(nn.Module):
         norm_affine: bool = True,
         layernorm_eps: float = 1e-5,
         rmsnorm_eps: float = 1e-6,
+        stream_eps_scale: float = 1.0,
         memory_efficient_norm: bool = False,
         apply_rmsnorm: bool = False,
         residual_func: str = 'base',
@@ -48,7 +49,7 @@ class NormalizedFeedForwardNetwork(nn.Module):
         self.init_std = init_std
 
         norm_cls = GroupRMSNorm if apply_rmsnorm else GroupLayerNorm
-        norm_eps = rmsnorm_eps if apply_rmsnorm else layernorm_eps
+        norm_eps = (rmsnorm_eps if apply_rmsnorm else layernorm_eps) * stream_eps_scale
         self.norm = norm_cls(
             model_dim,
             num_groups=norm_num_groups,
@@ -87,7 +88,7 @@ class NormalizedFeedForwardNetwork(nn.Module):
 
         self.residual = build_residual(
             residual_func, 2 * layer_id + 2, model_dim, num_heads=residual_heads,
-            num_features=ffn_hidden_dim, eps=rmsnorm_eps, init_std=init_std
+            num_features=ffn_hidden_dim, eps=rmsnorm_eps * stream_eps_scale, init_std=init_std
         )
 
         for fc, tp_dim in ((self.fc1, 0), (self.fc2, 1), (self.fc3, 0)):  # column, row, column parallel

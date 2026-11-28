@@ -3,6 +3,7 @@ from logging import getLogger
 from typing import Optional
 from pathlib import Path
 from typing import List, Dict
+import math
 import os
 import json
 
@@ -206,7 +207,10 @@ class ModelConf(Config):
     attention_dropout: float = 0.0  # Dropout rate for attention weights after softmax.
 
     swiglu: bool = False  # Whether to use SwiGLU in dense FFN. Otherwise uses SiLU.
-    embed_multiplier: float = 1.0  # Multiplier on the embedding output (the former scale_emb: sqrt(model_dim)).
+    # Multiplier on the embedding output (the former scale_emb: sqrt(model_dim)). Norms that read the residual stream
+    # automatically scale their eps by embed_multiplier^2 so this is an exact reparameterization of scaling every
+    # branch output by 1 / embed_multiplier.
+    embed_multiplier: float = 1.0
     layerwise_ckpt: bool = False  # Whether to enable activation checkpointing for each layer to save memory by recomputing forward during backprop.
 
     fused_block: bool = False  # Whether to use custom fused forward/backward implementations for training blocks; incompatible with layerwise_ckpt.
@@ -229,10 +233,14 @@ class ModelConf(Config):
         layers = [int(layer_id) for layer_id in self.full_attn_layer_list.split(',')]
         return layers
 
+    @property
+    def stream_eps_scale(self) -> float:
+        return self.embed_multiplier * self.embed_multiplier
+
     def __post_init__(self):
         assert self.arch in ['transformer', 'gekko', 'hybrid']
         assert self.ddp_backend in ['fsdp1', 'fsdp2']
-        assert self.embed_multiplier > 0 and self.embed_multiplier != float('inf'), \
+        assert self.embed_multiplier > 0 and math.isfinite(self.stream_eps_scale), \
             f'model.embed_multiplier must be finite and > 0, got {self.embed_multiplier}'
 
         assert self.causal_attn_backend in [None, "swift", "flash", 'xattn']

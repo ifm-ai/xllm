@@ -29,7 +29,6 @@ class TransformerMoEBlock(nn.Module):
         self.apply_nope = cfg.apply_nope_in_causal_attn
         self.apply_causal_conv = cfg.apply_conv_in_causal_attn
         self.apply_rmsnorm = cfg.apply_rmsnorm
-        self.layernorm_eps = cfg.layernorm_eps
         self.rmsnorm_eps = cfg.rmsnorm_eps
 
         if self.fused_block:
@@ -53,6 +52,7 @@ class TransformerMoEBlock(nn.Module):
             norm_affine=cfg.norm_affine,
             layernorm_eps=cfg.layernorm_eps,
             rmsnorm_eps=cfg.rmsnorm_eps,
+            stream_eps_scale=cfg.stream_eps_scale,
             memory_efficient_norm=cfg.memory_efficient_norm,
             apply_rmsnorm=cfg.apply_rmsnorm,
             apply_attn_gate=cfg.apply_attn_gate,
@@ -86,12 +86,13 @@ class TransformerMoEBlock(nn.Module):
             norm_affine=cfg.norm_affine,
             layernorm_eps=cfg.layernorm_eps,
             rmsnorm_eps=cfg.rmsnorm_eps,
+            stream_eps_scale=cfg.stream_eps_scale,
             memory_efficient_norm=cfg.memory_efficient_norm,
             apply_rmsnorm=cfg.apply_rmsnorm,
             residual_func=cfg.residual_func,
             residual_heads=cfg.residual_heads,
             init_mode=cfg.init_mode,
-            init_std=cfg.init_std
+            init_std=cfg.init_std,
         )
 
     def forward(
@@ -157,7 +158,7 @@ class TransformerMoEBlock(nn.Module):
                 self.dropout,
                 self.attention.attention_dropout,
                 self.attention.hidden_dropout,
-                self.layernorm_eps,
+                self.moe.norm.eps,
                 self.rmsnorm_eps,
                 self.apply_rmsnorm,
                 self.attention.norm.gather_input,
