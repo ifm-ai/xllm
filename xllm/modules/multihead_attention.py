@@ -33,6 +33,7 @@ from xllm.modules.fused_ops import (
 )
 from xllm.utils import get_init_fn
 from xllm.optim.muon_spec import register_muon
+from xllm.optim.roles import register_role
 
 
 class MultiheadAttention(nn.Module):
@@ -249,6 +250,12 @@ class MultiheadAttention(nn.Module):
         if self.wr is not None:
             register_muon(self.wr, layout="(h d) m", fan_out="d", fan_in="m", d=rdim // self.n_heads, tp_dim=0)
         register_muon(self.wo, tp_dim=1)
+
+        # roles (xllm/optim/roles.py): the matrices are Muon's and carry no role (optim.muon's values)
+        for module in (self.norm, self.query_norm, self.key_norm, self.q_conv, self.k_conv, self.v_conv):
+            if module is not None:
+                register_role(module, "weight", "hidden_vector")
+                register_role(module, "bias", "hidden_vector")
 
     def _receive_prev_tensors(self, x):
         bsz, seq_len, _ = x.size()
