@@ -25,7 +25,7 @@ from xllm.models.blocks import (
     TransformerBlock,
     TransformerMoEBlock,
     TransformerMoVABlock,
-    GekkoBlock,
+    GekkoGCABlock,
     GekkoOutputLayer
 )
 from xllm.models.transformer import Transformer
@@ -78,7 +78,7 @@ class HybridGekko(XLLModel):
             block_cls = TransformerBlock if layer_id < self.num_dense_layers else \
                 (TransformerMoVABlock if self.num_values > 0 else TransformerMoEBlock)
         else:
-            block_cls = GekkoBlock
+            block_cls = GekkoGCABlock
         return block_cls
 
     def forward(

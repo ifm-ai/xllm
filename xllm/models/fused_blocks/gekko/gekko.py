@@ -67,7 +67,7 @@ from xllm.models.fused_blocks.distributed import (
 )
 
 
-class GekkoBlockFunction(torch.autograd.Function):
+class GekkoGCABlockFunction(torch.autograd.Function):
     """
 
     """

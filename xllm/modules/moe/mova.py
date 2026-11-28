@@ -276,6 +276,7 @@ class MOVAttention(nn.Module):
         if self.wr is not None:
             register_muon(self.wr, layout="(h d) m", fan_out="d", fan_in="m", d=rdim // self.n_heads, tp_dim=0)
         register_muon(self.wo, tp_dim=1)
+        # TODO: register role
 
     def _receive_prev_tensors(self, x):
         bsz, seq_len, _ = x.size()

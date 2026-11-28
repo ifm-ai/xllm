@@ -22,7 +22,7 @@ from xllm.modules.utils import (
 )
 from xllm.models.xllm import XLLModel
 from xllm.models.blocks import (
-    GekkoBlock,
+    GekkoGCABlock,
     GekkoOutputLayer,
 )
 from xllm.utils import get_init_fn
@@ -62,7 +62,7 @@ class Gekko(XLLModel):
 
         self.layers = nn.ModuleList()
         for layer_id in range(self.num_layers):
-            layer = GekkoBlock(cfg, layer_id)
+            layer = GekkoGCABlock(cfg, layer_id)
             self.layers.append(wrap(layer))
 
         self.output = wrap(GekkoOutputLayer(cfg))

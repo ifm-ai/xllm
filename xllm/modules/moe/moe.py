@@ -147,6 +147,7 @@ class NormalizedMoE(nn.Module):
         for fc, tp_dim in ((self.fc1, 1), (self.fc2, 0), (self.fc3, 1)):  # row, column, row parallel
             if fc is not None:
                 register_muon(fc, tp_dim=tp_dim)  # Muon, shared experts as whole matrices (xllm/optim/muon.py)
+        # TODO: register role
 
     def forward(
         self,

@@ -1,5 +1,5 @@
 from .gekko import (
-    GekkoBlockFunction,
+    GekkoGCABlockFunction,
     GekkoOutputLayerFunction
 )
 from .transformer import (
